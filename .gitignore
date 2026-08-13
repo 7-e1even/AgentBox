@@ -1,5 +1,6 @@
 # Local references and preserved scaffold metadata
 /参考/
+/reference/
 /.scaffold-git-backup/
 
 # Local environments and secrets
@@ -10,6 +11,7 @@ server/.agentbox-secret-key
 .agentbox-secret-key
 
 # Dependencies and build outputs
+/node_modules/
 app/node_modules/
 app/.next/
 app/out/
@@ -22,3 +24,4 @@ server/agentbox-server.exe
 Thumbs.db
 *.log
 *.tsbuildinfo
+.code-review-graph/
