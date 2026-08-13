@@ -1,0 +1,22 @@
+# Local references and preserved scaffold metadata
+/参考/
+/.scaffold-git-backup/
+
+# Local environments and secrets
+app/.env*
+!app/.env.example
+server/.env
+
+# Dependencies and build outputs
+app/node_modules/
+app/.next/
+app/out/
+app/coverage/
+server/agentbox.exe
+server/agentbox-server.exe
+
+# Editors and operating systems
+.DS_Store
+Thumbs.db
+*.log
+*.tsbuildinfo
