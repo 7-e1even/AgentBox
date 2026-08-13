@@ -6,7 +6,7 @@ func validInput() Input {
 	credential := "openai-primary"
 	return Input{
 		ProjectID:     "default",
-		RuntimeID:     "python-venv",
+		RuntimeID:     "docker-agent",
 		Name:          "Research Agent",
 		Slug:          "research-agent",
 		Description:   "A focused assistant.",

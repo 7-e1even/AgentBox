@@ -21,6 +21,8 @@ export const credentialSchema = z.object({
   providerId: z.string(),
   environment: z.string(),
   status: z.enum(["configured", "attention"]),
+  modelId: z.string().default(""),
+  models: z.array(z.object({ id: z.string(), name: z.string() })).default([]),
 })
 
 export const skillDefinitionSchema = z.object({

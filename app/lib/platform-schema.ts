@@ -2,6 +2,7 @@ import { z } from "zod"
 
 export const resourceKindSchema = z.enum([
   "project",
+  "image",
   "runtime",
   "skill",
   "mcp",

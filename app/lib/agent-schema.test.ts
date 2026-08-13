@@ -8,7 +8,7 @@ import {
 
 const validAgent = {
   projectId: "default",
-  runtimeId: "python-venv",
+  runtimeId: "docker-agent",
   name: "Research Agent",
   slug: "research-agent",
   description: "A focused research assistant.",

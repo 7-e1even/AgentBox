@@ -23,10 +23,10 @@ func newCatalog() Catalog {
 			}},
 		},
 		Credentials: []Credential{
-			{ID: "openai-primary", Name: "OpenAI · Production", ProviderID: "openai", Environment: "引用槽位", Status: "configured"},
-			{ID: "anthropic-primary", Name: "Anthropic · Production", ProviderID: "anthropic", Environment: "引用槽位", Status: "configured"},
-			{ID: "google-primary", Name: "Google · Team", ProviderID: "google", Environment: "引用槽位", Status: "configured"},
-			{ID: "deepseek-primary", Name: "DeepSeek · Team", ProviderID: "deepseek", Environment: "引用槽位", Status: "configured"},
+			{ID: "openai-primary", Name: "OpenAI API Key", ProviderID: "openai", Environment: "待绑定真实密钥", Status: "attention"},
+			{ID: "anthropic-primary", Name: "Anthropic API Key", ProviderID: "anthropic", Environment: "待绑定真实密钥", Status: "attention"},
+			{ID: "google-primary", Name: "Google API Key", ProviderID: "google", Environment: "待绑定真实密钥", Status: "attention"},
+			{ID: "deepseek-primary", Name: "DeepSeek API Key", ProviderID: "deepseek", Environment: "待绑定真实密钥", Status: "attention"},
 		},
 		Skills: []Skill{
 			{ID: "web-research", Name: "Web Research", Description: "规划检索、比较来源并输出带证据的研究结论。", Version: "1.4.0", Category: "研究"},

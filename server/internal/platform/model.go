@@ -2,16 +2,20 @@ package platform
 
 import (
 	"errors"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/google/uuid"
 )
 
 type Kind string
 
 const (
 	KindProject  Kind = "project"
+	KindImage    Kind = "image"
 	KindRuntime  Kind = "runtime"
 	KindSkill    Kind = "skill"
 	KindMCP      Kind = "mcp"
@@ -43,6 +47,107 @@ type Snapshot struct {
 	Resources []Resource `json:"resources"`
 }
 
+type ManagedServer struct {
+	ID           string          `json:"id"`
+	Name         string          `json:"name"`
+	Hostname     string          `json:"hostname"`
+	OS           string          `json:"os"`
+	Arch         string          `json:"arch"`
+	Capabilities []string        `json:"capabilities"`
+	Inventory    ServerInventory `json:"inventory"`
+	Status       string          `json:"status"`
+	LastSeenAt   time.Time       `json:"lastSeenAt"`
+	CreatedAt    time.Time       `json:"createdAt"`
+	UpdatedAt    time.Time       `json:"updatedAt"`
+}
+
+type ServerImage struct {
+	ID           string `json:"id"`
+	Reference    string `json:"reference"`
+	Architecture string `json:"architecture"`
+	Size         string `json:"size"`
+	Created      string `json:"created"`
+	Format       string `json:"format"`
+	Path         string `json:"path"`
+}
+
+type ServerInventory struct {
+	DockerImages     []ServerImage `json:"dockerImages"`
+	VMImages         []ServerImage `json:"vmImages"`
+	VMImageDirectory string        `json:"vmImageDirectory"`
+}
+
+type ServerPairing struct {
+	ID        string     `json:"id"`
+	Token     string     `json:"token,omitempty"`
+	ExpiresAt time.Time  `json:"expiresAt"`
+	ServerID  *string    `json:"serverId"`
+	ClaimedAt *time.Time `json:"claimedAt"`
+}
+
+type ServerRegistration struct {
+	PairingToken string   `json:"pairingToken"`
+	ServerID     string   `json:"serverId"`
+	Name         string   `json:"name"`
+	Hostname     string   `json:"hostname"`
+	OS           string   `json:"os"`
+	Arch         string   `json:"arch"`
+	Capabilities []string `json:"capabilities"`
+}
+
+type CredentialInput struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	ProviderID string `json:"providerId"`
+	Protocol   string `json:"protocol"`
+	Endpoint   string `json:"endpoint"`
+	ModelID    string `json:"modelId"`
+	Secret     string `json:"secret"`
+	Enabled    bool   `json:"enabled"`
+}
+
+type ManagedCredential struct {
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	ProviderID     string            `json:"providerId"`
+	Protocol       string            `json:"protocol"`
+	Endpoint       string            `json:"endpoint"`
+	ModelID        string            `json:"modelId"`
+	Models         []CredentialModel `json:"models"`
+	MaskedSecret   string            `json:"maskedSecret"`
+	Enabled        bool              `json:"enabled"`
+	LastCheckAt    *time.Time        `json:"lastCheckAt"`
+	LastCheckOK    *bool             `json:"lastCheckOk"`
+	LastCheckError string            `json:"lastCheckError"`
+	CreatedAt      time.Time         `json:"createdAt"`
+	UpdatedAt      time.Time         `json:"updatedAt"`
+}
+
+type CredentialModel struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Group  string `json:"group"`
+	Source string `json:"source"`
+}
+
+type CredentialModelInput struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type WorkerJob struct {
+	ID         string         `json:"id"`
+	ResourceID string         `json:"resourceId"`
+	Action     string         `json:"action"`
+	Payload    map[string]any `json:"payload"`
+}
+
+type WorkerJobResult struct {
+	Success    bool   `json:"success"`
+	ExternalID string `json:"externalId"`
+	Message    string `json:"message"`
+}
+
 type ValidationError struct{ Message string }
 
 func (e *ValidationError) Error() string { return e.Message }
@@ -64,6 +169,145 @@ func Normalize(input *Input) {
 	}
 }
 
+func NormalizeServerRegistration(input *ServerRegistration) {
+	input.PairingToken = strings.TrimSpace(input.PairingToken)
+	input.ServerID = strings.TrimSpace(input.ServerID)
+	input.Name = strings.TrimSpace(input.Name)
+	input.Hostname = strings.TrimSpace(input.Hostname)
+	input.OS = strings.ToLower(strings.TrimSpace(input.OS))
+	input.Arch = strings.ToLower(strings.TrimSpace(input.Arch))
+	if input.Name == "" {
+		input.Name = input.Hostname
+	}
+	if input.Capabilities == nil {
+		input.Capabilities = []string{}
+	}
+}
+
+func ValidateServerRegistration(input ServerRegistration) error {
+	if len(input.PairingToken) < 32 {
+		return &ValidationError{Message: "配对令牌无效"}
+	}
+	if _, err := uuid.Parse(input.ServerID); err != nil {
+		return &ValidationError{Message: "服务器标识无效"}
+	}
+	if n := utf8.RuneCountInString(input.Name); n < 1 || n > 80 {
+		return &ValidationError{Message: "服务器名称需要 1 到 80 个字符"}
+	}
+	if n := utf8.RuneCountInString(input.Hostname); n < 1 || n > 255 {
+		return &ValidationError{Message: "服务器主机名无效"}
+	}
+	if input.OS != "linux" {
+		return &ValidationError{Message: "当前仅支持 Linux 服务器"}
+	}
+	if input.Arch != "amd64" && input.Arch != "arm64" {
+		return &ValidationError{Message: "当前仅支持 amd64 或 arm64 架构"}
+	}
+	if len(input.Capabilities) > 32 {
+		return &ValidationError{Message: "服务器能力数量过多"}
+	}
+	for _, capability := range input.Capabilities {
+		if n := utf8.RuneCountInString(capability); n < 1 || n > 64 {
+			return &ValidationError{Message: "服务器能力无效"}
+		}
+	}
+	return nil
+}
+
+func NormalizeServerInventory(inventory *ServerInventory) {
+	if inventory.DockerImages == nil {
+		inventory.DockerImages = []ServerImage{}
+	}
+	if inventory.VMImages == nil {
+		inventory.VMImages = []ServerImage{}
+	}
+	inventory.VMImageDirectory = strings.TrimSpace(inventory.VMImageDirectory)
+}
+
+func ValidateServerInventory(inventory ServerInventory) error {
+	if len(inventory.DockerImages) > 2000 || len(inventory.VMImages) > 2000 {
+		return &ValidationError{Message: "服务器镜像数量过多"}
+	}
+	if utf8.RuneCountInString(inventory.VMImageDirectory) > 500 {
+		return &ValidationError{Message: "VM 镜像目录过长"}
+	}
+	for _, image := range append(append([]ServerImage{}, inventory.DockerImages...), inventory.VMImages...) {
+		for _, value := range []string{image.ID, image.Reference, image.Architecture, image.Size, image.Created, image.Format, image.Path} {
+			if utf8.RuneCountInString(value) > 1000 || strings.ContainsRune(value, '\x00') {
+				return &ValidationError{Message: "服务器镜像信息无效"}
+			}
+		}
+	}
+	return nil
+}
+
+func NormalizeCredential(input *CredentialInput) {
+	input.ID = strings.ToLower(strings.TrimSpace(input.ID))
+	input.Name = strings.TrimSpace(input.Name)
+	input.ProviderID = strings.ToLower(strings.TrimSpace(input.ProviderID))
+	input.Protocol = strings.ToLower(strings.TrimSpace(input.Protocol))
+	input.Endpoint = strings.TrimSpace(input.Endpoint)
+	input.ModelID = strings.TrimSpace(input.ModelID)
+	input.Secret = strings.TrimSpace(input.Secret)
+}
+
+func ValidateCredential(input CredentialInput, requireSecret bool) error {
+	if n := utf8.RuneCountInString(input.ID); n < 2 || n > 64 || !idPattern.MatchString(input.ID) {
+		return &ValidationError{Message: "凭据标识只能包含小写字母、数字和连字符，长度为 2 到 64"}
+	}
+	if n := utf8.RuneCountInString(input.Name); n < 2 || n > 80 {
+		return &ValidationError{Message: "凭据名称需要 2 到 80 个字符"}
+	}
+	if input.ProviderID == "" {
+		return &ValidationError{Message: "请选择 Agent Provider"}
+	}
+	switch input.Protocol {
+	case "openai-responses", "openai-chat", "anthropic", "gemini":
+	default:
+		return &ValidationError{Message: "请选择有效的接口协议"}
+	}
+	if len(input.Endpoint) > 500 {
+		return &ValidationError{Message: "接口地址过长"}
+	}
+	if input.Endpoint != "" {
+		parsed, err := url.Parse(input.Endpoint)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+			return &ValidationError{Message: "接口地址必须是有效的 HTTP 或 HTTPS URL"}
+		}
+	}
+	if n := utf8.RuneCountInString(input.ModelID); n > 160 {
+		return &ValidationError{Message: "模型名称过长"}
+	}
+	if requireSecret && input.Secret == "" {
+		return &ValidationError{Message: "请填写 API Key"}
+	}
+	if len(input.Secret) > 16*1024 {
+		return &ValidationError{Message: "API Key 过长"}
+	}
+	if strings.ContainsAny(input.Secret, "\r\n") {
+		return &ValidationError{Message: "API Key 不能包含换行符"}
+	}
+	return nil
+}
+
+func NormalizeCredentialModel(input *CredentialModelInput) {
+	input.ID = strings.TrimSpace(strings.TrimPrefix(input.ID, "models/"))
+	input.Name = strings.TrimSpace(input.Name)
+	if input.Name == "" {
+		input.Name = input.ID
+	}
+}
+
+func ValidateCredentialModel(input CredentialModelInput) error {
+	if n := utf8.RuneCountInString(input.ID); n < 1 || n > 256 || strings.ContainsAny(input.ID, "\r\n\t") {
+		return &ValidationError{Message: "模型 ID 无效"}
+	}
+	if n := utf8.RuneCountInString(input.Name); n < 1 || n > 160 {
+		return &ValidationError{Message: "模型名称需要 1 到 160 个字符"}
+	}
+	return nil
+}
+
 func Validate(input Input) error {
 	if !isKind(input.Kind) {
 		return &ValidationError{Message: "资源类型无效"}
@@ -77,8 +321,30 @@ func Validate(input Input) error {
 	if utf8.RuneCountInString(input.Description) > 500 {
 		return &ValidationError{Message: "简介不能超过 500 个字符"}
 	}
-	if input.Kind != KindProject && input.ProjectID == nil {
+	if input.Kind != KindProject && input.Kind != KindImage && input.ProjectID == nil {
 		return &ValidationError{Message: "请选择所属项目"}
+	}
+	if input.Kind == KindImage {
+		if err := require(input.Spec, "reference", "请填写镜像引用"); err != nil {
+			return err
+		}
+		reference, _ := input.Spec["reference"].(string)
+		if strings.ContainsAny(reference, " \t\r\n") {
+			return &ValidationError{Message: "镜像引用不能包含空白字符"}
+		}
+		architecture, _ := input.Spec["architecture"].(string)
+		if architecture != "all" && architecture != "amd64" && architecture != "arm64" {
+			return &ValidationError{Message: "镜像架构无效"}
+		}
+		modes := stringList(input.Spec["modes"])
+		if len(modes) == 0 {
+			return &ValidationError{Message: "请至少选择一种兼容的隔离类型"}
+		}
+		for _, mode := range modes {
+			if mode != "docker" && mode != "vm" {
+				return &ValidationError{Message: "镜像兼容类型无效"}
+			}
+		}
 	}
 	if input.Kind == KindSchedule {
 		if err := require(input.Spec, "agentId", "请选择目标 Agent"); err != nil {
@@ -100,18 +366,39 @@ func Validate(input Input) error {
 		return require(input.Spec, "url", "HTTP MCP 需要 URL")
 	}
 	if input.Kind == KindRuntime {
+		serverID, _ := input.Spec["serverId"].(string)
+		if _, err := uuid.Parse(serverID); err != nil {
+			return &ValidationError{Message: "请选择运行服务器"}
+		}
 		driver, _ := input.Spec["driver"].(string)
 		switch driver {
-		case "process", "docker", "boxlite", "microsandbox":
+		case "docker", "vm":
 		default:
 			return &ValidationError{Message: "Runtime 驱动无效"}
+		}
+		if err := require(input.Spec, "imageReference", "请选择服务器上的镜像"); err != nil {
+			return err
+		}
+		allowedTools := map[string]bool{
+			"codex": true, "claude-code": true, "gemini-cli": true, "opencode": true,
+		}
+		for _, tool := range stringList(input.Spec["agentTools"]) {
+			if !allowedTools[tool] {
+				return &ValidationError{Message: "预装 Agent 工具无效"}
+			}
 		}
 	}
 	if input.Kind == KindSandbox {
 		if err := require(input.Spec, "agentId", "请选择 Agent"); err != nil {
 			return err
 		}
-		return require(input.Spec, "runtimeId", "请选择 Runtime")
+		if err := require(input.Spec, "runtimeId", "请选择环境模板"); err != nil {
+			return err
+		}
+		serverID, _ := input.Spec["serverId"].(string)
+		if _, err := uuid.Parse(serverID); err != nil {
+			return &ValidationError{Message: "请选择目标服务器"}
+		}
 	}
 	if input.Kind == KindWebhook {
 		if err := require(input.Spec, "agentId", "请选择目标 Agent"); err != nil {
@@ -139,6 +426,23 @@ func require(spec map[string]any, key, message string) error {
 	return nil
 }
 
+func stringList(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		if strings, ok := value.([]string); ok {
+			return strings
+		}
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		if value, ok := item.(string); ok {
+			result = append(result, value)
+		}
+	}
+	return result
+}
+
 func IsValidationError(err error) bool {
 	var target *ValidationError
 	return errors.As(err, &target)
@@ -146,7 +450,7 @@ func IsValidationError(err error) bool {
 
 func isKind(kind Kind) bool {
 	switch kind {
-	case KindProject, KindRuntime, KindSkill, KindMCP, KindSandbox, KindSchedule, KindWebhook, KindVariable:
+	case KindProject, KindImage, KindRuntime, KindSkill, KindMCP, KindSandbox, KindSchedule, KindWebhook, KindVariable:
 		return true
 	default:
 		return false
