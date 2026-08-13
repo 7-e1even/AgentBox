@@ -5,19 +5,23 @@ import "testing"
 func validInput() Input {
 	credential := "openai-primary"
 	return Input{
-		Name:         "Research Agent",
-		Slug:         "research-agent",
-		Description:  "A focused assistant.",
-		Avatar:       "RA",
-		ProviderID:   "openai",
-		ModelID:      "gpt-5",
-		CredentialID: &credential,
-		SystemPrompt: "You research questions carefully and explain the evidence behind each conclusion.",
-		SkillIDs:     []string{"web-research"},
-		MCPServerIDs: []string{"browser"},
-		Temperature:  0.4,
-		MaxSteps:     12,
-		Status:       StatusDraft,
+		ProjectID:     "default",
+		RuntimeID:     "python-venv",
+		Name:          "Research Agent",
+		Slug:          "research-agent",
+		Description:   "A focused assistant.",
+		Avatar:        "RA",
+		ProviderID:    "openai",
+		ModelID:       "gpt-5",
+		CredentialID:  &credential,
+		SystemPrompt:  "You research questions carefully and explain the evidence behind each conclusion.",
+		SkillIDs:      []string{"web-research"},
+		MCPServerIDs:  []string{"browser"},
+		Temperature:   0.4,
+		MaxSteps:      12,
+		Concurrency:   1,
+		SandboxPolicy: "new",
+		Status:        StatusDraft,
 	}
 }
 
@@ -35,9 +39,9 @@ func TestValidateRejectsProviderModelMismatch(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsUnknownCapabilities(t *testing.T) {
+func TestValidateRejectsInvalidProject(t *testing.T) {
 	input := validInput()
-	input.SkillIDs = []string{"does-not-exist"}
+	input.ProjectID = "Not Valid"
 	if err := Validate(input, BuiltinCatalog); !IsValidationError(err) {
 		t.Fatalf("Validate() error = %v, want validation error", err)
 	}

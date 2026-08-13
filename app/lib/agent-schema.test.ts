@@ -7,6 +7,8 @@ import {
 } from "./agent-schema"
 
 const validAgent = {
+  projectId: "default",
+  runtimeId: "python-venv",
   name: "Research Agent",
   slug: "research-agent",
   description: "A focused research assistant.",
@@ -18,8 +20,12 @@ const validAgent = {
     "You research questions carefully and explain the evidence behind every conclusion.",
   skillIds: ["web-research"],
   mcpServerIds: ["browser"],
+  variableIds: ["github-token"],
+  customArgs: [],
   temperature: 0.4,
   maxSteps: 12,
+  concurrency: 1,
+  sandboxPolicy: "new" as const,
   status: "draft" as const,
 }
 
@@ -59,7 +65,6 @@ describe("agentResponseSchema", () => {
       agent: {
         ...validAgent,
         id: "b88eb8db-3954-4d1a-bda3-005e1fb375c4",
-        projectId: "default",
         version: 1,
         createdAt: "2026-08-13T05:00:00Z",
         updatedAt: "2026-08-13T05:00:00Z",

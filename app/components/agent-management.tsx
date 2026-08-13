@@ -9,7 +9,6 @@ import {
   ChevronRightIcon,
   CircleDotIcon,
   CopyIcon,
-  DatabaseIcon,
   MoreHorizontalIcon,
   MoonIcon,
   PencilIcon,
@@ -25,6 +24,8 @@ import { toast } from "sonner"
 
 import { AgentEditorDialog } from "@/components/agent-editor-dialog"
 import { AppSidebar } from "@/components/app-sidebar"
+import { OverviewView, ResourceView } from "@/components/control-plane-view"
+import { ResourceEditorDialog } from "@/components/resource-editor-dialog"
 import {
   agentResponseSchema,
   type Agent,
@@ -37,6 +38,12 @@ import type {
   Provider,
   SkillDefinition,
 } from "@/lib/catalog"
+import {
+  resourceResponseSchema,
+  type Resource,
+  type ResourceInput,
+  type ResourceKind,
+} from "@/lib/platform-schema"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -98,7 +105,28 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 
-export type AppSection = "agents" | "skills" | "mcp"
+export type AppSection =
+  | "overview"
+  | "projects"
+  | "agents"
+  | "runtimes"
+  | "sandboxes"
+  | "skills"
+  | "mcp"
+  | "schedules"
+  | "webhooks"
+  | "variables"
+
+const sectionKinds: Partial<Record<AppSection, ResourceKind>> = {
+  projects: "project",
+  runtimes: "runtime",
+  sandboxes: "sandbox",
+  skills: "skill",
+  mcp: "mcp",
+  schedules: "schedule",
+  webhooks: "webhook",
+  variables: "variable",
+}
 
 type Catalog = {
   project: { id: string; name: string }
@@ -127,6 +155,8 @@ const statusMeta: Record<AgentStatus, { label: string; className: string }> = {
 
 function agentInput(agent: Agent): AgentInput {
   return {
+    projectId: agent.projectId,
+    runtimeId: agent.runtimeId,
     name: agent.name,
     slug: agent.slug,
     description: agent.description,
@@ -137,8 +167,12 @@ function agentInput(agent: Agent): AgentInput {
     systemPrompt: agent.systemPrompt,
     skillIds: agent.skillIds,
     mcpServerIds: agent.mcpServerIds,
+    variableIds: agent.variableIds,
+    customArgs: agent.customArgs,
     temperature: agent.temperature,
     maxSteps: agent.maxSteps,
+    concurrency: agent.concurrency,
+    sandboxPolicy: agent.sandboxPolicy,
     status: agent.status,
   }
 }
@@ -185,30 +219,99 @@ function updatedLabel(value: string) {
 
 export function AgentManagement({
   initialAgents,
+  initialResources,
   catalog,
 }: {
   initialAgents: Agent[]
+  initialResources: Resource[]
   catalog: Catalog
 }) {
   const [agents, setAgents] = useState(() => ordered(initialAgents))
-  const [section, setSection] = useState<AppSection>("agents")
+  const [resources, setResources] = useState(initialResources)
+  const [section, setSection] = useState<AppSection>("overview")
+  const [projectId, setProjectId] = useState(
+    initialResources.find((item) => item.kind === "project")?.id ?? "default"
+  )
   const [editor, setEditor] = useState<{ open: boolean; agent: Agent | null }>({
     open: false,
     agent: null,
   })
   const [deleting, setDeleting] = useState<Agent | null>(null)
+  const [resourceEditor, setResourceEditor] = useState<{
+    kind: ResourceKind
+    resource: Resource | null
+  } | null>(null)
+  const [deletingResource, setDeletingResource] = useState<Resource | null>(
+    null
+  )
   const [busyId, setBusyId] = useState<string | null>(null)
   const { setTheme } = useTheme()
 
-  const counts = {
-    agents: agents.length,
-    skills: catalog.skills.length,
-    mcp: catalog.mcpServers.length,
+  const count = (kind: ResourceKind) =>
+    resources.filter((item) => item.kind === kind).length
+  const counts: Record<AppSection, number> = {
+    overview: 0,
+    projects: count("project"),
+    agents: agents.filter((item) => item.projectId === projectId).length,
+    runtimes: count("runtime"),
+    sandboxes: count("sandbox"),
+    skills: count("skill"),
+    mcp: count("mcp"),
+    schedules: count("schedule"),
+    webhooks: count("webhook"),
+    variables: count("variable"),
   }
   const sectionLabels: Record<AppSection, string> = {
+    overview: "概览",
+    projects: "Projects",
     agents: "Agents",
+    runtimes: "Runtimes",
+    sandboxes: "Sandboxes",
     skills: "Skills",
     mcp: "MCP Servers",
+    schedules: "Schedules",
+    webhooks: "Webhooks",
+    variables: "Variables & Secrets",
+  }
+
+  const projectResources = resources.filter((item) => item.kind === "project")
+  const agentCatalog = {
+    ...catalog,
+    projects: [...projectResources].sort((a, b) =>
+      a.id === projectId
+        ? -1
+        : b.id === projectId
+          ? 1
+          : a.name.localeCompare(b.name)
+    ),
+    runtimes: resources.filter(
+      (item) => item.kind === "runtime" && item.enabled
+    ),
+    variables: resources.filter(
+      (item) => item.kind === "variable" && item.enabled
+    ),
+    skills: resources
+      .filter((item) => item.kind === "skill" && item.enabled)
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description,
+        version: String(item.spec.version ?? "1.0.0"),
+        category: String(item.spec.category ?? "通用"),
+      })),
+    mcpServers: resources
+      .filter((item) => item.kind === "mcp")
+      .map((item) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description,
+        transport:
+          item.spec.transport === "http"
+            ? ("http" as const)
+            : ("stdio" as const),
+        toolCount: Number(item.spec.toolCount ?? 0),
+        status: item.enabled ? ("ready" as const) : ("attention" as const),
+      })),
   }
 
   async function save(input: AgentInput, editing: Agent | null) {
@@ -308,12 +411,67 @@ export function AgentManagement({
     }
   }
 
+  async function saveResource(input: ResourceInput) {
+    const editing = resourceEditor?.resource
+    const result = resourceResponseSchema.parse(
+      await requestJson<unknown>(
+        editing ? `/api/resources/${editing.id}` : "/api/resources",
+        {
+          method: editing ? "PATCH" : "POST",
+          body: JSON.stringify(input),
+        }
+      )
+    )
+    setResources((current) =>
+      editing
+        ? current.map((item) =>
+            item.id === result.resource.id ? result.resource : item
+          )
+        : [...current, result.resource]
+    )
+    setResourceEditor(null)
+    if (input.kind === "project" && !editing) setProjectId(input.id)
+    toast.success(editing ? "配置已更新" : "配置已创建", {
+      description: result.resource.name,
+    })
+  }
+
+  async function permanentlyDeleteResource() {
+    if (!deletingResource) return
+    try {
+      await requestJson<void>(`/api/resources/${deletingResource.id}`, {
+        method: "DELETE",
+      })
+      setResources((current) =>
+        current.filter((item) => item.id !== deletingResource.id)
+      )
+      if (
+        deletingResource.kind === "project" &&
+        deletingResource.id === projectId
+      ) {
+        const next = resources.find(
+          (item) => item.kind === "project" && item.id !== deletingResource.id
+        )
+        if (next) setProjectId(next.id)
+      }
+      toast.success("配置已删除", { description: deletingResource.name })
+      setDeletingResource(null)
+    } catch (error) {
+      toast.error("删除失败", {
+        description: error instanceof Error ? error.message : "请稍后重试",
+      })
+    }
+  }
+
   return (
     <SidebarProvider>
       <AppSidebar
         section={section}
         onSectionChange={setSection}
         counts={counts}
+        projects={projectResources}
+        projectId={projectId}
+        onProjectChange={setProjectId}
       />
       <SidebarInset className="min-w-0 overflow-hidden">
         <header className="flex h-14 shrink-0 items-center gap-2 border-b px-4 sm:px-6">
@@ -359,10 +517,21 @@ export function AgentManagement({
         </header>
 
         <main className="min-h-0 flex-1 overflow-auto">
-          {section === "agents" ? (
+          {section === "overview" ? (
+            <OverviewView
+              agents={agents.filter((item) => item.projectId === projectId)}
+              resources={resources.filter(
+                (item) =>
+                  item.kind === "project" || item.projectId === projectId
+              )}
+              onCreateSandbox={() =>
+                setResourceEditor({ kind: "sandbox", resource: null })
+              }
+            />
+          ) : section === "agents" ? (
             <AgentsView
-              agents={agents}
-              catalog={catalog}
+              agents={agents.filter((item) => item.projectId === projectId)}
+              catalog={agentCatalog}
               busyId={busyId}
               onCreate={() => setEditor({ open: true, agent: null })}
               onEdit={(agent) => setEditor({ open: true, agent })}
@@ -370,9 +539,23 @@ export function AgentManagement({
               onStatusChange={changeStatus}
               onDelete={setDeleting}
             />
-          ) : (
-            <CatalogView section={section} catalog={catalog} />
-          )}
+          ) : sectionKinds[section] ? (
+            <ResourceView
+              kind={sectionKinds[section]!}
+              resources={resources}
+              projectId={projectId}
+              onCreate={() =>
+                setResourceEditor({
+                  kind: sectionKinds[section]!,
+                  resource: null,
+                })
+              }
+              onEdit={(resource) =>
+                setResourceEditor({ kind: resource.kind, resource })
+              }
+              onDelete={setDeletingResource}
+            />
+          ) : null}
         </main>
       </SidebarInset>
 
@@ -380,11 +563,24 @@ export function AgentManagement({
         <AgentEditorDialog
           key={editor.agent?.id ?? "new"}
           agent={editor.agent}
-          catalog={catalog}
+          catalog={agentCatalog}
           onOpenChange={(open) =>
             setEditor({ open, agent: open ? editor.agent : null })
           }
           onSave={save}
+        />
+      )}
+
+      {resourceEditor && (
+        <ResourceEditorDialog
+          key={resourceEditor.resource?.id ?? resourceEditor.kind}
+          kind={resourceEditor.kind}
+          resource={resourceEditor.resource}
+          projectId={projectId}
+          resources={resources}
+          agents={agents.filter((item) => item.projectId === projectId)}
+          onOpenChange={(open) => !open && setResourceEditor(null)}
+          onSave={saveResource}
         />
       )}
 
@@ -415,6 +611,33 @@ export function AgentManagement({
               ) : (
                 <Trash2Icon data-icon="inline-start" />
               )}
+              永久删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog
+        open={Boolean(deletingResource)}
+        onOpenChange={(open) => !open && setDeletingResource(null)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogMedia>
+              <Trash2Icon />
+            </AlertDialogMedia>
+            <AlertDialogTitle>删除 {deletingResource?.name}？</AlertDialogTitle>
+            <AlertDialogDescription>
+              该声明会从控制面永久删除。已经创建的远端 Sandbox
+              不会在这里被强制销毁。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              variant="destructive"
+              onClick={permanentlyDeleteResource}
+            >
               永久删除
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -474,8 +697,7 @@ function AgentsView({
             Agents
           </h1>
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground sm:text-base">
-            在平台中声明角色、模型与能力。当前只管理 Agent 配置，不创建
-            Runtime。
+            统一配置角色、模型、Runtime、Skills、MCP、变量与 Sandbox 策略。
           </p>
         </div>
         <Button onClick={onCreate} className="w-full sm:w-auto">
@@ -494,7 +716,7 @@ function AgentsView({
         <SummaryCard
           title="已启用"
           value={active}
-          description="可供未来 Runtime 选择"
+          description="可由 Sandbox 或触发器调用"
           icon={CheckCircle2Icon}
         />
         <SummaryCard
@@ -744,6 +966,7 @@ function AgentCard({
             {provider?.name ?? agent.providerId}
           </Badge>
           <Badge variant="secondary">{model?.name ?? agent.modelId}</Badge>
+          <Badge variant="outline">{agent.runtimeId}</Badge>
         </div>
         <div className="grid grid-cols-2 gap-3 rounded-lg bg-muted/50 p-3 text-sm">
           <div className="flex items-center gap-2">
@@ -781,91 +1004,5 @@ function AgentCard({
         </Button>
       </CardFooter>
     </Card>
-  )
-}
-
-function CatalogView({
-  section,
-  catalog,
-}: {
-  section: Exclude<AppSection, "agents">
-  catalog: Catalog
-}) {
-  const isSkills = section === "skills"
-  const items = isSkills ? catalog.skills : catalog.mcpServers
-  return (
-    <div className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-      <div className="flex items-start gap-3">
-        <div className="flex size-10 items-center justify-center rounded-xl bg-primary text-primary-foreground">
-          {isSkills ? <SparklesIcon /> : <PlugZapIcon />}
-        </div>
-        <div>
-          <h1 className="font-heading text-2xl font-semibold tracking-tight sm:text-3xl">
-            {isSkills ? "Skills" : "MCP Servers"}
-          </h1>
-          <p className="mt-1 max-w-2xl text-sm text-muted-foreground sm:text-base">
-            {isSkills
-              ? "当前可绑定到 Agent 的内置能力目录。"
-              : "当前可绑定到 Agent 的工具连接目录。"}
-          </p>
-        </div>
-      </div>
-
-      <div className="mt-6 flex items-center gap-2 rounded-xl border bg-muted/40 p-3 text-sm text-muted-foreground">
-        <DatabaseIcon className="size-4 shrink-0" />
-        目录目前是只读的；创建和编辑 Agent 时可以选择绑定。目录管理会单独建设。
-      </div>
-
-      <div className="mt-5 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-        {items.map((item) =>
-          isSkills ? (
-            <Card key={item.id} size="sm">
-              <CardHeader>
-                <CardTitle>{(item as SkillDefinition).name}</CardTitle>
-                <CardAction>
-                  <Badge variant="secondary">
-                    {(item as SkillDefinition).category}
-                  </Badge>
-                </CardAction>
-                <CardDescription>
-                  {(item as SkillDefinition).description}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <code className="text-xs text-muted-foreground">{item.id}</code>
-              </CardContent>
-              <CardFooter className="text-xs text-muted-foreground">
-                版本 {(item as SkillDefinition).version}
-              </CardFooter>
-            </Card>
-          ) : (
-            <Card key={item.id} size="sm">
-              <CardHeader>
-                <CardTitle>{(item as McpServerDefinition).name}</CardTitle>
-                <CardAction>
-                  <Badge variant="outline">
-                    {(item as McpServerDefinition).transport}
-                  </Badge>
-                </CardAction>
-                <CardDescription>
-                  {(item as McpServerDefinition).description}
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <code className="text-xs text-muted-foreground">{item.id}</code>
-              </CardContent>
-              <CardFooter className="justify-between text-xs text-muted-foreground">
-                <span>{(item as McpServerDefinition).toolCount} 个工具</span>
-                <span>
-                  {(item as McpServerDefinition).status === "ready"
-                    ? "可绑定"
-                    : "待配置"}
-                </span>
-              </CardFooter>
-            </Card>
-          )
-        )}
-      </div>
-    </div>
   )
 }

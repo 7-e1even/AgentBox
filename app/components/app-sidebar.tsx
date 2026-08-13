@@ -2,14 +2,21 @@
 
 import {
   BotIcon,
+  BoxIcon,
   BoxesIcon,
   ChevronsUpDownIcon,
+  Clock3Icon,
+  ContainerIcon,
+  FolderGit2Icon,
+  GaugeIcon,
   KeyRoundIcon,
   PlugZapIcon,
   SparklesIcon,
+  WebhookIcon,
 } from "lucide-react"
 
 import type { AppSection } from "@/components/agent-management"
+import type { Resource } from "@/lib/platform-schema"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import { Badge } from "@/components/ui/badge"
 import {
@@ -18,7 +25,6 @@ import {
   DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -37,20 +43,60 @@ import {
 } from "@/components/ui/sidebar"
 
 const navigation = [
-  { id: "agents" as const, label: "Agents", icon: BotIcon },
-  { id: "skills" as const, label: "Skills", icon: SparklesIcon },
-  { id: "mcp" as const, label: "MCP Servers", icon: PlugZapIcon },
+  {
+    label: "工作区",
+    items: [
+      { id: "overview" as const, label: "概览", icon: GaugeIcon },
+      { id: "projects" as const, label: "Projects", icon: FolderGit2Icon },
+      { id: "agents" as const, label: "Agents", icon: BotIcon },
+    ],
+  },
+  {
+    label: "运行环境",
+    items: [
+      { id: "runtimes" as const, label: "Runtimes", icon: ContainerIcon },
+      { id: "sandboxes" as const, label: "Sandboxes", icon: BoxIcon },
+    ],
+  },
+  {
+    label: "能力",
+    items: [
+      { id: "skills" as const, label: "Skills", icon: SparklesIcon },
+      { id: "mcp" as const, label: "MCP Servers", icon: PlugZapIcon },
+    ],
+  },
+  {
+    label: "触发器",
+    items: [
+      { id: "schedules" as const, label: "Schedules", icon: Clock3Icon },
+      { id: "webhooks" as const, label: "Webhooks", icon: WebhookIcon },
+    ],
+  },
+  {
+    label: "安全",
+    items: [
+      { id: "variables" as const, label: "Variables", icon: KeyRoundIcon },
+    ],
+  },
 ]
 
 export function AppSidebar({
   section,
   onSectionChange,
   counts,
+  projects,
+  projectId,
+  onProjectChange,
 }: {
   section: AppSection
   onSectionChange: (section: AppSection) => void
   counts: Record<AppSection, number>
+  projects: Resource[]
+  projectId: string
+  onProjectChange: (projectId: string) => void
 }) {
+  const currentProject =
+    projects.find((item) => item.id === projectId) ?? projects[0]
   return (
     <Sidebar collapsible="icon" variant="inset">
       <SidebarHeader>
@@ -67,7 +113,7 @@ export function AppSidebar({
                       AgentBox Studio
                     </span>
                     <span className="truncate text-xs text-muted-foreground">
-                      默认项目
+                      {currentProject?.name ?? "选择项目"}
                     </span>
                   </div>
                   <ChevronsUpDownIcon className="ml-auto" />
@@ -76,21 +122,22 @@ export function AppSidebar({
               <DropdownMenuContent className="w-64" align="start" side="bottom">
                 <DropdownMenuLabel>当前项目</DropdownMenuLabel>
                 <DropdownMenuGroup>
-                  <DropdownMenuItem>
-                    <div className="flex size-7 items-center justify-center rounded-md border">
-                      <BoxesIcon />
-                    </div>
-                    <span>AgentBox Studio</span>
-                    <Badge variant="secondary" className="ml-auto">
-                      当前
-                    </Badge>
-                  </DropdownMenuItem>
-                </DropdownMenuGroup>
-                <DropdownMenuSeparator />
-                <DropdownMenuGroup>
-                  <DropdownMenuItem disabled>
-                    多项目将在后续版本提供
-                  </DropdownMenuItem>
+                  {projects.map((project) => (
+                    <DropdownMenuItem
+                      key={project.id}
+                      onClick={() => onProjectChange(project.id)}
+                    >
+                      <div className="flex size-7 items-center justify-center rounded-md border">
+                        <BoxesIcon />
+                      </div>
+                      <span>{project.name}</span>
+                      {project.id === projectId && (
+                        <Badge variant="secondary" className="ml-auto">
+                          当前
+                        </Badge>
+                      )}
+                    </DropdownMenuItem>
+                  ))}
                 </DropdownMenuGroup>
               </DropdownMenuContent>
             </DropdownMenu>
@@ -99,46 +146,31 @@ export function AppSidebar({
       </SidebarHeader>
 
       <SidebarContent>
-        <SidebarGroup>
-          <SidebarGroupLabel>配置</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              {navigation.map((item) => (
-                <SidebarMenuItem key={item.id}>
-                  <SidebarMenuButton
-                    type="button"
-                    isActive={section === item.id}
-                    tooltip={item.label}
-                    onClick={() => onSectionChange(item.id)}
-                  >
-                    <item.icon />
-                    <span>{item.label}</span>
-                  </SidebarMenuButton>
-                  <SidebarMenuBadge>{counts[item.id]}</SidebarMenuBadge>
-                </SidebarMenuItem>
-              ))}
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
-
-        <SidebarGroup>
-          <SidebarGroupLabel>运行准备</SidebarGroupLabel>
-          <SidebarGroupContent>
-            <SidebarMenu>
-              <SidebarMenuItem>
-                <SidebarMenuButton
-                  type="button"
-                  disabled
-                  tooltip="后续版本提供"
-                >
-                  <KeyRoundIcon />
-                  <span>Credentials</span>
-                </SidebarMenuButton>
-                <SidebarMenuBadge>后续</SidebarMenuBadge>
-              </SidebarMenuItem>
-            </SidebarMenu>
-          </SidebarGroupContent>
-        </SidebarGroup>
+        {navigation.map((group) => (
+          <SidebarGroup key={group.label}>
+            <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+            <SidebarGroupContent>
+              <SidebarMenu>
+                {group.items.map((item) => (
+                  <SidebarMenuItem key={item.id}>
+                    <SidebarMenuButton
+                      type="button"
+                      isActive={section === item.id}
+                      tooltip={item.label}
+                      onClick={() => onSectionChange(item.id)}
+                    >
+                      <item.icon />
+                      <span>{item.label}</span>
+                    </SidebarMenuButton>
+                    {item.id !== "overview" && (
+                      <SidebarMenuBadge>{counts[item.id]}</SidebarMenuBadge>
+                    )}
+                  </SidebarMenuItem>
+                ))}
+              </SidebarMenu>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        ))}
       </SidebarContent>
 
       <SidebarFooter>

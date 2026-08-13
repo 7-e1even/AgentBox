@@ -3,6 +3,8 @@ import { z } from "zod"
 export const agentStatusSchema = z.enum(["draft", "active", "archived"])
 
 export const agentInputSchema = z.object({
+  projectId: z.string().trim().min(1, "请选择 Project"),
+  runtimeId: z.string().trim().min(1, "请选择 Runtime"),
   name: z
     .string()
     .trim()
@@ -30,8 +32,12 @@ export const agentInputSchema = z.object({
     .max(16000, "系统指令不能超过 16000 个字符"),
   skillIds: z.array(z.string()).max(20, "最多绑定 20 个 Skill"),
   mcpServerIds: z.array(z.string()).max(20, "最多绑定 20 个 MCP Server"),
+  variableIds: z.array(z.string()).max(50, "最多绑定 50 个变量"),
+  customArgs: z.array(z.string()).max(50, "最多配置 50 个启动参数"),
   temperature: z.number().min(0).max(2),
   maxSteps: z.number().int().min(1).max(50),
+  concurrency: z.number().int().min(1).max(8),
+  sandboxPolicy: z.enum(["new", "reuse", "sticky"]),
   status: agentStatusSchema,
 })
 
@@ -41,7 +47,6 @@ export const agentUpdateSchema = agentInputSchema.extend({
 
 export const agentSchema = agentInputSchema.extend({
   id: z.string().uuid(),
-  projectId: z.string().min(1),
   version: z.number().int().positive(),
   createdAt: z.string().datetime({ offset: true }),
   updatedAt: z.string().datetime({ offset: true }),

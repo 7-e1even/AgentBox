@@ -30,3 +30,30 @@ CREATE TABLE IF NOT EXISTS agent_revisions (
 
 CREATE INDEX IF NOT EXISTS idx_agents_project_status
   ON agents(project_id, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS control_resources (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL CHECK (kind IN (
+    'project', 'runtime', 'skill', 'mcp', 'sandbox', 'schedule', 'webhook', 'variable'
+  )),
+  project_id TEXT,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  spec JSONB NOT NULL DEFAULT '{}'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_control_resources_kind_project
+  ON control_resources(kind, project_id, updated_at DESC);
+
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS runtime_id TEXT NOT NULL DEFAULT 'python-venv';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS variable_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS custom_args JSONB NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS concurrency INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS sandbox_policy TEXT NOT NULL DEFAULT 'new';
+
+UPDATE control_resources
+SET spec = jsonb_set(spec, '{url}', to_jsonb('runtime://' || id), TRUE)
+WHERE kind = 'mcp' AND spec->>'transport' = 'http' AND COALESCE(spec->>'url', '') = '';

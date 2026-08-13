@@ -18,6 +18,8 @@ func (e *ValidationError) Error() string { return e.Message }
 func validation(message string) error { return &ValidationError{Message: message} }
 
 func Normalize(input *Input) {
+	input.ProjectID = strings.TrimSpace(input.ProjectID)
+	input.RuntimeID = strings.TrimSpace(input.RuntimeID)
 	input.Name = strings.TrimSpace(input.Name)
 	input.Slug = strings.TrimSpace(input.Slug)
 	input.Description = strings.TrimSpace(input.Description)
@@ -31,9 +33,22 @@ func Normalize(input *Input) {
 	if input.MCPServerIDs == nil {
 		input.MCPServerIDs = []string{}
 	}
+	if input.VariableIDs == nil {
+		input.VariableIDs = []string{}
+	}
+	if input.CustomArgs == nil {
+		input.CustomArgs = []string{}
+	}
+	input.SandboxPolicy = strings.TrimSpace(input.SandboxPolicy)
 }
 
 func Validate(input Input, catalog Catalog) error {
+	if !slugPattern.MatchString(input.ProjectID) {
+		return validation("所属项目无效")
+	}
+	if !slugPattern.MatchString(input.RuntimeID) {
+		return validation("Runtime 无效")
+	}
 	if n := utf8.RuneCountInString(input.Name); n < 2 || n > 60 {
 		return validation("名称需要 2 到 60 个字符")
 	}
@@ -55,11 +70,20 @@ func Validate(input Input, catalog Catalog) error {
 	if input.MaxSteps < 1 || input.MaxSteps > 50 {
 		return validation("最大步骤需要在 1 到 50 之间")
 	}
+	if input.Concurrency < 1 || input.Concurrency > 8 {
+		return validation("并发上限需要在 1 到 8 之间")
+	}
+	if input.SandboxPolicy != "new" && input.SandboxPolicy != "reuse" && input.SandboxPolicy != "sticky" {
+		return validation("Sandbox 策略无效")
+	}
 	if input.Status != StatusDraft && input.Status != StatusActive && input.Status != StatusArchived {
 		return validation("Agent 状态无效")
 	}
 	if len(input.SkillIDs) > 20 || len(input.MCPServerIDs) > 20 {
 		return validation("单个 Agent 最多绑定 20 个 Skill 和 20 个 MCP Server")
+	}
+	if len(input.VariableIDs) > 50 || len(input.CustomArgs) > 50 {
+		return validation("单个 Agent 最多绑定 50 个变量和 50 个启动参数")
 	}
 
 	var provider *Provider
@@ -96,24 +120,6 @@ func Validate(input Input, catalog Catalog) error {
 		return validation("请选择与 Provider 匹配的凭据引用")
 	}
 
-	skillSet := make(map[string]struct{}, len(catalog.Skills))
-	for _, skill := range catalog.Skills {
-		skillSet[skill.ID] = struct{}{}
-	}
-	for _, id := range input.SkillIDs {
-		if _, ok := skillSet[id]; !ok {
-			return validation("包含不存在的 Skill")
-		}
-	}
-	mcpSet := make(map[string]struct{}, len(catalog.MCPServers))
-	for _, server := range catalog.MCPServers {
-		mcpSet[server.ID] = struct{}{}
-	}
-	for _, id := range input.MCPServerIDs {
-		if _, ok := mcpSet[id]; !ok {
-			return validation("包含不存在的 MCP Server")
-		}
-	}
 	return nil
 }
 

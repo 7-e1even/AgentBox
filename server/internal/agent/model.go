@@ -11,19 +11,25 @@ const (
 )
 
 type Input struct {
-	Name         string   `json:"name"`
-	Slug         string   `json:"slug"`
-	Description  string   `json:"description"`
-	Avatar       string   `json:"avatar"`
-	ProviderID   string   `json:"providerId"`
-	ModelID      string   `json:"modelId"`
-	CredentialID *string  `json:"credentialId"`
-	SystemPrompt string   `json:"systemPrompt"`
-	SkillIDs     []string `json:"skillIds"`
-	MCPServerIDs []string `json:"mcpServerIds"`
-	Temperature  float64  `json:"temperature"`
-	MaxSteps     int      `json:"maxSteps"`
-	Status       Status   `json:"status"`
+	ProjectID     string   `json:"projectId"`
+	RuntimeID     string   `json:"runtimeId"`
+	Name          string   `json:"name"`
+	Slug          string   `json:"slug"`
+	Description   string   `json:"description"`
+	Avatar        string   `json:"avatar"`
+	ProviderID    string   `json:"providerId"`
+	ModelID       string   `json:"modelId"`
+	CredentialID  *string  `json:"credentialId"`
+	SystemPrompt  string   `json:"systemPrompt"`
+	SkillIDs      []string `json:"skillIds"`
+	MCPServerIDs  []string `json:"mcpServerIds"`
+	VariableIDs   []string `json:"variableIds"`
+	CustomArgs    []string `json:"customArgs"`
+	Temperature   float64  `json:"temperature"`
+	MaxSteps      int      `json:"maxSteps"`
+	Concurrency   int      `json:"concurrency"`
+	SandboxPolicy string   `json:"sandboxPolicy"`
+	Status        Status   `json:"status"`
 }
 
 type UpdateInput struct {
@@ -34,7 +40,6 @@ type UpdateInput struct {
 type Agent struct {
 	Input
 	ID        string    `json:"id"`
-	ProjectID string    `json:"projectId"`
 	Version   int       `json:"version"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`

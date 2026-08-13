@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"agentbox/internal/agent"
+	"agentbox/internal/platform"
 	"agentbox/internal/store"
 	"github.com/google/uuid"
 )
@@ -23,6 +24,10 @@ type AgentStore interface {
 	Update(context.Context, string, agent.Input, int) (agent.Agent, error)
 	Duplicate(context.Context, string) (agent.Agent, error)
 	Delete(context.Context, string) error
+	ListResources(context.Context) ([]platform.Resource, error)
+	CreateResource(context.Context, platform.Input) (platform.Resource, error)
+	UpdateResource(context.Context, string, platform.Input) (platform.Resource, error)
+	DeleteResource(context.Context, string) error
 	Ping(context.Context) error
 }
 
@@ -55,6 +60,10 @@ func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, orig
 	mux.HandleFunc("PATCH /api/agents/{id}", server.updateAgent)
 	mux.HandleFunc("DELETE /api/agents/{id}", server.deleteAgent)
 	mux.HandleFunc("POST /api/agents/{id}/duplicate", server.duplicateAgent)
+	mux.HandleFunc("GET /api/resources", server.listResources)
+	mux.HandleFunc("POST /api/resources", server.createResource)
+	mux.HandleFunc("PATCH /api/resources/{id}", server.updateResource)
+	mux.HandleFunc("DELETE /api/resources/{id}", server.deleteResource)
 
 	return server.recoverPanic(server.cors(server.logRequests(mux)))
 }
@@ -150,6 +159,49 @@ func (s *Server) deleteAgent(w http.ResponseWriter, request *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (s *Server) listResources(w http.ResponseWriter, request *http.Request) {
+	resources, err := s.store.ListResources(request.Context())
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, platform.Snapshot{Resources: resources})
+}
+
+func (s *Server) createResource(w http.ResponseWriter, request *http.Request) {
+	var input platform.Input
+	if !s.decodeJSON(w, request, &input) {
+		return
+	}
+	resource, err := s.store.CreateResource(request.Context(), input)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusCreated, map[string]any{"resource": resource})
+}
+
+func (s *Server) updateResource(w http.ResponseWriter, request *http.Request) {
+	var input platform.Input
+	if !s.decodeJSON(w, request, &input) {
+		return
+	}
+	resource, err := s.store.UpdateResource(request.Context(), request.PathValue("id"), input)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"resource": resource})
+}
+
+func (s *Server) deleteResource(w http.ResponseWriter, request *http.Request) {
+	if err := s.store.DeleteResource(request.Context(), request.PathValue("id")); err != nil {
+		s.handleError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) agentID(w http.ResponseWriter, request *http.Request) (string, bool) {
 	id := request.PathValue("id")
 	if _, err := uuid.Parse(id); err != nil {
@@ -184,12 +236,12 @@ func (s *Server) decodeJSON(w http.ResponseWriter, request *http.Request, target
 
 func (s *Server) handleError(w http.ResponseWriter, err error) {
 	switch {
-	case agent.IsValidationError(err):
+	case agent.IsValidationError(err), platform.IsValidationError(err):
 		s.writeError(w, http.StatusBadRequest, err.Error())
-	case errors.Is(err, store.ErrNotFound):
-		s.writeError(w, http.StatusNotFound, "Agent 不存在")
+	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrResourceNotFound):
+		s.writeError(w, http.StatusNotFound, "记录不存在")
 	case errors.Is(err, store.ErrConflict):
-		message := "Agent 已被更新，或标识已被使用，请刷新后重试"
+		message := "记录已存在、已被更新，或仍被其他配置引用"
 		if err == store.ErrConflict {
 			message = "请先归档 Agent，再执行永久删除"
 		}

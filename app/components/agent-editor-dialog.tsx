@@ -6,6 +6,7 @@ import {
   ArrowRightIcon,
   BotIcon,
   CheckIcon,
+  ContainerIcon,
   KeyRoundIcon,
   PlugZapIcon,
   SaveIcon,
@@ -25,6 +26,7 @@ import type {
   Provider,
   SkillDefinition,
 } from "@/lib/catalog"
+import type { Resource } from "@/lib/platform-schema"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -75,10 +77,14 @@ type Catalog = {
   credentials: Credential[]
   skills: SkillDefinition[]
   mcpServers: McpServerDefinition[]
+  projects: Resource[]
+  runtimes: Resource[]
+  variables: Resource[]
 }
 
 const steps = [
   { title: "身份", description: "名称与用途" },
+  { title: "环境", description: "Project 与 Runtime" },
   { title: "模型", description: "Provider 与指令" },
   { title: "能力", description: "Skills 与 MCP" },
   { title: "发布", description: "参数与状态" },
@@ -90,6 +96,8 @@ function defaultInput(catalog: Catalog): AgentInput {
     (item) => item.providerId === provider.id
   )
   return {
+    projectId: catalog.projects[0]?.id ?? "default",
+    runtimeId: catalog.runtimes[0]?.id ?? "python-venv",
     name: "",
     slug: "",
     description: "",
@@ -100,14 +108,20 @@ function defaultInput(catalog: Catalog): AgentInput {
     systemPrompt: "",
     skillIds: [],
     mcpServerIds: [],
+    variableIds: [],
+    customArgs: [],
     temperature: 0.4,
     maxSteps: 12,
+    concurrency: 1,
+    sandboxPolicy: "new",
     status: "draft",
   }
 }
 
 function fromAgent(agent: Agent): AgentInput {
   return {
+    projectId: agent.projectId,
+    runtimeId: agent.runtimeId,
     name: agent.name,
     slug: agent.slug,
     description: agent.description,
@@ -118,8 +132,12 @@ function fromAgent(agent: Agent): AgentInput {
     systemPrompt: agent.systemPrompt,
     skillIds: agent.skillIds,
     mcpServerIds: agent.mcpServerIds,
+    variableIds: agent.variableIds,
+    customArgs: agent.customArgs,
     temperature: agent.temperature,
     maxSteps: agent.maxSteps,
+    concurrency: agent.concurrency,
+    sandboxPolicy: agent.sandboxPolicy,
     status: agent.status,
   }
 }
@@ -199,6 +217,14 @@ export function AgentEditorDialog({
   function validateCurrentStep() {
     const keys: Array<Array<keyof AgentInput>> = [
       ["name", "slug", "description", "avatar"],
+      [
+        "projectId",
+        "runtimeId",
+        "variableIds",
+        "customArgs",
+        "concurrency",
+        "sandboxPolicy",
+      ],
       ["providerId", "modelId", "credentialId", "systemPrompt"],
       ["skillIds", "mcpServerIds"],
       ["temperature", "maxSteps", "status"],
@@ -232,13 +258,24 @@ export function AgentEditorDialog({
       )
         setStep(0)
       else if (
+        [
+          "projectId",
+          "runtimeId",
+          "variableIds",
+          "customArgs",
+          "concurrency",
+          "sandboxPolicy",
+        ].includes(String(firstError))
+      )
+        setStep(1)
+      else if (
         ["providerId", "modelId", "credentialId", "systemPrompt"].includes(
           String(firstError)
         )
       )
-        setStep(1)
-      else if (["skillIds", "mcpServerIds"].includes(String(firstError)))
         setStep(2)
+      else if (["skillIds", "mcpServerIds"].includes(String(firstError)))
+        setStep(3)
       return
     }
 
@@ -261,7 +298,7 @@ export function AgentEditorDialog({
             {agent ? `编辑 ${agent.name}` : "创建 Agent"}
           </DialogTitle>
           <DialogDescription>
-            配置 Agent 本身。模型执行、Runtime 和任务编排不在当前范围内。
+            声明 Agent、运行环境和能力；保存配置不会立即启动 Sandbox。
           </DialogDescription>
         </DialogHeader>
 
@@ -275,7 +312,7 @@ export function AgentEditorDialog({
             </span>
           </div>
           <Progress value={((step + 1) / steps.length) * 100} />
-          <ol className="mt-3 hidden grid-cols-4 gap-2 sm:grid">
+          <ol className="mt-3 hidden grid-cols-5 gap-2 sm:grid">
             {steps.map((item, index) => (
               <li
                 key={item.title}
@@ -395,6 +432,186 @@ export function AgentEditorDialog({
             )}
 
             {step === 1 && (
+              <FieldGroup>
+                <div className="flex items-start gap-3 rounded-xl border bg-muted/30 p-4">
+                  <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-foreground text-background">
+                    <ContainerIcon />
+                  </div>
+                  <div>
+                    <p className="font-medium">运行声明</p>
+                    <p className="mt-1 text-sm text-muted-foreground">
+                      Agent 绑定模板；Sandbox 启动时才创建实际隔离环境。
+                    </p>
+                  </div>
+                </div>
+                <div className="grid gap-5 sm:grid-cols-2">
+                  <Field data-invalid={Boolean(errors.projectId)}>
+                    <FieldLabel>Project</FieldLabel>
+                    <Select
+                      value={input.projectId}
+                      onValueChange={(value) => update("projectId", value)}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="选择项目" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectLabel>Projects</SelectLabel>
+                          {catalog.projects.map((item) => (
+                            <SelectItem key={item.id} value={item.id}>
+                              {item.name}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FieldError>{errors.projectId}</FieldError>
+                  </Field>
+                  <Field data-invalid={Boolean(errors.runtimeId)}>
+                    <FieldLabel>Runtime</FieldLabel>
+                    <Select
+                      value={input.runtimeId}
+                      onValueChange={(value) => update("runtimeId", value)}
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue placeholder="选择 Runtime" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectLabel>Runtime templates</SelectLabel>
+                          {catalog.runtimes
+                            .filter(
+                              (item) => item.projectId === input.projectId
+                            )
+                            .map((item) => (
+                              <SelectItem key={item.id} value={item.id}>
+                                {item.name} ·{" "}
+                                {String(item.spec.driver ?? "runtime")}
+                              </SelectItem>
+                            ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FieldError>{errors.runtimeId}</FieldError>
+                  </Field>
+                  <Field>
+                    <FieldLabel>Sandbox 策略</FieldLabel>
+                    <Select
+                      value={input.sandboxPolicy}
+                      onValueChange={(value) =>
+                        update(
+                          "sandboxPolicy",
+                          value as AgentInput["sandboxPolicy"]
+                        )
+                      }
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectLabel>生命周期</SelectLabel>
+                          <SelectItem value="new">new · 每次新建</SelectItem>
+                          <SelectItem value="reuse">
+                            reuse · 优先复用
+                          </SelectItem>
+                          <SelectItem value="sticky">
+                            sticky · 固定实例
+                          </SelectItem>
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                  <Field>
+                    <FieldLabel>并发上限</FieldLabel>
+                    <Select
+                      value={String(input.concurrency)}
+                      onValueChange={(value) =>
+                        update("concurrency", Number(value))
+                      }
+                    >
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectLabel>同时运行</SelectLabel>
+                          {[1, 2, 4, 8].map((value) => (
+                            <SelectItem key={value} value={String(value)}>
+                              {value} 个 Sandbox
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                  </Field>
+                </div>
+                <Field>
+                  <FieldLabel>环境变量与 Secret 引用</FieldLabel>
+                  <FieldGroup className="grid gap-3 sm:grid-cols-2">
+                    {catalog.variables
+                      .filter((item) => item.projectId === input.projectId)
+                      .map((variable) => (
+                        <Field
+                          key={variable.id}
+                          orientation="horizontal"
+                          className="rounded-xl border p-3 has-data-checked:border-primary"
+                        >
+                          <Checkbox
+                            id={`variable-${variable.id}`}
+                            checked={input.variableIds.includes(variable.id)}
+                            onCheckedChange={(checked) =>
+                              update(
+                                "variableIds",
+                                checked === true
+                                  ? [...input.variableIds, variable.id]
+                                  : input.variableIds.filter(
+                                      (id) => id !== variable.id
+                                    )
+                              )
+                            }
+                          />
+                          <FieldContent>
+                            <FieldLabel htmlFor={`variable-${variable.id}`}>
+                              {String(variable.spec.key ?? variable.name)}
+                            </FieldLabel>
+                            <FieldDescription>
+                              {String(
+                                variable.spec.reference ?? variable.description
+                              )}
+                            </FieldDescription>
+                          </FieldContent>
+                        </Field>
+                      ))}
+                  </FieldGroup>
+                </Field>
+                <Field>
+                  <FieldLabel htmlFor="agent-custom-args">
+                    自定义启动参数
+                  </FieldLabel>
+                  <Textarea
+                    id="agent-custom-args"
+                    className="min-h-24 font-mono text-sm"
+                    value={input.customArgs.join("\n")}
+                    placeholder="--profile&#10;research"
+                    onChange={(event) =>
+                      update(
+                        "customArgs",
+                        event.target.value
+                          .split("\n")
+                          .map((value) => value.trim())
+                          .filter(Boolean)
+                      )
+                    }
+                  />
+                  <FieldDescription>
+                    每行一个参数，启动 Provider CLI 时按顺序传入。
+                  </FieldDescription>
+                </Field>
+              </FieldGroup>
+            )}
+
+            {step === 2 && (
               <FieldGroup>
                 <Field data-invalid={Boolean(errors.providerId)}>
                   <FieldLabel>Provider</FieldLabel>
@@ -523,7 +740,7 @@ export function AgentEditorDialog({
               </FieldGroup>
             )}
 
-            {step === 2 && (
+            {step === 3 && (
               <div className="grid gap-7">
                 <div>
                   <div className="mb-3 flex items-start gap-3">
@@ -636,7 +853,7 @@ export function AgentEditorDialog({
               </div>
             )}
 
-            {step === 3 && (
+            {step === 4 && (
               <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_20rem]">
                 <FieldGroup>
                   <Field>

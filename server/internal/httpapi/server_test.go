@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"agentbox/internal/agent"
+	"agentbox/internal/platform"
 )
 
 type fakeStore struct{}
@@ -17,14 +18,24 @@ type fakeStore struct{}
 func (fakeStore) List(context.Context) ([]agent.Agent, error)      { return []agent.Agent{}, nil }
 func (fakeStore) Get(context.Context, string) (agent.Agent, error) { return agent.Agent{}, nil }
 func (fakeStore) Create(_ context.Context, input agent.Input) (agent.Agent, error) {
-	return agent.Agent{Input: input, ID: "b88eb8db-3954-4d1a-bda3-005e1fb375c4", ProjectID: "default", Version: 1}, nil
+	return agent.Agent{Input: input, ID: "b88eb8db-3954-4d1a-bda3-005e1fb375c4", Version: 1}, nil
 }
 func (fakeStore) Update(context.Context, string, agent.Input, int) (agent.Agent, error) {
 	return agent.Agent{}, nil
 }
 func (fakeStore) Duplicate(context.Context, string) (agent.Agent, error) { return agent.Agent{}, nil }
 func (fakeStore) Delete(context.Context, string) error                   { return nil }
-func (fakeStore) Ping(context.Context) error                             { return nil }
+func (fakeStore) ListResources(context.Context) ([]platform.Resource, error) {
+	return []platform.Resource{}, nil
+}
+func (fakeStore) CreateResource(_ context.Context, input platform.Input) (platform.Resource, error) {
+	return platform.Resource{Input: input}, nil
+}
+func (fakeStore) UpdateResource(_ context.Context, _ string, input platform.Input) (platform.Resource, error) {
+	return platform.Resource{Input: input}, nil
+}
+func (fakeStore) DeleteResource(context.Context, string) error { return nil }
+func (fakeStore) Ping(context.Context) error                   { return nil }
 
 func testHandler() http.Handler {
 	return New(fakeStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
