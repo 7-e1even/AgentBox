@@ -1,0 +1,5 @@
+.env
+.agentbox-secret-key
+*.exe
+*.log
+coverage/

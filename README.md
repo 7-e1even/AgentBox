@@ -75,6 +75,29 @@ Worker 只有在 SDK、运行时和 KVM 探测都通过后才会上报 `boxlite`
 
 本地界面调试时，可以在 `server/.env` 中同时设置 `AGENTBOX_ENV=development` 和 `AGENTBOX_DISABLE_AUTH=true`。Go API 会为未登录请求注入管理员调试身份，Next.js 登录页会自动进入控制台；删除任一配置即可恢复登录。该开关在非 development 环境下会拒绝启动。
 
+## Docker Compose 部署
+
+Docker Compose 会启动 Next.js、Go API 和 PostgreSQL 三个容器，仅向宿主机开放统一入口 `3000`。Go API 与数据库只在 Compose 内部网络中通信；Linux Worker 仍安装在需要运行沙箱的物理机或 VM 上。
+
+```sh
+cp .env.example .env
+# 编辑 .env：至少修改 POSTGRES_PASSWORD；远程部署还要把
+# AGENTBOX_PUBLIC_URL 和 AGENTBOX_ALLOWED_ORIGINS 改为服务器可访问地址。
+docker compose up -d --build
+docker compose ps
+```
+
+启动后打开 `AGENTBOX_PUBLIC_URL` 完成管理员初始化。查看日志与停止服务：
+
+```sh
+docker compose logs -f app server postgres
+docker compose down
+```
+
+PostgreSQL 数据和凭据加密主密钥分别保存在 `agentbox-postgres` 与 `agentbox-secrets` 命名卷中。普通升级不要添加 `-v`；只有确认不再需要全部平台数据时才删除这些卷。数据库密码建议仅使用 URL 安全字符，避免在 `DATABASE_URL` 中额外转义。
+
+如果构建服务器无法访问默认的 `proxy.golang.org`，可在 `.env` 中把 `GOPROXY` 改为组织内的可信 Go 模块代理后重新构建。
+
 ## 验证
 
 ```powershell

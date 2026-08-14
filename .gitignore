@@ -4,6 +4,7 @@
 /.scaffold-git-backup/
 
 # Local environments and secrets
+/.env
 app/.env*
 !app/.env.example
 server/.env
@@ -25,5 +26,6 @@ Thumbs.db
 *.log
 *.tsbuildinfo
 .code-review-graph/
+skills-lock.json
 
 .agents/
