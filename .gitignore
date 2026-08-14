@@ -25,3 +25,5 @@ Thumbs.db
 *.log
 *.tsbuildinfo
 .code-review-graph/
+
+.agents/

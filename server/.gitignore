@@ -1,3 +1,4 @@
 .env
 agentbox.exe
-agentbox-server.exe
+agentbox-server*.exe
+.agent/
