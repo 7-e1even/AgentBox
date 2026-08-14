@@ -26,13 +26,15 @@ const (
 var idPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 var allowedAgentTools = map[string]bool{
-	"antigravity": true, "claude-code": true, "codebuddy": true,
-	"codex": true, "copilot-cli": true, "cursor": true,
-	"gemini-cli": true, "grok": true, "kimi": true, "omp": true,
-	"openclaw": true, "opencode": true,
-	"pi": true, "qoder-cli": true, "qoder-cn": true,
-	"qwen-code": true, "qwenpaw": true, "reasonix": true,
+	"claude-code": true,
+	"codex":       true,
+	"kimi":        true,
+	"opencode":    true,
+	"pi":          true,
+	"reasonix":    true,
 }
+
+var environmentVariableNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 type Input struct {
 	ID          string         `json:"id"`
@@ -55,17 +57,21 @@ type Snapshot struct {
 }
 
 type ManagedServer struct {
-	ID           string          `json:"id"`
-	Name         string          `json:"name"`
-	Hostname     string          `json:"hostname"`
-	OS           string          `json:"os"`
-	Arch         string          `json:"arch"`
-	Capabilities []string        `json:"capabilities"`
-	Inventory    ServerInventory `json:"inventory"`
-	Status       string          `json:"status"`
-	LastSeenAt   time.Time       `json:"lastSeenAt"`
-	CreatedAt    time.Time       `json:"createdAt"`
-	UpdatedAt    time.Time       `json:"updatedAt"`
+	ID                  string          `json:"id"`
+	Name                string          `json:"name"`
+	Hostname            string          `json:"hostname"`
+	OS                  string          `json:"os"`
+	Arch                string          `json:"arch"`
+	Capabilities        []string        `json:"capabilities"`
+	Inventory           ServerInventory `json:"inventory"`
+	WorkerVersion       string          `json:"workerVersion"`
+	WorkerUpdateStatus  string          `json:"workerUpdateStatus"`
+	WorkerUpdateTarget  string          `json:"workerUpdateTarget"`
+	WorkerUpdateMessage string          `json:"workerUpdateMessage"`
+	Status              string          `json:"status"`
+	LastSeenAt          time.Time       `json:"lastSeenAt"`
+	CreatedAt           time.Time       `json:"createdAt"`
+	UpdatedAt           time.Time       `json:"updatedAt"`
 }
 
 type ServerImage struct {
@@ -140,6 +146,18 @@ type CredentialModel struct {
 type CredentialModelInput struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+// RuntimeLLMTarget is the server-side upstream bound to one sandbox credential.
+// Secret is intentionally never serialized into worker jobs or API responses.
+type RuntimeLLMTarget struct {
+	SandboxID    string
+	CredentialID string
+	ProviderID   string
+	Protocol     string
+	Endpoint     string
+	ModelID      string
+	Secret       string
 }
 
 type WorkerJob struct {
@@ -379,6 +397,9 @@ func Validate(input Input) error {
 		if err := validateAgentTools(input.Spec); err != nil {
 			return err
 		}
+		if err := validateEnvironmentVariables(input.Spec); err != nil {
+			return err
+		}
 	}
 	if input.Kind == KindSandbox {
 		if err := require(input.Spec, "runtimeId", "请选择沙箱模板"); err != nil {
@@ -389,6 +410,9 @@ func Validate(input Input) error {
 			return &ValidationError{Message: "请选择目标服务器"}
 		}
 		if err := validateAgentTools(input.Spec); err != nil {
+			return err
+		}
+		if err := validateEnvironmentVariables(input.Spec); err != nil {
 			return err
 		}
 	}
@@ -406,6 +430,43 @@ func validateAgentTools(spec map[string]any) error {
 		if !allowedAgentTools[tool] {
 			return &ValidationError{Message: "Agent 工具无效"}
 		}
+	}
+	return nil
+}
+
+func validateEnvironmentVariables(spec map[string]any) error {
+	raw, exists := spec["environmentVariables"]
+	if !exists || raw == nil {
+		return nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return &ValidationError{Message: "环境变量配置无效"}
+	}
+	if len(items) > 100 {
+		return &ValidationError{Message: "环境变量不能超过 100 个"}
+	}
+	names := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			return &ValidationError{Message: "环境变量配置无效"}
+		}
+		name, nameOK := entry["name"].(string)
+		value, valueOK := entry["value"].(string)
+		if !nameOK || !valueOK || !environmentVariableNamePattern.MatchString(name) {
+			return &ValidationError{Message: "环境变量名格式不正确"}
+		}
+		if strings.HasPrefix(name, "AGENTBOX_") {
+			return &ValidationError{Message: "AGENTBOX_ 前缀由平台保留"}
+		}
+		if _, duplicate := names[name]; duplicate {
+			return &ValidationError{Message: "环境变量名不能重复"}
+		}
+		if utf8.RuneCountInString(value) > 16*1024 || strings.ContainsAny(value, "\x00\r\n") {
+			return &ValidationError{Message: "环境变量值无效"}
+		}
+		names[name] = struct{}{}
 	}
 	return nil
 }

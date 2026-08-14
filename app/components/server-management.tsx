@@ -10,8 +10,10 @@ import {
   CopyIcon,
   LayoutTemplateIcon,
   PlusIcon,
+  RefreshCwIcon,
   ServerIcon,
   Trash2Icon,
+  TriangleAlertIcon,
 } from "lucide-react"
 import { appToast as toast } from "@/lib/app-toast"
 
@@ -99,6 +101,7 @@ export function ServerManagement({
   const [serverUrl, setServerUrl] = useState("")
   const [addressStatus, setAddressStatus] =
     useState<AddressStatus>("idle")
+  const [targetWorkerVersion, setTargetWorkerVersion] = useState("")
 
   const detectServerUrl = useCallback(async () => {
     setAddressStatus("detecting")
@@ -117,11 +120,22 @@ export function ServerManagement({
       await requestJson<unknown>("/api/servers")
     )
     onServersChange(body.servers)
+    setTargetWorkerVersion(body.workerVersion)
   }, [onServersChange])
 
   useEffect(() => {
-    const timer = window.setInterval(() => void refreshServers(), 15_000)
-    return () => window.clearInterval(timer)
+    const initial = window.setTimeout(
+      () => void refreshServers().catch(() => undefined),
+      0
+    )
+    const timer = window.setInterval(
+      () => void refreshServers().catch(() => undefined),
+      15_000
+    )
+    return () => {
+      window.clearTimeout(initial)
+      window.clearInterval(timer)
+    }
   }, [refreshServers])
 
   useEffect(() => {
@@ -198,6 +212,8 @@ export function ServerManagement({
         onBack={() => setSelectedServerId(null)}
         onCreateRuntime={() => onCreateRuntime(selectedServer.id)}
         onEditRuntime={onEditRuntime}
+        targetWorkerVersion={targetWorkerVersion}
+        onWorkerUpdate={refreshServers}
         onDeleted={() => {
           onServersChange(
             servers.filter((server) => server.id !== selectedServer.id)
@@ -489,6 +505,8 @@ function ServerDetail({
   onBack,
   onCreateRuntime,
   onEditRuntime,
+  targetWorkerVersion,
+  onWorkerUpdate,
   onDeleted,
 }: {
   server: ManagedServer
@@ -496,10 +514,53 @@ function ServerDetail({
   onBack: () => void
   onCreateRuntime: () => void
   onEditRuntime: (runtime: Resource) => void
+  targetWorkerVersion: string
+  onWorkerUpdate: () => Promise<void>
   onDeleted: () => void
 }) {
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  const [confirmUpdate, setConfirmUpdate] = useState(false)
+  const [updating, setUpdating] = useState(false)
+
+  const updateInProgress =
+    server.workerUpdateStatus === "pending" ||
+    server.workerUpdateStatus === "updating"
+  const releaseTarget = targetWorkerVersion.startsWith("v")
+    ? targetWorkerVersion
+    : ""
+  const supportsWorkerUpdate = server.workerVersion.startsWith("v")
+  const workerIsCurrent =
+    releaseTarget !== "" && server.workerVersion === releaseTarget
+  const canUpdate =
+    server.status === "online" &&
+    releaseTarget !== "" &&
+    supportsWorkerUpdate &&
+    !workerIsCurrent &&
+    !updateInProgress
+
+  async function updateWorker() {
+    if (!canUpdate) return
+    setUpdating(true)
+    try {
+      await requestJson<{ version: string }>(
+        `/api/servers/${server.id}/actions/update-worker`,
+        {
+          method: "POST",
+          body: JSON.stringify({ version: releaseTarget }),
+        }
+      )
+      await onWorkerUpdate()
+      setConfirmUpdate(false)
+      toast.success("Worker 更新已进入队列", {
+        description: `目标版本 ${releaseTarget}`,
+      })
+    } catch (cause) {
+      toast.error("无法更新 Worker", { description: errorMessage(cause) })
+    } finally {
+      setUpdating(false)
+    }
+  }
 
   async function deleteServer() {
     setDeleting(true)
@@ -545,22 +606,63 @@ function ServerDetail({
               </p>
             </div>
           </div>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setConfirmDelete(true)}
-          >
-            <Trash2Icon data-icon="inline-start" />
-            移除服务器
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={!canUpdate}
+              title={workerUpdateButtonTitle(
+                server,
+                releaseTarget,
+                supportsWorkerUpdate,
+                workerIsCurrent,
+                updateInProgress
+              )}
+              onClick={() => setConfirmUpdate(true)}
+            >
+              {updateInProgress ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <RefreshCwIcon data-icon="inline-start" />
+              )}
+              {updateInProgress
+                ? "正在更新"
+                : workerIsCurrent
+                  ? "已是最新"
+                  : "更新 Worker"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setConfirmDelete(true)}
+            >
+              <Trash2Icon data-icon="inline-start" />
+              移除服务器
+            </Button>
+          </div>
         </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-auto p-4 sm:p-6">
         <div className="mx-auto grid max-w-5xl gap-6">
-          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <WorkerUpdateAlert server={server} />
+          {!supportsWorkerUpdate ? (
+            <Alert>
+              <TriangleAlertIcon />
+              <AlertTitle>需要完成一次 Worker 迁移</AlertTitle>
+              <AlertDescription>
+                当前版本还不支持在线更新。请在这台服务器上重新运行一次“添加服务器”中的安装命令；现有配对配置会保留，之后即可从本页面更新。
+              </AlertDescription>
+            </Alert>
+          ) : null}
+
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
             <ServerFact label="主机名" value={server.hostname} />
             <ServerFact label="系统" value={`${server.os} / ${server.arch}`} />
+            <ServerFact
+              label="Worker 版本"
+              value={server.workerVersion || "等待首次心跳"}
+            />
             <ServerFact label="默认环境" value={`${runtimes.length} 个`} />
             <ServerFact
               label="最近心跳"
@@ -657,6 +759,35 @@ function ServerDetail({
         </div>
       </div>
 
+      <AlertDialog open={confirmUpdate} onOpenChange={setConfirmUpdate}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>更新 {server.name} 的 Worker？</AlertDialogTitle>
+            <AlertDialogDescription>
+              将从 {server.workerVersion || "未知版本"} 更新到 {releaseTarget}
+              。服务会短暂重连；若新版未能正常启动，服务器会自动恢复上一版。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={updating}>取消</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={updating}
+              onClick={(event) => {
+                event.preventDefault()
+                void updateWorker()
+              }}
+            >
+              {updating ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <RefreshCwIcon data-icon="inline-start" />
+              )}
+              {updating ? "正在提交…" : "确认更新"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       <AlertDialog open={confirmDelete} onOpenChange={setConfirmDelete}>
         <AlertDialogContent>
           <AlertDialogHeader>
@@ -681,6 +812,60 @@ function ServerDetail({
       </AlertDialog>
     </section>
   )
+}
+
+function WorkerUpdateAlert({ server }: { server: ManagedServer }) {
+  if (!server.workerUpdateStatus) return null
+  if (server.workerUpdateStatus === "failed") {
+    return (
+      <Alert variant="destructive">
+        <TriangleAlertIcon />
+        <AlertTitle>Worker 更新失败</AlertTitle>
+        <AlertDescription>
+          {server.workerUpdateMessage || "服务器已保留或恢复上一版本。"}
+        </AlertDescription>
+      </Alert>
+    )
+  }
+  if (server.workerUpdateStatus === "succeeded") {
+    return (
+      <Alert className="border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">
+        <CheckCircle2Icon />
+        <AlertTitle>Worker 已更新到 {server.workerUpdateTarget}</AlertTitle>
+        <AlertDescription>
+          {server.workerUpdateMessage || "新版 Worker 已完成重启并恢复心跳。"}
+        </AlertDescription>
+      </Alert>
+    )
+  }
+  return (
+    <Alert>
+      <RefreshCwIcon />
+      <AlertTitle>
+        {server.workerUpdateStatus === "pending"
+          ? "Worker 更新正在等待执行"
+          : "Worker 正在更新并重启"}
+      </AlertTitle>
+      <AlertDescription>
+        目标版本 {server.workerUpdateTarget}，期间终端会话可能短暂断开。
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+function workerUpdateButtonTitle(
+  server: ManagedServer,
+  target: string,
+  supportsUpdate: boolean,
+  isCurrent: boolean,
+  inProgress: boolean
+) {
+  if (server.status !== "online") return "服务器离线时不能更新 Worker"
+  if (!target) return "当前 Server 镜像未配置可发布的 Worker 版本"
+  if (!supportsUpdate) return "请先重新运行一次 Worker 安装命令完成迁移"
+  if (inProgress) return `正在更新到 ${server.workerUpdateTarget}`
+  if (isCurrent) return `当前已是 ${target}`
+  return `更新到 ${target}`
 }
 
 function ServerFact({ label, value }: { label: string; value: string }) {

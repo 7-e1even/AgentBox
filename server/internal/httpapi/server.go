@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"agentbox/internal/catalog"
@@ -30,13 +31,15 @@ type PlatformStore interface {
 	AddCredentialModel(context.Context, string, platform.CredentialModelInput) ([]platform.CredentialModel, error)
 	DeleteCredentialModel(context.Context, string, string) ([]platform.CredentialModel, error)
 	DeleteCredential(context.Context, string) error
+	ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error)
 	ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error)
 	CompleteWorkerJob(context.Context, string, string, string, platform.WorkerJobResult) error
 	ListServers(context.Context) ([]platform.ManagedServer, error)
 	CreateServerPairing(context.Context) (platform.ServerPairing, error)
 	GetServerPairing(context.Context, string) (platform.ServerPairing, error)
 	RegisterServer(context.Context, platform.ServerRegistration) (platform.ManagedServer, string, error)
-	HeartbeatServer(context.Context, string, string, []string, *platform.ServerInventory) error
+	HeartbeatServer(context.Context, string, string, []string, *platform.ServerInventory, string) error
+	EnqueueWorkerUpdate(context.Context, string, string) error
 	DeleteServer(context.Context, string) error
 	NeedsUserSetup(context.Context) (bool, error)
 	SetupAdmin(context.Context, platform.UserInput, []byte, time.Time) (platform.User, error)
@@ -52,26 +55,43 @@ type PlatformStore interface {
 }
 
 type Server struct {
-	store          PlatformStore
-	catalog        catalog.Catalog
-	logger         *slog.Logger
-	allowedOrigins map[string]struct{}
-	disableAuth    bool
-	sessions       *sessionHub
+	store            PlatformStore
+	catalog          catalog.Catalog
+	logger           *slog.Logger
+	allowedOrigins   map[string]struct{}
+	disableAuth      bool
+	sessions         *sessionHub
+	runtimeLLMClient *http.Client
+	workerBinaryDir  string
+	workerVersion    string
+	workerReleaseURL string
+	workerCacheDir   string
+	workerHTTPClient *http.Client
+	workerBinaryMu   sync.Mutex
 }
 
 type Config struct {
-	DisableAuth bool
+	DisableAuth      bool
+	WorkerBinaryDir  string
+	WorkerVersion    string
+	WorkerReleaseURL string
+	WorkerCacheDir   string
 }
 
 func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger, origins []string, config Config) http.Handler {
 	server := &Server{
-		store:          repository,
-		catalog:        catalog,
-		logger:         logger,
-		allowedOrigins: make(map[string]struct{}, len(origins)),
-		disableAuth:    config.DisableAuth,
-		sessions:       newSessionHub(origins),
+		store:            repository,
+		catalog:          catalog,
+		logger:           logger,
+		allowedOrigins:   make(map[string]struct{}, len(origins)),
+		disableAuth:      config.DisableAuth,
+		sessions:         newSessionHub(origins),
+		runtimeLLMClient: newRuntimeLLMHTTPClient(),
+		workerBinaryDir:  config.WorkerBinaryDir,
+		workerVersion:    config.WorkerVersion,
+		workerReleaseURL: config.WorkerReleaseURL,
+		workerCacheDir:   config.WorkerCacheDir,
+		workerHTTPClient: &http.Client{Timeout: 2 * time.Minute},
 	}
 	for _, origin := range origins {
 		if trimmed := strings.TrimSpace(origin); trimmed != "" {
@@ -115,6 +135,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	authenticated("DELETE /api/credentials/{id}", server.deleteCredential)
 	authenticated("GET /api/servers", server.listServers)
 	authenticated("DELETE /api/servers/{id}", server.deleteServer)
+	authenticated("POST /api/servers/{id}/actions/update-worker", server.updateWorker)
 	authenticated("POST /api/server-pairings", server.createServerPairing)
 	authenticated("GET /api/server-pairings/{id}", server.getServerPairing)
 	mux.HandleFunc("POST /api/servers/register", server.registerServer)
@@ -124,10 +145,14 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	mux.HandleFunc("GET /api/servers/{id}/sessions/connect", server.connectWorkerSessions)
 	mux.HandleFunc("GET /api/sandboxes/{id}/session", server.connectSandboxSession)
 	mux.HandleFunc("GET /api/worker/install.sh", server.workerInstallScript)
-	mux.HandleFunc("GET /api/worker/agentbox-worker", server.workerScript)
-	mux.HandleFunc("GET /api/worker/agentbox-session-worker", server.workerSessionScript)
-	mux.HandleFunc("GET /api/worker/agentbox-runtime-driver", server.workerRuntimeDriverScript)
+	mux.HandleFunc("GET /api/worker/agentbox-worker", server.workerBinary)
 	mux.HandleFunc("GET /api/worker/agentbox-microsandbox-driver.go", server.workerMicrosandboxDriverSourceScript)
+	mux.HandleFunc("POST /api/runtime/sandboxes/{id}/llm/{credentialId}/anthropic/v1/messages", server.runtimeLLMAnthropic)
+	mux.HandleFunc("POST /api/runtime/sandboxes/{id}/llm/{credentialId}/anthropic/v1/messages/count_tokens", server.runtimeLLMAnthropicCountTokens)
+	mux.HandleFunc("POST /api/runtime/sandboxes/{id}/llm/{credentialId}/openai/v1/responses", server.runtimeLLMResponses)
+	mux.HandleFunc("POST /api/runtime/sandboxes/{id}/llm/{credentialId}/openai/v1/chat/completions", server.runtimeLLMChat)
+	mux.HandleFunc("GET /api/runtime/sandboxes/{id}/llm/{credentialId}/gemini/{path...}", server.runtimeLLMGemini)
+	mux.HandleFunc("POST /api/runtime/sandboxes/{id}/llm/{credentialId}/gemini/{path...}", server.runtimeLLMGemini)
 
 	return server.recoverPanic(server.cors(server.logRequests(mux)))
 }

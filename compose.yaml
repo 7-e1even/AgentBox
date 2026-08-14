@@ -18,10 +18,12 @@ services:
       retries: 12
 
   server:
+    image: ghcr.io/7-e1even/agentbox-server:${AGENTBOX_VERSION:-latest}
     build:
       context: ./server
       args:
         GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
+        VERSION: ${AGENTBOX_VERSION:-dev}
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-agentbox}:${POSTGRES_PASSWORD:-change-me-before-deploy}@postgres:5432/${POSTGRES_DB:-agentbox}?sslmode=disable
@@ -52,6 +54,7 @@ services:
       retries: 12
 
   app:
+    image: ghcr.io/7-e1even/agentbox-app:${AGENTBOX_VERSION:-latest}
     build:
       context: ./app
       args:

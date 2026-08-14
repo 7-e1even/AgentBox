@@ -24,6 +24,10 @@ export const managedServerSchema = z.object({
   arch: z.string(),
   capabilities: z.array(z.string()),
   inventory: serverInventorySchema,
+  workerVersion: z.string(),
+  workerUpdateStatus: z.enum(["", "pending", "updating", "succeeded", "failed"]),
+  workerUpdateTarget: z.string(),
+  workerUpdateMessage: z.string(),
   status: z.enum(["online", "offline"]),
   lastSeenAt: z.string().datetime({ offset: true }),
   createdAt: z.string().datetime({ offset: true }),
@@ -32,6 +36,7 @@ export const managedServerSchema = z.object({
 
 export const serversResponseSchema = z.object({
   servers: z.array(managedServerSchema),
+  workerVersion: z.string(),
 })
 
 export const serverPairingSchema = z.object({

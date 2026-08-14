@@ -13,6 +13,9 @@ func TestEffectiveSandboxSpecUsesTemplateDefaultsAndInstanceOverrides(t *testing
 		"cpu":           "2",
 		"memory":        "4 GiB",
 		"credentialIds": []string{"template-key"},
+		"environmentVariables": []any{
+			map[string]any{"name": "NODE_ENV", "value": "development"},
+		},
 	}
 	sandboxSpec := map[string]any{
 		"serverId":      "sandbox-server",
@@ -20,6 +23,9 @@ func TestEffectiveSandboxSpecUsesTemplateDefaultsAndInstanceOverrides(t *testing
 		"cpu":           "4",
 		"credentialIds": []string{"sandbox-key"},
 		"status":        "requested",
+		"environmentVariables": []any{
+			map[string]any{"name": "NODE_ENV", "value": "production"},
+		},
 	}
 
 	effective := effectiveSandboxSpec(runtimeSpec, sandboxSpec)
@@ -41,6 +47,9 @@ func TestEffectiveSandboxSpecUsesTemplateDefaultsAndInstanceOverrides(t *testing
 	}
 	if got := effective["credentialIds"]; !reflect.DeepEqual(got, []string{"sandbox-key"}) {
 		t.Fatalf("credentialIds = %#v, want sandbox override", got)
+	}
+	if got := effective["environmentVariables"]; !reflect.DeepEqual(got, sandboxSpec["environmentVariables"]) {
+		t.Fatalf("environmentVariables = %#v, want sandbox override", got)
 	}
 	if _, ok := effective["status"]; ok {
 		t.Fatal("sandbox lifecycle metadata must not leak into the runtime spec")
@@ -64,5 +73,28 @@ func TestEffectiveSandboxSpecAllowsClearingInheritedLists(t *testing.T) {
 	}
 	if got := effective["skillIds"]; !reflect.DeepEqual(got, []string{}) {
 		t.Fatalf("skillIds = %#v, want empty instance override", got)
+	}
+}
+
+func TestIncompatibleAgentToolsChecksCredentialProtocols(t *testing.T) {
+	protocols := map[string]bool{"anthropic": true}
+	got := incompatibleAgentTools(
+		[]string{"claude-code", "codex", "kimi", "opencode", "pi", "reasonix"},
+		protocols,
+	)
+	if len(got) != 0 {
+		t.Fatalf("incompatibleAgentTools() = %#v, want none", got)
+	}
+}
+
+func TestIncompatibleAgentToolsAllowsSingleConvertibleLLMProtocol(t *testing.T) {
+	for _, protocol := range []string{"anthropic", "openai-responses", "openai-chat"} {
+		got := incompatibleAgentTools(
+			[]string{"claude-code", "codex", "kimi", "opencode", "pi", "reasonix"},
+			map[string]bool{protocol: true},
+		)
+		if len(got) != 0 {
+			t.Fatalf("protocol %s incompatibleAgentTools() = %#v, want none", protocol, got)
+		}
 	}
 }

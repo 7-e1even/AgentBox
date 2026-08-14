@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	_ "embed"
@@ -38,12 +39,16 @@ var (
 	ErrConflict            = errors.New("record conflict")
 	ErrPairingInvalid      = errors.New("server pairing invalid")
 	ErrWorkerUnauthorized  = errors.New("worker unauthorized")
+	ErrRuntimeUnauthorized = errors.New("runtime credential unauthorized")
 	ErrUnauthorized        = errors.New("user unauthorized")
 	ErrNoJob               = errors.New("no worker job available")
 	ErrProviderUnavailable = errors.New("Provider 服务不可用")
 )
 
-const workerJobLeaseDuration = 2 * time.Hour
+const (
+	workerJobLeaseDuration = 2 * time.Hour
+	runtimeLLMTokenTTL     = 30 * 24 * time.Hour
+)
 
 type Store struct {
 	pool      *pgxpool.Pool
@@ -175,6 +180,7 @@ func mustMapJSON(value map[string]any) []byte {
 
 const serverColumns = `
   id::text, name, hostname, os, arch, capabilities, inventory,
+  worker_version, worker_update_status, worker_update_target, worker_update_message,
   CASE WHEN last_seen_at > NOW() - INTERVAL '45 seconds' THEN 'online' ELSE 'offline' END,
   last_seen_at, created_at, updated_at`
 
@@ -182,7 +188,9 @@ func scanManagedServer(row pgx.Row) (platform.ManagedServer, error) {
 	var result platform.ManagedServer
 	var capabilitiesJSON, inventoryJSON []byte
 	if err := row.Scan(&result.ID, &result.Name, &result.Hostname, &result.OS, &result.Arch,
-		&capabilitiesJSON, &inventoryJSON, &result.Status, &result.LastSeenAt, &result.CreatedAt, &result.UpdatedAt); err != nil {
+		&capabilitiesJSON, &inventoryJSON, &result.WorkerVersion, &result.WorkerUpdateStatus,
+		&result.WorkerUpdateTarget, &result.WorkerUpdateMessage, &result.Status,
+		&result.LastSeenAt, &result.CreatedAt, &result.UpdatedAt); err != nil {
 		return platform.ManagedServer{}, err
 	}
 	if err := json.Unmarshal(capabilitiesJSON, &result.Capabilities); err != nil {
@@ -314,46 +322,93 @@ func (s *Store) HeartbeatServer(
 	id, credential string,
 	capabilities []string,
 	inventory *platform.ServerInventory,
+	workerVersion string,
 ) error {
 	if _, err := uuid.Parse(id); err != nil || len(credential) < 32 {
 		return ErrWorkerUnauthorized
 	}
 	now := time.Now().UTC()
-	var result pgconn.CommandTag
-	var err error
-	if capabilities == nil && inventory == nil {
-		result, err = s.pool.Exec(ctx, `UPDATE managed_servers
-      SET last_seen_at = $1, updated_at = $1 WHERE id = $2 AND credential_hash = $3`,
-			now, id, hashToken(credential))
-	} else if inventory == nil {
-		result, err = s.pool.Exec(ctx, `UPDATE managed_servers
-      SET capabilities = $1::jsonb, last_seen_at = $2, updated_at = $2
-      WHERE id = $3 AND credential_hash = $4`,
-			mustJSON(capabilities), now, id, hashToken(credential))
-	} else if capabilities == nil {
+	if inventory != nil {
 		platform.NormalizeServerInventory(inventory)
-		result, err = s.pool.Exec(ctx, `UPDATE managed_servers
-      SET inventory = $1::jsonb, last_seen_at = $2, updated_at = $2
-      WHERE id = $3 AND credential_hash = $4`,
-			mustMapJSON(map[string]any{
-				"dockerImages": inventory.DockerImages, "vmImages": inventory.VMImages,
-				"vmImageDirectory": inventory.VMImageDirectory,
-			}), now, id, hashToken(credential))
-	} else {
-		platform.NormalizeServerInventory(inventory)
-		result, err = s.pool.Exec(ctx, `UPDATE managed_servers
-      SET capabilities = $1::jsonb, inventory = $2::jsonb, last_seen_at = $3, updated_at = $3
-      WHERE id = $4 AND credential_hash = $5`,
-			mustJSON(capabilities), mustMapJSON(map[string]any{
-				"dockerImages": inventory.DockerImages, "vmImages": inventory.VMImages,
-				"vmImageDirectory": inventory.VMImageDirectory,
-			}), now, id, hashToken(credential))
 	}
+	inventoryJSON := mustMapJSON(map[string]any{})
+	if inventory != nil {
+		inventoryJSON = mustMapJSON(map[string]any{
+			"dockerImages": inventory.DockerImages, "vmImages": inventory.VMImages,
+			"vmImageDirectory": inventory.VMImageDirectory,
+		})
+	}
+	result, err := s.pool.Exec(ctx, `UPDATE managed_servers SET
+      capabilities = CASE WHEN $1::boolean THEN $2::jsonb ELSE capabilities END,
+      inventory = CASE WHEN $3::boolean THEN $4::jsonb ELSE inventory END,
+      worker_version = CASE WHEN $5::text <> '' THEN $5::text ELSE worker_version END,
+      last_seen_at = $6, updated_at = $6
+    WHERE id = $7 AND credential_hash = $8`,
+		capabilities != nil, mustJSON(capabilities), inventory != nil, inventoryJSON,
+		strings.TrimSpace(workerVersion), now, id, hashToken(credential))
 	if err != nil {
 		return fmt.Errorf("heartbeat server: %w", err)
 	}
 	if result.RowsAffected() != 1 {
 		return ErrWorkerUnauthorized
+	}
+	return nil
+}
+
+func (s *Store) EnqueueWorkerUpdate(ctx context.Context, serverID, targetVersion string) error {
+	if _, err := uuid.Parse(serverID); err != nil {
+		return ErrResourceNotFound
+	}
+	targetVersion = strings.TrimSpace(targetVersion)
+	if targetVersion == "" || len(targetVersion) > 64 {
+		return &platform.ValidationError{Message: "Worker 版本无效"}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin Worker update: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var currentVersion string
+	var online bool
+	if err := tx.QueryRow(ctx, `SELECT worker_version,
+      last_seen_at > NOW() - INTERVAL '45 seconds'
+      FROM managed_servers WHERE id = $1 FOR UPDATE`, serverID).Scan(&currentVersion, &online); errors.Is(err, pgx.ErrNoRows) {
+		return ErrResourceNotFound
+	} else if err != nil {
+		return fmt.Errorf("load Worker update target: %w", err)
+	}
+	if !online {
+		return &platform.ValidationError{Message: "服务器离线，不能更新 Worker"}
+	}
+	if !strings.HasPrefix(currentVersion, "v") {
+		return &platform.ValidationError{Message: "当前 Worker 需要先重新运行安装命令完成迁移"}
+	}
+	if currentVersion == targetVersion {
+		return fmt.Errorf("%w: Worker already uses target version", ErrConflict)
+	}
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM worker_jobs
+      WHERE server_id = $1 AND action = 'update-worker'
+        AND status IN ('pending', 'leased'))`, serverID).Scan(&active); err != nil {
+		return fmt.Errorf("check active Worker update: %w", err)
+	}
+	if active {
+		return fmt.Errorf("%w: Worker update already in progress", ErrConflict)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
+      (id, server_id, resource_id, action, status, payload, created_at, updated_at)
+      VALUES ($1, $2, NULL, 'update-worker', 'pending', $3::jsonb, $4, $4)`,
+		uuid.NewString(), serverID, mustMapJSON(map[string]any{"version": targetVersion}), now); err != nil {
+		return fmt.Errorf("enqueue Worker update: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
+      worker_update_status = 'pending', worker_update_target = $1,
+      worker_update_message = '', updated_at = $2 WHERE id = $3`, targetVersion, now, serverID); err != nil {
+		return fmt.Errorf("mark Worker update pending: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit Worker update: %w", err)
 	}
 	return nil
 }
@@ -1085,14 +1140,15 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	}
 	var job platform.WorkerJob
 	var payloadJSON []byte
+	var resourceID pgtype.Text
 	err = tx.QueryRow(ctx, `SELECT id, resource_id, action, payload
     FROM worker_jobs
     WHERE server_id = $1
       AND (status = 'pending' OR (status = 'leased' AND lease_until < $2))
     ORDER BY created_at
     FOR UPDATE SKIP LOCKED
-    LIMIT 1`, serverID, time.Now().UTC()).Scan(
-		&job.ID, &job.ResourceID, &job.Action, &payloadJSON,
+	LIMIT 1`, serverID, time.Now().UTC()).Scan(
+		&job.ID, &resourceID, &job.Action, &payloadJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.WorkerJob{}, ErrNoJob
@@ -1103,13 +1159,20 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	if err := json.Unmarshal(payloadJSON, &job.Payload); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("decode worker job payload: %w", err)
 	}
-	if err := s.attachWorkerCredentials(ctx, tx, job.Payload); err != nil {
-		return platform.WorkerJob{}, err
+	if resourceID.Valid {
+		job.ResourceID = resourceID.String
+		if err := s.attachWorkerCredentials(ctx, tx, job.ResourceID, job.Payload); err != nil {
+			return platform.WorkerJob{}, err
+		}
 	}
 	now := time.Now().UTC()
+	leaseDuration := workerJobLeaseDuration
+	if job.Action == "update-worker" {
+		leaseDuration = 5 * time.Minute
+	}
 	if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET
     status = 'leased', lease_until = $1, attempts = attempts + 1, updated_at = $2
-    WHERE id = $3`, now.Add(workerJobLeaseDuration), now, job.ID); err != nil {
+    WHERE id = $3`, now.Add(leaseDuration), now, job.ID); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("lease worker job: %w", err)
 	}
 	if job.Action == "create-sandbox" {
@@ -1122,23 +1185,28 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 			return platform.WorkerJob{}, fmt.Errorf("update claimed sandbox status: %w", err)
 		}
 	}
+	if job.Action == "update-worker" {
+		if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
+      worker_update_status = 'updating', worker_update_message = '', updated_at = $1
+      WHERE id = $2`, now, serverID); err != nil {
+			return platform.WorkerJob{}, fmt.Errorf("mark Worker update active: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("commit worker job claim: %w", err)
 	}
 	return job, nil
 }
 
-func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, payload map[string]any) error {
+func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, sandboxID string, payload map[string]any) error {
 	credentialIDs := specStringList(payload, "credentialIds")
 	modelBindings := specStringMap(payload, "modelBindings")
 	credentials := make([]map[string]any, 0, len(credentialIDs))
 	for _, id := range credentialIDs {
-		var providerID, protocol, endpoint string
-		var ciphertext, nonce []byte
-		err := tx.QueryRow(ctx, `SELECT provider_id, protocol, endpoint,
-      secret_ciphertext, secret_nonce FROM provider_credentials
+		var providerID, protocol string
+		err := tx.QueryRow(ctx, `SELECT provider_id, protocol FROM provider_credentials
       WHERE id = $1 AND enabled = TRUE`, id).Scan(
-			&providerID, &protocol, &endpoint, &ciphertext, &nonce,
+			&providerID, &protocol,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &platform.ValidationError{Message: "环境引用了不可用的 API Key"}
@@ -1146,19 +1214,135 @@ func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, payload 
 		if err != nil {
 			return fmt.Errorf("load worker credential: %w", err)
 		}
-		secret, err := decryptSecret(s.secretKey, ciphertext, nonce)
+		modelID := modelBindings[id]
+		token, err := s.issueRuntimeLLMToken(sandboxID, id, modelID, time.Now().UTC().Add(runtimeLLMTokenTTL))
 		if err != nil {
 			return err
 		}
-		endpoint = normalizeKnownProviderEndpoint(protocol, endpoint)
-		modelID := modelBindings[id]
 		credentials = append(credentials, map[string]any{
 			"id": id, "providerId": providerID, "protocol": protocol,
-			"endpoint": endpoint, "modelId": modelID, "secret": secret,
+			"facadePath": "/api/runtime/sandboxes/" + url.PathEscape(sandboxID) +
+				"/llm/" + url.PathEscape(id),
+			"modelId": modelID, "secret": token,
 		})
 	}
 	payload["credentials"] = credentials
 	return nil
+}
+
+type runtimeLLMTokenClaims struct {
+	SandboxID    string `json:"sandboxId"`
+	CredentialID string `json:"credentialId"`
+	ModelID      string `json:"modelId"`
+	ExpiresAt    int64  `json:"expiresAt"`
+}
+
+func (s *Store) issueRuntimeLLMToken(sandboxID, credentialID, modelID string, expiresAt time.Time) (string, error) {
+	claims := runtimeLLMTokenClaims{
+		SandboxID: sandboxID, CredentialID: credentialID, ModelID: modelID,
+		ExpiresAt: expiresAt.Unix(),
+	}
+	payload, err := json.Marshal(claims)
+	if err != nil {
+		return "", fmt.Errorf("encode runtime LLM token: %w", err)
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(payload)
+	signed := "abxrt1." + encoded
+	mac := hmac.New(sha256.New, runtimeLLMTokenKey(s.secretKey))
+	_, _ = mac.Write([]byte(signed))
+	return signed + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil)), nil
+}
+
+func (s *Store) parseRuntimeLLMToken(token string, now time.Time) (runtimeLLMTokenClaims, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || parts[0] != "abxrt1" {
+		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
+	}
+	providedSignature, err := base64.RawURLEncoding.DecodeString(parts[2])
+	if err != nil {
+		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
+	}
+	mac := hmac.New(sha256.New, runtimeLLMTokenKey(s.secretKey))
+	_, _ = mac.Write([]byte(parts[0] + "." + parts[1]))
+	if !hmac.Equal(providedSignature, mac.Sum(nil)) {
+		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
+	}
+	var claims runtimeLLMTokenClaims
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.SandboxID == "" ||
+		claims.CredentialID == "" || claims.ModelID == "" || claims.ExpiresAt <= now.Unix() {
+		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
+	}
+	return claims, nil
+}
+
+func runtimeLLMTokenKey(secretKey []byte) []byte {
+	sum := sha256.Sum256(append([]byte("agentbox/runtime-llm-token/v1\x00"), secretKey...))
+	return sum[:]
+}
+
+func (s *Store) ResolveRuntimeLLMTarget(
+	ctx context.Context, sandboxID, credentialID, token string,
+) (platform.RuntimeLLMTarget, error) {
+	claims, err := s.parseRuntimeLLMToken(token, time.Now().UTC())
+	if err != nil || claims.SandboxID != sandboxID || claims.CredentialID != credentialID {
+		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	}
+
+	var sandboxSpecJSON, runtimeSpecJSON, ciphertext, nonce []byte
+	var providerID, protocol, endpoint string
+	err = s.pool.QueryRow(ctx, `SELECT sandbox.spec, COALESCE(runtime.spec, '{}'::jsonb),
+      credential.provider_id, credential.protocol, credential.endpoint,
+      credential.secret_ciphertext, credential.secret_nonce
+    FROM control_resources sandbox
+    LEFT JOIN control_resources runtime
+      ON runtime.id = sandbox.spec->>'runtimeId' AND runtime.kind = 'runtime'
+    JOIN provider_credentials credential ON credential.id = $2 AND credential.enabled = TRUE
+    WHERE sandbox.id = $1 AND sandbox.kind = 'sandbox'`, sandboxID, credentialID).Scan(
+		&sandboxSpecJSON, &runtimeSpecJSON, &providerID, &protocol, &endpoint, &ciphertext, &nonce,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	}
+	if err != nil {
+		return platform.RuntimeLLMTarget{}, fmt.Errorf("resolve runtime LLM credential: %w", err)
+	}
+	var sandboxSpec, runtimeSpec map[string]any
+	if err := json.Unmarshal(sandboxSpecJSON, &sandboxSpec); err != nil {
+		return platform.RuntimeLLMTarget{}, fmt.Errorf("decode runtime sandbox spec: %w", err)
+	}
+	if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
+		return platform.RuntimeLLMTarget{}, fmt.Errorf("decode runtime template spec: %w", err)
+	}
+	if status, _ := sandboxSpec["status"].(string); status != "running" {
+		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	}
+	effectiveSpec := effectiveSandboxSpec(runtimeSpec, sandboxSpec)
+	if !stringListContains(specStringList(effectiveSpec, "credentialIds"), credentialID) ||
+		specStringMap(effectiveSpec, "modelBindings")[credentialID] != claims.ModelID {
+		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	}
+	secret, err := decryptSecret(s.secretKey, ciphertext, nonce)
+	if err != nil {
+		return platform.RuntimeLLMTarget{}, err
+	}
+	return platform.RuntimeLLMTarget{
+		SandboxID: sandboxID, CredentialID: credentialID, ProviderID: providerID,
+		Protocol: protocol, Endpoint: normalizeKnownProviderEndpoint(protocol, endpoint),
+		ModelID: claims.ModelID, Secret: secret,
+	}, nil
+}
+
+func stringListContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, jobID string, result platform.WorkerJobResult) error {
@@ -1186,7 +1370,8 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if result.Success {
 		status = "succeeded"
 	}
-	var resourceID, action string
+	var resourceID pgtype.Text
+	var action string
 	err = tx.QueryRow(ctx, `UPDATE worker_jobs SET
     status = $1, lease_until = NULL, result_message = $2, external_id = $3, updated_at = $4
     WHERE id = $5 AND server_id = $6 AND status = 'leased'
@@ -1199,31 +1384,36 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if err != nil {
 		return fmt.Errorf("complete worker job: %w", err)
 	}
+	if action == "update-worker" {
+		now := time.Now().UTC()
+		if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
+      worker_version = CASE WHEN $1::boolean THEN worker_update_target ELSE worker_version END,
+      worker_update_status = $2, worker_update_message = $3, updated_at = $4
+      WHERE id = $5`, result.Success, status, result.Message, now, serverID); err != nil {
+			return fmt.Errorf("finish Worker update: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit Worker update completion: %w", err)
+		}
+		return nil
+	}
+	resourceIDValue := ""
+	if resourceID.Valid {
+		resourceIDValue = resourceID.String
+	}
 	if result.Success && action == "delete-sandbox" {
 		if _, err := tx.Exec(ctx, `DELETE FROM control_resources
-      WHERE id = $1 AND kind = 'sandbox'`, resourceID); err != nil {
+      WHERE id = $1 AND kind = 'sandbox'`, resourceIDValue); err != nil {
 			return fmt.Errorf("delete completed sandbox: %w", err)
 		}
 		return tx.Commit(ctx)
 	}
-	if action == "login-agent" {
-		loginStatus := "error"
-		if result.Success {
-			loginStatus = "waiting"
-		}
-		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
-      spec = spec || jsonb_build_object(
-        'loginStatus', $1::text,
-        'loginMessage', $2::text
-      ), updated_at = $3
-      WHERE id = $4 AND kind = 'sandbox'`, loginStatus, result.Message,
-			time.Now().UTC(), resourceID,
-		); err != nil {
-			return fmt.Errorf("update sandbox login status: %w", err)
-		}
+	if strings.HasPrefix(action, "workspace-") {
 		return tx.Commit(ctx)
 	}
-	if strings.HasPrefix(action, "workspace-") {
+	switch action {
+	case "create-sandbox", "start-sandbox", "stop-sandbox", "restart-sandbox", "delete-sandbox":
+	default:
 		return tx.Commit(ctx)
 	}
 	sandboxStatus := "error"
@@ -1242,7 +1432,7 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
       'message', $3::text
     ), updated_at = $4
     WHERE id = $5 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
-		result.Message, time.Now().UTC(), resourceID,
+		result.Message, time.Now().UTC(), resourceIDValue,
 	); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
@@ -1384,22 +1574,23 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		return nil, "", "", fmt.Errorf("environment template has no runtime driver")
 	}
 	payload := map[string]any{
-		"sandboxId":     sandbox.ID,
-		"name":          sandbox.Name,
-		"driver":        driver,
-		"image":         imageReference,
-		"workdir":       effectiveSpec["workdir"],
-		"setup":         effectiveSpec["setup"],
-		"cpu":           effectiveSpec["cpu"],
-		"memory":        effectiveSpec["memory"],
-		"network":       effectiveSpec["network"],
-		"agentTools":    effectiveSpec["agentTools"],
-		"skillIds":      effectiveSpec["skillIds"],
-		"mcpServerIds":  effectiveSpec["mcpServerIds"],
-		"variableIds":   effectiveSpec["variableIds"],
-		"credentialIds": effectiveSpec["credentialIds"],
-		"modelBindings": effectiveSpec["modelBindings"],
-		"workspace":     effectiveSpec["workspace"],
+		"sandboxId":            sandbox.ID,
+		"name":                 sandbox.Name,
+		"driver":               driver,
+		"image":                imageReference,
+		"workdir":              effectiveSpec["workdir"],
+		"setup":                effectiveSpec["setup"],
+		"cpu":                  effectiveSpec["cpu"],
+		"memory":               effectiveSpec["memory"],
+		"network":              effectiveSpec["network"],
+		"agentTools":           effectiveSpec["agentTools"],
+		"skillIds":             effectiveSpec["skillIds"],
+		"mcpServerIds":         effectiveSpec["mcpServerIds"],
+		"variableIds":          effectiveSpec["variableIds"],
+		"environmentVariables": effectiveSpec["environmentVariables"],
+		"credentialIds":        effectiveSpec["credentialIds"],
+		"modelBindings":        effectiveSpec["modelBindings"],
+		"workspace":            effectiveSpec["workspace"],
 	}
 	for _, definitions := range []struct {
 		payloadKey string
@@ -1438,6 +1629,7 @@ func effectiveSandboxSpec(runtimeSpec, sandboxSpec map[string]any) map[string]an
 		"skillIds",
 		"mcpServerIds",
 		"variableIds",
+		"environmentVariables",
 		"credentialIds",
 		"modelBindings",
 		"workspace",
@@ -1512,7 +1704,6 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	workerAction := ""
 	pendingStatus := ""
 	message := ""
-	loginTool := ""
 	switch action {
 	case "start":
 		workerAction, pendingStatus, message = "start-sandbox", "starting", "正在启动沙箱"
@@ -1522,8 +1713,6 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 		workerAction, pendingStatus, message = "restart-sandbox", "restarting", "正在重启并应用沙箱配置"
 	case "delete":
 		workerAction, pendingStatus, message = "delete-sandbox", "deleting", "正在删除沙箱"
-	case "login-codex":
-		workerAction, message, loginTool = "login-agent", "正在发起 Codex 设备登录", "codex"
 	default:
 		return platform.Resource{}, &platform.ValidationError{Message: "不支持的沙箱操作"}
 	}
@@ -1565,9 +1754,6 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	if action == "restart" && status != "running" {
 		return platform.Resource{}, fmt.Errorf("%w: sandbox must be running before restart", ErrConflict)
 	}
-	if action == "login-codex" && status != "running" {
-		return platform.Resource{}, fmt.Errorf("%w: sandbox must be running before login", ErrConflict)
-	}
 	serverID, _ := resource.Spec["serverId"].(string)
 	driver, _ := resource.Spec["driver"].(string)
 	if driver == "" {
@@ -1581,7 +1767,6 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 		"sandboxId":  id,
 		"externalId": resource.Spec["externalId"],
 		"driver":     driver,
-		"tool":       loginTool,
 	}
 	if action == "start" || action == "restart" {
 		configuredPayload, configuredDriver, _, err := buildSandboxJobPayload(ctx, tx, resource)
@@ -1600,22 +1785,11 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	); err != nil {
 		return platform.Resource{}, fmt.Errorf("enqueue sandbox operation: %w", err)
 	}
-	if action == "login-codex" {
-		resource, err = scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
-      spec = spec || jsonb_build_object(
-        'loginStatus', 'starting'::text,
-        'loginTool', $1::text,
-        'loginMessage', $2::text
-      ), updated_at = $3 WHERE id = $4 RETURNING `+resourceColumns,
-			loginTool, message, now, id,
-		))
-	} else {
-		resource, err = scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
+	resource, err = scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
       spec = spec || jsonb_build_object('status', $1::text, 'message', $2::text),
       updated_at = $3 WHERE id = $4 RETURNING `+resourceColumns,
-			pendingStatus, message, now, id,
-		))
-	}
+		pendingStatus, message, now, id,
+	))
 	if err != nil {
 		return platform.Resource{}, fmt.Errorf("update sandbox operation status: %w", err)
 	}
@@ -1846,31 +2020,72 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 		return &platform.ValidationError{Message: "请为沙箱中的每个模型服务选择具体模型"}
 	}
 	allowedCredentials := make(map[string]bool, len(allowedCredentialIDs))
+	credentialProtocols := make(map[string]bool, len(allowedCredentialIDs))
 	for _, credentialID := range allowedCredentialIDs {
 		allowedCredentials[credentialID] = true
 		modelID := strings.TrimSpace(modelBindings[credentialID])
 		if modelID == "" {
 			return &platform.ValidationError{Message: "请为沙箱中的每个模型服务选择具体模型"}
 		}
-		var exists bool
-		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
-          SELECT 1 FROM provider_credentials
+		var protocol string
+		if err := s.pool.QueryRow(ctx, `SELECT protocol
+          FROM provider_credentials
           WHERE id = $1 AND enabled = TRUE
             AND models @> jsonb_build_array(jsonb_build_object('id', $2::text))
-        )`, credentialID, modelID).Scan(&exists); err != nil {
+        `, credentialID, modelID).Scan(&protocol); errors.Is(err, pgx.ErrNoRows) {
+			return &platform.ValidationError{Message: "所选模型不存在、已停用或模型列表已更新"}
+		} else if err != nil {
 			return fmt.Errorf("check sandbox model binding: %w", err)
 		}
-		if !exists {
-			return &platform.ValidationError{Message: "所选模型不存在、已停用或模型列表已更新"}
-		}
+		credentialProtocols[protocol] = true
 	}
 	for credentialID := range modelBindings {
 		if !allowedCredentials[credentialID] {
 			return &platform.ValidationError{Message: "所选模型服务不属于当前沙箱"}
 		}
 	}
+	if incompatible := incompatibleAgentTools(specStringList(effectiveSpec, "agentTools"), credentialProtocols); len(incompatible) > 0 {
+		return &platform.ValidationError{Message: strings.Join(incompatible, "、") + " 与当前所选模型服务的接口协议不兼容"}
+	}
 	input.Spec["credentialIds"] = allowedCredentialIDs
 	return nil
+}
+
+func incompatibleAgentTools(agentTools []string, protocols map[string]bool) []string {
+	compatibility := map[string][]string{
+		"claude-code": {"anthropic", "openai-responses", "openai-chat"},
+		"codex":       {"openai-responses", "anthropic", "openai-chat"},
+		"kimi":        {"anthropic", "openai-chat", "openai-responses"},
+		"opencode":    {"anthropic", "openai-chat", "openai-responses", "gemini"},
+		"pi":          {"anthropic", "openai-chat", "openai-responses", "gemini"},
+		"reasonix":    {"anthropic", "openai-chat", "openai-responses"},
+	}
+	labels := map[string]string{
+		"claude-code": "Claude Code",
+		"codex":       "Codex",
+		"kimi":        "Kimi Code",
+		"opencode":    "OpenCode",
+		"pi":          "Pi",
+		"reasonix":    "Reasonix",
+	}
+	var incompatible []string
+	for _, agentTool := range agentTools {
+		accepted, supported := compatibility[agentTool]
+		if !supported {
+			continue
+		}
+		compatible := false
+		for _, protocol := range accepted {
+			if protocols[protocol] {
+				compatible = true
+				break
+			}
+		}
+		if !compatible {
+			incompatible = append(incompatible, labels[agentTool])
+		}
+	}
+	return incompatible
 }
 
 func runtimeImageIsAvailable(driver string, inventory platform.ServerInventory, reference, serverArch string) bool {

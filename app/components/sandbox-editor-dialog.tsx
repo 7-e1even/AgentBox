@@ -9,14 +9,20 @@ import {
   ServerIcon,
 } from "lucide-react"
 
-import { agentToolOptions } from "@/lib/agent-tools"
+import {
+  agentToolOptions,
+  incompatibleAgentTools,
+  supportedAgentToolList,
+} from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
+import { environmentVariablesError } from "@/lib/environment-variables"
 import {
   resourceInputSchema,
   type Resource,
   type ResourceInput,
 } from "@/lib/platform-schema"
 import type { ManagedServer } from "@/lib/server-schema"
+import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -113,11 +119,10 @@ export function SandboxEditorDialog({
   const enabledCredentials = credentials.filter((item) => item.enabled)
   const projectSkills = projectResources(resources, projectId, "skill")
   const projectMCPServers = projectResources(resources, projectId, "mcp")
-  const projectVariables = projectResources(resources, projectId, "variable")
   const driverOptions = runtimeDriverOptions(server)
   const imageOptions = runtimeImageOptions(server, input.spec.imageReference)
   const lockedTools = useMemo(
-    () => (resource ? stringList(resource.spec.agentTools) : []),
+    () => (resource ? supportedAgentToolList(resource.spec.agentTools) : []),
     [resource]
   )
 
@@ -212,6 +217,13 @@ export function SandboxEditorDialog({
       setError("运行服务器当前不可用，或所选隔离驱动尚未通过 Worker 自检")
       return
     }
+    const environmentError = environmentVariablesError(
+      input.spec.environmentVariables
+    )
+    if (environmentError) {
+      setError(environmentError)
+      return
+    }
     const next: ResourceInput = {
       ...input,
       projectId,
@@ -241,6 +253,20 @@ export function SandboxEditorDialog({
         setError(`请为 ${item.credential.name} 选择具体模型`)
         return
       }
+    }
+    const incompatibleTools = incompatibleAgentTools(
+      input.spec.agentTools,
+      selectedCredentials.flatMap((item) =>
+        item.credential ? [item.credential.protocol] : []
+      )
+    )
+    if (incompatibleTools.length > 0) {
+      const labels = incompatibleTools.map(
+        (tool) =>
+          agentToolOptions.find((option) => option.value === tool)?.label ?? tool
+      )
+      setError(`${labels.join("、")} 与当前所选模型服务的接口协议不兼容`)
+      return
     }
     setSaving(true)
     setError("")
@@ -572,7 +598,7 @@ export function SandboxEditorDialog({
                     <ToggleGroupItem
                       key={option.value}
                       value={option.value}
-                      disabled={option.disabled || Boolean(locked)}
+                      disabled={Boolean(locked)}
                     >
                       {selected && <CheckIcon data-icon="inline-start" />}
                       {option.label}
@@ -608,12 +634,18 @@ export function SandboxEditorDialog({
                 value={stringList(input.spec.mcpServerIds)}
                 onValueChange={(values) => updateSpec("mcpServerIds", values)}
               />
-              <CapabilitySelector
-                label="注入环境变量"
-                options={projectVariables}
-                value={stringList(input.spec.variableIds)}
-                onValueChange={(values) => updateSpec("variableIds", values)}
-              />
+              <Field>
+                <FieldLabel>环境变量</FieldLabel>
+                <EnvironmentVariablesEditor
+                  value={input.spec.environmentVariables}
+                  onChange={(value) =>
+                    updateSpec("environmentVariables", value)
+                  }
+                />
+                <FieldDescription>
+                  模板提供初始值；在这里修改后仅影响当前沙箱。
+                </FieldDescription>
+              </Field>
             </FieldSet>
 
             <Separator />
@@ -834,6 +866,7 @@ function sandboxInputFromResource(resource: Resource, template?: Resource) {
     spec: {
       ...templateDefaults(template),
       ...input.spec,
+      agentTools: supportedAgentToolList(input.spec.agentTools),
     },
   }
 }
@@ -849,10 +882,13 @@ function templateDefaults(template?: Resource) {
     cpu: stringValue(template?.spec.cpu) || "2",
     memory: stringValue(template?.spec.memory) || "4 GiB",
     network: stringValue(template?.spec.network) || "restricted",
-    agentTools: stringList(template?.spec.agentTools),
+    agentTools: supportedAgentToolList(template?.spec.agentTools),
     skillIds: stringList(template?.spec.skillIds),
     mcpServerIds: stringList(template?.spec.mcpServerIds),
     variableIds: stringList(template?.spec.variableIds),
+    environmentVariables: Array.isArray(template?.spec.environmentVariables)
+      ? template.spec.environmentVariables
+      : [],
     credentialIds: stringList(template?.spec.credentialIds),
   }
 }
@@ -925,7 +961,7 @@ function runtimeImageOptions(
 function projectResources(
   resources: Resource[],
   projectId: string,
-  kind: "skill" | "mcp" | "variable"
+  kind: "skill" | "mcp"
 ) {
   return resources
     .filter(

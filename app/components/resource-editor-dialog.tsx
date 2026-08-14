@@ -3,12 +3,9 @@
 import { useState } from "react"
 import { CheckIcon, SaveIcon } from "lucide-react"
 
-import {
-  agentToolOptions,
-  commonAgentToolIds,
-  multicaLinuxAgentToolIds,
-} from "@/lib/agent-tools"
+import { agentToolOptions, supportedAgentToolList } from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
+import { environmentVariablesError } from "@/lib/environment-variables"
 import {
   resourceInputSchema,
   type Resource,
@@ -16,6 +13,7 @@ import {
   type ResourceKind,
 } from "@/lib/platform-schema"
 import type { ManagedServer } from "@/lib/server-schema"
+import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import {
@@ -58,7 +56,6 @@ const labels: Record<ResourceKind, string> = {
 }
 
 type Option = { value: string; label: string; disabled?: boolean }
-type Preset = { label: string; values: string[] }
 type SpecField = {
   key: string
   label: string
@@ -67,7 +64,7 @@ type SpecField = {
   textarea?: boolean
   options?: Option[]
   multiOptions?: Option[]
-  presets?: Preset[]
+  environmentVariables?: boolean
   advanced?: boolean
 }
 
@@ -228,14 +225,6 @@ function fields(
           key: "agentTools",
           label: "Agent 工具",
           multiOptions: agentToolOptions,
-          presets: [
-            { label: "常用 7 个", values: commonAgentToolIds },
-            {
-              label: "全部 17 个（重型）",
-              values: multicaLinuxAgentToolIds,
-            },
-            { label: "清空", values: [] },
-          ],
           description:
             driver === "docker"
               ? "只安装所选工具；首个沙箱会构建缓存镜像，之后同组合直接复用。部分工具仍需各自账号登录。"
@@ -292,11 +281,9 @@ function fields(
           advanced: true,
         },
         {
-          key: "variableIds",
-          label: "注入环境变量",
-          multiOptions: resources
-            .filter((item) => item.kind === "variable" && item.enabled)
-            .map((item) => ({ value: item.id, label: item.name })),
+          key: "environmentVariables",
+          label: "环境变量",
+          environmentVariables: true,
           advanced: true,
         },
       ]
@@ -359,11 +346,6 @@ function fields(
           key: "agentTools",
           label: "沙箱内的 Agent（可多选）",
           multiOptions: agentToolOptions,
-          presets: [
-            { label: "常用 7 个", values: commonAgentToolIds },
-            { label: "全部", values: multicaLinuxAgentToolIds },
-            { label: "清空", values: [] },
-          ],
           description: "同一个沙箱可以同时安装并运行多个 Agent CLI。",
         },
         {
@@ -432,6 +414,7 @@ function defaults(kind: ResourceKind) {
       skillIds: [],
       mcpServerIds: [],
       variableIds: [],
+      environmentVariables: [],
       credentialIds: [],
     },
     skill: { version: "1.0.0", source: "inline" },
@@ -440,6 +423,7 @@ function defaults(kind: ResourceKind) {
       policy: "new",
       status: "requested",
       agentTools: [],
+      environmentVariables: [],
       credentialIds: [],
     },
     variable: { mode: "secret-ref" },
@@ -469,28 +453,21 @@ function SpecFieldEditor({
   return (
     <Field
       className={
-        field.textarea || field.multiOptions ? "sm:col-span-2" : undefined
+        field.textarea || field.multiOptions || field.environmentVariables
+          ? "sm:col-span-2"
+          : undefined
       }
       data-invalid={invalid}
     >
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <FieldLabel htmlFor={`spec-${field.key}`}>{field.label}</FieldLabel>
-        {field.presets && (
-          <div className="flex flex-wrap items-center gap-1.5">
-            {field.presets.map((preset) => (
-              <Button
-                key={preset.label}
-                type="button"
-                variant="outline"
-                size="xs"
-                onClick={() => onChange(field.key, preset.values)}
-              >
-                {preset.label}
-              </Button>
-            ))}
-          </div>
-        )}
-      </div>
+      <FieldLabel
+        htmlFor={
+          field.multiOptions || field.environmentVariables
+            ? undefined
+            : `spec-${field.key}`
+        }
+      >
+        {field.label}
+      </FieldLabel>
       {field.multiOptions ? (
         <ToggleGroup
           type="multiple"
@@ -513,6 +490,11 @@ function SpecFieldEditor({
             </ToggleGroupItem>
           ))}
         </ToggleGroup>
+      ) : field.environmentVariables ? (
+        <EnvironmentVariablesEditor
+          value={spec[field.key]}
+          onChange={(value) => onChange(field.key, value)}
+        />
       ) : field.options ? (
         <Select
           value={
@@ -583,8 +565,9 @@ function nextSpec(
     )
     if (runtime) {
       next.serverId = runtime.spec.serverId
-      next.agentTools = stringArray(runtime.spec.agentTools)
+      next.agentTools = supportedAgentToolList(runtime.spec.agentTools)
       next.credentialIds = stringArray(runtime.spec.credentialIds)
+      next.environmentVariables = runtime.spec.environmentVariables
     }
     return next
   }
@@ -640,8 +623,9 @@ function initialEditorSpec(
     if (runtime) {
       spec.runtimeId = runtime.id
       spec.serverId = runtime.spec.serverId
-      spec.agentTools = stringArray(runtime.spec.agentTools)
+      spec.agentTools = supportedAgentToolList(runtime.spec.agentTools)
       spec.credentialIds = stringArray(runtime.spec.credentialIds)
+      spec.environmentVariables = runtime.spec.environmentVariables
     }
     return spec
   }
@@ -684,6 +668,18 @@ function initialEditorSpec(
   return spec
 }
 
+function inputFromResource(resource: Resource): ResourceInput {
+  const input = resourceInputSchema.parse(resource)
+  if (resource.kind !== "runtime" && resource.kind !== "sandbox") return input
+  return {
+    ...input,
+    spec: {
+      ...input.spec,
+      agentTools: supportedAgentToolList(input.spec.agentTools),
+    },
+  }
+}
+
 function specAfterProjectChange(
   kind: ResourceKind,
   spec: Record<string, unknown>
@@ -724,7 +720,7 @@ export function ResourceEditorDialog({
 }) {
   const [input, setInput] = useState<ResourceInput>(() =>
     resource
-      ? resourceInputSchema.parse(resource)
+      ? inputFromResource(resource)
       : {
           id: "",
           kind,
@@ -817,6 +813,13 @@ export function ResourceEditorDialog({
     }
     if (kind === "sandbox" && !String(input.spec.serverId ?? "").trim()) {
       setErrors({ spec: "请选择创建沙箱的目标服务器" })
+      return
+    }
+    const environmentError = environmentVariablesError(
+      input.spec.environmentVariables
+    )
+    if (environmentError) {
+      setErrors({ spec: environmentError })
       return
     }
     setSaving(true)

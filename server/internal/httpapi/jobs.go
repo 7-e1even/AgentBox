@@ -3,6 +3,7 @@ package httpapi
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"agentbox/internal/platform"
@@ -22,7 +23,61 @@ func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
+	attachWorkerRuntimeEndpoints(job.Payload, workerRequestBaseURL(request))
 	s.writeJSON(w, http.StatusOK, map[string]any{"job": job})
+}
+
+func workerRequestBaseURL(request *http.Request) string {
+	scheme := "http"
+	if request.TLS != nil {
+		scheme = "https"
+	}
+	if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Proto")); forwarded == "http" || forwarded == "https" {
+		scheme = forwarded
+	}
+	host := request.Host
+	if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Host")); forwarded != "" {
+		host = forwarded
+	}
+	parsed, err := url.Parse(scheme + "://" + host)
+	if err != nil || parsed.Host == "" || parsed.User != nil {
+		return ""
+	}
+	return strings.TrimRight(parsed.String(), "/")
+}
+
+func firstForwardedValue(value string) string {
+	first, _, _ := strings.Cut(value, ",")
+	return strings.TrimSpace(first)
+}
+
+func attachWorkerRuntimeEndpoints(payload map[string]any, baseURL string) {
+	if baseURL == "" {
+		return
+	}
+	credentials, ok := payload["credentials"].([]map[string]any)
+	if !ok {
+		return
+	}
+	for _, credential := range credentials {
+		facadePath, _ := credential["facadePath"].(string)
+		protocol, _ := credential["protocol"].(string)
+		if facadePath == "" {
+			continue
+		}
+		root := baseURL + "/" + strings.TrimLeft(facadePath, "/")
+		credential["anthropicEndpoint"] = root + "/anthropic"
+		credential["openaiEndpoint"] = root + "/openai/v1"
+		credential["chatEndpoint"] = root + "/openai/v1"
+		switch protocol {
+		case "anthropic":
+			credential["endpoint"] = credential["anthropicEndpoint"]
+		case "gemini":
+			credential["endpoint"] = root + "/gemini"
+		default:
+			credential["endpoint"] = credential["openaiEndpoint"]
+		}
+	}
 }
 
 func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request) {

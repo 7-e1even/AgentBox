@@ -317,7 +317,7 @@ export function ControlPlaneShell({
 
   async function operateSandbox(
     sandbox: Resource,
-    action: "start" | "stop" | "restart" | "delete" | "login-codex"
+    action: "start" | "stop" | "restart" | "delete"
   ) {
     setSandboxBusyId(sandbox.id)
     try {
@@ -339,9 +339,7 @@ export function ControlPlaneShell({
             ? "停止任务已提交"
             : action === "restart"
               ? "重启任务已提交"
-              : action === "delete"
-                ? "删除任务已提交"
-                : "Codex 登录已发起",
+              : "删除任务已提交",
         { description: sandbox.name }
       )
       window.setTimeout(() => void refreshResources(), 6000)

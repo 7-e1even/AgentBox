@@ -32,6 +32,10 @@ CREATE TABLE IF NOT EXISTS managed_servers (
   arch TEXT NOT NULL,
   capabilities JSONB NOT NULL DEFAULT '[]'::jsonb,
   inventory JSONB NOT NULL DEFAULT '{"dockerImages":[],"vmImages":[],"vmImageDirectory":"/var/lib/agentbox/vm-images"}'::jsonb,
+  worker_version TEXT NOT NULL DEFAULT '',
+  worker_update_status TEXT NOT NULL DEFAULT '',
+  worker_update_target TEXT NOT NULL DEFAULT '',
+  worker_update_message TEXT NOT NULL DEFAULT '',
   credential_hash BYTEA NOT NULL UNIQUE,
   last_seen_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
@@ -40,6 +44,10 @@ CREATE TABLE IF NOT EXISTS managed_servers (
 
 ALTER TABLE managed_servers ADD COLUMN IF NOT EXISTS inventory JSONB NOT NULL
   DEFAULT '{"dockerImages":[],"vmImages":[],"vmImageDirectory":"/var/lib/agentbox/vm-images"}'::jsonb;
+ALTER TABLE managed_servers ADD COLUMN IF NOT EXISTS worker_version TEXT NOT NULL DEFAULT '';
+ALTER TABLE managed_servers ADD COLUMN IF NOT EXISTS worker_update_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE managed_servers ADD COLUMN IF NOT EXISTS worker_update_target TEXT NOT NULL DEFAULT '';
+ALTER TABLE managed_servers ADD COLUMN IF NOT EXISTS worker_update_message TEXT NOT NULL DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS server_pairings (
   id UUID PRIMARY KEY,
@@ -103,7 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider
 CREATE TABLE IF NOT EXISTS worker_jobs (
   id UUID PRIMARY KEY,
   server_id UUID NOT NULL REFERENCES managed_servers(id) ON DELETE CASCADE,
-  resource_id TEXT NOT NULL REFERENCES control_resources(id) ON DELETE CASCADE,
+  resource_id TEXT REFERENCES control_resources(id) ON DELETE CASCADE,
   action TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('pending', 'leased', 'succeeded', 'failed')),
   payload JSONB NOT NULL,
@@ -115,8 +123,17 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
   updated_at TIMESTAMPTZ NOT NULL
 );
 
+ALTER TABLE worker_jobs ALTER COLUMN resource_id DROP NOT NULL;
+
 CREATE INDEX IF NOT EXISTS idx_worker_jobs_claim
   ON worker_jobs(server_id, status, created_at);
+
+DELETE FROM worker_jobs WHERE action = 'login-agent';
+
+UPDATE control_resources
+SET spec = spec - 'loginStatus' - 'loginMessage' - 'loginTool'
+WHERE kind = 'sandbox'
+  AND spec ?| ARRAY['loginStatus', 'loginMessage', 'loginTool'];
 
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY,
@@ -219,9 +236,16 @@ SET spec = spec || jsonb_build_object(
   'skillIds', COALESCE(spec->'skillIds', '[]'::jsonb),
   'mcpServerIds', COALESCE(spec->'mcpServerIds', '[]'::jsonb),
   'variableIds', COALESCE(spec->'variableIds', '[]'::jsonb),
+  'environmentVariables', COALESCE(spec->'environmentVariables', '[]'::jsonb),
   'credentialIds', COALESCE(spec->'credentialIds', '[]'::jsonb)
 )
 WHERE kind = 'runtime';
+
+UPDATE control_resources
+SET spec = spec || jsonb_build_object(
+  'environmentVariables', COALESCE(spec->'environmentVariables', '[]'::jsonb)
+)
+WHERE kind = 'sandbox';
 
 UPDATE control_resources runtime
 SET spec = runtime.spec || jsonb_build_object('imageReference', image.spec->>'reference')

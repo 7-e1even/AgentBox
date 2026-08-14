@@ -9,11 +9,9 @@ import {
   CheckCircle2Icon,
   ChevronRightIcon,
   ContainerIcon,
-  CopyIcon,
   KeyRoundIcon,
   LayoutTemplateIcon,
   LoaderCircleIcon,
-  LogInIcon,
   MonitorIcon,
   MoreHorizontalIcon,
   PencilIcon,
@@ -444,7 +442,7 @@ export function SandboxesView({
   busyId: string | null
   onAction: (
     resource: Resource,
-    action: "start" | "stop" | "restart" | "delete" | "login-codex"
+    action: "start" | "stop" | "restart" | "delete"
   ) => Promise<void>
   onDelete: (resource: Resource) => void
 }) {
@@ -525,8 +523,6 @@ export function SandboxesView({
           )}
           server={servers.find((item) => item.id === selected.spec.serverId)}
           resources={resources}
-          busy={busyId === selected.id}
-          onLogin={() => void onAction(selected, "login-codex")}
           onOpenChange={(open) => !open && setSelectedId(null)}
         />
       )}
@@ -696,7 +692,7 @@ function sandboxColumns({
   onOpen: (sandbox: Resource) => void
   onAction: (
     resource: Resource,
-    action: "start" | "stop" | "restart" | "delete" | "login-codex"
+    action: "start" | "stop" | "restart" | "delete"
   ) => Promise<void>
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
@@ -915,16 +911,12 @@ function SandboxDetailsDialog({
   environment,
   server,
   resources,
-  busy,
-  onLogin,
   onOpenChange,
 }: {
   sandbox: Resource
   environment?: Resource
   server?: ManagedServer
   resources: Resource[]
-  busy: boolean
-  onLogin: () => void
   onOpenChange: (open: boolean) => void
 }) {
   const tools = stringList(
@@ -947,11 +939,6 @@ function SandboxDetailsDialog({
     typeof sandbox.spec.externalId === "string"
       ? sandbox.spec.externalId
       : `agentbox-${sandbox.id}`
-  const loginMessage =
-    typeof sandbox.spec.loginMessage === "string"
-      ? sandbox.spec.loginMessage
-      : ""
-  const loginCommand = `docker exec -it ${externalId} codex login --device-auth`
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
@@ -985,58 +972,6 @@ function SandboxDetailsDialog({
             <CapabilityList title="Skills" values={skills} />
             <CapabilityList title="MCP Servers" values={mcpServers} />
           </div>
-
-          {tools.includes("codex") && (
-            <div className="rounded-xl border p-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                <div>
-                  <p className="font-medium">Codex 账号登录</p>
-                  <p className="mt-1 text-sm leading-5 text-muted-foreground">
-                    模型凭据已由 Sandbox 配置自动注入；如果要使用 ChatGPT
-                    订阅账号，可在这个沙箱内单独发起设备登录。
-                  </p>
-                </div>
-                <Button
-                  size="sm"
-                  disabled={busy || sandbox.spec.status !== "running"}
-                  onClick={onLogin}
-                >
-                  {busy ? (
-                    <LoaderCircleIcon className="animate-spin" />
-                  ) : (
-                    <LogInIcon />
-                  )}
-                  发起登录
-                </Button>
-              </div>
-              {loginMessage && (
-                <pre
-                  className={`mt-3 max-h-40 overflow-auto rounded-lg p-3 text-xs leading-5 whitespace-pre-wrap ${
-                    sandbox.spec.loginStatus === "error"
-                      ? "bg-destructive/10 text-destructive"
-                      : "bg-muted"
-                  }`}
-                >
-                  {loginMessage}
-                </pre>
-              )}
-              <div className="mt-3 flex items-center gap-2 rounded-lg bg-muted/50 p-2 pl-3">
-                <code className="min-w-0 flex-1 truncate text-xs">
-                  {loginCommand}
-                </code>
-                <Button
-                  size="icon-sm"
-                  variant="ghost"
-                  aria-label="复制终端登录命令"
-                  onClick={() =>
-                    void navigator.clipboard.writeText(loginCommand)
-                  }
-                >
-                  <CopyIcon />
-                </Button>
-              </div>
-            </div>
-          )}
         </div>
 
         <DialogFooter>

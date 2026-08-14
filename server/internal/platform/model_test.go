@@ -62,10 +62,7 @@ func TestEnvironmentTemplateRequiresServerInventorySelection(t *testing.T) {
 	}
 	input.Spec["serverId"] = "7b20f83b-6418-4a9f-8477-3dc7c35d6310"
 	input.Spec["agentTools"] = []any{
-		"antigravity", "claude-code", "codebuddy", "codex", "copilot-cli",
-		"cursor", "gemini-cli", "grok", "kimi", "omp",
-		"openclaw", "opencode", "pi", "qoder-cli", "qoder-cn", "qwen-code",
-		"qwenpaw", "reasonix",
+		"claude-code", "codex", "kimi", "opencode", "pi", "reasonix",
 	}
 	if err := Validate(input); err != nil {
 		t.Fatalf("Validate() returned error: %v", err)
@@ -125,6 +122,38 @@ func TestSandboxRejectsUnknownAgentTool(t *testing.T) {
 	}
 	if err := Validate(input); !IsValidationError(err) {
 		t.Fatalf("Validate() error = %v, want unknown Agent tool rejection", err)
+	}
+}
+
+func TestSandboxValidatesEnvironmentVariables(t *testing.T) {
+	projectID := "default"
+	input := Input{
+		ID:        "sandbox-one",
+		Kind:      KindSandbox,
+		ProjectID: &projectID,
+		Name:      "Sandbox One",
+		Spec: map[string]any{
+			"runtimeId": "runtime-one",
+			"serverId":  "7b20f83b-6418-4a9f-8477-3dc7c35d6310",
+			"environmentVariables": []any{
+				map[string]any{"name": "NODE_ENV", "value": "production"},
+			},
+		},
+	}
+	if err := Validate(input); err != nil {
+		t.Fatalf("Validate() rejected environment variables: %v", err)
+	}
+	input.Spec["environmentVariables"] = []any{
+		map[string]any{"name": "BAD-NAME", "value": "production"},
+	}
+	if err := Validate(input); !IsValidationError(err) {
+		t.Fatalf("Validate() error = %v, want invalid environment name rejection", err)
+	}
+	input.Spec["environmentVariables"] = []any{
+		map[string]any{"name": "AGENTBOX_KEY", "value": "secret"},
+	}
+	if err := Validate(input); !IsValidationError(err) {
+		t.Fatalf("Validate() error = %v, want reserved environment name rejection", err)
 	}
 }
 

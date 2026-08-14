@@ -18,6 +18,8 @@ import (
 	"github.com/joho/godotenv"
 )
 
+var version = "dev"
+
 func main() {
 	_ = godotenv.Load(".env", "server/.env")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -36,6 +38,19 @@ func main() {
 	}
 	origins := strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",")
 	disableAuth := strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_DISABLE_AUTH")), "true")
+	workerBinaryDir := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_BINARY_DIR"))
+	workerVersion := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_VERSION"))
+	if workerVersion == "" {
+		workerVersion = version
+	}
+	workerReleaseURL := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_RELEASE_BASE_URL"))
+	if workerReleaseURL == "" {
+		workerReleaseURL = "https://github.com/7-e1even/AgentBox/releases/download"
+	}
+	workerCacheDir := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_CACHE_DIR"))
+	if workerCacheDir == "" {
+		workerCacheDir = "/var/lib/agentbox/worker-cache"
+	}
 	if disableAuth && !strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_ENV")), "development") {
 		logger.Error("AGENTBOX_DISABLE_AUTH is only allowed when AGENTBOX_ENV=development")
 		os.Exit(1)
@@ -51,11 +66,17 @@ func main() {
 	defer repository.Close()
 
 	server := &http.Server{
-		Addr:              net.JoinHostPort(bindHost, port),
-		Handler:           httpapi.New(repository, catalog.BuiltinCatalog, logger, origins, httpapi.Config{DisableAuth: disableAuth}),
+		Addr: net.JoinHostPort(bindHost, port),
+		Handler: httpapi.New(repository, catalog.BuiltinCatalog, logger, origins, httpapi.Config{
+			DisableAuth:      disableAuth,
+			WorkerBinaryDir:  workerBinaryDir,
+			WorkerVersion:    workerVersion,
+			WorkerReleaseURL: workerReleaseURL,
+			WorkerCacheDir:   workerCacheDir,
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		WriteTimeout:      3 * time.Minute,
 		IdleTimeout:       60 * time.Second,
 	}
 

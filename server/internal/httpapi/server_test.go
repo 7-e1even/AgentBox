@@ -34,6 +34,11 @@ func (fakeStore) UpdateResource(_ context.Context, _ string, input platform.Inpu
 }
 func (fakeStore) DeleteResource(context.Context, string) error { return nil }
 func (fakeStore) OperateSandbox(_ context.Context, id, action string) (platform.Resource, error) {
+	switch action {
+	case "start", "stop", "restart", "delete":
+	default:
+		return platform.Resource{}, &platform.ValidationError{Message: "不支持的沙箱操作"}
+	}
 	return platform.Resource{Input: platform.Input{ID: id, Kind: platform.KindSandbox, Name: action}}, nil
 }
 func (fakeStore) ListCredentials(context.Context) ([]platform.ManagedCredential, error) {
@@ -58,12 +63,16 @@ func (fakeStore) DeleteCredentialModel(context.Context, string, string) ([]platf
 	return []platform.CredentialModel{}, nil
 }
 func (fakeStore) DeleteCredential(context.Context, string) error { return nil }
+func (fakeStore) ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error) {
+	return platform.RuntimeLLMTarget{}, store.ErrRuntimeUnauthorized
+}
 func (fakeStore) ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error) {
 	return platform.WorkerJob{}, store.ErrNoJob
 }
 func (fakeStore) CompleteWorkerJob(context.Context, string, string, string, platform.WorkerJobResult) error {
 	return nil
 }
+func (fakeStore) EnqueueWorkerUpdate(context.Context, string, string) error { return nil }
 func (fakeStore) ListServers(context.Context) ([]platform.ManagedServer, error) {
 	return []platform.ManagedServer{}, nil
 }
@@ -76,7 +85,7 @@ func (fakeStore) GetServerPairing(context.Context, string) (platform.ServerPairi
 func (fakeStore) RegisterServer(context.Context, platform.ServerRegistration) (platform.ManagedServer, string, error) {
 	return platform.ManagedServer{}, strings.Repeat("b", 32), nil
 }
-func (fakeStore) HeartbeatServer(context.Context, string, string, []string, *platform.ServerInventory) error {
+func (fakeStore) HeartbeatServer(context.Context, string, string, []string, *platform.ServerInventory, string) error {
 	return nil
 }
 func (fakeStore) DeleteServer(context.Context, string) error   { return nil }
@@ -291,7 +300,7 @@ func TestWorkerClaimReturnsNoContentWhenQueueIsEmpty(t *testing.T) {
 	}
 }
 
-func TestSandboxCodexLoginActionIsAccepted(t *testing.T) {
+func TestSandboxCodexLoginActionIsRemoved(t *testing.T) {
 	request := httptest.NewRequest(
 		http.MethodPost,
 		"/api/sandboxes/sandbox-one/actions/login-codex",
@@ -299,8 +308,8 @@ func TestSandboxCodexLoginActionIsAccepted(t *testing.T) {
 	)
 	response := httptest.NewRecorder()
 	testHandler().ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
 	}
 }
 

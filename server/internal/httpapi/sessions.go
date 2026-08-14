@@ -267,7 +267,7 @@ func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID stri
 func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Request) {
 	serverID := request.PathValue("id")
 	credential := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
-	if err := s.store.HeartbeatServer(request.Context(), serverID, credential, nil, nil); err != nil {
+	if err := s.store.HeartbeatServer(request.Context(), serverID, credential, nil, nil, ""); err != nil {
 		if errors.Is(err, store.ErrWorkerUnauthorized) {
 			s.writeError(w, http.StatusUnauthorized, "Worker authentication failed")
 			return

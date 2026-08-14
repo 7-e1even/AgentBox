@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -32,10 +33,14 @@ func TestWorkerOnlyAdvertisesUsableDocker(t *testing.T) {
 
 func TestWorkerCredentialFormatsFollowProtocol(t *testing.T) {
 	for _, mapping := range []string{
+		`$runtimeBase + .facadePath`,
+		`anthropicEndpoint: ($runtimeBase + .facadePath + "/anthropic")`,
+		`openaiEndpoint: ($runtimeBase + .facadePath + "/openai/v1")`,
 		`case "$PROTOCOL" in`,
 		`openai-responses|openai-chat)`,
 		`append_env "$ENV_FILE" OPENAI_API_KEY "$SECRET"`,
 		`append_env "$ENV_FILE" ANTHROPIC_API_KEY "$SECRET"`,
+		`append_env "$ENV_FILE" ANTHROPIC_AUTH_TOKEN "$CLAUDE_SECRET"`,
 		`append_env "$ENV_FILE" GEMINI_API_KEY "$SECRET"`,
 		`append_env "$ENV_FILE" "AGENTBOX_KEY_$ENV_ID" "$SECRET"`,
 	} {
@@ -57,6 +62,19 @@ func TestWorkerAgentConfigsMatchSupportedProtocols(t *testing.T) {
 	} {
 		if !strings.Contains(workerDaemon, config) {
 			t.Fatalf("worker Agent config is missing %q", config)
+		}
+	}
+}
+
+func TestWorkerPreconfiguresClaudeCodeOnboarding(t *testing.T) {
+	for _, expected := range []string{
+		`jq '.hasCompletedOnboarding = true' "$CLAUDE_CURRENT"`,
+		`test ! -s /root/.claude.json || cat /root/.claude.json`,
+		`cat > /root/.claude.json`,
+		`jq -s '.[0] * .[1] | .hasCompletedOnboarding = true'`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Claude Code onboarding config is missing %q", expected)
 		}
 	}
 }
@@ -145,18 +163,14 @@ func TestWorkerRestartReappliesSandboxConfiguration(t *testing.T) {
 	}
 }
 
-func TestWorkerSessionSupportsAtomicChunkedUploads(t *testing.T) {
-	for _, expected := range []string{
-		`MAX_UPLOAD_SIZE = 50 * 1024 * 1024`,
-		`def rpc_upload_start`,
-		`def rpc_upload_chunk`,
-		`def rpc_upload_finish`,
-		`def rpc_upload_cancel`,
-		`base64.b64decode(content, validate=True)`,
-		`mv "$temp" "$final"`,
+func TestWorkerHasNoDedicatedAgentAccountLogin(t *testing.T) {
+	for _, removed := range []string{
+		`login_agent()`,
+		`login-agent)`,
+		`codex login --device-auth`,
 	} {
-		if !strings.Contains(workerSessionDaemon, expected) {
-			t.Fatalf("chunked upload support is missing %q", expected)
+		if strings.Contains(workerDaemon, removed) {
+			t.Fatalf("worker still contains removed account login flow %q", removed)
 		}
 	}
 }
@@ -169,12 +183,19 @@ func TestWorkerConfiguresExtendedAgentCredentials(t *testing.T) {
 		`append_env "$ENV_FILE" KIMI_MODEL_API_KEY "$KIMI_SECRET"`,
 		`append_env "$ENV_FILE" KIMI_MODEL_PROVIDER_TYPE "$KIMI_PROVIDER_TYPE"`,
 		`append_env "$ENV_FILE" KIMI_MODEL_BASE_URL "$KIMI_ENDPOINT"`,
+		`KIMI_ENDPOINT=$(printf '%s' "$KIMI_CREDENTIAL" | jq -r '.chatEndpoint')`,
 		`"anthropic-messages"`,
 		`"openai-responses"`,
 		`"google-generative-ai"`,
-		`apiKey: ("AGENTBOX_KEY_" + (.id | env_id))`,
+		`apiKey: ("$AGENTBOX_KEY_" + (.id | env_id))`,
 		`cat > /root/.pi/agent/models.json`,
 		`cat > /root/.pi/agent/settings.json`,
+		`cat > /root/.reasonix/config.toml`,
+		`cp /opt/agentbox/secrets/agentbox.env /root/.reasonix/.env`,
+		`"bash = \"off\""`,
+		`elif . == "openai-chat" then "openai"`,
+		`if . == "openai-responses" then "responses"`,
+		`("api_key_env = " + ("AGENTBOX_KEY_\(.id | env_id)" | @json))`,
 		`cat > /root/.qwen/settings.json`,
 		`append_env "$ENV_FILE" CURSOR_API_KEY "$SECRET"`,
 		`append_env "$ENV_FILE" XAI_API_KEY "$SECRET"`,
@@ -186,12 +207,27 @@ func TestWorkerConfiguresExtendedAgentCredentials(t *testing.T) {
 	}
 }
 
+func TestWorkerInjectsSandboxEnvironmentVariables(t *testing.T) {
+	for _, expected := range []string{
+		`.job.payload.environmentVariables[]?`,
+		`append_env "$ENV_FILE" "$NAME" "$VALUE"`,
+		`cat > /etc/profile.d/agentbox-env.sh`,
+		`. /opt/agentbox/secrets/agentbox.env`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("sandbox environment injection is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 	for _, expected := range []string{
-		`/api/worker/agentbox-session-worker`,
-		`/usr/local/lib/agentbox/session_worker.py`,
+		`/api/worker/agentbox-worker?arch=$ARCH`,
+		`install -m 0755 "$worker_tmp" /usr/local/bin/agentbox-worker`,
 		`install_host_dependencies`,
 		`migrate_existing_config`,
+		`if ! go mod tidy; then`,
+		`GOPROXY=https://goproxy.cn,direct go mod tidy`,
 		`printf '%s\n%s\n%s\n' "$SERVER_URL" "$SERVER_ID" "$CREDENTIAL" > "$CONFIG"`,
 		`systemctl restart agentbox-worker.service`,
 	} {
@@ -199,7 +235,7 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 			t.Fatalf("interactive worker installer is missing %q", expected)
 		}
 	}
-	if !strings.Contains(workerDaemon, `"$SESSION_PYTHON" /usr/local/lib/agentbox/session_worker.py "$CONFIG" &`) {
+	if !strings.Contains(workerDaemon, `/usr/local/bin/agentbox-worker session "$CONFIG" &`) {
 		t.Fatal("worker service does not start the interactive session daemon")
 	}
 	if !strings.Contains(workerDaemon, `CAPS="$CAPS\"interactive-session\""`) {
@@ -210,14 +246,35 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 	}
 }
 
+func TestWorkerSupportsVersionedAtomicSelfUpdate(t *testing.T) {
+	for _, expected := range []string{
+		`--arg workerVersion "$AGENTBOX_WORKER_VERSION"`,
+		`LEGACY_HEARTBEAT=$(printf '%s' "$HEARTBEAT" | jq 'del(.workerVersion)')`,
+		`update-worker)`,
+		`/api/worker/agentbox-worker?arch=$ARCH&version=$TARGET_VERSION`,
+		`DOWNLOADED_VERSION=$("$WORKER_TMP" version`,
+		`/usr/local/lib/agentbox/agentbox-worker.previous`,
+		`mv -f "$NEXT" /usr/local/bin/agentbox-worker`,
+		`systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=20s`,
+		`systemd-run --quiet --unit="agentbox-worker-restart-$JOB_ID" --on-active=1s`,
+		`finalize_worker_update`,
+		`Worker 更新已回滚`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker self-update is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 	for _, expected := range []string{
-		`/api/worker/agentbox-runtime-driver`,
-		`/usr/local/lib/agentbox/runtime_driver.py`,
-		`"boxlite==0.9.7"`,
+		`BOXLITE_VERSION=0.9.7`,
+		`boxlite-cli-v${BOXLITE_VERSION}-${BOXLITE_ARCH}-unknown-linux-gnu.tar.gz`,
+		`sha256sum -c`,
+		`/usr/local/bin/boxlite`,
 		`/api/worker/agentbox-microsandbox-driver.go`,
 		`github.com/superradcompany/microsandbox/sdk/go v0.6.8`,
-		`GOPROXY=https://goproxy.cn,direct go mod download`,
+		`GOPROXY=https://goproxy.cn,direct go mod tidy`,
 		`CGO_ENABLED=1 go build -tags agentbox_driver`,
 		`/usr/local/bin/agentbox-microsandbox-driver`,
 		`Runtime capabilities will be published after self-test`,
@@ -229,6 +286,9 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 	for _, expected := range []string{
 		`runtime_probe boxlite`,
 		`CAPS="$CAPS\"boxlite\""`,
+		`boxlite_call`,
+		`/usr/local/bin/boxlite create --detach`,
+		`/usr/local/bin/boxlite exec`,
 		`runtime_probe microsandbox`,
 		`CAPS="$CAPS\"microsandbox\""`,
 		`runtime_call "$DRIVER" create`,
@@ -239,56 +299,24 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 			t.Fatalf("runtime SDK worker integration is missing %q", expected)
 		}
 	}
-	if strings.Contains(workerInstall, `"microsandbox==`) {
-		t.Fatal("Microsandbox must be installed through the Go SDK driver, not Python")
-	}
-	if strings.Contains(workerRuntimeDriver, "import microsandbox") {
-		t.Fatal("legacy Python Microsandbox driver must not remain after the Go SDK migration")
-	}
-}
-
-func TestWorkerSessionDaemonHasValidPythonSyntax(t *testing.T) {
-	python := ""
-	for _, candidate := range []string{"python3", "python"} {
-		if path, err := exec.LookPath(candidate); err == nil && exec.Command(path, "--version").Run() == nil {
-			python = path
-			break
+	for _, removed := range []string{"pip install", "python3 -m venv", "/api/worker/agentbox-runtime-driver"} {
+		if strings.Contains(workerInstall, removed) {
+			t.Fatalf("Worker installer still depends on Python runtime path %q", removed)
 		}
-	}
-	if python == "" {
-		t.Skip("Python is not available on this test host")
-	}
-	path := filepath.Join(t.TempDir(), "session_worker.py")
-	if err := os.WriteFile(path, []byte(workerSessionDaemon), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if output, err := exec.Command(python, "-m", "py_compile", path).CombinedOutput(); err != nil {
-		t.Fatalf("session worker syntax: %v\n%s", err, output)
-	}
-}
-
-func TestWorkerRuntimeDriverHasValidPythonSyntax(t *testing.T) {
-	python := ""
-	for _, candidate := range []string{"python3", "python"} {
-		if path, err := exec.LookPath(candidate); err == nil && exec.Command(path, "--version").Run() == nil {
-			python = path
-			break
-		}
-	}
-	if python == "" {
-		t.Skip("Python is not available on this test host")
-	}
-	path := filepath.Join(t.TempDir(), "runtime_driver.py")
-	if err := os.WriteFile(path, []byte(workerRuntimeDriver), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if output, err := exec.Command(python, "-m", "py_compile", path).CombinedOutput(); err != nil {
-		t.Fatalf("runtime driver syntax: %v\n%s", err, output)
 	}
 }
 
 func TestWorkerShellScriptsHaveValidSyntax(t *testing.T) {
 	sh, err := exec.LookPath("sh")
+	useWSL := false
+	if err != nil && runtime.GOOS == "windows" {
+		wsl, wslErr := exec.LookPath("wsl")
+		if wslErr == nil && exec.Command(wsl, "sh", "-c", "true").Run() == nil {
+			sh = wsl
+			err = nil
+			useWSL = true
+		}
+	}
 	if err != nil {
 		t.Skip("POSIX shell is not available on this test host")
 	}
@@ -300,7 +328,15 @@ func TestWorkerShellScriptsHaveValidSyntax(t *testing.T) {
 		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 			t.Fatal(err)
 		}
-		if output, err := exec.Command(sh, "-n", path).CombinedOutput(); err != nil {
+		command := exec.Command(sh, "-n", path)
+		if useWSL {
+			linuxPath, err := exec.Command(sh, "wslpath", "-a", path).Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			command = exec.Command(sh, "sh", "-n", strings.TrimSpace(string(linuxPath)))
+		}
+		if output, err := command.CombinedOutput(); err != nil {
 			t.Fatalf("%s syntax: %v\n%s", name, err, output)
 		}
 	}
