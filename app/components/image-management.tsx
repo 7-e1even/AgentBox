@@ -44,7 +44,7 @@ import {
   type ServerImage,
 } from "@/lib/server-schema"
 
-type RuntimeDriver = "docker" | "vm"
+type RuntimeDriver = "docker" | "boxlite" | "microsandbox"
 type ImageRow = { image: ServerImage; driver: RuntimeDriver }
 
 export function ImageManagement({
@@ -91,21 +91,17 @@ export function ImageManagement({
       servers[0]?.id ??
       "")
   const server = servers.find((item) => item.id === selectedServerId)
-  const imageCount = server
-    ? server.inventory.dockerImages.length + server.inventory.vmImages.length
-    : 0
-  const images = server
-    ? [
-        ...server.inventory.dockerImages.map((image) => ({
+  const preferredDriver = server
+    ? preferredRuntimeDriver(server.capabilities)
+    : undefined
+  const imageCount = server?.inventory.dockerImages.length ?? 0
+  const images =
+    server && preferredDriver
+      ? server.inventory.dockerImages.map((image) => ({
           image,
-          driver: "docker" as const,
-        })),
-        ...server.inventory.vmImages.map((image) => ({
-          image,
-          driver: "vm" as const,
-        })),
-      ]
-    : []
+          driver: preferredDriver,
+        }))
+      : []
   const columns = useMemo(
     () =>
       server
@@ -186,19 +182,16 @@ export function ImageManagement({
               </Select>
             </CollectionToolbar>
 
-            {server &&
-              server.inventory.vmImages.length > 0 &&
-              !server.capabilities.includes("kvm") && (
-                <Alert>
-                  <TriangleAlertIcon />
-                  <AlertTitle>VM 镜像仅供盘点</AlertTitle>
-                  <AlertDescription>
-                    {server.capabilities.includes("kvm-device")
-                      ? "KVM 硬件可用，但 AgentBox VM 后端尚未接入，暂不能创建 VM 环境。"
-                      : "这台服务器没有可用的 /dev/kvm，暂不能创建 VM 环境。"}
-                  </AlertDescription>
-                </Alert>
-              )}
+            {server && server.inventory.vmImages.length > 0 && (
+              <Alert>
+                <TriangleAlertIcon />
+                <AlertTitle>原生 VM 磁盘仅供盘点</AlertTitle>
+                <AlertDescription>
+                  BoxLite 与 Microsandbox 通过 SDK 使用 OCI 镜像；qcow2/raw
+                  磁盘暂不进入可操作列表。
+                </AlertDescription>
+              </Alert>
+            )}
 
             {server && images.length > 0 ? (
               <DataTable
@@ -218,7 +211,8 @@ export function ImageManagement({
                     title: "类型",
                     options: [
                       { label: "Docker", value: "docker" },
-                      { label: "VM", value: "vm" },
+                      { label: "BoxLite", value: "boxlite" },
+                      { label: "Microsandbox", value: "microsandbox" },
                     ],
                   },
                 ]}
@@ -280,7 +274,7 @@ function imageColumns(
       ),
       cell: ({ row }) => (
         <Badge variant="outline">
-          {row.original.driver === "docker" ? "Docker" : "VM"}
+          {runtimeDriverLabel(row.original.driver)}
         </Badge>
       ),
       filterFn: (row, columnId, filterValue) =>
@@ -335,17 +329,11 @@ function imageColumns(
       id: "actions",
       cell: ({ row }) => {
         const { image, driver } = row.original
-        const reference =
-          driver === "vm" ? image.path || image.reference : image.reference
-        const canCreate =
-          driver === "docker" || server.capabilities.includes("kvm")
         return (
           <Button
             size="sm"
             variant="outline"
-            disabled={!canCreate}
-            title={canCreate ? undefined : "当前服务器暂不支持创建 VM 环境"}
-            onClick={() => onCreateRuntime(server.id, reference, driver)}
+            onClick={() => onCreateRuntime(server.id, image.reference, driver)}
           >
             <PlusIcon data-icon="inline-start" />
             创建环境
@@ -357,6 +345,19 @@ function imageColumns(
       meta: { className: "w-28" },
     },
   ]
+}
+
+function preferredRuntimeDriver(capabilities: string[]) {
+  if (capabilities.includes("boxlite")) return "boxlite" as const
+  if (capabilities.includes("docker")) return "docker" as const
+  if (capabilities.includes("microsandbox")) return "microsandbox" as const
+  return undefined
+}
+
+function runtimeDriverLabel(driver: RuntimeDriver) {
+  if (driver === "boxlite") return "BoxLite"
+  if (driver === "microsandbox") return "Microsandbox"
+  return "Docker"
 }
 
 function shortID(value: string) {

@@ -11,19 +11,12 @@ import (
 	"strings"
 	"time"
 
-	"agentbox/internal/agent"
+	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
 	"agentbox/internal/store"
-	"github.com/google/uuid"
 )
 
-type AgentStore interface {
-	List(context.Context) ([]agent.Agent, error)
-	Get(context.Context, string) (agent.Agent, error)
-	Create(context.Context, agent.Input) (agent.Agent, error)
-	Update(context.Context, string, agent.Input, int) (agent.Agent, error)
-	Duplicate(context.Context, string) (agent.Agent, error)
-	Delete(context.Context, string) error
+type PlatformStore interface {
 	ListResources(context.Context) ([]platform.Resource, error)
 	CreateResource(context.Context, platform.Input) (platform.Resource, error)
 	UpdateResource(context.Context, string, platform.Input) (platform.Resource, error)
@@ -59,8 +52,8 @@ type AgentStore interface {
 }
 
 type Server struct {
-	store          AgentStore
-	catalog        agent.Catalog
+	store          PlatformStore
+	catalog        catalog.Catalog
 	logger         *slog.Logger
 	allowedOrigins map[string]struct{}
 	disableAuth    bool
@@ -71,7 +64,7 @@ type Config struct {
 	DisableAuth bool
 }
 
-func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, origins []string, config Config) http.Handler {
+func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger, origins []string, config Config) http.Handler {
 	server := &Server{
 		store:          repository,
 		catalog:        catalog,
@@ -106,12 +99,6 @@ func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, orig
 	admin("PATCH /api/users/{id}", server.updateUser)
 	admin("DELETE /api/users/{id}", server.deleteUser)
 	authenticated("GET /api/catalog", server.getCatalog)
-	authenticated("GET /api/agents", server.listAgents)
-	authenticated("POST /api/agents", server.createAgent)
-	authenticated("GET /api/agents/{id}", server.getAgent)
-	authenticated("PATCH /api/agents/{id}", server.updateAgent)
-	authenticated("DELETE /api/agents/{id}", server.deleteAgent)
-	authenticated("POST /api/agents/{id}/duplicate", server.duplicateAgent)
 	authenticated("GET /api/resources", server.listResources)
 	authenticated("POST /api/resources", server.createResource)
 	authenticated("PATCH /api/resources/{id}", server.updateResource)
@@ -139,6 +126,8 @@ func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, orig
 	mux.HandleFunc("GET /api/worker/install.sh", server.workerInstallScript)
 	mux.HandleFunc("GET /api/worker/agentbox-worker", server.workerScript)
 	mux.HandleFunc("GET /api/worker/agentbox-session-worker", server.workerSessionScript)
+	mux.HandleFunc("GET /api/worker/agentbox-runtime-driver", server.workerRuntimeDriverScript)
+	mux.HandleFunc("GET /api/worker/agentbox-microsandbox-driver.go", server.workerMicrosandboxDriverSourceScript)
 
 	return server.recoverPanic(server.cors(server.logRequests(mux)))
 }
@@ -155,83 +144,6 @@ func (s *Server) health(w http.ResponseWriter, request *http.Request) {
 
 func (s *Server) getCatalog(w http.ResponseWriter, _ *http.Request) {
 	s.writeJSON(w, http.StatusOK, s.catalog)
-}
-
-func (s *Server) listAgents(w http.ResponseWriter, request *http.Request) {
-	agents, err := s.store.List(request.Context())
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"agents": agents})
-}
-
-func (s *Server) getAgent(w http.ResponseWriter, request *http.Request) {
-	id, ok := s.agentID(w, request)
-	if !ok {
-		return
-	}
-	value, err := s.store.Get(request.Context(), id)
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"agent": value})
-}
-
-func (s *Server) createAgent(w http.ResponseWriter, request *http.Request) {
-	var input agent.Input
-	if !s.decodeJSON(w, request, &input) {
-		return
-	}
-	value, err := s.store.Create(request.Context(), input)
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusCreated, map[string]any{"agent": value})
-}
-
-func (s *Server) updateAgent(w http.ResponseWriter, request *http.Request) {
-	id, ok := s.agentID(w, request)
-	if !ok {
-		return
-	}
-	var input agent.UpdateInput
-	if !s.decodeJSON(w, request, &input) {
-		return
-	}
-	value, err := s.store.Update(request.Context(), id, input.Input, input.Version)
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"agent": value})
-}
-
-func (s *Server) duplicateAgent(w http.ResponseWriter, request *http.Request) {
-	id, ok := s.agentID(w, request)
-	if !ok {
-		return
-	}
-	value, err := s.store.Duplicate(request.Context(), id)
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusCreated, map[string]any{"agent": value})
-}
-
-func (s *Server) deleteAgent(w http.ResponseWriter, request *http.Request) {
-	id, ok := s.agentID(w, request)
-	if !ok {
-		return
-	}
-	if err := s.store.Delete(request.Context(), id); err != nil {
-		s.handleError(w, err)
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) listResources(w http.ResponseWriter, request *http.Request) {
@@ -277,15 +189,6 @@ func (s *Server) deleteResource(w http.ResponseWriter, request *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func (s *Server) agentID(w http.ResponseWriter, request *http.Request) (string, bool) {
-	id := request.PathValue("id")
-	if _, err := uuid.Parse(id); err != nil {
-		s.writeError(w, http.StatusNotFound, "Agent 不存在")
-		return "", false
-	}
-	return id, true
-}
-
 func (s *Server) decodeJSON(w http.ResponseWriter, request *http.Request, target any) bool {
 	request.Body = http.MaxBytesReader(w, request.Body, 1<<20)
 	decoder := json.NewDecoder(request.Body)
@@ -311,7 +214,7 @@ func (s *Server) decodeJSON(w http.ResponseWriter, request *http.Request, target
 
 func (s *Server) handleError(w http.ResponseWriter, err error) {
 	switch {
-	case agent.IsValidationError(err), platform.IsValidationError(err), platform.IsUserValidationError(err):
+	case platform.IsValidationError(err), platform.IsUserValidationError(err):
 		s.writeError(w, http.StatusBadRequest, err.Error())
 	case errors.Is(err, store.ErrNotFound), errors.Is(err, store.ErrResourceNotFound):
 		s.writeError(w, http.StatusNotFound, "记录不存在")

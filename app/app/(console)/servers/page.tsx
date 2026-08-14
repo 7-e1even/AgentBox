@@ -1,5 +1,5 @@
-import { AgentManagementSection } from "@/components/agent-management"
+import { ControlPlaneSection } from "@/components/control-plane-shell"
 
 export default function ServersPage() {
-  return <AgentManagementSection section="servers" />
+  return <ControlPlaneSection section="servers" />
 }

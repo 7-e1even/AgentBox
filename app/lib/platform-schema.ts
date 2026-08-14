@@ -7,8 +7,6 @@ export const resourceKindSchema = z.enum([
   "skill",
   "mcp",
   "sandbox",
-  "schedule",
-  "webhook",
   "variable",
 ])
 

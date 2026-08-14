@@ -22,9 +22,13 @@ import threading
 import time
 from urllib.parse import urlsplit
 
-VERSION = "1"
+VERSION = "2"
 MAX_FILE_SIZE = 512 * 1024
+MAX_UPLOAD_CHUNK_SIZE = 192 * 1024
+MAX_UPLOAD_SIZE = 50 * 1024 * 1024
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+RUNTIME_DRIVER = "/usr/local/lib/agentbox/runtime_driver.py"
+RUNTIME_PYTHON = "/opt/agentbox/runtime/bin/python"
 
 
 class WebSocket:
@@ -173,17 +177,21 @@ def resize_pty(fd, columns, rows):
 
 
 class TerminalSession:
-    def __init__(self, manager, session_id, container, columns, rows):
+    def __init__(self, manager, session_id, driver, target, columns, rows):
         self.manager = manager
         self.session_id = session_id
-        self.container = container
+        self.driver = driver
+        self.target = target
         self.master_fd, slave_fd = pty.openpty()
         resize_pty(self.master_fd, columns, rows)
-        command = [
-            "docker", "exec", "-it", "-u", "0:0", container,
-            "env", "HOME=/root", "USER=root", "LOGNAME=root", "TERM=xterm-256color",
-            "sh", "-c", "cd /root 2>/dev/null || cd /; if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi",
-        ]
+        if driver == "docker":
+            command = [
+                "docker", "exec", "-it", "-u", "0:0", target,
+                "env", "HOME=/root", "USER=root", "LOGNAME=root", "TERM=xterm-256color",
+                "sh", "-c", "cd /root 2>/dev/null || cd /; if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi",
+            ]
+        else:
+            command = [runtime_python(), RUNTIME_DRIVER, driver, "terminal", target]
         try:
             self.process = subprocess.Popen(
                 command, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
@@ -255,19 +263,39 @@ def valid_path(value):
     return posixpath.normpath(value)
 
 
-def docker_run(container, script, path, input_bytes=None, timeout=15):
-    command = ["docker", "exec", "-u", "0:0"]
-    if input_bytes is not None:
-        command.append("-i")
-    command.extend([container, "sh", "-c", script, "sh", path])
+def runtime_python():
+    return RUNTIME_PYTHON if os.path.isfile(RUNTIME_PYTHON) else sys.executable
+
+
+def runtime_inspect(driver, target):
+    if driver == "docker":
+        command = ["docker", "inspect", target]
+    else:
+        command = [runtime_python(), RUNTIME_DRIVER, driver, "inspect", target]
+    subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=15)
+
+
+def runtime_run(driver, target, script, path, input_bytes=None, timeout=15, extra_args=None):
+    if driver == "docker":
+        command = ["docker", "exec", "-u", "0:0"]
+        if input_bytes is not None:
+            command.append("-i")
+        command.extend([target, "sh", "-c", script, "sh", path])
+    else:
+        command = [runtime_python(), RUNTIME_DRIVER, driver, "exec"]
+        if input_bytes is not None:
+            command.append("--stdin")
+        command.extend([target, "--", "sh", "-c", script, "sh", path])
+    if extra_args:
+        command.extend(extra_args)
     completed = subprocess.run(command, input=input_bytes, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     if completed.returncode != 0:
-        raise RuntimeError(completed.stdout.decode("utf-8", "replace").strip() or "container operation failed")
+        raise RuntimeError(completed.stdout.decode("utf-8", "replace").strip() or "sandbox operation failed")
     return completed.stdout
 
 
-def rpc_list(container, path):
-    output = docker_run(container, 'set -eu; test -d "$1" || { echo "directory not found: $1" >&2; exit 1; }; find "$1" -mindepth 1 -maxdepth 1 -printf "%y\\t%s\\t%T@\\t%p\\n" | sed -n "1,1000p"', path)
+def rpc_list(driver, target, path):
+    output = runtime_run(driver, target, 'set -eu; test -d "$1" || { echo "directory not found: $1" >&2; exit 1; }; find "$1" -mindepth 1 -maxdepth 1 -printf "%y\\t%s\\t%T@\\t%p\\n" | sed -n "1,1000p"', path)
     entries = []
     for raw_line in output.decode("utf-8", "replace").splitlines():
         fields = raw_line.split("\t")
@@ -285,8 +313,8 @@ def rpc_list(container, path):
     return entries
 
 
-def rpc_read(container, path):
-    output = docker_run(container, 'set -eu; test -f "$1" || { echo "file not found: $1" >&2; exit 1; }; size=$(wc -c < "$1"); [ "$size" -le 524288 ] || { echo "file exceeds the 512 KiB editor limit" >&2; exit 1; }; cat "$1"', path)
+def rpc_read(driver, target, path):
+    output = runtime_run(driver, target, 'set -eu; test -f "$1" || { echo "file not found: $1" >&2; exit 1; }; size=$(wc -c < "$1"); [ "$size" -le 524288 ] || { echo "file exceeds the 512 KiB editor limit" >&2; exit 1; }; cat "$1"', path)
     if b"\x00" in output:
         raise RuntimeError("binary files cannot be opened in the text editor")
     try:
@@ -295,12 +323,63 @@ def rpc_read(container, path):
         raise RuntimeError("file is not valid UTF-8 text")
 
 
-def rpc_write(container, path, content):
+def rpc_write(driver, target, path, content):
     encoded = content.encode("utf-8")
     if len(encoded) > MAX_FILE_SIZE:
         raise RuntimeError("file exceeds the 512 KiB editor limit")
-    docker_run(container, 'set -eu; target=$1; parent=${target%/*}; [ -n "$parent" ] || parent=/; mkdir -p "$parent"; temp="$target.agentbox.$$"; trap "rm -f \\$temp" EXIT; cat > "$temp"; mv "$temp" "$target"; trap - EXIT', path, encoded)
+    runtime_run(driver, target, 'set -eu; target=$1; parent=${target%/*}; [ -n "$parent" ] || parent=/; mkdir -p "$parent"; temp="$target.agentbox.$$"; trap "rm -f \\$temp" EXIT; cat > "$temp"; mv "$temp" "$target"; trap - EXIT', path, encoded)
     return "saved"
+
+
+def upload_temp_path(path, upload_id):
+    if not isinstance(upload_id, str) or len(upload_id) != 36 or any(character not in "0123456789abcdef-" for character in upload_id.lower()):
+        raise RuntimeError("invalid upload id")
+    return path + ".agentbox-upload-" + upload_id
+
+
+def rpc_upload_start(driver, target, path, upload_id):
+    temp_path = upload_temp_path(path, upload_id)
+    runtime_run(
+        driver,
+        target,
+        'set -eu; final=$1; temp=$2; [ ! -e "$final" ] || { echo "file already exists: $final" >&2; exit 1; }; parent=${final%/*}; [ -n "$parent" ] || parent=/; mkdir -p "$parent"; rm -f "$temp"; : > "$temp"',
+        path,
+        extra_args=[temp_path],
+    )
+    return "started"
+
+
+def rpc_upload_chunk(driver, target, path, upload_id, content):
+    temp_path = upload_temp_path(path, upload_id)
+    if not isinstance(content, str):
+        raise RuntimeError("upload chunk is invalid")
+    try:
+        chunk = base64.b64decode(content, validate=True)
+    except Exception:
+        raise RuntimeError("upload chunk is not valid base64")
+    if len(chunk) > MAX_UPLOAD_CHUNK_SIZE:
+        raise RuntimeError("upload chunk exceeds 192 KiB")
+    script = 'set -eu; target=$1; test -f "$target" || { echo "upload is not initialized" >&2; exit 1; }; cat >> "$target"; size=$(wc -c < "$target"); [ "$size" -le %d ] || { rm -f "$target"; echo "upload exceeds 50 MiB" >&2; exit 1; }' % MAX_UPLOAD_SIZE
+    runtime_run(driver, target, script, temp_path, chunk, timeout=30)
+    return "received"
+
+
+def rpc_upload_finish(driver, target, path, upload_id):
+    temp_path = upload_temp_path(path, upload_id)
+    runtime_run(
+        driver,
+        target,
+        'set -eu; final=$1; temp=$2; test -f "$temp" || { echo "upload is not initialized" >&2; exit 1; }; [ ! -e "$final" ] || { rm -f "$temp"; echo "file already exists: $final" >&2; exit 1; }; mv "$temp" "$final"',
+        path,
+        extra_args=[temp_path],
+    )
+    return "uploaded"
+
+
+def rpc_upload_cancel(driver, target, path, upload_id):
+    temp_path = upload_temp_path(path, upload_id)
+    runtime_run(driver, target, 'rm -f "$1"', temp_path)
+    return "cancelled"
 
 
 class SessionManager:
@@ -317,13 +396,14 @@ class SessionManager:
 
     def open(self, message):
         session_id = message.get("sessionId", "")
-        container = message.get("externalId", "")
-        if not session_id or message.get("driver") != "docker" or not container:
-            self.send({"type": "error", "sessionId": session_id, "error": "invalid Docker session target"})
+        driver = message.get("driver", "")
+        target = message.get("externalId", "")
+        if not session_id or driver not in ("docker", "boxlite", "microsandbox") or not target:
+            self.send({"type": "error", "sessionId": session_id, "error": "invalid sandbox session target"})
             return
         try:
-            subprocess.run(["docker", "inspect", container], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=10)
-            session = TerminalSession(self, session_id, container, message.get("cols"), message.get("rows"))
+            runtime_inspect(driver, target)
+            session = TerminalSession(self, session_id, driver, target, message.get("cols"), message.get("rows"))
             with self.lock:
                 previous = self.sessions.pop(session_id, None)
                 self.sessions[session_id] = session
@@ -350,11 +430,19 @@ class SessionManager:
             path = valid_path(message.get("path"))
             operation = message.get("operation")
             if operation == "list":
-                result = rpc_list(session.container, path)
+                result = rpc_list(session.driver, session.target, path)
             elif operation == "read":
-                result = rpc_read(session.container, path)
+                result = rpc_read(session.driver, session.target, path)
             elif operation == "write":
-                result = rpc_write(session.container, path, message.get("content", ""))
+                result = rpc_write(session.driver, session.target, path, message.get("content", ""))
+            elif operation == "upload-start":
+                result = rpc_upload_start(session.driver, session.target, path, message.get("uploadId", ""))
+            elif operation == "upload-chunk":
+                result = rpc_upload_chunk(session.driver, session.target, path, message.get("uploadId", ""), message.get("content", ""))
+            elif operation == "upload-finish":
+                result = rpc_upload_finish(session.driver, session.target, path, message.get("uploadId", ""))
+            elif operation == "upload-cancel":
+                result = rpc_upload_cancel(session.driver, session.target, path, message.get("uploadId", ""))
             else:
                 raise RuntimeError("unsupported file operation")
             self.send({"type": "rpc-result", "sessionId": session_id, "requestId": request_id, "ok": True, "result": result})

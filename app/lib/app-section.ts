@@ -1,8 +1,6 @@
 export const APP_SECTION_PATHS = {
   overview: "/overview",
   projects: "/projects",
-  automations: "/automations",
-  agents: "/agents",
   sandboxes: "/sandboxes",
   servers: "/servers",
   runtimes: "/environment-templates",

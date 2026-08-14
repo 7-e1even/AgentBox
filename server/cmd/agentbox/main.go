@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"agentbox/internal/agent"
+	"agentbox/internal/catalog"
 	"agentbox/internal/httpapi"
 	"agentbox/internal/store"
 	"github.com/joho/godotenv"
@@ -29,6 +30,10 @@ func main() {
 	if port == "" {
 		port = "8091"
 	}
+	bindHost := strings.TrimSpace(os.Getenv("AGENTBOX_BIND_HOST"))
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
 	origins := strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",")
 	disableAuth := strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_DISABLE_AUTH")), "true")
 	if disableAuth && !strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_ENV")), "development") {
@@ -38,7 +43,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	repository, err := store.New(ctx, databaseURL, agent.BuiltinCatalog)
+	repository, err := store.New(ctx, databaseURL, catalog.BuiltinCatalog)
 	if err != nil {
 		logger.Error("initialize store", "error", err)
 		os.Exit(1)
@@ -46,8 +51,8 @@ func main() {
 	defer repository.Close()
 
 	server := &http.Server{
-		Addr:              ":" + port,
-		Handler:           httpapi.New(repository, agent.BuiltinCatalog, logger, origins, httpapi.Config{DisableAuth: disableAuth}),
+		Addr:              net.JoinHostPort(bindHost, port),
+		Handler:           httpapi.New(repository, catalog.BuiltinCatalog, logger, origins, httpapi.Config{DisableAuth: disableAuth}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,

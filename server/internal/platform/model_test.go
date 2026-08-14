@@ -7,11 +7,11 @@ import (
 
 func TestValidateControlPlaneResource(t *testing.T) {
 	projectID := "default"
-	valid := Input{ID: "daily-review", Kind: KindSchedule, ProjectID: &projectID, Name: "Daily review", Enabled: true, Spec: map[string]any{"agentId": "agent-1", "cron": "0 9 * * *"}}
+	valid := Input{ID: "custom-api-token", Kind: KindVariable, ProjectID: &projectID, Name: "Custom API Token", Enabled: true, Spec: map[string]any{"key": "CUSTOM_API_TOKEN", "reference": "env://CUSTOM_API_TOKEN"}}
 	if err := Validate(valid); err != nil {
 		t.Fatalf("Validate() returned error: %v", err)
 	}
-	valid.Spec["cron"] = "every day"
+	valid.Spec["reference"] = ""
 	if err := Validate(valid); !IsValidationError(err) {
 		t.Fatalf("Validate() error = %v, want validation error", err)
 	}
@@ -76,8 +76,16 @@ func TestEnvironmentTemplateRequiresServerInventorySelection(t *testing.T) {
 	}
 	input.Spec["agentTools"] = []any{"pi"}
 	input.Spec["driver"] = "boxlite"
+	if err := Validate(input); err != nil {
+		t.Fatalf("Validate() rejected BoxLite driver: %v", err)
+	}
+	input.Spec["driver"] = "microsandbox"
+	if err := Validate(input); err != nil {
+		t.Fatalf("Validate() rejected Microsandbox driver: %v", err)
+	}
+	input.Spec["driver"] = "unknown"
 	if err := Validate(input); !IsValidationError(err) {
-		t.Fatalf("Validate() error = %v, want internal driver rejection", err)
+		t.Fatalf("Validate() error = %v, want unknown driver rejection", err)
 	}
 }
 
@@ -160,11 +168,11 @@ func TestValidateCredential(t *testing.T) {
 		t.Fatalf("ValidateCredential() error = %v, want invalid endpoint", err)
 	}
 	input.Endpoint = "https://api.openai.com/v1"
-	input.ModelID = "gpt-5.3-codex\nOPENAI_API_KEY=overridden"
-	if err := ValidateCredential(input, true); !IsValidationError(err) {
-		t.Fatalf("ValidateCredential() error = %v, want model newline rejection", err)
+	input.ModelID = "legacy-default"
+	NormalizeCredential(&input)
+	if input.ModelID != "" {
+		t.Fatalf("NormalizeCredential() modelId = %q, want no credential default", input.ModelID)
 	}
-	input.ModelID = "gpt-5.3-codex"
 	input.Secret = "line-one\nline-two"
 	if err := ValidateCredential(input, true); !IsValidationError(err) {
 		t.Fatalf("ValidateCredential() error = %v, want newline rejection", err)

@@ -4,11 +4,11 @@ import { useCallback, useEffect, useMemo, useState } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   ArrowLeftIcon,
-  BoxIcon,
   CheckCircle2Icon,
   ChevronRightIcon,
   CircleDotIcon,
   CopyIcon,
+  LayoutTemplateIcon,
   PlusIcon,
   ServerIcon,
   Trash2Icon,
@@ -52,6 +52,12 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldLabel,
+} from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import {
   ItemActions,
@@ -68,6 +74,9 @@ import {
   type ManagedServer,
   type ServerPairing,
 } from "@/lib/server-schema"
+import { normalizeHttpOrigin } from "@/lib/worker-address"
+
+type AddressStatus = "idle" | "detecting" | "verified" | "manual" | "failed"
 
 export function ServerManagement({
   servers,
@@ -87,10 +96,21 @@ export function ServerManagement({
   const [pairing, setPairing] = useState<ServerPairing | null>(null)
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState("")
-  const [serverUrl, setServerUrl] = useState(
-    process.env.NEXT_PUBLIC_AGENTBOX_URL?.replace(/\/$/, "") ??
-      "http://localhost:3015"
-  )
+  const [serverUrl, setServerUrl] = useState("")
+  const [addressStatus, setAddressStatus] =
+    useState<AddressStatus>("idle")
+
+  const detectServerUrl = useCallback(async () => {
+    setAddressStatus("detecting")
+    try {
+      const body = await requestJson<{ url?: unknown }>("/api/worker-address")
+      if (typeof body.url !== "string") throw new Error("检测结果无效")
+      setServerUrl(body.url)
+      setAddressStatus("verified")
+    } catch {
+      setAddressStatus("failed")
+    }
+  }, [])
 
   const refreshServers = useCallback(async () => {
     const body = serversResponseSchema.parse(
@@ -134,6 +154,7 @@ export function ServerManagement({
   }, [open, pairing, refreshServers])
 
   async function addServer() {
+    void detectServerUrl()
     setOpen(true)
     setCreating(true)
     setPairing(null)
@@ -150,10 +171,14 @@ export function ServerManagement({
     }
   }
 
-  const installCommand = `curl -fsSL ${serverUrl}/api/worker/install.sh | sudo sh -s -- ${serverUrl}`
-  const setupCommand = pairing?.token
-    ? `sudo agentbox-worker setup --server ${serverUrl} --token ${pairing.token}`
+  const normalizedServerUrl = normalizeHttpOrigin(serverUrl)
+  const installCommand = normalizedServerUrl
+    ? `curl -fsSL ${normalizedServerUrl}/api/worker/install.sh | sudo sh -s -- ${normalizedServerUrl}`
     : ""
+  const setupCommand = pairing?.token && normalizedServerUrl
+    ? `sudo agentbox-worker setup --server ${normalizedServerUrl} --token ${pairing.token}`
+    : ""
+  const invalidServerUrl = serverUrl.length > 0 && !normalizedServerUrl
 
   const selectedServer =
     servers.find((server) => server.id === selectedServerId) ?? null
@@ -246,19 +271,27 @@ export function ServerManagement({
             </DialogDescription>
           </DialogHeader>
 
-          <label className="grid gap-1.5 text-sm font-medium">
-            AgentBox 地址
+          <Field data-invalid={invalidServerUrl || undefined}>
+            <FieldLabel htmlFor="worker-api-url">平台入口地址</FieldLabel>
             <Input
+              id="worker-api-url"
               value={serverUrl}
-              onChange={(event) =>
-                setServerUrl(event.target.value.replace(/\/$/, ""))
-              }
-              placeholder="http://192.168.1.10:3015"
+              aria-invalid={invalidServerUrl || undefined}
+              onChange={(event) => {
+                setServerUrl(event.target.value)
+                setAddressStatus("manual")
+              }}
+              onBlur={() => {
+                const normalized = normalizeHttpOrigin(serverUrl)
+                if (normalized) setServerUrl(normalized)
+              }}
+              placeholder="http://192.168.1.10:3000"
             />
-            <span className="text-xs font-normal text-muted-foreground">
-              物理机必须能访问此地址，不能使用 localhost。
-            </span>
-          </label>
+            <AddressDescription status={addressStatus} />
+            {invalidServerUrl ? (
+              <FieldError>请输入以 http:// 或 https:// 开头的地址。</FieldError>
+            ) : null}
+          </Field>
 
           {creating ? (
             <div className="flex items-center justify-center gap-2 py-8 text-muted-foreground">
@@ -275,7 +308,7 @@ export function ServerManagement({
               <AlertTitle>服务器已上线</AlertTitle>
               <AlertDescription>已登记物理机并启动心跳。</AlertDescription>
             </Alert>
-          ) : pairing ? (
+          ) : pairing && normalizedServerUrl ? (
             <div className="grid gap-4">
               <CommandStep
                 number={1}
@@ -295,6 +328,13 @@ export function ServerManagement({
                 </AlertDescription>
               </Alert>
             </div>
+          ) : pairing ? (
+            <Alert variant="destructive">
+              <AlertTitle>需要平台入口地址</AlertTitle>
+              <AlertDescription>
+                自动检测失败，请填写物理服务器能够访问的 AgentBox 前端入口。
+              </AlertDescription>
+            </Alert>
           ) : null}
 
           <DialogFooter>
@@ -305,6 +345,43 @@ export function ServerManagement({
         </DialogContent>
       </Dialog>
     </section>
+  )
+}
+
+function AddressDescription({ status }: { status: AddressStatus }) {
+  if (status === "detecting") {
+    return (
+      <FieldDescription className="flex items-center gap-1.5">
+        <Spinner /> 正在检测 AgentBox 平台入口…
+      </FieldDescription>
+    )
+  }
+  if (status === "verified") {
+    return (
+      <FieldDescription className="flex items-center gap-1.5">
+        <CheckCircle2Icon className="size-3.5" />
+        已验证前端网关及后端代理。物理机只需访问此地址。
+      </FieldDescription>
+    )
+  }
+  if (status === "failed") {
+    return (
+      <FieldDescription>
+        自动检测失败，请手动填写平台入口；物理服务器不能使用 localhost。
+      </FieldDescription>
+    )
+  }
+  if (status === "manual") {
+    return (
+      <FieldDescription>
+        已手动修改。这里填写网页访问地址，API 与终端会话会由它统一代理。
+      </FieldDescription>
+    )
+  }
+  return (
+    <FieldDescription>
+      将自动检测网页入口；Go API 的 8091 端口无需对外开放。
+    </FieldDescription>
   )
 }
 
@@ -525,7 +602,7 @@ function ServerDetail({
               <Empty className="min-h-56 border">
                 <EmptyHeader>
                   <EmptyMedia variant="icon">
-                    <BoxIcon />
+                    <LayoutTemplateIcon />
                   </EmptyMedia>
                   <EmptyTitle>还没有沙箱模板</EmptyTitle>
                   <EmptyDescription>
@@ -551,7 +628,7 @@ function ServerDetail({
                         variant="icon"
                         className="flex size-9 items-center justify-center rounded-lg bg-muted"
                       >
-                        <BoxIcon />
+                        <LayoutTemplateIcon />
                       </ItemMedia>
                       <ItemContent className="min-w-0">
                         <ItemTitle>
@@ -563,7 +640,9 @@ function ServerDetail({
                           </Badge>
                         </ItemTitle>
                         <ItemDescription>
-                          {specString(runtime.spec, "driver") || "未选择驱动"}
+                          {runtimeDriverLabel(
+                            specString(runtime.spec, "driver")
+                          )}
                         </ItemDescription>
                       </ItemContent>
                       <ItemActions>
@@ -663,6 +742,13 @@ async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
 function specString(spec: Record<string, unknown>, key: string) {
   const value = spec[key]
   return typeof value === "string" ? value : ""
+}
+
+function runtimeDriverLabel(driver: string) {
+  if (driver === "boxlite") return "BoxLite"
+  if (driver === "microsandbox") return "Microsandbox"
+  if (driver === "vm") return "VM（旧）"
+  return driver ? "Docker" : "未选择驱动"
 }
 
 function errorMessage(error: unknown) {

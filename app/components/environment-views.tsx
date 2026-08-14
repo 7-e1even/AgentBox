@@ -11,6 +11,7 @@ import {
   ContainerIcon,
   CopyIcon,
   KeyRoundIcon,
+  LayoutTemplateIcon,
   LoaderCircleIcon,
   LogInIcon,
   MonitorIcon,
@@ -20,6 +21,7 @@ import {
   PlusIcon,
   PlugZapIcon,
   RocketIcon,
+  RotateCwIcon,
   ServerIcon,
   Settings2Icon,
   SquareIcon,
@@ -161,7 +163,7 @@ export function DashboardView({
 
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard
-              icon={MonitorIcon}
+              icon={LayoutTemplateIcon}
               label="沙箱模板"
               value={environments.length}
               detail="镜像、工具与凭据组合"
@@ -220,8 +222,11 @@ export function DashboardView({
                       <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-muted">
                         {specString(environment.spec, "driver") === "vm" ? (
                           <MonitorIcon className="size-4" />
-                        ) : (
+                        ) : specString(environment.spec, "driver") ===
+                          "docker" ? (
                           <ContainerIcon className="size-4" />
+                        ) : (
+                          <BoxIcon className="size-4" />
                         )}
                       </span>
                       <span className="min-w-0 flex-1">
@@ -377,7 +382,7 @@ export function EnvironmentTemplatesView({
           <Empty className="mx-auto min-h-[28rem] max-w-3xl border-0">
             <EmptyHeader>
               <EmptyMedia variant="icon">
-                <MonitorIcon />
+                <LayoutTemplateIcon />
               </EmptyMedia>
               <EmptyTitle>还没有沙箱模板</EmptyTitle>
               <EmptyDescription>
@@ -405,7 +410,8 @@ export function EnvironmentTemplatesView({
                 title: "隔离方式",
                 options: [
                   { label: "Docker", value: "docker" },
-                  { label: "VM", value: "vm" },
+                  { label: "BoxLite", value: "boxlite" },
+                  { label: "Microsandbox", value: "microsandbox" },
                 ],
               },
               {
@@ -428,15 +434,17 @@ export function SandboxesView({
   resources,
   servers,
   onCreate,
+  onEdit,
   busyId,
   onAction,
   onDelete,
 }: EnvironmentProps & {
   onCreate: () => void
+  onEdit: (resource: Resource) => void
   busyId: string | null
   onAction: (
     resource: Resource,
-    action: "start" | "stop" | "delete" | "login-codex"
+    action: "start" | "stop" | "restart" | "delete" | "login-codex"
   ) => Promise<void>
   onDelete: (resource: Resource) => void
 }) {
@@ -450,9 +458,10 @@ export function SandboxesView({
         busyId,
         onOpen: (sandbox) => setSelectedId(sandbox.id),
         onAction,
+        onEdit,
         onDelete,
       }),
-    [busyId, onAction, onDelete, resources, servers, setSelectedId]
+    [busyId, onAction, onDelete, onEdit, resources, servers, setSelectedId]
   )
   const selected = sandboxes.find((item) => item.id === selectedId) ?? null
   return (
@@ -547,7 +556,13 @@ function environmentColumns({
         const driver = specString(row.original.spec, "driver")
         return (
           <CollectionTablePrimaryContent
-            icon={driver === "vm" ? MonitorIcon : ContainerIcon}
+            icon={
+              driver === "vm"
+                ? MonitorIcon
+                : driver === "docker"
+                  ? ContainerIcon
+                  : BoxIcon
+            }
             title={row.original.name}
             description={row.original.description || "可复用的 Agent 工作环境"}
             onClick={() => onEdit(row.original)}
@@ -596,7 +611,7 @@ function environmentColumns({
       ),
       cell: ({ getValue }) => (
         <span className="text-muted-foreground">
-          {getValue() === "vm" ? "VM" : "Docker"}
+          {runtimeDriverLabel(String(getValue()))}
         </span>
       ),
       filterFn: (row, columnId, filterValue) =>
@@ -672,6 +687,7 @@ function sandboxColumns({
   busyId,
   onOpen,
   onAction,
+  onEdit,
   onDelete,
 }: {
   resources: Resource[]
@@ -680,8 +696,9 @@ function sandboxColumns({
   onOpen: (sandbox: Resource) => void
   onAction: (
     resource: Resource,
-    action: "start" | "stop" | "delete" | "login-codex"
+    action: "start" | "stop" | "restart" | "delete" | "login-codex"
   ) => Promise<void>
+  onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
 }): ColumnDef<Resource>[] {
   return [
@@ -836,15 +853,32 @@ function sandboxColumns({
                     <Settings2Icon />
                     管理
                   </DropdownMenuItem>
+                  <DropdownMenuItem onClick={() => onEdit(sandbox)}>
+                    <PencilIcon />
+                    编辑配置
+                  </DropdownMenuItem>
+                  {sandbox.spec.status === "running" && (
+                    <DropdownMenuItem
+                      disabled={busy}
+                      onClick={() => void onAction(sandbox, "restart")}
+                    >
+                      <RotateCwIcon />
+                      重启并应用配置
+                    </DropdownMenuItem>
+                  )}
                 </DropdownMenuGroup>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
                   variant="destructive"
                   disabled={
                     busy ||
-                    ["requested", "starting", "stopping", "deleting"].includes(
-                      String(sandbox.spec.status ?? "")
-                    )
+                    [
+                      "requested",
+                      "starting",
+                      "stopping",
+                      "restarting",
+                      "deleting",
+                    ].includes(String(sandbox.spec.status ?? ""))
                   }
                   onClick={() => onDelete(sandbox)}
                 >
@@ -865,7 +899,13 @@ function sandboxColumns({
 
 function sandboxFilterStatus(sandbox: Resource) {
   const status = String(sandbox.spec.status ?? "")
-  return ["requested", "starting", "stopping", "deleting"].includes(status)
+  return [
+    "requested",
+    "starting",
+    "stopping",
+    "restarting",
+    "deleting",
+  ].includes(status)
     ? "pending"
     : status || "error"
 }
@@ -1078,7 +1118,7 @@ function EnvironmentBadges({
     return (
       <div className="hidden shrink-0 gap-1 sm:flex">
         <Badge variant="outline">
-          {specString(resource.spec, "driver") === "vm" ? "VM" : "Docker"}
+          {runtimeDriverLabel(specString(resource.spec, "driver"))}
         </Badge>
         {tools.length > 0 && (
           <Badge variant="outline">{tools.length} 个 Agent</Badge>
@@ -1113,8 +1153,7 @@ function environmentSummary(
   resources: Resource[],
   servers: ManagedServer[]
 ) {
-  const driver =
-    specString(environment.spec, "driver") === "vm" ? "VM" : "Docker"
+  const driver = runtimeDriverLabel(specString(environment.spec, "driver"))
   const server = servers.find((item) => item.id === environment.spec.serverId)
   return `${driver} · ${environmentImage(environment, resources)} · ${server?.name ?? "未绑定服务器"}`
 }
@@ -1131,6 +1170,14 @@ function environmentImage(environment: Resource, resources: Resource[]) {
 function specString(spec: Record<string, unknown>, key: string) {
   const value = spec[key]
   return typeof value === "string" ? value : ""
+}
+
+function runtimeDriverLabel(driver: string) {
+  if (driver === "docker") return "Docker"
+  if (driver === "boxlite") return "BoxLite"
+  if (driver === "microsandbox") return "Microsandbox"
+  if (driver === "vm") return "VM（旧）"
+  return "未配置"
 }
 
 function stringList(value: unknown) {
@@ -1150,11 +1197,13 @@ function sandboxStatus(resource: Resource) {
     case "stopped":
       return "已停止"
     case "error":
-      return "创建失败"
+      return "运行异常"
     case "starting":
       return "启动中"
     case "stopping":
       return "停止中"
+    case "restarting":
+      return "重启中"
     case "deleting":
       return "删除中"
     default:

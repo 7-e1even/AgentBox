@@ -3,7 +3,6 @@
 import { useMemo, type ReactNode } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
-  Clock3Icon,
   ContainerIcon,
   Disc3Icon,
   FolderKanbanIcon,
@@ -14,8 +13,6 @@ import {
   PlusIcon,
   SparklesIcon,
   Trash2Icon,
-  WebhookIcon,
-  ZapIcon,
   type LucideIcon,
 } from "lucide-react"
 
@@ -25,8 +22,8 @@ import {
 } from "@/components/collection-list"
 import { DataTable, DataTableColumnHeader } from "@/components/data-table"
 import { SiteHeader } from "@/components/site-header"
-import type { Agent } from "@/lib/agent-schema"
 import type { Resource } from "@/lib/platform-schema"
+import { getProjectEmoji } from "@/lib/project-emoji"
 import type { ManagedServer } from "@/lib/server-schema"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -125,7 +122,6 @@ export function CollectionHeader({
 export function ResourceView({
   kind,
   resources,
-  agents,
   servers,
   onCreate,
   onEdit,
@@ -134,7 +130,6 @@ export function ResourceView({
 }: {
   kind: ResourceTableKind
   resources: Resource[]
-  agents: Agent[]
   servers: ManagedServer[]
   onCreate: () => void
   onEdit: (resource: Resource) => void
@@ -150,7 +145,6 @@ export function ResourceView({
         kind,
         icon: config.icon,
         resources,
-        agents,
         servers,
         onOpen: (resource) =>
           resource.kind === "project" && onProjectOpen
@@ -159,16 +153,7 @@ export function ResourceView({
         onEdit,
         onDelete,
       }),
-    [
-      agents,
-      config.icon,
-      kind,
-      onDelete,
-      onEdit,
-      onProjectOpen,
-      resources,
-      servers,
-    ]
+    [config.icon, kind, onDelete, onEdit, onProjectOpen, resources, servers]
   )
   const Icon = config.icon
 
@@ -220,269 +205,6 @@ export function ResourceView({
   )
 }
 
-export function AutomationsView({
-  resources,
-  agents,
-  onCreate,
-  onEdit,
-  onDelete,
-}: {
-  resources: Resource[]
-  agents: Agent[]
-  onCreate: (kind: "schedule" | "webhook") => void
-  onEdit: (resource: Resource) => void
-  onDelete: (resource: Resource) => void
-}) {
-  const all = resources.filter(
-    (item) => item.kind === "schedule" || item.kind === "webhook"
-  )
-  const columns = useMemo(
-    () => automationColumns(agents, onEdit, onDelete),
-    [agents, onDelete, onEdit]
-  )
-  const createAction = (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button size="sm">
-          <PlusIcon data-icon="inline-start" />
-          新建自动化
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuGroup>
-          <DropdownMenuItem onClick={() => onCreate("schedule")}>
-            <Clock3Icon />
-            定时任务
-          </DropdownMenuItem>
-          <DropdownMenuItem onClick={() => onCreate("webhook")}>
-            <WebhookIcon />
-            Webhook
-          </DropdownMenuItem>
-        </DropdownMenuGroup>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-
-  return (
-    <section className="flex min-h-0 flex-1 flex-col">
-      <CollectionHeader
-        title="自动化"
-        count={all.length}
-        action={createAction}
-      />
-      <CollectionContent>
-        {all.length === 0 ? (
-          <AutomationEmpty onCreate={onCreate} />
-        ) : (
-          <DataTable
-            data={all}
-            columns={columns}
-            getRowId={(resource) => resource.id}
-            searchPlaceholder="搜索自动化…"
-            searchValue={(resource) =>
-              `${resource.name} ${resource.description} ${summary(resource)}`
-            }
-            filters={[
-              {
-                columnId: "type",
-                title: "触发方式",
-                options: [
-                  { label: "定时", value: "schedule" },
-                  { label: "Webhook", value: "webhook" },
-                ],
-              },
-              {
-                columnId: "status",
-                title: "状态",
-                options: [
-                  { label: "运行中", value: "enabled" },
-                  { label: "已暂停", value: "disabled" },
-                ],
-              },
-            ]}
-          />
-        )}
-      </CollectionContent>
-    </section>
-  )
-}
-
-function AutomationEmpty({
-  onCreate,
-}: {
-  onCreate: (kind: "schedule" | "webhook") => void
-}) {
-  const templates = [
-    {
-      title: "定时巡检",
-      description: "按 Cron 周期唤醒一个 Agent。",
-      icon: Clock3Icon,
-      kind: "schedule" as const,
-    },
-    {
-      title: "定时报告",
-      description: "每天或每周生成固定报告。",
-      icon: ZapIcon,
-      kind: "schedule" as const,
-    },
-    {
-      title: "Webhook 触发",
-      description: "收到外部事件后调用一个 Agent。",
-      icon: WebhookIcon,
-      kind: "webhook" as const,
-    },
-  ]
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center px-5 py-16">
-      <ZapIcon className="mb-3 size-9 text-muted-foreground" />
-      <p className="text-sm font-medium">还没有自动化</p>
-      <p className="mt-1 text-sm text-muted-foreground">
-        自动化只负责触发一个 Agent，不编排任务节点。
-      </p>
-      <div className="mt-6 grid w-full max-w-3xl grid-cols-1 gap-3 sm:grid-cols-3">
-        {templates.map((template) => (
-          <button
-            key={template.title}
-            type="button"
-            className="flex items-start gap-3 rounded-lg border p-3 text-left transition-colors hover:bg-muted/40"
-            onClick={() => onCreate(template.kind)}
-          >
-            <template.icon className="mt-0.5 size-5 shrink-0 text-muted-foreground" />
-            <span className="min-w-0">
-              <span className="block text-sm font-medium">
-                {template.title}
-              </span>
-              <span className="mt-0.5 block text-xs text-muted-foreground">
-                {template.description}
-              </span>
-            </span>
-          </button>
-        ))}
-      </div>
-    </div>
-  )
-}
-
-function automationColumns(
-  agents: Agent[],
-  onEdit: (resource: Resource) => void,
-  onDelete: (resource: Resource) => void
-): ColumnDef<Resource>[] {
-  return [
-    {
-      id: "name",
-      accessorFn: (resource) => resource.name,
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="自动化" />
-      ),
-      cell: ({ row }) => {
-        const Icon = row.original.kind === "schedule" ? Clock3Icon : WebhookIcon
-        return (
-          <CollectionTablePrimaryContent
-            icon={Icon}
-            title={row.original.name}
-            description={row.original.description || "触发一个 Agent"}
-            onClick={() => onEdit(row.original)}
-          />
-        )
-      },
-      meta: { label: "自动化" },
-      enableHiding: false,
-    },
-    {
-      id: "agent",
-      accessorFn: (resource) =>
-        agents.find(
-          (agent) => agent.id === stringValue(resource.spec, "agentId")
-        )?.name ?? "未绑定",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="目标 Agent" />
-      ),
-      cell: ({ getValue }) => (
-        <span className="text-muted-foreground">{String(getValue())}</span>
-      ),
-      meta: { label: "目标 Agent", className: "hidden md:table-cell" },
-    },
-    {
-      id: "type",
-      accessorFn: (resource) => resource.kind,
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="触发方式" />
-      ),
-      cell: ({ row }) => {
-        const isSchedule = row.original.kind === "schedule"
-        const Icon = isSchedule ? Clock3Icon : WebhookIcon
-        return (
-          <span className="flex items-center gap-1.5 text-muted-foreground">
-            <Icon className="size-3" />
-            {isSchedule ? "定时" : "Webhook"}
-          </span>
-        )
-      },
-      filterFn: (row, columnId, filterValue) =>
-        (filterValue as string[]).includes(row.getValue(columnId)),
-      meta: { label: "触发方式", className: "hidden lg:table-cell" },
-    },
-    {
-      id: "config",
-      accessorFn: (resource) =>
-        resource.kind === "schedule"
-          ? text(resource.spec, "cron")
-          : text(resource.spec, "path"),
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="触发配置" />
-      ),
-      cell: ({ getValue }) => (
-        <span className="block max-w-40 truncate font-mono text-muted-foreground">
-          {String(getValue())}
-        </span>
-      ),
-      meta: { label: "触发配置", className: "hidden xl:table-cell" },
-    },
-    {
-      id: "status",
-      accessorFn: (resource) => (resource.enabled ? "enabled" : "disabled"),
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="状态" />
-      ),
-      cell: ({ row }) => (
-        <Badge variant={row.original.enabled ? "secondary" : "outline"}>
-          {row.original.enabled ? "运行中" : "已暂停"}
-        </Badge>
-      ),
-      filterFn: (row, columnId, filterValue) =>
-        (filterValue as string[]).includes(row.getValue(columnId)),
-      meta: { label: "状态" },
-    },
-    {
-      id: "updatedAt",
-      accessorFn: (resource) => resource.updatedAt,
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="最近更新" />
-      ),
-      cell: ({ row }) => (
-        <span className="text-muted-foreground">
-          {relativeTime(row.original.updatedAt)}
-        </span>
-      ),
-      meta: { label: "最近更新", className: "hidden xl:table-cell" },
-    },
-    {
-      id: "actions",
-      cell: ({ row }) => (
-        <ResourceActions
-          resource={row.original}
-          onEdit={() => onEdit(row.original)}
-          onDelete={() => onDelete(row.original)}
-        />
-      ),
-      enableSorting: false,
-      enableHiding: false,
-      meta: { className: "w-10" },
-    },
-  ]
-}
-
 function CollectionEmpty({
   icon: Icon,
   title,
@@ -523,7 +245,6 @@ function resourceColumns({
   kind,
   icon,
   resources,
-  agents,
   servers,
   onOpen,
   onEdit,
@@ -532,7 +253,6 @@ function resourceColumns({
   kind: ResourceTableKind
   icon: LucideIcon
   resources: Resource[]
-  agents: Agent[]
   servers: ManagedServer[]
   onOpen: (resource: Resource) => void
   onEdit: (resource: Resource) => void
@@ -540,7 +260,7 @@ function resourceColumns({
 }): ColumnDef<Resource>[] {
   const labels =
     kind === "project"
-      ? ["项目", "智能体", "环境模板", "标识"]
+      ? ["项目", "沙箱", "环境模板", "标识"]
       : kind === "image"
         ? ["镜像", "OCI 引用", "兼容类型", "使用者"]
         : kind === "runtime"
@@ -559,6 +279,16 @@ function resourceColumns({
       cell: ({ row }) => (
         <CollectionTablePrimaryContent
           icon={icon}
+          media={
+            kind === "project" ? (
+              <span
+                aria-hidden="true"
+                className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-base"
+              >
+                {getProjectEmoji(row.original)}
+              </span>
+            ) : undefined
+          }
           title={row.original.name}
           description={row.original.description || summary(row.original)}
           onClick={() => onOpen(row.original)}
@@ -573,7 +303,7 @@ function resourceColumns({
     columns.push({
       id: `detail-${index + 1}`,
       accessorFn: (resource) =>
-        resourceColumnValues(resource, resources, agents, servers)[index],
+        resourceColumnValues(resource, resources, servers)[index],
       header: ({ column }) => (
         <DataTableColumnHeader column={column} title={labels[index + 1]} />
       ),
@@ -639,11 +369,10 @@ function resourceColumns({
 function resourceColumnValues(
   resource: Resource,
   resources: Resource[],
-  agents: Agent[],
   servers: ManagedServer[]
 ) {
-  const projectAgents = agents.filter(
-    (agent) => agent.projectId === resource.id
+  const projectSandboxes = resources.filter(
+    (item) => item.kind === "sandbox" && item.projectId === resource.id
   )
   const projectRuntimes = resources.filter(
     (item) => item.kind === "runtime" && item.projectId === resource.id
@@ -651,18 +380,22 @@ function resourceColumnValues(
   const imageRuntimes = resources.filter(
     (item) => item.kind === "runtime" && item.spec.imageId === resource.id
   )
-  const skillAgents = agents.filter((agent) =>
-    agent.skillIds.includes(resource.id)
+  const skillRuntimes = resources.filter(
+    (item) =>
+      item.kind === "runtime" &&
+      stringArray(item.spec.skillIds).includes(resource.id)
   )
-  const mcpAgents = agents.filter((agent) =>
-    agent.mcpServerIds.includes(resource.id)
+  const mcpRuntimes = resources.filter(
+    (item) =>
+      item.kind === "runtime" &&
+      stringArray(item.spec.mcpServerIds).includes(resource.id)
   )
   const server = servers.find(
     (item) => item.id === stringValue(resource.spec, "serverId")
   )
   return resource.kind === "project"
     ? [
-        `${projectAgents.length} 个`,
+        `${projectSandboxes.length} 个`,
         `${projectRuntimes.length} 个`,
         resource.id,
       ]
@@ -679,7 +412,7 @@ function resourceColumnValues(
       : resource.kind === "runtime"
         ? [
             server?.name ?? "未绑定",
-            text(resource.spec, "driver") === "vm" ? "VM" : "Docker",
+            runtimeDriverLabel(text(resource.spec, "driver")),
             resources.find(
               (item) =>
                 item.kind === "image" && item.id === resource.spec.imageId
@@ -687,14 +420,16 @@ function resourceColumnValues(
           ]
         : resource.kind === "skill"
           ? [
-              skillAgents.length > 0
-                ? `${skillAgents.length} 个智能体`
+              skillRuntimes.length > 0
+                ? `${skillRuntimes.length} 个环境模板`
                 : "未使用",
               text(resource.spec, "source"),
               `v${text(resource.spec, "version")}`,
             ]
           : [
-              mcpAgents.length > 0 ? `${mcpAgents.length} 个智能体` : "未使用",
+              mcpRuntimes.length > 0
+                ? `${mcpRuntimes.length} 个环境模板`
+                : "未使用",
               text(resource.spec, "transport").toUpperCase(),
               text(resource.spec, "transport") === "http"
                 ? text(resource.spec, "url")
@@ -765,6 +500,14 @@ function text(spec: Record<string, unknown>, key: string) {
   return typeof value === "string" && value ? value : "—"
 }
 
+function runtimeDriverLabel(driver: string) {
+  if (driver === "docker") return "Docker"
+  if (driver === "boxlite") return "BoxLite"
+  if (driver === "microsandbox") return "Microsandbox"
+  if (driver === "vm") return "VM（旧）"
+  return driver === "—" ? "未配置" : driver
+}
+
 function stringArray(value: unknown) {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
@@ -778,15 +521,11 @@ function summary(resource: Resource) {
     case "image":
       return `${text(resource.spec, "reference")} · ${stringArray(resource.spec.modes).join(" / ")}`
     case "runtime":
-      return `${text(resource.spec, "driver")} · ${text(resource.spec, "imageId")} · ${stringArray(resource.spec.agentTools).length} Agent 工具`
+      return `${runtimeDriverLabel(text(resource.spec, "driver"))} · ${text(resource.spec, "imageReference")} · ${stringArray(resource.spec.agentTools).length} Agent 工具`
     case "skill":
       return `v${text(resource.spec, "version")} · ${text(resource.spec, "source")}`
     case "mcp":
       return `${text(resource.spec, "transport")} · ${text(resource.spec, "command")}`
-    case "schedule":
-      return `${text(resource.spec, "cron")} · ${text(resource.spec, "timezone")}`
-    case "webhook":
-      return `${text(resource.spec, "event")} · ${text(resource.spec, "path")}`
     case "variable":
       return `${text(resource.spec, "key")} · ${text(resource.spec, "reference")}`
     case "sandbox":

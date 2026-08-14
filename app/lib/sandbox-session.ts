@@ -1,8 +1,5 @@
 export type SandboxSessionState =
-  | "disconnected"
-  | "connecting"
-  | "ready"
-  | "error"
+  "disconnected" | "connecting" | "ready" | "error"
 
 type SessionMessage = {
   type: string
@@ -21,6 +18,19 @@ type PendingRequest = {
 
 type StateListener = (state: SandboxSessionState, detail?: string) => void
 type OutputListener = (data: string) => void
+
+type FileOperation =
+  | "list"
+  | "read"
+  | "write"
+  | "upload-start"
+  | "upload-chunk"
+  | "upload-finish"
+  | "upload-cancel"
+
+const uploadChunkSize = 192 * 1024
+
+export const sandboxUploadMaxSize = 50 * 1024 * 1024
 
 export class SandboxSessionClient {
   private socket: WebSocket | null = null
@@ -81,9 +91,10 @@ export class SandboxSessionClient {
   }
 
   async request<T>(
-    operation: "list" | "read" | "write",
+    operation: FileOperation,
     path: string,
-    content?: string
+    content?: string,
+    uploadId?: string
   ): Promise<T> {
     await this.waitUntilReady()
     const requestId = crypto.randomUUID()
@@ -98,13 +109,61 @@ export class SandboxSessionClient {
         timeout,
       })
       try {
-        this.send({ type: "rpc", requestId, operation, path, content })
+        this.send({
+          type: "rpc",
+          requestId,
+          operation,
+          path,
+          content,
+          uploadId,
+        })
       } catch (error) {
         clearTimeout(timeout)
         this.pending.delete(requestId)
         reject(error instanceof Error ? error : new Error("无法发送文件操作"))
       }
     })
+  }
+
+  async uploadFile(
+    file: File,
+    path: string,
+    onProgress?: (percent: number) => void
+  ) {
+    if (file.size > sandboxUploadMaxSize) {
+      throw new Error("单个文件不能超过 50 MiB")
+    }
+
+    const uploadId = crypto.randomUUID()
+    await this.request<string>("upload-start", path, undefined, uploadId)
+    try {
+      if (file.size === 0) onProgress?.(100)
+      for (let offset = 0; offset < file.size; offset += uploadChunkSize) {
+        const bytes = new Uint8Array(
+          await file.slice(offset, offset + uploadChunkSize).arrayBuffer()
+        )
+        await this.request<string>(
+          "upload-chunk",
+          path,
+          encodeBase64(bytes),
+          uploadId
+        )
+        onProgress?.(
+          Math.round(
+            (Math.min(offset + bytes.length, file.size) / file.size) * 100
+          )
+        )
+      }
+      await this.request<string>("upload-finish", path, undefined, uploadId)
+    } catch (error) {
+      await this.request<string>(
+        "upload-cancel",
+        path,
+        undefined,
+        uploadId
+      ).catch(() => undefined)
+      throw error
+    }
   }
 
   private async connect() {
@@ -116,17 +175,22 @@ export class SandboxSessionClient {
         `/api/sandboxes/${encodeURIComponent(this.sandboxId)}/session-ticket`,
         { method: "POST", credentials: "include" }
       )
-      const payload = (await response.json().catch(() => null)) as
-        | { ticket?: string; error?: string }
-        | null
+      const payload = (await response.json().catch(() => null)) as {
+        ticket?: string
+        error?: string
+      } | null
       if (!response.ok || !payload?.ticket) {
-        throw new Error(payload?.error || `无法创建沙箱会话（HTTP ${response.status}）`)
+        throw new Error(
+          payload?.error || `无法创建沙箱会话（HTTP ${response.status}）`
+        )
       }
       if (this.stopped || generation !== this.connectionGeneration) return
 
       const socket = new WebSocket(sessionURL(this.sandboxId, payload.ticket))
       this.socket = socket
-      socket.addEventListener("message", (event) => this.handleMessage(event.data))
+      socket.addEventListener("message", (event) =>
+        this.handleMessage(event.data)
+      )
       socket.addEventListener("error", () => {
         if (this.socket === socket) this.setState("error", "实时会话连接失败")
       })
@@ -247,12 +311,20 @@ export class SandboxSessionClient {
   }
 }
 
+function encodeBase64(bytes: Uint8Array) {
+  let binary = ""
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(
+      ...bytes.subarray(offset, Math.min(offset + 0x8000, bytes.length))
+    )
+  }
+  return btoa(binary)
+}
+
 function sessionURL(sandboxId: string, ticket: string) {
-  const configuredOrigin = process.env.NEXT_PUBLIC_AGENTBOX_URL?.trim()
-  const origin = configuredOrigin || window.location.origin
   const url = new URL(
     `/api/sandboxes/${encodeURIComponent(sandboxId)}/session`,
-    origin
+    window.location.origin
   )
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:"
   url.searchParams.set("ticket", ticket)

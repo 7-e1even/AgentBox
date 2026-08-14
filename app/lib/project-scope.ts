@@ -1,4 +1,3 @@
-import type { Agent } from "@/lib/agent-schema"
 import type { Resource } from "@/lib/platform-schema"
 
 export const PROJECT_COOKIE_NAME = "agentbox-project"
@@ -21,8 +20,4 @@ export function resourcesForProject(resources: Resource[], projectId: string) {
     if (resource.kind === "project") return resource.id === projectId
     return resource.projectId === projectId
   })
-}
-
-export function agentsForProject(agents: Agent[], projectId: string) {
-  return agents.filter((agent) => agent.projectId === projectId)
 }

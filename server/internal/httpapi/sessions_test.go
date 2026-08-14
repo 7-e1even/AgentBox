@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"agentbox/internal/agent"
+	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
 	"github.com/coder/websocket"
 )
@@ -26,7 +26,7 @@ func (sessionTestStore) ListResources(context.Context) ([]platform.Resource, err
 		{Input: platform.Input{ID: "runtime-one", Kind: platform.KindRuntime, ProjectID: &projectID, Spec: map[string]any{"driver": "docker"}}},
 		{Input: platform.Input{ID: "sandbox-one", Kind: platform.KindSandbox, ProjectID: &projectID, Spec: map[string]any{
 			"runtimeId": "runtime-one", "serverId": sessionTestServerID,
-			"externalId": "agentbox-sandbox-one", "status": "running",
+			"externalId": "agentbox-sandbox-one", "status": "running", "driver": "boxlite",
 		}}},
 	}, nil
 }
@@ -34,7 +34,7 @@ func (sessionTestStore) ListResources(context.Context) ([]platform.Resource, err
 func newSessionTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	handler := New(
-		sessionTestStore{}, agent.BuiltinCatalog,
+		sessionTestStore{}, catalog.BuiltinCatalog,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 		Config{DisableAuth: true},
 	)
@@ -108,7 +108,7 @@ func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 	if err := json.Unmarshal(openPayload, &open); err != nil {
 		t.Fatal(err)
 	}
-	if open.Type != "open" || open.ExternalID != "agentbox-sandbox-one" || open.SessionID == "" {
+	if open.Type != "open" || open.ExternalID != "agentbox-sandbox-one" || open.Driver != "boxlite" || open.SessionID == "" {
 		t.Fatalf("unexpected open message: %+v", open)
 	}
 
@@ -137,5 +137,83 @@ func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 	}
 	if !strings.Contains(string(outputPayload), `/root\r\n`) {
 		t.Fatalf("unexpected browser output: %s", outputPayload)
+	}
+
+	uploadID := "3e8774b5-4921-4c8c-8927-2b7a30d518d2"
+	uploadRequest, _ := json.Marshal(sessionMessage{
+		Type: "rpc", RequestID: "upload-one", Operation: "upload-chunk",
+		Path: "/workspace/example.bin", Content: "YWdlbnRib3g=", UploadID: uploadID,
+	})
+	if err := browser.Write(ctx, websocket.MessageText, uploadRequest); err != nil {
+		t.Fatal(err)
+	}
+	_, forwardedPayload, err := worker.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var forwarded sessionMessage
+	if err := json.Unmarshal(forwardedPayload, &forwarded); err != nil {
+		t.Fatal(err)
+	}
+	if forwarded.SessionID != open.SessionID || forwarded.Operation != "upload-chunk" || forwarded.UploadID != uploadID || forwarded.Content != "YWdlbnRib3g=" {
+		t.Fatalf("unexpected forwarded upload: %+v", forwarded)
+	}
+
+	uploadResult, _ := json.Marshal(sessionMessage{
+		Type: "rpc-result", SessionID: open.SessionID, RequestID: "upload-one", OK: true,
+	})
+	if err := worker.Write(ctx, websocket.MessageText, uploadResult); err != nil {
+		t.Fatal(err)
+	}
+	_, uploadResultPayload, err := browser.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(uploadResultPayload), `"requestId":"upload-one"`) {
+		t.Fatalf("unexpected browser upload result: %s", uploadResultPayload)
+	}
+}
+
+func TestValidBrowserSessionMessageAcceptsChunkedUploads(t *testing.T) {
+	uploadID := "3e8774b5-4921-4c8c-8927-2b7a30d518d2"
+	for _, operation := range []string{"upload-start", "upload-chunk", "upload-finish", "upload-cancel"} {
+		payload, err := json.Marshal(sessionMessage{
+			Type: "rpc", RequestID: "request-one", Operation: operation,
+			Path: "/workspace/example.bin", UploadID: uploadID,
+			Content: func() string {
+				if operation == "upload-chunk" {
+					return "YWdlbnRib3g="
+				}
+				return ""
+			}(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := validBrowserSessionMessage(payload); !ok {
+			t.Fatalf("operation %q was rejected", operation)
+		}
+	}
+}
+
+func TestValidBrowserSessionMessageRejectsInvalidUploads(t *testing.T) {
+	for name, message := range map[string]sessionMessage{
+		"invalid id": {
+			Type: "rpc", RequestID: "request-one", Operation: "upload-start",
+			Path: "/workspace/example.bin", UploadID: "not-a-uuid",
+		},
+		"oversized chunk": {
+			Type: "rpc", RequestID: "request-one", Operation: "upload-chunk",
+			Path: "/workspace/example.bin", UploadID: "3e8774b5-4921-4c8c-8927-2b7a30d518d2",
+			Content: strings.Repeat("a", 384*1024+1),
+		},
+	} {
+		payload, err := json.Marshal(message)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := validBrowserSessionMessage(payload); ok {
+			t.Fatalf("%s was accepted", name)
+		}
 	}
 }

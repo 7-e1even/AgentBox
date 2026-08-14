@@ -1,8 +1,9 @@
 "use client"
 
 import { useState, type FormEvent } from "react"
-import { BoxesIcon, LockKeyholeIcon } from "lucide-react"
+import { LockKeyholeIcon } from "lucide-react"
 
+import { AgentBoxMark } from "@/components/agentbox-mark"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -73,8 +74,8 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
     <main className="grid min-h-svh bg-muted/30 lg:grid-cols-2">
       <section className="hidden flex-col justify-between border-r bg-sidebar p-10 lg:flex">
         <div className="flex items-center gap-3">
-          <span className="flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <BoxesIcon />
+          <span className="flex size-10 items-center justify-center rounded-lg border bg-muted text-foreground">
+            <AgentBoxMark className="size-6" />
           </span>
           <div>
             <p className="font-semibold">AgentBox</p>
@@ -95,8 +96,8 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
       <section className="flex items-center justify-center p-4 sm:p-8">
         <Card className="w-full max-w-md">
           <CardHeader>
-            <div className="mb-2 flex size-10 items-center justify-center rounded-lg border bg-background lg:hidden">
-              <BoxesIcon />
+            <div className="mb-2 flex size-10 items-center justify-center rounded-lg border bg-muted text-foreground lg:hidden">
+              <AgentBoxMark className="size-6" />
             </div>
             <CardTitle>{needsSetup ? "创建管理员" : "登录 AgentBox"}</CardTitle>
             <CardDescription>

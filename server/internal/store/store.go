@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"agentbox/internal/agent"
+	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -33,9 +33,9 @@ import (
 var schema string
 
 var (
-	ErrNotFound            = errors.New("agent not found")
+	ErrNotFound            = errors.New("record not found")
 	ErrResourceNotFound    = errors.New("resource not found")
-	ErrConflict            = errors.New("agent conflict")
+	ErrConflict            = errors.New("record conflict")
 	ErrPairingInvalid      = errors.New("server pairing invalid")
 	ErrWorkerUnauthorized  = errors.New("worker unauthorized")
 	ErrUnauthorized        = errors.New("user unauthorized")
@@ -45,18 +45,13 @@ var (
 
 const workerJobLeaseDuration = 2 * time.Hour
 
-const columns = `
-  id, project_id, runtime_id, name, slug, description, avatar, provider_id, model_id,
-  credential_id, system_prompt, skill_ids, mcp_server_ids, variable_ids, custom_args,
-  temperature, max_steps, concurrency, sandbox_policy, status, version, created_at, updated_at`
-
 type Store struct {
 	pool      *pgxpool.Pool
-	catalog   agent.Catalog
+	catalog   catalog.Catalog
 	secretKey []byte
 }
 
-func New(ctx context.Context, databaseURL string, catalog agent.Catalog) (*Store, error) {
+func New(ctx context.Context, databaseURL string, catalog catalog.Catalog) (*Store, error) {
 	config, err := pgxpool.ParseConfig(databaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("parse database config: %w", err)
@@ -115,57 +110,17 @@ func (s *Store) seed(ctx context.Context) error {
 	if err := seedResources(ctx, tx, s.catalog); err != nil {
 		return err
 	}
-	var count int
-	if err := tx.QueryRow(ctx, "SELECT COUNT(*) FROM agents").Scan(&count); err != nil {
-		return fmt.Errorf("count agents: %w", err)
-	}
-	if count > 0 {
-		return tx.Commit(ctx)
-	}
-
-	openAICredential := "openai-primary"
-	anthropicCredential := "anthropic-primary"
-	examples := []agent.Input{
-		{
-			ProjectID: "default", RuntimeID: "docker-agent", Concurrency: 1, SandboxPolicy: "reuse",
-			Name: "Research Copilot", Slug: "research-copilot", Description: "收集可信来源，比较观点并整理成可执行的研究结论。", Avatar: "RC",
-			ProviderID: "openai", ModelID: "gpt-5", CredentialID: &openAICredential,
-			SystemPrompt: "你是一名严谨的研究助理。先明确问题和证据标准，再检索并交叉验证来源，清楚区分事实、推断与未知信息。",
-			SkillIDs:     []string{"web-research", "document-writer", "task-planner"}, MCPServerIDs: []string{"browser", "filesystem"},
-			Temperature: 0.3, MaxSteps: 16, Status: agent.StatusActive,
-		},
-		{
-			ProjectID: "default", RuntimeID: "docker-agent", Concurrency: 1, SandboxPolicy: "new",
-			Name: "Release Writer", Slug: "release-writer", Description: "把代码变更整理成面向用户的发布说明。", Avatar: "RW",
-			ProviderID: "anthropic", ModelID: "claude-sonnet", CredentialID: &anthropicCredential,
-			SystemPrompt: "你负责撰写清晰、具体的发布说明。基于实际变更解释用户价值，不夸大影响，不遗漏破坏性变更和迁移步骤。",
-			SkillIDs:     []string{"document-writer", "code-review"}, MCPServerIDs: []string{"github", "filesystem"},
-			Temperature: 0.5, MaxSteps: 10, Status: agent.StatusDraft,
-		},
-	}
-	for _, input := range examples {
-		agent.Normalize(&input)
-		created, err := createInTx(ctx, tx, input)
-		if err != nil {
-			return fmt.Errorf("seed agent: %w", err)
-		}
-		if err := saveRevision(ctx, tx, created); err != nil {
-			return fmt.Errorf("seed revision: %w", err)
-		}
-	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit seed: %w", err)
 	}
 	return nil
 }
 
-func seedResources(ctx context.Context, tx pgx.Tx, catalog agent.Catalog) error {
+func seedResources(ctx context.Context, tx pgx.Tx, catalog catalog.Catalog) error {
 	now := time.Now().UTC()
 	resources := []platform.Input{
 		{ID: "default", Kind: platform.KindProject, Name: "AgentBox Studio", Description: "默认 Agent 沙箱项目", Enabled: true, Spec: map[string]any{}},
 		{ID: "image-ubuntu-2404", Kind: platform.KindImage, Name: "Ubuntu 24.04", Description: "Docker 与 VM 环境模板可复用的基础 OCI 镜像", Enabled: true, Spec: map[string]any{"reference": "ubuntu:24.04", "architecture": "all", "modes": []string{"docker", "vm"}}},
-		{ID: "docker-agent", Kind: platform.KindRuntime, ProjectID: stringRef("default"), Name: "Codex 开发环境", Description: "预装 Codex、Git 与常用 Agent 能力的标准 Linux 环境", Enabled: true, Spec: map[string]any{"driver": "docker", "imageId": "image-ubuntu-2404", "agentTools": []string{"codex"}, "skillIds": []string{"code-review", "task-planner"}, "mcpServerIds": []string{"filesystem"}, "variableIds": []string{"github-token"}, "credentialIds": []string{}, "workdir": "/workspace", "cpu": "2", "memory": "4 GiB", "network": "egress"}},
-		{ID: "github-token", Kind: platform.KindVariable, ProjectID: stringRef("default"), Name: "GITHUB_TOKEN", Description: "由 Runtime worker 从宿主机环境解析", Enabled: true, Spec: map[string]any{"mode": "secret-ref", "reference": "env://GITHUB_TOKEN"}},
 	}
 	for _, skill := range catalog.Skills {
 		resources = append(resources, platform.Input{ID: skill.ID, Kind: platform.KindSkill, ProjectID: stringRef("default"), Name: skill.Name, Description: skill.Description, Enabled: true, Spec: map[string]any{"version": skill.Version, "category": skill.Category, "source": "builtin", "instructions": "由平台在创建沙箱时安装到 Agent 的 skills 目录。"}})
@@ -182,7 +137,6 @@ func seedResources(ctx context.Context, tx pgx.Tx, catalog agent.Catalog) error 
 			spec["args"] = "-y @playwright/mcp@latest --headless"
 		case "github":
 			spec["url"] = "https://api.githubcopilot.com/mcp/"
-			spec["headers"] = "Authorization=env://GITHUB_TOKEN"
 		default:
 			spec["command"] = server.ID
 		}
@@ -202,289 +156,6 @@ func seedResources(ctx context.Context, tx pgx.Tx, catalog agent.Catalog) error 
 }
 
 func stringRef(value string) *string { return &value }
-
-func scanAgent(row pgx.Row) (agent.Agent, error) {
-	var result agent.Agent
-	var credential pgtype.Text
-	var skillJSON []byte
-	var mcpJSON []byte
-	var variableJSON []byte
-	var argsJSON []byte
-	err := row.Scan(
-		&result.ID, &result.ProjectID, &result.RuntimeID, &result.Name, &result.Slug, &result.Description,
-		&result.Avatar, &result.ProviderID, &result.ModelID, &credential,
-		&result.SystemPrompt, &skillJSON, &mcpJSON, &variableJSON, &argsJSON, &result.Temperature,
-		&result.MaxSteps, &result.Concurrency, &result.SandboxPolicy, &result.Status,
-		&result.Version, &result.CreatedAt, &result.UpdatedAt,
-	)
-	if err != nil {
-		return agent.Agent{}, err
-	}
-	if credential.Valid {
-		result.CredentialID = &credential.String
-	}
-	if err := json.Unmarshal(skillJSON, &result.SkillIDs); err != nil {
-		return agent.Agent{}, fmt.Errorf("decode skill ids: %w", err)
-	}
-	if err := json.Unmarshal(mcpJSON, &result.MCPServerIDs); err != nil {
-		return agent.Agent{}, fmt.Errorf("decode mcp server ids: %w", err)
-	}
-	if err := json.Unmarshal(variableJSON, &result.VariableIDs); err != nil {
-		return agent.Agent{}, fmt.Errorf("decode variable ids: %w", err)
-	}
-	if err := json.Unmarshal(argsJSON, &result.CustomArgs); err != nil {
-		return agent.Agent{}, fmt.Errorf("decode custom args: %w", err)
-	}
-	if result.VariableIDs == nil {
-		result.VariableIDs = []string{}
-	}
-	if result.CustomArgs == nil {
-		result.CustomArgs = []string{}
-	}
-	return result, nil
-}
-
-func (s *Store) List(ctx context.Context) ([]agent.Agent, error) {
-	rows, err := s.pool.Query(ctx, `SELECT `+columns+` FROM agents
-    ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END,
-             updated_at DESC`)
-	if err != nil {
-		return nil, fmt.Errorf("list agents: %w", err)
-	}
-	defer rows.Close()
-	result := make([]agent.Agent, 0)
-	for rows.Next() {
-		item, err := scanAgent(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan agent: %w", err)
-		}
-		result = append(result, item)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate agents: %w", err)
-	}
-	return result, nil
-}
-
-func (s *Store) Get(ctx context.Context, id string) (agent.Agent, error) {
-	result, err := scanAgent(s.pool.QueryRow(ctx, `SELECT `+columns+` FROM agents WHERE id = $1`, id))
-	if errors.Is(err, pgx.ErrNoRows) {
-		return agent.Agent{}, ErrNotFound
-	}
-	if err != nil {
-		return agent.Agent{}, fmt.Errorf("get agent: %w", err)
-	}
-	return result, nil
-}
-
-func (s *Store) Create(ctx context.Context, input agent.Input) (agent.Agent, error) {
-	agent.Normalize(&input)
-	validationCatalog, err := s.validationCatalog(ctx)
-	if err != nil {
-		return agent.Agent{}, err
-	}
-	if err := agent.Validate(input, validationCatalog); err != nil {
-		return agent.Agent{}, err
-	}
-	if err := s.validateAgentBindings(ctx, input); err != nil {
-		return agent.Agent{}, err
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return agent.Agent{}, fmt.Errorf("begin create: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	created, err := createInTx(ctx, tx, input)
-	if err != nil {
-		return agent.Agent{}, mapDatabaseError(err)
-	}
-	if err := saveRevision(ctx, tx, created); err != nil {
-		return agent.Agent{}, fmt.Errorf("save revision: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return agent.Agent{}, mapDatabaseError(err)
-	}
-	return created, nil
-}
-
-func createInTx(ctx context.Context, tx pgx.Tx, input agent.Input) (agent.Agent, error) {
-	now := time.Now().UTC()
-	return scanAgent(tx.QueryRow(ctx, `INSERT INTO agents (
-    id, project_id, runtime_id, name, slug, description, avatar, provider_id, model_id,
-    credential_id, system_prompt, skill_ids, mcp_server_ids, variable_ids, custom_args,
-    temperature, max_steps, concurrency, sandbox_policy, status, version, created_at, updated_at
-  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb,
-    $13::jsonb, $14::jsonb, $15::jsonb, $16, $17, $18, $19, $20, 1, $21, $21)
-  RETURNING `+columns,
-		uuid.NewString(), input.ProjectID, input.RuntimeID, input.Name, input.Slug,
-		input.Description, input.Avatar, input.ProviderID, input.ModelID, input.CredentialID,
-		input.SystemPrompt, mustJSON(input.SkillIDs), mustJSON(input.MCPServerIDs),
-		mustJSON(input.VariableIDs), mustJSON(input.CustomArgs), input.Temperature,
-		input.MaxSteps, input.Concurrency, input.SandboxPolicy, input.Status, now,
-	))
-}
-
-func (s *Store) Update(ctx context.Context, id string, input agent.Input, expectedVersion int) (agent.Agent, error) {
-	agent.Normalize(&input)
-	validationCatalog, err := s.validationCatalog(ctx)
-	if err != nil {
-		return agent.Agent{}, err
-	}
-	if err := agent.Validate(input, validationCatalog); err != nil {
-		return agent.Agent{}, err
-	}
-	if err := s.validateAgentBindings(ctx, input); err != nil {
-		return agent.Agent{}, err
-	}
-	if expectedVersion < 1 {
-		return agent.Agent{}, &agent.ValidationError{Message: "版本号无效"}
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return agent.Agent{}, fmt.Errorf("begin update: %w", err)
-	}
-	defer tx.Rollback(ctx)
-
-	updated, err := scanAgent(tx.QueryRow(ctx, `UPDATE agents SET
-    project_id = $1, runtime_id = $2, name = $3, slug = $4, description = $5,
-    avatar = $6, provider_id = $7, model_id = $8, credential_id = $9,
-    system_prompt = $10, skill_ids = $11::jsonb, mcp_server_ids = $12::jsonb,
-    variable_ids = $13::jsonb, custom_args = $14::jsonb, temperature = $15,
-    max_steps = $16, concurrency = $17, sandbox_policy = $18, status = $19,
-    version = version + 1, updated_at = $20
-  WHERE id = $21 AND version = $22 RETURNING `+columns,
-		input.ProjectID, input.RuntimeID, input.Name, input.Slug, input.Description,
-		input.Avatar, input.ProviderID, input.ModelID, input.CredentialID, input.SystemPrompt,
-		mustJSON(input.SkillIDs), mustJSON(input.MCPServerIDs), mustJSON(input.VariableIDs),
-		mustJSON(input.CustomArgs), input.Temperature, input.MaxSteps, input.Concurrency,
-		input.SandboxPolicy, input.Status, time.Now().UTC(), id, expectedVersion,
-	))
-	if errors.Is(err, pgx.ErrNoRows) {
-		var exists bool
-		if queryErr := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)", id).Scan(&exists); queryErr != nil {
-			return agent.Agent{}, fmt.Errorf("check update conflict: %w", queryErr)
-		}
-		if !exists {
-			return agent.Agent{}, ErrNotFound
-		}
-		return agent.Agent{}, ErrConflict
-	}
-	if err != nil {
-		return agent.Agent{}, mapDatabaseError(err)
-	}
-	if err := saveRevision(ctx, tx, updated); err != nil {
-		return agent.Agent{}, fmt.Errorf("save revision: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return agent.Agent{}, mapDatabaseError(err)
-	}
-	return updated, nil
-}
-
-func (s *Store) validateAgentBindings(ctx context.Context, input agent.Input) error {
-	type binding struct {
-		id   string
-		kind platform.Kind
-		name string
-	}
-	bindings := []binding{
-		{input.ProjectID, platform.KindProject, "Project"},
-		{input.RuntimeID, platform.KindRuntime, "Runtime"},
-	}
-	for _, id := range input.SkillIDs {
-		bindings = append(bindings, binding{id, platform.KindSkill, "Skill"})
-	}
-	for _, id := range input.MCPServerIDs {
-		bindings = append(bindings, binding{id, platform.KindMCP, "MCP Server"})
-	}
-	for _, id := range input.VariableIDs {
-		bindings = append(bindings, binding{id, platform.KindVariable, "Variable"})
-	}
-	for _, binding := range bindings {
-		var exists bool
-		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
-      SELECT 1 FROM control_resources
-      WHERE id = $1 AND kind = $2 AND enabled = TRUE
-        AND (kind = 'project' OR project_id = $3)
-    )`, binding.id, binding.kind, input.ProjectID).Scan(&exists); err != nil {
-			return fmt.Errorf("validate agent binding: %w", err)
-		}
-		if !exists {
-			return &agent.ValidationError{Message: binding.name + " 不存在、未启用或不属于当前 Project"}
-		}
-	}
-	return nil
-}
-
-func (s *Store) Duplicate(ctx context.Context, id string) (agent.Agent, error) {
-	source, err := s.Get(ctx, id)
-	if err != nil {
-		return agent.Agent{}, err
-	}
-	rows, err := s.pool.Query(ctx, "SELECT slug FROM agents WHERE slug = $1 OR slug LIKE $2", source.Slug+"-copy", source.Slug+"-copy-%")
-	if err != nil {
-		return agent.Agent{}, fmt.Errorf("find duplicate slugs: %w", err)
-	}
-	existing := map[string]struct{}{}
-	for rows.Next() {
-		var slug string
-		if err := rows.Scan(&slug); err != nil {
-			rows.Close()
-			return agent.Agent{}, fmt.Errorf("scan duplicate slug: %w", err)
-		}
-		existing[slug] = struct{}{}
-	}
-	rows.Close()
-
-	input := source.Input
-	input.Name += " 副本"
-	input.Slug = source.Slug + "-copy"
-	input.Status = agent.StatusDraft
-	for suffix := 2; ; suffix++ {
-		if _, found := existing[input.Slug]; !found {
-			break
-		}
-		input.Slug = fmt.Sprintf("%s-copy-%d", source.Slug, suffix)
-	}
-	return s.Create(ctx, input)
-}
-
-func (s *Store) Delete(ctx context.Context, id string) error {
-	var exists bool
-	if err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1)", id).Scan(&exists); err != nil {
-		return fmt.Errorf("check delete agent: %w", err)
-	}
-	if !exists {
-		return ErrNotFound
-	}
-	var referenced bool
-	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
-    SELECT 1 FROM control_resources WHERE spec->>'agentId' = $1
-  )`, id).Scan(&referenced); err != nil {
-		return fmt.Errorf("check delete agent references: %w", err)
-	}
-	if referenced {
-		return fmt.Errorf("%w: agent is still referenced", ErrConflict)
-	}
-	command, err := s.pool.Exec(ctx, "DELETE FROM agents WHERE id = $1", id)
-	if err != nil {
-		return fmt.Errorf("delete agent: %w", err)
-	}
-	if command.RowsAffected() != 1 {
-		return ErrNotFound
-	}
-	return nil
-}
-
-func saveRevision(ctx context.Context, tx pgx.Tx, value agent.Agent) error {
-	snapshot, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO agent_revisions (agent_id, version, snapshot, created_at)
-    VALUES ($1, $2, $3::jsonb, $4)`, value.ID, value.Version, snapshot, value.UpdatedAt)
-	return err
-}
 
 func mustJSON(value []string) []byte {
 	encoded, err := json.Marshal(value)
@@ -842,9 +513,10 @@ func (s *Store) UpdateCredential(ctx context.Context, id string, input platform.
 func (s *Store) DeleteCredential(ctx context.Context, id string) error {
 	var referenced bool
 	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
-    SELECT 1 FROM agents WHERE credential_id = $1
-    UNION ALL
-    SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'credentialIds' ? $1
+    SELECT 1 FROM control_resources
+    WHERE kind IN ('runtime', 'sandbox') AND (
+      spec->'credentialIds' ? $1 OR spec->'modelBindings' ? $1
+    )
   )`, id).Scan(&referenced); err != nil {
 		return fmt.Errorf("check credential bindings: %w", err)
 	}
@@ -911,8 +583,8 @@ func (s *Store) PullCredentialModels(ctx context.Context, id string) ([]platform
 		return nil, err
 	}
 	if models := knownCredentialModels(protocol, endpoint); len(models) > 0 {
-		return s.mutateCredentialModels(ctx, id, func(existing []platform.CredentialModel, defaultModelID string) ([]platform.CredentialModel, error) {
-			return mergeCredentialModels(existing, models, defaultModelID), nil
+		return s.mutateCredentialModels(ctx, id, func(existing []platform.CredentialModel) ([]platform.CredentialModel, error) {
+			return mergeCredentialModels(existing, models), nil
 		})
 	}
 	request, err := providerModelsRequest(ctx, providerID, protocol, endpoint, secret)
@@ -931,8 +603,8 @@ func (s *Store) PullCredentialModels(ctx context.Context, id string) ([]platform
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrProviderUnavailable, err)
 	}
-	return s.mutateCredentialModels(ctx, id, func(existing []platform.CredentialModel, defaultModelID string) ([]platform.CredentialModel, error) {
-		return mergeCredentialModels(existing, models, defaultModelID), nil
+	return s.mutateCredentialModels(ctx, id, func(existing []platform.CredentialModel) ([]platform.CredentialModel, error) {
+		return mergeCredentialModels(existing, models), nil
 	})
 }
 
@@ -941,7 +613,7 @@ func (s *Store) AddCredentialModel(ctx context.Context, id string, input platfor
 	if err := platform.ValidateCredentialModel(input); err != nil {
 		return nil, err
 	}
-	return s.mutateCredentialModels(ctx, id, func(models []platform.CredentialModel, _ string) ([]platform.CredentialModel, error) {
+	return s.mutateCredentialModels(ctx, id, func(models []platform.CredentialModel) ([]platform.CredentialModel, error) {
 		for _, model := range models {
 			if model.ID == input.ID {
 				return nil, fmt.Errorf("%w: model already exists", ErrConflict)
@@ -960,10 +632,17 @@ func (s *Store) DeleteCredentialModel(ctx context.Context, id, modelID string) (
 	if modelID == "" {
 		return nil, &platform.ValidationError{Message: "模型 ID 不能为空"}
 	}
-	return s.mutateCredentialModels(ctx, id, func(models []platform.CredentialModel, defaultModelID string) ([]platform.CredentialModel, error) {
-		if modelID == defaultModelID {
-			return nil, fmt.Errorf("%w: default model cannot be deleted", ErrConflict)
-		}
+	var referenced bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+    SELECT 1 FROM control_resources
+    WHERE kind = 'sandbox' AND spec->'modelBindings'->>$1 = $2
+  )`, id, modelID).Scan(&referenced); err != nil {
+		return nil, fmt.Errorf("check sandbox model bindings: %w", err)
+	}
+	if referenced {
+		return nil, fmt.Errorf("%w: model is still used by a sandbox", ErrConflict)
+	}
+	return s.mutateCredentialModels(ctx, id, func(models []platform.CredentialModel) ([]platform.CredentialModel, error) {
 		result := make([]platform.CredentialModel, 0, len(models))
 		found := false
 		for _, model := range models {
@@ -983,7 +662,7 @@ func (s *Store) DeleteCredentialModel(ctx context.Context, id, modelID string) (
 func (s *Store) mutateCredentialModels(
 	ctx context.Context,
 	id string,
-	mutate func([]platform.CredentialModel, string) ([]platform.CredentialModel, error),
+	mutate func([]platform.CredentialModel) ([]platform.CredentialModel, error),
 ) ([]platform.CredentialModel, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -991,9 +670,8 @@ func (s *Store) mutateCredentialModels(
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	var modelsJSON []byte
-	var defaultModelID string
-	if err := tx.QueryRow(ctx, `SELECT models, model_id FROM provider_credentials WHERE id = $1 FOR UPDATE`, id).Scan(
-		&modelsJSON, &defaultModelID,
+	if err := tx.QueryRow(ctx, `SELECT models FROM provider_credentials WHERE id = $1 FOR UPDATE`, id).Scan(
+		&modelsJSON,
 	); errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrResourceNotFound
 	} else if err != nil {
@@ -1003,7 +681,7 @@ func (s *Store) mutateCredentialModels(
 	if err != nil {
 		return nil, err
 	}
-	models, err = mutate(models, defaultModelID)
+	models, err = mutate(models)
 	if err != nil {
 		return nil, err
 	}
@@ -1033,11 +711,11 @@ func decodeCredentialModels(value []byte) ([]platform.CredentialModel, error) {
 	return models, nil
 }
 
-func mergeCredentialModels(existing, remote []platform.CredentialModel, defaultModelID string) []platform.CredentialModel {
+func mergeCredentialModels(existing, remote []platform.CredentialModel) []platform.CredentialModel {
 	result := make([]platform.CredentialModel, 0, len(existing)+len(remote))
 	seen := make(map[string]struct{}, len(existing)+len(remote))
 	for _, model := range existing {
-		if model.Source != "manual" && model.ID != defaultModelID {
+		if model.Source != "manual" {
 			continue
 		}
 		if _, ok := seen[model.ID]; ok {
@@ -1313,34 +991,6 @@ func (s *Store) providerExists(providerID string) bool {
 	return false
 }
 
-func (s *Store) validationCatalog(ctx context.Context) (agent.Catalog, error) {
-	managed, err := s.ListCredentials(ctx)
-	if err != nil {
-		return agent.Catalog{}, err
-	}
-	managedIDs := make(map[string]bool, len(managed))
-	credentials := make([]agent.Credential, 0, len(s.catalog.Credentials)+len(managed))
-	for _, credential := range managed {
-		managedIDs[credential.ID] = true
-		status := "attention"
-		if credential.Enabled {
-			status = "configured"
-		}
-		credentials = append(credentials, agent.Credential{
-			ID: credential.ID, Name: credential.Name, ProviderID: credential.ProviderID,
-			Environment: credential.Endpoint, Status: status,
-		})
-	}
-	for _, credential := range s.catalog.Credentials {
-		if !managedIDs[credential.ID] {
-			credentials = append(credentials, credential)
-		}
-	}
-	catalog := s.catalog
-	catalog.Credentials = credentials
-	return catalog, nil
-}
-
 func lastFour(value string) string {
 	if len(value) <= 4 {
 		return value
@@ -1480,14 +1130,15 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 
 func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, payload map[string]any) error {
 	credentialIDs := specStringList(payload, "credentialIds")
+	modelBindings := specStringMap(payload, "modelBindings")
 	credentials := make([]map[string]any, 0, len(credentialIDs))
 	for _, id := range credentialIDs {
-		var providerID, protocol, endpoint, modelID string
+		var providerID, protocol, endpoint string
 		var ciphertext, nonce []byte
-		err := tx.QueryRow(ctx, `SELECT provider_id, protocol, endpoint, model_id,
+		err := tx.QueryRow(ctx, `SELECT provider_id, protocol, endpoint,
       secret_ciphertext, secret_nonce FROM provider_credentials
       WHERE id = $1 AND enabled = TRUE`, id).Scan(
-			&providerID, &protocol, &endpoint, &modelID, &ciphertext, &nonce,
+			&providerID, &protocol, &endpoint, &ciphertext, &nonce,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &platform.ValidationError{Message: "环境引用了不可用的 API Key"}
@@ -1500,6 +1151,7 @@ func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, payload 
 			return err
 		}
 		endpoint = normalizeKnownProviderEndpoint(protocol, endpoint)
+		modelID := modelBindings[id]
 		credentials = append(credentials, map[string]any{
 			"id": id, "providerId": providerID, "protocol": protocol,
 			"endpoint": endpoint, "modelId": modelID, "secret": secret,
@@ -1577,7 +1229,7 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	sandboxStatus := "error"
 	if result.Success {
 		switch action {
-		case "create-sandbox", "start-sandbox":
+		case "create-sandbox", "start-sandbox", "restart-sandbox":
 			sandboxStatus = "running"
 		case "stop-sandbox":
 			sandboxStatus = "stopped"
@@ -1687,74 +1339,114 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 }
 
 func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource) error {
+	payload, driver, imageReference, err := buildSandboxJobPayload(ctx, tx, sandbox)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE control_resources
+    SET spec = spec || jsonb_build_object('driver', $1::text, 'imageReference', $2::text)
+    WHERE id = $3 AND kind = 'sandbox'`, driver, imageReference, sandbox.ID); err != nil {
+		return fmt.Errorf("persist sandbox runtime snapshot: %w", err)
+	}
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
+    (id, server_id, resource_id, action, status, payload, created_at, updated_at)
+    VALUES ($1, $2, $3, 'create-sandbox', 'pending', $4::jsonb, $5, $5)`,
+		uuid.NewString(), sandbox.Spec["serverId"], sandbox.ID, mustMapJSON(payload), now,
+	); err != nil {
+		return fmt.Errorf("enqueue sandbox creation: %w", err)
+	}
+	return nil
+}
+
+func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Resource) (map[string]any, string, string, error) {
 	runtimeID, _ := sandbox.Spec["runtimeId"].(string)
-	serverID, _ := sandbox.Spec["serverId"].(string)
 	var runtimeSpecJSON []byte
 	if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
     WHERE id = $1 AND kind = 'runtime'`, runtimeID).Scan(&runtimeSpecJSON); err != nil {
-		return fmt.Errorf("load sandbox environment template: %w", err)
+		return nil, "", "", fmt.Errorf("load sandbox environment template: %w", err)
 	}
 	var runtimeSpec map[string]any
 	if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
-		return fmt.Errorf("decode sandbox environment template: %w", err)
+		return nil, "", "", fmt.Errorf("decode sandbox environment template: %w", err)
 	}
-	imageReference, _ := runtimeSpec["imageReference"].(string)
+	effectiveSpec := effectiveSandboxSpec(runtimeSpec, sandbox.Spec)
+	imageReference, _ := effectiveSpec["imageReference"].(string)
 	if imageReference == "" {
-		imageID, _ := runtimeSpec["imageId"].(string)
+		imageID, _ := effectiveSpec["imageId"].(string)
 		if err := tx.QueryRow(ctx, `SELECT spec->>'reference' FROM control_resources
       WHERE id = $1 AND kind = 'image' AND enabled = TRUE`, imageID).Scan(&imageReference); err != nil {
-			return fmt.Errorf("load sandbox image: %w", err)
+			return nil, "", "", fmt.Errorf("load sandbox image: %w", err)
 		}
 	}
-	agentTools := runtimeSpec["agentTools"]
-	if sandboxTools, ok := sandbox.Spec["agentTools"]; ok {
-		agentTools = sandboxTools
-	}
-	credentialIDs := runtimeSpec["credentialIds"]
-	if sandboxCredentials, ok := sandbox.Spec["credentialIds"]; ok {
-		credentialIDs = sandboxCredentials
+	driver, _ := effectiveSpec["driver"].(string)
+	if driver == "" {
+		return nil, "", "", fmt.Errorf("environment template has no runtime driver")
 	}
 	payload := map[string]any{
 		"sandboxId":     sandbox.ID,
 		"name":          sandbox.Name,
-		"driver":        runtimeSpec["driver"],
+		"driver":        driver,
 		"image":         imageReference,
-		"workdir":       runtimeSpec["workdir"],
-		"setup":         runtimeSpec["setup"],
-		"cpu":           runtimeSpec["cpu"],
-		"memory":        runtimeSpec["memory"],
-		"network":       runtimeSpec["network"],
-		"agentTools":    agentTools,
-		"skillIds":      runtimeSpec["skillIds"],
-		"mcpServerIds":  runtimeSpec["mcpServerIds"],
-		"variableIds":   runtimeSpec["variableIds"],
-		"credentialIds": credentialIDs,
-		"workspace":     sandbox.Spec["workspace"],
+		"workdir":       effectiveSpec["workdir"],
+		"setup":         effectiveSpec["setup"],
+		"cpu":           effectiveSpec["cpu"],
+		"memory":        effectiveSpec["memory"],
+		"network":       effectiveSpec["network"],
+		"agentTools":    effectiveSpec["agentTools"],
+		"skillIds":      effectiveSpec["skillIds"],
+		"mcpServerIds":  effectiveSpec["mcpServerIds"],
+		"variableIds":   effectiveSpec["variableIds"],
+		"credentialIds": effectiveSpec["credentialIds"],
+		"modelBindings": effectiveSpec["modelBindings"],
+		"workspace":     effectiveSpec["workspace"],
 	}
 	for _, definitions := range []struct {
 		payloadKey string
 		kind       platform.Kind
 		ids        []string
 	}{
-		{payloadKey: "skills", kind: platform.KindSkill, ids: specStringList(runtimeSpec, "skillIds")},
-		{payloadKey: "mcpServers", kind: platform.KindMCP, ids: specStringList(runtimeSpec, "mcpServerIds")},
-		{payloadKey: "variables", kind: platform.KindVariable, ids: specStringList(runtimeSpec, "variableIds")},
+		{payloadKey: "skills", kind: platform.KindSkill, ids: specStringList(effectiveSpec, "skillIds")},
+		{payloadKey: "mcpServers", kind: platform.KindMCP, ids: specStringList(effectiveSpec, "mcpServerIds")},
+		{payloadKey: "variables", kind: platform.KindVariable, ids: specStringList(effectiveSpec, "variableIds")},
 	} {
 		resources, err := loadWorkerResourceDefinitions(ctx, tx, definitions.kind, definitions.ids)
 		if err != nil {
-			return err
+			return nil, "", "", err
 		}
 		payload[definitions.payloadKey] = resources
 	}
-	now := time.Now().UTC()
-	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-    (id, server_id, resource_id, action, status, payload, created_at, updated_at)
-    VALUES ($1, $2, $3, 'create-sandbox', 'pending', $4::jsonb, $5, $5)`,
-		uuid.NewString(), serverID, sandbox.ID, mustMapJSON(payload), now,
-	); err != nil {
-		return fmt.Errorf("enqueue sandbox creation: %w", err)
+	return payload, driver, imageReference, nil
+}
+
+func effectiveSandboxSpec(runtimeSpec, sandboxSpec map[string]any) map[string]any {
+	result := make(map[string]any, len(runtimeSpec))
+	for key, value := range runtimeSpec {
+		result[key] = value
 	}
-	return nil
+	for _, key := range []string{
+		"serverId",
+		"driver",
+		"imageReference",
+		"imageId",
+		"workdir",
+		"setup",
+		"cpu",
+		"memory",
+		"network",
+		"agentTools",
+		"skillIds",
+		"mcpServerIds",
+		"variableIds",
+		"credentialIds",
+		"modelBindings",
+		"workspace",
+	} {
+		if value, ok := sandboxSpec[key]; ok {
+			result[key] = value
+		}
+	}
+	return result
 }
 
 func loadWorkerResourceDefinitions(
@@ -1826,6 +1518,8 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 		workerAction, pendingStatus, message = "start-sandbox", "starting", "正在启动沙箱"
 	case "stop":
 		workerAction, pendingStatus, message = "stop-sandbox", "stopping", "正在停止沙箱"
+	case "restart":
+		workerAction, pendingStatus, message = "restart-sandbox", "restarting", "正在重启并应用沙箱配置"
 	case "delete":
 		workerAction, pendingStatus, message = "delete-sandbox", "deleting", "正在删除沙箱"
 	case "login-codex":
@@ -1859,7 +1553,7 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 		return platform.Resource{}, fmt.Errorf("decode sandbox operation: %w", err)
 	}
 	status, _ := resource.Spec["status"].(string)
-	if status == "requested" || status == "starting" || status == "stopping" || status == "deleting" {
+	if status == "requested" || status == "starting" || status == "stopping" || status == "restarting" || status == "deleting" {
 		return platform.Resource{}, fmt.Errorf("%w: sandbox already has an operation in progress", ErrConflict)
 	}
 	if action == "start" && status == "running" {
@@ -1868,14 +1562,35 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	if action == "stop" && status != "running" {
 		return platform.Resource{}, fmt.Errorf("%w: sandbox is not running", ErrConflict)
 	}
+	if action == "restart" && status != "running" {
+		return platform.Resource{}, fmt.Errorf("%w: sandbox must be running before restart", ErrConflict)
+	}
 	if action == "login-codex" && status != "running" {
 		return platform.Resource{}, fmt.Errorf("%w: sandbox must be running before login", ErrConflict)
 	}
 	serverID, _ := resource.Spec["serverId"].(string)
+	driver, _ := resource.Spec["driver"].(string)
+	if driver == "" {
+		runtimeID, _ := resource.Spec["runtimeId"].(string)
+		if err := tx.QueryRow(ctx, `SELECT spec->>'driver' FROM control_resources
+      WHERE id = $1 AND kind = 'runtime'`, runtimeID).Scan(&driver); err != nil {
+			return platform.Resource{}, fmt.Errorf("load sandbox runtime driver: %w", err)
+		}
+	}
 	payload := map[string]any{
 		"sandboxId":  id,
 		"externalId": resource.Spec["externalId"],
+		"driver":     driver,
 		"tool":       loginTool,
+	}
+	if action == "start" || action == "restart" {
+		configuredPayload, configuredDriver, _, err := buildSandboxJobPayload(ctx, tx, resource)
+		if err != nil {
+			return platform.Resource{}, err
+		}
+		payload = configuredPayload
+		payload["externalId"] = resource.Spec["externalId"]
+		driver = configuredDriver
 	}
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
@@ -1921,17 +1636,17 @@ func (s *Store) DeleteResource(ctx context.Context, id string) error {
 	var referenceQuery string
 	switch kind {
 	case platform.KindProject:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM agents WHERE project_id = $1 UNION ALL SELECT 1 FROM control_resources WHERE project_id = $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE project_id = $1)"
 	case platform.KindImage:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind = 'runtime' AND spec->>'imageId' = $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->>'imageId' = $1)"
 	case platform.KindRuntime:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM agents WHERE runtime_id = $1 UNION ALL SELECT 1 FROM control_resources WHERE kind = 'sandbox' AND spec->>'runtimeId' = $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind = 'sandbox' AND spec->>'runtimeId' = $1)"
 	case platform.KindSkill:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM agents WHERE skill_ids ? $1 UNION ALL SELECT 1 FROM control_resources WHERE kind = 'runtime' AND spec->'skillIds' ? $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'skillIds' ? $1)"
 	case platform.KindMCP:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM agents WHERE mcp_server_ids ? $1 UNION ALL SELECT 1 FROM control_resources WHERE kind = 'runtime' AND spec->'mcpServerIds' ? $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'mcpServerIds' ? $1)"
 	case platform.KindVariable:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM agents WHERE variable_ids ? $1 UNION ALL SELECT 1 FROM control_resources WHERE kind = 'runtime' AND spec->'variableIds' ? $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'variableIds' ? $1)"
 	case platform.KindSandbox:
 		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE id = $1 AND kind = 'sandbox' AND spec->>'status' = 'running')"
 	}
@@ -1985,7 +1700,11 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 			if !input.Enabled {
 				return &platform.ValidationError{Message: "镜像仍被 Runtime 使用，不能停用"}
 			}
-			if !modes[driver] {
+			imageMode := driver
+			if driver == "boxlite" || driver == "microsandbox" {
+				imageMode = "docker"
+			}
+			if !modes[imageMode] {
 				return &platform.ValidationError{Message: "镜像仍被不兼容的 Runtime 使用"}
 			}
 		}
@@ -2013,7 +1732,7 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 			if driver == "vm" {
 				return &platform.ValidationError{Message: "运行服务器尚未配置可用的 KVM/QEMU 后端"}
 			}
-			return &platform.ValidationError{Message: "运行服务器不支持 Docker"}
+			return &platform.ValidationError{Message: "运行服务器尚未通过所选隔离驱动的自检"}
 		}
 		var inventory platform.ServerInventory
 		if err := json.Unmarshal(inventoryJSON, &inventory); err != nil {
@@ -2054,89 +1773,108 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 		}
 		return nil
 	}
-	if input.Kind != platform.KindSandbox && input.Kind != platform.KindSchedule && input.Kind != platform.KindWebhook {
+	if input.Kind != platform.KindSandbox {
 		return nil
 	}
-	if input.Kind != platform.KindSandbox {
-		agentID, _ := input.Spec["agentId"].(string)
-		if _, err := uuid.Parse(agentID); err != nil {
-			return &platform.ValidationError{Message: "目标 Agent 无效"}
-		}
-		var agentExists bool
-		if err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND project_id = $2)", agentID, input.ProjectID).Scan(&agentExists); err != nil {
-			return fmt.Errorf("check target agent: %w", err)
-		}
-		if !agentExists {
-			return &platform.ValidationError{Message: "目标 Agent 不存在或不属于当前 Project"}
+	runtimeID, _ := input.Spec["runtimeId"].(string)
+	var runtimeSpecJSON []byte
+	if err := s.pool.QueryRow(ctx, `SELECT spec FROM control_resources
+      WHERE id = $1 AND kind = 'runtime' AND project_id = $2 AND enabled = TRUE`, runtimeID, input.ProjectID).Scan(&runtimeSpecJSON); errors.Is(err, pgx.ErrNoRows) {
+		return &platform.ValidationError{Message: "环境模板不存在、未启用或不属于当前 Project"}
+	} else if err != nil {
+		return fmt.Errorf("check sandbox runtime: %w", err)
+	}
+	var runtimeSpec map[string]any
+	if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
+		return fmt.Errorf("decode sandbox environment: %w", err)
+	}
+	effectiveSpec := effectiveSandboxSpec(runtimeSpec, input.Spec)
+	serverID, _ := effectiveSpec["serverId"].(string)
+	driver, _ := effectiveSpec["driver"].(string)
+	requiredCapability := driver
+	if driver == "vm" {
+		requiredCapability = "kvm"
+	}
+	var supports bool
+	var serverArch string
+	var inventoryJSON []byte
+	if err := s.pool.QueryRow(ctx, `SELECT capabilities ? $2, arch, inventory
+      FROM managed_servers WHERE id = $1`, serverID, requiredCapability).Scan(&supports, &serverArch, &inventoryJSON); errors.Is(err, pgx.ErrNoRows) {
+		return &platform.ValidationError{Message: "目标服务器不存在"}
+	} else if err != nil {
+		return fmt.Errorf("check sandbox server: %w", err)
+	}
+	if !supports {
+		return &platform.ValidationError{Message: "目标服务器尚未通过所选隔离驱动的自检"}
+	}
+	imageReference, _ := effectiveSpec["imageReference"].(string)
+	if imageReference == "" {
+		imageID, _ := effectiveSpec["imageId"].(string)
+		if err := s.pool.QueryRow(ctx, `SELECT spec->>'reference' FROM control_resources
+          WHERE id = $1 AND kind = 'image' AND enabled = TRUE`, imageID).Scan(&imageReference); err != nil {
+			return &platform.ValidationError{Message: "沙箱引用的旧镜像不存在"}
 		}
 	}
-	if input.Kind == platform.KindSandbox {
-		runtimeID, _ := input.Spec["runtimeId"].(string)
-		var runtimeSpecJSON []byte
-		if err := s.pool.QueryRow(ctx, `SELECT spec FROM control_resources
-      WHERE id = $1 AND kind = 'runtime' AND project_id = $2 AND enabled = TRUE`, runtimeID, input.ProjectID).Scan(&runtimeSpecJSON); errors.Is(err, pgx.ErrNoRows) {
-			return &platform.ValidationError{Message: "环境模板不存在、未启用或不属于当前 Project"}
-		} else if err != nil {
-			return fmt.Errorf("check sandbox runtime: %w", err)
-		}
-		var runtimeSpec map[string]any
-		if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
-			return fmt.Errorf("decode sandbox environment: %w", err)
-		}
-		serverID, _ := input.Spec["serverId"].(string)
-		runtimeServerID, _ := runtimeSpec["serverId"].(string)
-		if runtimeServerID != "" && runtimeServerID != serverID {
-			return &platform.ValidationError{Message: "环境模板绑定了另一台运行服务器"}
-		}
-		driver, _ := runtimeSpec["driver"].(string)
-		requiredCapability := driver
-		if driver == "vm" {
-			requiredCapability = "kvm"
-		}
-		var supports bool
-		var serverArch string
-		var inventoryJSON []byte
-		if err := s.pool.QueryRow(ctx, `SELECT capabilities ? $2, arch, inventory
-      FROM managed_servers WHERE id = $1`, serverID, requiredCapability).Scan(&supports, &serverArch, &inventoryJSON); errors.Is(err, pgx.ErrNoRows) {
-			return &platform.ValidationError{Message: "目标服务器不存在"}
-		} else if err != nil {
-			return fmt.Errorf("check sandbox server: %w", err)
-		}
-		if !supports {
-			return &platform.ValidationError{Message: "目标服务器不支持环境模板的隔离类型"}
-		}
-		imageReference, _ := runtimeSpec["imageReference"].(string)
-		if imageReference == "" {
-			imageID, _ := runtimeSpec["imageId"].(string)
-			if err := s.pool.QueryRow(ctx, `SELECT spec->>'reference' FROM control_resources
-          WHERE id = $1 AND kind = 'image' AND enabled = TRUE`, imageID).Scan(&imageReference); err != nil {
-				return &platform.ValidationError{Message: "环境模板引用的旧镜像不存在"}
-			}
-		}
-		var inventory platform.ServerInventory
-		if err := json.Unmarshal(inventoryJSON, &inventory); err != nil {
-			return fmt.Errorf("decode sandbox server inventory: %w", err)
-		}
-		if !runtimeImageIsAvailable(driver, inventory, imageReference, serverArch) {
-			return &platform.ValidationError{Message: "环境模板使用的镜像已不在目标服务器上"}
-		}
-		for _, credentialID := range specStringList(input.Spec, "credentialIds") {
+	var inventory platform.ServerInventory
+	if err := json.Unmarshal(inventoryJSON, &inventory); err != nil {
+		return fmt.Errorf("decode sandbox server inventory: %w", err)
+	}
+	if !runtimeImageIsAvailable(driver, inventory, imageReference, serverArch) {
+		return &platform.ValidationError{Message: "沙箱使用的镜像已不在目标服务器上"}
+	}
+	for kind, key := range map[platform.Kind]string{
+		platform.KindSkill:    "skillIds",
+		platform.KindMCP:      "mcpServerIds",
+		platform.KindVariable: "variableIds",
+	} {
+		for _, resourceID := range specStringList(effectiveSpec, key) {
 			var exists bool
 			if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
-          SELECT 1 FROM provider_credentials WHERE id = $1 AND enabled = TRUE
-        )`, credentialID).Scan(&exists); err != nil {
-				return fmt.Errorf("check sandbox credential: %w", err)
+            SELECT 1 FROM control_resources
+            WHERE id = $1 AND kind = $2 AND enabled = TRUE
+          )`, resourceID, kind).Scan(&exists); err != nil {
+				return fmt.Errorf("check sandbox binding: %w", err)
 			}
 			if !exists {
-				return &platform.ValidationError{Message: "沙箱包含不存在或已停用的模型凭据"}
+				return &platform.ValidationError{Message: "沙箱包含不存在或已停用的能力配置"}
 			}
 		}
 	}
+	allowedCredentialIDs := specStringList(effectiveSpec, "credentialIds")
+	modelBindings := specStringMap(effectiveSpec, "modelBindings")
+	if len(modelBindings) != len(allowedCredentialIDs) {
+		return &platform.ValidationError{Message: "请为沙箱中的每个模型服务选择具体模型"}
+	}
+	allowedCredentials := make(map[string]bool, len(allowedCredentialIDs))
+	for _, credentialID := range allowedCredentialIDs {
+		allowedCredentials[credentialID] = true
+		modelID := strings.TrimSpace(modelBindings[credentialID])
+		if modelID == "" {
+			return &platform.ValidationError{Message: "请为沙箱中的每个模型服务选择具体模型"}
+		}
+		var exists bool
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+          SELECT 1 FROM provider_credentials
+          WHERE id = $1 AND enabled = TRUE
+            AND models @> jsonb_build_array(jsonb_build_object('id', $2::text))
+        )`, credentialID, modelID).Scan(&exists); err != nil {
+			return fmt.Errorf("check sandbox model binding: %w", err)
+		}
+		if !exists {
+			return &platform.ValidationError{Message: "所选模型不存在、已停用或模型列表已更新"}
+		}
+	}
+	for credentialID := range modelBindings {
+		if !allowedCredentials[credentialID] {
+			return &platform.ValidationError{Message: "所选模型服务不属于当前沙箱"}
+		}
+	}
+	input.Spec["credentialIds"] = allowedCredentialIDs
 	return nil
 }
 
 func runtimeImageIsAvailable(driver string, inventory platform.ServerInventory, reference, serverArch string) bool {
-	if driver == "docker" {
+	if driver == "docker" || driver == "boxlite" || driver == "microsandbox" {
 		return strings.TrimSpace(reference) != ""
 	}
 	return serverInventoryHasImage(inventory.VMImages, reference, serverArch)
@@ -2170,18 +1908,27 @@ func specStringList(spec map[string]any, key string) []string {
 	return result
 }
 
+func specStringMap(spec map[string]any, key string) map[string]string {
+	values, ok := spec[key].(map[string]any)
+	if !ok {
+		if values, ok := spec[key].(map[string]string); ok {
+			return values
+		}
+		return map[string]string{}
+	}
+	result := make(map[string]string, len(values))
+	for id, value := range values {
+		if value, ok := value.(string); ok {
+			result[id] = value
+		}
+	}
+	return result
+}
+
 func mapResourceError(err error) error {
 	var postgresError *pgconn.PgError
 	if errors.As(err, &postgresError) && postgresError.Code == "23505" {
 		return fmt.Errorf("%w: resource id already exists", ErrConflict)
-	}
-	return err
-}
-
-func mapDatabaseError(err error) error {
-	var postgresError *pgconn.PgError
-	if errors.As(err, &postgresError) && postgresError.Code == "23505" {
-		return fmt.Errorf("%w: agent slug already exists", ErrConflict)
 	}
 	return err
 }

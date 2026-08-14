@@ -1,13 +1,23 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+} from "react"
 import {
   ArrowLeftIcon,
   BoxIcon,
   ChevronDownIcon,
   ChevronRightIcon,
+  ClipboardPasteIcon,
   Code2Icon,
+  CopyIcon,
   FileIcon,
+  FileUpIcon,
   FolderIcon,
   FolderOpenIcon,
   InfoIcon,
@@ -25,7 +35,10 @@ import {
 import Link from "next/link"
 
 import { SandboxCodeEditor } from "@/components/sandbox-code-editor"
-import { SandboxTerminal } from "@/components/sandbox-terminal"
+import {
+  SandboxTerminal,
+  type SandboxTerminalHandle,
+} from "@/components/sandbox-terminal"
 import { SiteHeader } from "@/components/site-header"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -37,6 +50,16 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 import { Input } from "@/components/ui/input"
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuGroup,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu"
+import { Progress } from "@/components/ui/progress"
 import {
   ResizableHandle,
   ResizablePanel,
@@ -61,6 +84,7 @@ import {
 } from "@/lib/sandbox-file-schema"
 import {
   SandboxSessionClient,
+  sandboxUploadMaxSize,
   type SandboxSessionState,
 } from "@/lib/sandbox-session"
 import { cn } from "@/lib/utils"
@@ -78,7 +102,17 @@ type OpenFile = {
   size: number
 }
 
+type UploadProgress = {
+  fileName: string
+  fileIndex: number
+  fileCount: number
+  percent: number
+}
+
 export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
+  const terminalRef = useRef<SandboxTerminalHandle>(null)
+  const uploadInputRef = useRef<HTMLInputElement>(null)
+  const uploadDirectoryRef = useRef("/")
   const session = useMemo(
     () => new SandboxSessionClient(sandboxId),
     [sandboxId]
@@ -108,6 +142,10 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
   const [showInspector, setShowInspector] = useState(false)
   const [showTerminal, setShowTerminal] = useState(true)
   const [showSearch, setShowSearch] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(
+    null
+  )
+  const [dragUploadTarget, setDragUploadTarget] = useState<string | null>(null)
 
   const isRunning = sandbox?.spec.status === "running"
   const runtime = resources.find((item) => item.id === sandbox?.spec.runtimeId)
@@ -333,6 +371,153 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
     )
   }
 
+  function chooseFiles(directory: string) {
+    if (sessionState !== "ready" || uploadProgress) return
+    uploadDirectoryRef.current = directory
+    if (uploadInputRef.current) {
+      uploadInputRef.current.value = ""
+      uploadInputRef.current.click()
+    }
+  }
+
+  function markUploadDropTarget(
+    event: DragEvent<HTMLElement>,
+    directory: string
+  ) {
+    if (!event.dataTransfer.types.includes("Files") || uploadProgress) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.dataTransfer.dropEffect = "copy"
+    setDragUploadTarget(directory)
+  }
+
+  function clearUploadDropTarget(
+    event: DragEvent<HTMLElement>,
+    directory: string
+  ) {
+    if (event.currentTarget.contains(event.relatedTarget as Node | null)) return
+    setDragUploadTarget((current) => (current === directory ? null : current))
+  }
+
+  function uploadDroppedFiles(
+    event: DragEvent<HTMLElement>,
+    directory: string
+  ) {
+    if (!event.dataTransfer.types.includes("Files") || uploadProgress) return
+    event.preventDefault()
+    event.stopPropagation()
+    uploadDirectoryRef.current = directory
+    setDragUploadTarget(null)
+    void uploadSelectedFiles(event.dataTransfer.files)
+  }
+
+  async function uploadSelectedFiles(files: FileList | null) {
+    const selectedFiles = Array.from(files ?? [])
+    if (selectedFiles.length === 0) return
+
+    const directory = uploadDirectoryRef.current
+    let uploaded = 0
+    const failures: string[] = []
+    try {
+      const currentEntries = sandboxFileEntriesSchema.parse(
+        await runFileOperation({ kind: "list", path: directory })
+      )
+      setDirectoryEntries((current) => ({
+        ...current,
+        [directory]: currentEntries,
+      }))
+      const existingNames = new Set(currentEntries.map((entry) => entry.name))
+
+      for (const [index, file] of selectedFiles.entries()) {
+        const invalidName = uploadNameError(file.name)
+        if (invalidName) {
+          failures.push(`${file.name || "未命名文件"}：${invalidName}`)
+          continue
+        }
+        if (file.size > sandboxUploadMaxSize) {
+          failures.push(`${file.name}：单个文件不能超过 50 MiB`)
+          continue
+        }
+        if (existingNames.has(file.name)) {
+          failures.push(`${file.name}：目标目录已存在同名文件`)
+          continue
+        }
+
+        const destination = joinSandboxPath(directory, file.name)
+        setUploadProgress({
+          fileName: file.name,
+          fileIndex: index + 1,
+          fileCount: selectedFiles.length,
+          percent: 0,
+        })
+        try {
+          await uploadFile(file, destination, (percent) =>
+            setUploadProgress({
+              fileName: file.name,
+              fileIndex: index + 1,
+              fileCount: selectedFiles.length,
+              percent,
+            })
+          )
+          existingNames.add(file.name)
+          uploaded += 1
+        } catch (error) {
+          failures.push(`${file.name}：${uploadErrorMessage(error)}`)
+        }
+      }
+
+      setExpandedDirectories((current) => new Set(current).add(directory))
+      await loadDirectory(directory, false)
+      if (uploaded > 0) {
+        toast.success(`已上传 ${uploaded} 个文件`, { description: directory })
+      }
+      if (failures.length > 0) {
+        toast.error(`${failures.length} 个文件未上传`, {
+          description: failures.slice(0, 3).join("；"),
+        })
+      }
+    } catch (error) {
+      toast.error("上传失败", { description: errorMessage(error) })
+    } finally {
+      setUploadProgress(null)
+    }
+  }
+
+  async function uploadFile(
+    file: File,
+    destination: string,
+    onProgress: (percent: number) => void
+  ) {
+    if (file.size <= 512 * 1024) {
+      const bytes = new Uint8Array(await file.arrayBuffer())
+      let text: string | null = null
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+      } catch {
+        // Binary files use the chunked upload protocol below.
+      }
+      if (text !== null) {
+        await runFileOperation({
+          kind: "write",
+          path: destination,
+          content: text,
+        })
+        onProgress(100)
+        return
+      }
+    }
+    await session.uploadFile(file, destination, onProgress)
+  }
+
+  async function copyPath(path: string) {
+    try {
+      await writeClipboardText(path)
+      toast.success("路径已复制", { description: path })
+    } catch {
+      toast.error("复制失败", { description: "浏览器未授权访问剪贴板。" })
+    }
+  }
+
   function renderEntry(entry: SandboxFileEntry, depth = 0) {
     const expanded = expandedDirectories.has(entry.path)
     const loading = loadingDirectories.has(entry.path)
@@ -342,50 +527,127 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
         key={entry.path}
         style={{ contentVisibility: "auto", containIntrinsicSize: "24px" }}
       >
-        <button
-          type="button"
-          aria-expanded={entry.type === "directory" ? expanded : undefined}
-          className={cn(
-            "flex h-6 w-full items-center gap-1 pr-2 text-left text-[13px] hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-            active && "bg-accent text-accent-foreground"
-          )}
-          style={{ paddingLeft: 8 + depth * 12 }}
-          onClick={() => void openEntry(entry)}
-        >
-          {entry.type === "directory" ? (
-            expanded ? (
-              <ChevronDownIcon aria-hidden="true" className="size-3 shrink-0" />
-            ) : (
-              <ChevronRightIcon
-                aria-hidden="true"
-                className="size-3 shrink-0"
-              />
-            )
-          ) : (
-            <span className="size-3 shrink-0" />
-          )}
-          {entry.type === "directory" ? (
-            expanded ? (
-              <FolderOpenIcon
-                aria-hidden="true"
-                className="size-3.5 shrink-0 text-muted-foreground"
-              />
-            ) : (
-              <FolderIcon
-                aria-hidden="true"
-                className="size-3.5 shrink-0 text-muted-foreground"
-              />
-            )
-          ) : openingFilePath === entry.path ? (
-            <Spinner className="size-3.5 shrink-0" />
-          ) : (
-            <FileIcon
-              aria-hidden="true"
-              className="size-3.5 shrink-0 text-muted-foreground"
-            />
-          )}
-          <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-        </button>
+        <ContextMenu>
+          <ContextMenuTrigger asChild>
+            <button
+              type="button"
+              aria-expanded={entry.type === "directory" ? expanded : undefined}
+              className={cn(
+                "flex h-6 w-full items-center gap-1 pr-2 text-left text-[13px] hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                active && "bg-accent text-accent-foreground",
+                dragUploadTarget === entry.path &&
+                  "bg-primary/10 text-foreground ring-1 ring-primary/60 ring-inset"
+              )}
+              style={{ paddingLeft: 8 + depth * 12 }}
+              onClick={() => void openEntry(entry)}
+              onDragEnter={(event) => {
+                if (entry.type === "directory") {
+                  markUploadDropTarget(event, entry.path)
+                }
+              }}
+              onDragOver={(event) => {
+                if (entry.type === "directory") {
+                  markUploadDropTarget(event, entry.path)
+                }
+              }}
+              onDragLeave={(event) => {
+                if (entry.type === "directory") {
+                  clearUploadDropTarget(event, entry.path)
+                }
+              }}
+              onDrop={(event) => {
+                if (entry.type === "directory") {
+                  uploadDroppedFiles(event, entry.path)
+                }
+              }}
+            >
+              {entry.type === "directory" ? (
+                expanded ? (
+                  <ChevronDownIcon
+                    aria-hidden="true"
+                    className="size-3 shrink-0"
+                  />
+                ) : (
+                  <ChevronRightIcon
+                    aria-hidden="true"
+                    className="size-3 shrink-0"
+                  />
+                )
+              ) : (
+                <span className="size-3 shrink-0" />
+              )}
+              {entry.type === "directory" ? (
+                expanded ? (
+                  <FolderOpenIcon
+                    aria-hidden="true"
+                    className="size-3.5 shrink-0 text-muted-foreground"
+                  />
+                ) : (
+                  <FolderIcon
+                    aria-hidden="true"
+                    className="size-3.5 shrink-0 text-muted-foreground"
+                  />
+                )
+              ) : openingFilePath === entry.path ? (
+                <Spinner className="size-3.5 shrink-0" />
+              ) : (
+                <FileIcon
+                  aria-hidden="true"
+                  className="size-3.5 shrink-0 text-muted-foreground"
+                />
+              )}
+              <span className="min-w-0 flex-1 truncate">{entry.name}</span>
+            </button>
+          </ContextMenuTrigger>
+          <ContextMenuContent className="w-56">
+            <ContextMenuLabel className="truncate">
+              {entry.name}
+            </ContextMenuLabel>
+            <ContextMenuGroup>
+              <ContextMenuItem onSelect={() => void openEntry(entry)}>
+                {entry.type === "directory" ? (
+                  expanded ? (
+                    <ChevronRightIcon aria-hidden="true" />
+                  ) : (
+                    <ChevronDownIcon aria-hidden="true" />
+                  )
+                ) : (
+                  <FileIcon aria-hidden="true" />
+                )}
+                {entry.type === "directory"
+                  ? expanded
+                    ? "折叠目录"
+                    : "展开目录"
+                  : "打开文件"}
+              </ContextMenuItem>
+              {entry.type === "directory" ? (
+                <>
+                  <ContextMenuItem
+                    disabled={sessionState !== "ready" || !!uploadProgress}
+                    onSelect={() => chooseFiles(entry.path)}
+                  >
+                    <FileUpIcon aria-hidden="true" />
+                    上传到此目录
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    disabled={loading}
+                    onSelect={() => void loadDirectory(entry.path)}
+                  >
+                    <RefreshCwIcon aria-hidden="true" />
+                    刷新目录
+                  </ContextMenuItem>
+                </>
+              ) : null}
+            </ContextMenuGroup>
+            <ContextMenuSeparator />
+            <ContextMenuGroup>
+              <ContextMenuItem onSelect={() => void copyPath(entry.path)}>
+                <CopyIcon aria-hidden="true" />
+                复制路径
+              </ContextMenuItem>
+            </ContextMenuGroup>
+          </ContextMenuContent>
+        </ContextMenu>
         {entry.type === "directory" && expanded && (
           <div>
             {loading ? (
@@ -418,6 +680,20 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
           <h2 className="min-w-0 flex-1 truncate text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
             资源管理器
           </h2>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                aria-label="上传文件到根目录"
+                disabled={sessionState !== "ready" || !!uploadProgress}
+                onClick={() => chooseFiles("/")}
+              >
+                <FileUpIcon aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>上传文件到根目录</TooltipContent>
+          </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -478,24 +754,99 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
           <ChevronDownIcon aria-hidden="true" className="size-3" />
           <span className="truncate">{sandbox?.id}</span>
         </div>
-        <div className="min-h-0 flex-1 overflow-auto py-1">
-          {fileFilter.trim() ? (
-            visibleSearchFiles.length > 0 ? (
-              visibleSearchFiles.map((entry) => renderEntry(entry))
-            ) : (
-              <p className="px-3 py-2 text-xs text-muted-foreground">
-                已展开目录中没有匹配文件
-              </p>
-            )
-          ) : loadingDirectories.has("/") && !directoryEntries["/"] ? (
-            <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
-              <Spinner />
-              正在读取根文件系统…
+        <ContextMenu>
+          <ContextMenuTrigger asChild>
+            <div
+              aria-label="资源管理器文件列表"
+              className={cn(
+                "relative min-h-0 flex-1 overflow-auto py-1",
+                dragUploadTarget === "/" &&
+                  "bg-primary/5 ring-1 ring-primary/60 ring-inset"
+              )}
+              onDragEnter={(event) => markUploadDropTarget(event, "/")}
+              onDragOver={(event) => markUploadDropTarget(event, "/")}
+              onDragLeave={(event) => clearUploadDropTarget(event, "/")}
+              onDrop={(event) => uploadDroppedFiles(event, "/")}
+            >
+              {dragUploadTarget === "/" ? (
+                <div className="pointer-events-none sticky top-1 z-10 mx-2 flex h-8 items-center justify-center gap-2 rounded-sm border border-primary/40 bg-background/95 text-xs font-medium shadow-sm">
+                  <FileUpIcon aria-hidden="true" className="size-3.5" />
+                  松开上传到根目录
+                </div>
+              ) : null}
+              {fileFilter.trim() ? (
+                visibleSearchFiles.length > 0 ? (
+                  visibleSearchFiles.map((entry) => renderEntry(entry))
+                ) : (
+                  <p className="px-3 py-2 text-xs text-muted-foreground">
+                    已展开目录中没有匹配文件
+                  </p>
+                )
+              ) : loadingDirectories.has("/") && !directoryEntries["/"] ? (
+                <div className="flex items-center gap-2 px-3 py-2 text-xs text-muted-foreground">
+                  <Spinner />
+                  正在读取根文件系统…
+                </div>
+              ) : (
+                renderTree("/")
+              )}
             </div>
-          ) : (
-            renderTree("/")
-          )}
-        </div>
+          </ContextMenuTrigger>
+          <ContextMenuContent className="w-56">
+            <ContextMenuLabel>沙箱根目录</ContextMenuLabel>
+            <ContextMenuGroup>
+              <ContextMenuItem
+                disabled={sessionState !== "ready" || !!uploadProgress}
+                onSelect={() => chooseFiles("/")}
+              >
+                <FileUpIcon aria-hidden="true" />
+                上传文件
+              </ContextMenuItem>
+              <ContextMenuItem
+                disabled={loadingDirectories.has("/")}
+                onSelect={() => {
+                  setDirectoryEntries({})
+                  setExpandedDirectories(new Set(["/"]))
+                  void loadDirectory("/")
+                }}
+              >
+                <RefreshCwIcon aria-hidden="true" />
+                刷新文件树
+              </ContextMenuItem>
+            </ContextMenuGroup>
+          </ContextMenuContent>
+        </ContextMenu>
+        {uploadProgress ? (
+          <div className="shrink-0 border-t bg-background px-2.5 py-2">
+            <div className="mb-1.5 flex items-center gap-2 text-[11px]">
+              <FileUpIcon
+                aria-hidden="true"
+                className="size-3 shrink-0 text-muted-foreground"
+              />
+              <span className="min-w-0 flex-1 truncate">
+                {uploadProgress.fileName}
+              </span>
+              <span className="shrink-0 text-muted-foreground tabular-nums">
+                {uploadProgress.fileIndex}/{uploadProgress.fileCount} ·{" "}
+                {uploadProgress.percent}%
+              </span>
+            </div>
+            <Progress
+              aria-label={`正在上传 ${uploadProgress.fileName}`}
+              value={uploadProgress.percent}
+            />
+          </div>
+        ) : null}
+        <input
+          ref={uploadInputRef}
+          type="file"
+          multiple
+          className="sr-only"
+          aria-label="选择要上传到沙箱的文件"
+          onChange={(event) => {
+            void uploadSelectedFiles(event.currentTarget.files)
+          }}
+        />
       </aside>
     )
   }
@@ -627,6 +978,32 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
             <Badge variant="outline" className="h-5 rounded-sm text-[10px]">
               root
             </Badge>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label="粘贴到终端"
+                  disabled={sessionState !== "ready"}
+                  onClick={() => {
+                    void terminalRef.current
+                      ?.pasteFromClipboard()
+                      .then((pasted) => {
+                        if (!pasted) toast.error("剪贴板为空")
+                      })
+                      .catch(() => {
+                        toast.error("无法读取剪贴板", {
+                          description:
+                            "请允许浏览器读取剪贴板，或点击终端后按 Ctrl+V。",
+                        })
+                      })
+                  }}
+                >
+                  <ClipboardPasteIcon aria-hidden="true" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>粘贴到终端（Ctrl+V）</TooltipContent>
+            </Tooltip>
             <Button
               variant="ghost"
               size="icon-xs"
@@ -638,7 +1015,7 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
           </div>
         </div>
         <div className="min-h-0 flex-1 overflow-hidden">
-          <SandboxTerminal session={session} />
+          <SandboxTerminal ref={terminalRef} session={session} />
         </div>
       </section>
     )
@@ -988,6 +1365,44 @@ function formatBytes(value: number) {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${Math.round(value / 1024)} KiB`
   return `${(value / 1024 / 1024).toFixed(1)} MiB`
+}
+
+function uploadNameError(name: string) {
+  if (!name || name === "." || name === "..") return "文件名无效"
+  if (name.includes("/") || name.includes("\\") || name.includes("\0")) {
+    return "文件名不能包含路径分隔符"
+  }
+  return ""
+}
+
+function joinSandboxPath(directory: string, name: string) {
+  return directory === "/"
+    ? `/${name}`
+    : `${directory.replace(/\/+$/, "")}/${name}`
+}
+
+function uploadErrorMessage(error: unknown) {
+  const message = errorMessage(error)
+  return message.includes("unsupported file operation")
+    ? "当前 Worker 版本不支持二进制或大文件上传，请重新运行 Worker 安装脚本"
+    : message
+}
+
+async function writeClipboardText(value: string) {
+  try {
+    await navigator.clipboard.writeText(value)
+    return
+  } catch {
+    const textarea = document.createElement("textarea")
+    textarea.value = value
+    textarea.style.position = "fixed"
+    textarea.style.opacity = "0"
+    document.body.append(textarea)
+    textarea.select()
+    const copied = document.execCommand("copy")
+    textarea.remove()
+    if (!copied) throw new Error("clipboard unavailable")
+  }
 }
 
 async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {

@@ -106,6 +106,11 @@ func (s *Server) workerSessionScript(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(workerSessionDaemon))
 }
 
+func (s *Server) workerRuntimeDriverScript(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/x-python; charset=utf-8")
+	_, _ = w.Write([]byte(workerRuntimeDriver))
+}
+
 const workerInstall = `#!/bin/sh
 set -eu
 
@@ -117,17 +122,109 @@ esac
 
 worker_tmp=$(mktemp)
 session_tmp=$(mktemp)
-trap 'rm -f "$worker_tmp" "$session_tmp"' EXIT
+runtime_tmp=$(mktemp)
+microsandbox_source_tmp=$(mktemp)
+microsandbox_build_tmp=$(mktemp -d)
+trap 'rm -f "$worker_tmp" "$session_tmp" "$runtime_tmp" "$microsandbox_source_tmp"; rm -rf "$microsandbox_build_tmp"' EXIT
 curl -fsSL "$SERVER_URL/api/worker/agentbox-worker" -o "$worker_tmp"
 curl -fsSL "$SERVER_URL/api/worker/agentbox-session-worker" -o "$session_tmp"
-command -v python3 >/dev/null || { echo "python3 is required for interactive sessions" >&2; exit 1; }
+curl -fsSL "$SERVER_URL/api/worker/agentbox-runtime-driver" -o "$runtime_tmp"
+curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$microsandbox_source_tmp"
+
+install_host_dependencies() {
+  if command -v python3 >/dev/null && command -v jq >/dev/null; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null; then
+    echo "python3 and jq are required; automatic installation currently supports apt-based Linux" >&2
+    exit 1
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y ca-certificates jq python3
+}
+
+install_host_dependencies
 install -m 0755 "$worker_tmp" /usr/local/bin/agentbox-worker
 install -d -m 0755 /usr/local/lib/agentbox
 install -m 0644 "$session_tmp" /usr/local/lib/agentbox/session_worker.py
+install -m 0755 "$runtime_tmp" /usr/local/lib/agentbox/runtime_driver.py
+
+migrate_existing_config() {
+  CONFIG=/etc/agentbox-worker.conf
+  [ -s "$CONFIG" ] || return 0
+  SERVER_ID=$(sed -n '2p' "$CONFIG")
+  CREDENTIAL=$(sed -n '3p' "$CONFIG")
+  if [ -z "$SERVER_ID" ] || [ -z "$CREDENTIAL" ]; then
+    echo "warning: existing Worker config is invalid; endpoint was not changed" >&2
+    return 0
+  fi
+  umask 077
+  printf '%s\n%s\n%s\n' "$SERVER_URL" "$SERVER_ID" "$CREDENTIAL" > "$CONFIG"
+}
+
+install_microvm_build_dependencies() {
+  [ -c /dev/kvm ] || return 0
+  if command -v go >/dev/null && command -v gcc >/dev/null; then
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null; then
+    echo "Go 1.22+ and a C compiler are required to build the Microsandbox driver" >&2
+    exit 1
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y golang-go build-essential
+}
+
+install_boxlite_sdk() {
+  [ -c /dev/kvm ] || return 0
+  if ! python3 -m venv /opt/agentbox/runtime >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null; then
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update
+      apt-get install -y python3-venv
+      python3 -m venv /opt/agentbox/runtime
+    else
+      echo "warning: python3-venv is unavailable; skipping microVM SDKs" >&2
+      return 0
+    fi
+  fi
+  if ! /opt/agentbox/runtime/bin/python -m pip install --disable-pip-version-check --upgrade \
+      "boxlite==0.9.7"; then
+    echo "warning: BoxLite SDK installation failed; Docker remains available" >&2
+  fi
+}
+
+install_microsandbox_driver() {
+  [ -c /dev/kvm ] || return 0
+  cp "$microsandbox_source_tmp" "$microsandbox_build_tmp/main.go"
+  cat > "$microsandbox_build_tmp/go.mod" <<'EOF'
+module agentbox/microsandbox-driver
+
+go 1.22
+
+require github.com/superradcompany/microsandbox/sdk/go v0.6.8
+EOF
+  (
+    cd "$microsandbox_build_tmp"
+    if ! go mod download; then
+      GOPROXY=https://goproxy.cn,direct go mod download
+    fi
+    CGO_ENABLED=1 go build -tags agentbox_driver -trimpath -ldflags '-s -w' -o agentbox-microsandbox-driver .
+  )
+  install -m 0755 "$microsandbox_build_tmp/agentbox-microsandbox-driver" /usr/local/bin/agentbox-microsandbox-driver
+  /usr/local/bin/agentbox-microsandbox-driver probe >/dev/null
+}
+
+install_microvm_build_dependencies
+install_boxlite_sdk
+install_microsandbox_driver
+migrate_existing_config
 if command -v systemctl >/dev/null && systemctl is-active --quiet agentbox-worker.service; then
   systemctl restart agentbox-worker.service
 fi
-echo "AgentBox Worker installed with interactive session support."
+echo "AgentBox Worker installed. Runtime capabilities will be published after self-test."
 `
 
 const workerDaemon = `#!/bin/sh
@@ -174,25 +271,10 @@ setup_worker() {
     aarch64|arm64) ARCH=arm64 ;;
     *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
   esac
-  CAPS=''
-  command -v docker >/dev/null && docker info >/dev/null 2>&1 && CAPS='"docker"'
-  if [ -c /dev/kvm ]; then
-    [ -n "$CAPS" ] && CAPS="$CAPS,"
-    CAPS="$CAPS\"kvm-device\""
-  fi
-  if command -v qemu-system-x86_64 >/dev/null && command -v qemu-img >/dev/null; then
-    [ -n "$CAPS" ] && CAPS="$CAPS,"
-    CAPS="$CAPS\"qemu\""
-  fi
-  if command -v virsh >/dev/null; then
-    [ -n "$CAPS" ] && CAPS="$CAPS,"
-    CAPS="$CAPS\"libvirt\""
-  fi
-  if command -v python3 >/dev/null && [ -r /usr/local/lib/agentbox/session_worker.py ]; then
-    [ -n "$CAPS" ] && CAPS="$CAPS,"
-    CAPS="$CAPS\"interactive-session\""
-  fi
-  BODY=$(printf '{"pairingToken":"%s","serverId":"%s","name":"%s","hostname":"%s","os":"linux","arch":"%s","capabilities":[%s]}' "$TOKEN" "$SERVER_ID" "$HOST" "$HOST" "$ARCH" "$CAPS")
+  CAPS=$(worker_capabilities)
+  BODY=$(jq -n --arg pairingToken "$TOKEN" --arg serverId "$SERVER_ID" \
+    --arg name "$HOST" --arg hostname "$HOST" --arg arch "$ARCH" --argjson capabilities "$CAPS" \
+    '{pairingToken:$pairingToken,serverId:$serverId,name:$name,hostname:$hostname,os:"linux",arch:$arch,capabilities:$capabilities}')
   RESPONSE=$(curl -fsS -X POST "$SERVER_URL/api/servers/register" -H 'Content-Type: application/json' --data "$BODY")
   CREDENTIAL=$(printf '%s' "$RESPONSE" | sed -n 's/.*"credential":"\([^"]*\)".*/\1/p')
   [ -n "$CREDENTIAL" ] || { echo "registration response was invalid" >&2; exit 1; }
@@ -219,6 +301,87 @@ UNIT
   echo "Server connected to AgentBox."
 }
 
+runtime_python() {
+  if [ -x /opt/agentbox/runtime/bin/python ]; then
+    printf '%s' /opt/agentbox/runtime/bin/python
+  else
+    command -v python3
+  fi
+}
+
+runtime_call() {
+  if [ "${1:-}" = microsandbox ]; then
+    [ -x /usr/local/bin/agentbox-microsandbox-driver ] || { echo "AgentBox Microsandbox Go driver is unavailable" >&2; return 1; }
+    shift
+    /usr/local/bin/agentbox-microsandbox-driver "$@"
+    return
+  fi
+  PYTHON=$(runtime_python) || { echo "Python runtime is unavailable" >&2; return 1; }
+  [ -r /usr/local/lib/agentbox/runtime_driver.py ] || { echo "AgentBox runtime driver is unavailable" >&2; return 1; }
+  "$PYTHON" /usr/local/lib/agentbox/runtime_driver.py "$@"
+}
+
+runtime_probe() {
+  runtime_call "$1" probe >/dev/null 2>&1
+}
+
+docker() {
+  if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = docker ]; then
+    command docker "$@"
+    return
+  fi
+  OPERATION=${1:-}
+  [ "$#" -gt 0 ] && shift
+  case "$OPERATION" in
+    inspect)
+      runtime_call "$AGENTBOX_RUNTIME_DRIVER" inspect "$1"
+      ;;
+    exec)
+      USE_STDIN=false
+      WORKDIR=
+      while [ "$#" -gt 0 ]; do
+        case "$1" in
+          -i|-it|-ti) USE_STDIN=true; shift ;;
+          -t) shift ;;
+          -u|--user) shift 2 ;;
+          -w|--workdir) WORKDIR=${2:-}; shift 2 ;;
+          --) shift; break ;;
+          -*) echo "unsupported runtime exec option: $1" >&2; return 2 ;;
+          *) break ;;
+        esac
+      done
+      TARGET=${1:-}
+      [ -n "$TARGET" ] || { echo "runtime exec target is required" >&2; return 2; }
+      shift
+      if [ "$USE_STDIN" = true ] && [ -n "$WORKDIR" ]; then
+        runtime_call "$AGENTBOX_RUNTIME_DRIVER" exec --stdin --workdir "$WORKDIR" "$TARGET" -- "$@"
+      elif [ "$USE_STDIN" = true ]; then
+        runtime_call "$AGENTBOX_RUNTIME_DRIVER" exec --stdin "$TARGET" -- "$@"
+      elif [ -n "$WORKDIR" ]; then
+        runtime_call "$AGENTBOX_RUNTIME_DRIVER" exec --workdir "$WORKDIR" "$TARGET" -- "$@"
+      else
+        runtime_call "$AGENTBOX_RUNTIME_DRIVER" exec "$TARGET" -- "$@"
+      fi
+      ;;
+    cp)
+      SOURCE=${1:-}
+      DESTINATION=${2:-}
+      case "$DESTINATION" in
+        *:/*)
+          TARGET=${DESTINATION%%:*}
+          PATH_VALUE=${DESTINATION#*:}
+          PARENT=${PATH_VALUE%/*}
+          [ -n "$PARENT" ] || PARENT=/
+          runtime_call "$AGENTBOX_RUNTIME_DRIVER" exec --stdin "$TARGET" -- \
+            sh -c 'set -eu; mkdir -p "$1"; cat > "$2"' sh "$PARENT" "$PATH_VALUE" < "$SOURCE"
+          ;;
+        *) echo "only host-to-sandbox copy is supported" >&2; return 2 ;;
+      esac
+      ;;
+    *) echo "unsupported compatibility operation for $AGENTBOX_RUNTIME_DRIVER: $OPERATION" >&2; return 2 ;;
+  esac
+}
+
 worker_capabilities() {
   CAPS=
   command -v docker >/dev/null && docker info >/dev/null 2>&1 && CAPS='"docker"'
@@ -226,13 +389,13 @@ worker_capabilities() {
     [ -n "$CAPS" ] && CAPS="$CAPS,"
     CAPS="$CAPS\"kvm-device\""
   fi
-  if command -v qemu-system-x86_64 >/dev/null && command -v qemu-img >/dev/null; then
+  if runtime_probe boxlite; then
     [ -n "$CAPS" ] && CAPS="$CAPS,"
-    CAPS="$CAPS\"qemu\""
+    CAPS="$CAPS\"boxlite\""
   fi
-  if command -v virsh >/dev/null; then
+  if runtime_probe microsandbox; then
     [ -n "$CAPS" ] && CAPS="$CAPS,"
-    CAPS="$CAPS\"libvirt\""
+    CAPS="$CAPS\"microsandbox\""
   fi
   if command -v python3 >/dev/null && [ -r /usr/local/lib/agentbox/session_worker.py ]; then
     [ -n "$CAPS" ] && CAPS="$CAPS,"
@@ -878,53 +1041,75 @@ install_agent_wrappers() {
   done
 }
 
+memory_mib() {
+  VALUE=$(printf '%s' "$1" | tr -d ' ')
+  case "$VALUE" in
+    *GiB) NUMBER=${VALUE%GiB}; awk -v value="$NUMBER" 'BEGIN { printf "%d", value * 1024 }' ;;
+    *MiB) NUMBER=${VALUE%MiB}; awk -v value="$NUMBER" 'BEGIN { printf "%d", value }' ;;
+    *g|*G) NUMBER=${VALUE%?}; awk -v value="$NUMBER" 'BEGIN { printf "%d", value * 1024 }' ;;
+    *m|*M) NUMBER=${VALUE%?}; awk -v value="$NUMBER" 'BEGIN { printf "%d", value }' ;;
+    ''|*[!0-9]*) printf '4096' ;;
+    *) printf '%s' "$VALUE" ;;
+  esac
+}
+
 create_sandbox() {
   JOB_FILE=$1
   SANDBOX_ID=$(jq -r '.job.payload.sandboxId' "$JOB_FILE")
   DRIVER=$(jq -r '.job.payload.driver' "$JOB_FILE")
-  [ "$DRIVER" = docker ] || {
-    echo "VM backend is not installed on this worker" >&2
-    return 1
-  }
-  command -v docker >/dev/null || { echo "Docker is not installed" >&2; return 1; }
-  docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; return 1; }
+  case "$DRIVER" in docker|boxlite|microsandbox) ;; *) echo "unsupported runtime driver: $DRIVER" >&2; return 1 ;; esac
+  AGENTBOX_RUNTIME_DRIVER=$DRIVER
+  export AGENTBOX_RUNTIME_DRIVER
   IMAGE=$(jq -r '.job.payload.image' "$JOB_FILE")
   WORKDIR=$(jq -r '.job.payload.workdir // "/workspace"' "$JOB_FILE")
   CPU=$(jq -r '.job.payload.cpu // empty' "$JOB_FILE")
-  MEMORY=$(jq -r '.job.payload.memory // empty' "$JOB_FILE" | tr -d ' ' | sed -e 's/GiB$/g/' -e 's/MiB$/m/')
+  MEMORY_VALUE=$(jq -r '.job.payload.memory // empty' "$JOB_FILE")
   NETWORK=$(jq -r '.job.payload.network // "restricted"' "$JOB_FILE")
   SETUP=$(jq -r '.job.payload.setup // empty' "$JOB_FILE")
-  CONTAINER="agentbox-$SANDBOX_ID"
+  TARGET="agentbox-$SANDBOX_ID"
   VOLUME="agentbox-$SANDBOX_ID-workspace"
 
-  if docker inspect "$CONTAINER" >/dev/null 2>&1; then
-    OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$CONTAINER")
-    [ "$OWNER" = "$SANDBOX_ID" ] || { echo "container name collision: $CONTAINER" >&2; return 1; }
-    docker start "$CONTAINER" >/dev/null
+  if [ "$DRIVER" = docker ]; then
+    command -v docker >/dev/null || { echo "Docker is not installed" >&2; return 1; }
+    docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; return 1; }
+    MEMORY=$(printf '%s' "$MEMORY_VALUE" | tr -d ' ' | sed -e 's/GiB$/g/' -e 's/MiB$/m/')
+    if docker inspect "$TARGET" >/dev/null 2>&1; then
+      OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET")
+      [ "$OWNER" = "$SANDBOX_ID" ] || { echo "container name collision: $TARGET" >&2; return 1; }
+      docker start "$TARGET" >/dev/null
+    else
+      RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")
+      set -- docker run -d --name "$TARGET" \
+        --label "agentbox.sandbox=$SANDBOX_ID" \
+        --restart unless-stopped --user 0:0 --workdir "$WORKDIR" \
+        -v "$VOLUME:$WORKDIR"
+      [ -n "$CPU" ] && set -- "$@" --cpus "$CPU"
+      [ -n "$MEMORY" ] && set -- "$@" --memory "$MEMORY"
+      [ "$NETWORK" = none ] && set -- "$@" --network none
+      set -- "$@" "$RUNTIME_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait'
+      "$@" >/dev/null
+    fi
   else
-    RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")
-    set -- docker run -d --name "$CONTAINER" \
-      --label "agentbox.sandbox=$SANDBOX_ID" \
-      --restart unless-stopped --user 0:0 --workdir "$WORKDIR" \
-      -v "$VOLUME:$WORKDIR"
-    [ -n "$CPU" ] && set -- "$@" --cpus "$CPU"
-    [ -n "$MEMORY" ] && set -- "$@" --memory "$MEMORY"
-    [ "$NETWORK" = none ] && set -- "$@" --network none
-    set -- "$@" "$RUNTIME_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait'
-    "$@" >/dev/null
+    runtime_probe "$DRIVER" || { echo "$DRIVER SDK self-test failed" >&2; return 1; }
+    CPU_COUNT=$(printf '%s' "${CPU:-2}" | sed 's/\..*$//')
+    case "$CPU_COUNT" in ''|*[!0-9]*) CPU_COUNT=2 ;; esac
+    MEMORY_MIB=$(memory_mib "$MEMORY_VALUE")
+    runtime_call "$DRIVER" create "$TARGET" "$IMAGE" --cpus "$CPU_COUNT" \
+      --memory "$MEMORY_MIB" --workdir "$WORKDIR" --network "$NETWORK" >/dev/null
+    install_agent_tools "$TARGET" "$JOB_FILE"
   fi
 
-  docker exec "$CONTAINER" mkdir -p /opt/agentbox
+  docker exec "$TARGET" mkdir -p /opt/agentbox
   MANIFEST=$(mktemp)
   jq '.job.payload | del(.credentials)' "$JOB_FILE" > "$MANIFEST"
-  docker cp "$MANIFEST" "$CONTAINER:/opt/agentbox/manifest.json" >/dev/null
+  docker cp "$MANIFEST" "$TARGET:/opt/agentbox/manifest.json" >/dev/null
   rm -f "$MANIFEST"
-  configure_credentials "$CONTAINER" "$JOB_FILE"
-  configure_skills "$CONTAINER" "$JOB_FILE"
-  configure_mcp_servers "$CONTAINER" "$JOB_FILE"
-  install_agent_wrappers "$CONTAINER" "$JOB_FILE"
-  [ -z "$SETUP" ] || docker exec "$CONTAINER" sh -lc "$SETUP" >&2
-  printf '%s' "$CONTAINER"
+  configure_credentials "$TARGET" "$JOB_FILE"
+  configure_skills "$TARGET" "$JOB_FILE"
+  configure_mcp_servers "$TARGET" "$JOB_FILE"
+  install_agent_wrappers "$TARGET" "$JOB_FILE"
+  [ -z "$SETUP" ] || docker exec "$TARGET" sh -lc "$SETUP" >&2
+  printf '%s' "$TARGET"
 }
 
 sandbox_container_name() {
@@ -939,30 +1124,69 @@ sandbox_container_name() {
 }
 
 start_sandbox() {
-  CONTAINER=$(sandbox_container_name "$1")
-  docker inspect "$CONTAINER" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
-  docker start "$CONTAINER" >/dev/null
-  printf '%s' "$CONTAINER"
+  JOB_FILE=$1
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  TARGET=$(sandbox_container_name "$JOB_FILE")
+  AGENTBOX_RUNTIME_DRIVER=$DRIVER
+  export AGENTBOX_RUNTIME_DRIVER
+  if [ "$DRIVER" = docker ]; then
+    docker inspect "$TARGET" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
+    docker start "$TARGET" >/dev/null
+  else
+    runtime_call "$DRIVER" start "$TARGET" >/dev/null
+  fi
+
+  if jq -e '.job.payload.credentials? and .job.payload.agentTools?' "$JOB_FILE" >/dev/null; then
+    install_agent_tools "$TARGET" "$JOB_FILE"
+    configure_credentials "$TARGET" "$JOB_FILE"
+    configure_skills "$TARGET" "$JOB_FILE"
+    configure_mcp_servers "$TARGET" "$JOB_FILE"
+    install_agent_wrappers "$TARGET" "$JOB_FILE"
+  fi
+  printf '%s' "$TARGET"
+}
+
+restart_sandbox() {
+  JOB_FILE=$1
+  stop_sandbox "$JOB_FILE" >/dev/null
+  start_sandbox "$JOB_FILE"
 }
 
 stop_sandbox() {
-  CONTAINER=$(sandbox_container_name "$1")
-  docker inspect "$CONTAINER" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
-  docker stop --time 10 "$CONTAINER" >/dev/null
-  printf '%s' "$CONTAINER"
+  JOB_FILE=$1
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  TARGET=$(sandbox_container_name "$JOB_FILE")
+  AGENTBOX_RUNTIME_DRIVER=$DRIVER
+  export AGENTBOX_RUNTIME_DRIVER
+  if [ "$DRIVER" = docker ]; then
+    docker inspect "$TARGET" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
+    docker stop --time 10 "$TARGET" >/dev/null
+  else
+    runtime_call "$DRIVER" stop "$TARGET" >/dev/null
+  fi
+  printf '%s' "$TARGET"
 }
 
 delete_sandbox() {
   JOB_FILE=$1
   SANDBOX_ID=$(jq -r '.job.payload.sandboxId' "$JOB_FILE")
-  CONTAINER=$(sandbox_container_name "$JOB_FILE")
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
-  docker volume rm "agentbox-$SANDBOX_ID-workspace" >/dev/null 2>&1 || true
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  TARGET=$(sandbox_container_name "$JOB_FILE")
+  AGENTBOX_RUNTIME_DRIVER=$DRIVER
+  export AGENTBOX_RUNTIME_DRIVER
+  if [ "$DRIVER" = docker ]; then
+    docker rm -f "$TARGET" >/dev/null 2>&1 || true
+    docker volume rm "agentbox-$SANDBOX_ID-workspace" >/dev/null 2>&1 || true
+  else
+    runtime_call "$DRIVER" delete "$TARGET"
+  fi
 }
 
 login_agent() {
   JOB_FILE=$1
   CONTAINER=$(sandbox_container_name "$JOB_FILE")
+  AGENTBOX_RUNTIME_DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  export AGENTBOX_RUNTIME_DRIVER
   TOOL=$(jq -r '.job.payload.tool // empty' "$JOB_FILE")
   docker inspect "$CONTAINER" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
   case "$TOOL" in
@@ -1017,11 +1241,12 @@ process_job() {
       fi
       rm -f "$LOG_FILE"
       ;;
-    start-sandbox|stop-sandbox|delete-sandbox)
+    start-sandbox|stop-sandbox|restart-sandbox|delete-sandbox)
       LOG_FILE=$(mktemp)
       case "$ACTION" in
         start-sandbox) OPERATION=start_sandbox ;;
         stop-sandbox) OPERATION=stop_sandbox ;;
+        restart-sandbox) OPERATION=restart_sandbox ;;
         delete-sandbox) OPERATION=delete_sandbox ;;
       esac
       if EXTERNAL_ID=$($OPERATION "$JOB_FILE" 2>"$LOG_FILE"); then
@@ -1069,8 +1294,8 @@ run_worker() {
   heartbeat_loop &
   HEARTBEAT_PID=$!
   SESSION_PID=
-  if command -v python3 >/dev/null && [ -r /usr/local/lib/agentbox/session_worker.py ]; then
-    python3 /usr/local/lib/agentbox/session_worker.py "$CONFIG" &
+  if SESSION_PYTHON=$(runtime_python 2>/dev/null) && [ -r /usr/local/lib/agentbox/session_worker.py ]; then
+    "$SESSION_PYTHON" /usr/local/lib/agentbox/session_worker.py "$CONFIG" &
     SESSION_PID=$!
   fi
   trap 'kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true; [ -z "$SESSION_PID" ] || kill "$SESSION_PID" >/dev/null 2>&1 || true' EXIT INT TERM

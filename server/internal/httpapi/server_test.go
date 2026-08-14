@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"agentbox/internal/agent"
+	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
 	"agentbox/internal/store"
 )
@@ -23,16 +23,6 @@ func (emptyUsersStore) ListUsers(context.Context) ([]platform.User, error) {
 	return []platform.User{}, nil
 }
 
-func (fakeStore) List(context.Context) ([]agent.Agent, error)      { return []agent.Agent{}, nil }
-func (fakeStore) Get(context.Context, string) (agent.Agent, error) { return agent.Agent{}, nil }
-func (fakeStore) Create(_ context.Context, input agent.Input) (agent.Agent, error) {
-	return agent.Agent{Input: input, ID: "b88eb8db-3954-4d1a-bda3-005e1fb375c4", Version: 1}, nil
-}
-func (fakeStore) Update(context.Context, string, agent.Input, int) (agent.Agent, error) {
-	return agent.Agent{}, nil
-}
-func (fakeStore) Duplicate(context.Context, string) (agent.Agent, error) { return agent.Agent{}, nil }
-func (fakeStore) Delete(context.Context, string) error                   { return nil }
 func (fakeStore) ListResources(context.Context) ([]platform.Resource, error) {
 	return []platform.Resource{}, nil
 }
@@ -120,15 +110,15 @@ func (fakeStore) DeleteUser(context.Context, string) error { return nil }
 func (fakeStore) Ping(context.Context) error               { return nil }
 
 func rawTestHandler() http.Handler {
-	return New(fakeStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{})
+	return New(fakeStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{})
 }
 
 func debugTestHandler() http.Handler {
-	return New(fakeStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
+	return New(fakeStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
 }
 
 func emptyDebugTestHandler() http.Handler {
-	return New(emptyUsersStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
+	return New(emptyUsersStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
 }
 
 func testHandler() http.Handler {
@@ -261,8 +251,8 @@ func TestDeleteCredentialModelEndpoint(t *testing.T) {
 	}
 }
 
-func TestInvalidAgentIDReturnsNotFound(t *testing.T) {
-	request := httptest.NewRequest(http.MethodGet, "/api/agents/not-a-uuid", nil)
+func TestLegacyAgentRoutesAreRemoved(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/agents", nil)
 	response := httptest.NewRecorder()
 	testHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound {
@@ -271,7 +261,7 @@ func TestInvalidAgentIDReturnsNotFound(t *testing.T) {
 }
 
 func TestCreateRejectsUnknownJSONFields(t *testing.T) {
-	request := httptest.NewRequest(http.MethodPost, "/api/agents", strings.NewReader(`{"unexpected":true}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/resources", strings.NewReader(`{"unexpected":true}`))
 	response := httptest.NewRecorder()
 	testHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
@@ -324,18 +314,5 @@ func TestLegacyQueuedWorkspaceRoutesAreRemoved(t *testing.T) {
 	testHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
-	}
-}
-
-func TestDeleteAgentIsAccepted(t *testing.T) {
-	request := httptest.NewRequest(
-		http.MethodDelete,
-		"/api/agents/b88eb8db-3954-4d1a-bda3-005e1fb375c4",
-		nil,
-	)
-	response := httptest.NewRecorder()
-	testHandler().ServeHTTP(response, request)
-	if response.Code != http.StatusNoContent {
-		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
 	}
 }

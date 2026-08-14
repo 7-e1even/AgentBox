@@ -13,13 +13,15 @@ func TestWorkerJobLeaseCoversLargeAgentImageBuilds(t *testing.T) {
 	}
 }
 
-func TestRuntimeImageAvailabilityAllowsDockerPull(t *testing.T) {
+func TestRuntimeImageAvailabilityAllowsOCIPullForManagedDrivers(t *testing.T) {
 	inventory := platform.ServerInventory{}
-	if !runtimeImageIsAvailable("docker", inventory, "ubuntu:24.04", "amd64") {
-		t.Fatal("Docker registry references should be pullable even when the local inventory is empty")
-	}
-	if runtimeImageIsAvailable("docker", inventory, "  ", "amd64") {
-		t.Fatal("empty Docker image references must not be accepted")
+	for _, driver := range []string{"docker", "boxlite", "microsandbox"} {
+		if !runtimeImageIsAvailable(driver, inventory, "ubuntu:24.04", "amd64") {
+			t.Fatalf("%s registry references should be pullable when local inventory is empty", driver)
+		}
+		if runtimeImageIsAvailable(driver, inventory, "  ", "amd64") {
+			t.Fatalf("empty %s image references must not be accepted", driver)
+		}
 	}
 }
 

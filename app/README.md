@@ -2,7 +2,7 @@
 
 AgentBox 的 Windows 操作平台，使用 Next.js 16、React 19、Tailwind CSS 4 和 shadcn/ui。
 
-前端不直接访问 PostgreSQL。服务端渲染和浏览器请求统一通过 `AGENTBOX_API_URL` 或 `/api` 代理访问独立 Go API。
+前端不直接访问 PostgreSQL。服务端渲染通过 `AGENTBOX_API_URL` 访问独立 Go API；浏览器、Worker 和交互 WebSocket 统一走前端 `/api` 代理，因此部署时只需公开平台入口端口。
 
 ```powershell
 Copy-Item .env.example .env.local

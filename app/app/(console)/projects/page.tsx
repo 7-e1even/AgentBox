@@ -1,5 +1,5 @@
-import { redirect } from "next/navigation"
+import { ControlPlaneSection } from "@/components/control-plane-shell"
 
 export default function ProjectsPage() {
-  redirect("/overview")
+  return <ControlPlaneSection section="projects" />
 }

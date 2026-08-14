@@ -446,6 +446,12 @@ function DataTablePagination<TData>({ table }: { table: TanStackTable<TData> }) 
   const last = Math.min((pageIndex + 1) * pageSize, total)
   const pages = visiblePages(pageIndex + 1, pageCount)
 
+  if (pageCount <= 1) {
+    return (
+      <p className="px-1 text-xs text-muted-foreground">共 {total} 项</p>
+    )
+  }
+
   return (
     <div className="flex flex-col gap-3 px-1 sm:flex-row sm:items-center sm:justify-between">
       <p className="text-xs text-muted-foreground">

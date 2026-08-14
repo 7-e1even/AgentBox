@@ -20,8 +20,6 @@ const (
 	KindSkill    Kind = "skill"
 	KindMCP      Kind = "mcp"
 	KindSandbox  Kind = "sandbox"
-	KindSchedule Kind = "schedule"
-	KindWebhook  Kind = "webhook"
 	KindVariable Kind = "variable"
 )
 
@@ -256,7 +254,9 @@ func NormalizeCredential(input *CredentialInput) {
 	input.ProviderID = strings.ToLower(strings.TrimSpace(input.ProviderID))
 	input.Protocol = strings.ToLower(strings.TrimSpace(input.Protocol))
 	input.Endpoint = strings.TrimSpace(input.Endpoint)
-	input.ModelID = strings.TrimSpace(input.ModelID)
+	// Model selection belongs to a sandbox instance. Credentials only expose a
+	// catalog of available models and intentionally have no platform default.
+	input.ModelID = ""
 	input.Secret = strings.TrimSpace(input.Secret)
 }
 
@@ -283,12 +283,6 @@ func ValidateCredential(input CredentialInput, requireSecret bool) error {
 		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
 			return &ValidationError{Message: "接口地址必须是有效的 HTTP 或 HTTPS URL"}
 		}
-	}
-	if n := utf8.RuneCountInString(input.ModelID); n > 160 {
-		return &ValidationError{Message: "模型名称过长"}
-	}
-	if strings.ContainsAny(input.ModelID, "\r\n") {
-		return &ValidationError{Message: "模型 ID 不能包含换行符"}
 	}
 	if requireSecret && input.Secret == "" {
 		return &ValidationError{Message: "请填写 API Key"}
@@ -358,15 +352,6 @@ func Validate(input Input) error {
 			}
 		}
 	}
-	if input.Kind == KindSchedule {
-		if err := require(input.Spec, "agentId", "请选择目标 Agent"); err != nil {
-			return err
-		}
-		cron, _ := input.Spec["cron"].(string)
-		if len(strings.Fields(cron)) != 5 {
-			return &ValidationError{Message: "Cron 表达式需要 5 段"}
-		}
-	}
 	if input.Kind == KindMCP {
 		transport, _ := input.Spec["transport"].(string)
 		if transport != "stdio" && transport != "http" {
@@ -384,7 +369,7 @@ func Validate(input Input) error {
 		}
 		driver, _ := input.Spec["driver"].(string)
 		switch driver {
-		case "docker", "vm":
+		case "docker", "boxlite", "microsandbox", "vm":
 		default:
 			return &ValidationError{Message: "Runtime 驱动无效"}
 		}
@@ -406,15 +391,6 @@ func Validate(input Input) error {
 		if err := validateAgentTools(input.Spec); err != nil {
 			return err
 		}
-	}
-	if input.Kind == KindWebhook {
-		if err := require(input.Spec, "agentId", "请选择目标 Agent"); err != nil {
-			return err
-		}
-		if err := require(input.Spec, "path", "请填写 Webhook 路径"); err != nil {
-			return err
-		}
-		return require(input.Spec, "secretRef", "请配置签名密钥引用")
 	}
 	if input.Kind == KindVariable {
 		if err := require(input.Spec, "key", "请填写环境变量名"); err != nil {
@@ -466,7 +442,7 @@ func IsValidationError(err error) bool {
 
 func isKind(kind Kind) bool {
 	switch kind {
-	case KindProject, KindImage, KindRuntime, KindSkill, KindMCP, KindSandbox, KindSchedule, KindWebhook, KindVariable:
+	case KindProject, KindImage, KindRuntime, KindSkill, KindMCP, KindSandbox, KindVariable:
 		return true
 	default:
 		return false

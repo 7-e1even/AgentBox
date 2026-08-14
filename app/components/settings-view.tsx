@@ -721,8 +721,8 @@ function EnvironmentSettings({
           <KeyRoundIcon />
           <AlertTitle>平台保存引用，不保存宿主机明文</AlertTitle>
           <AlertDescription>
-            例如 GITHUB_TOKEN 可以指向 env://GITHUB_TOKEN 或
-            secret://GITHUB_TOKEN。环境模板或 Agent
+            例如 CUSTOM_API_TOKEN 可以指向 env://CUSTOM_API_TOKEN 或
+            secret://CUSTOM_API_TOKEN。环境模板或 Agent
             选中它后，创建沙箱时才解析并注入。
           </AlertDescription>
         </Alert>

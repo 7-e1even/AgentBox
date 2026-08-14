@@ -1,7 +1,8 @@
 "use client"
 
-import { BoxesIcon, CheckIcon, ChevronsUpDownIcon } from "lucide-react"
+import { CheckIcon, ChevronsUpDownIcon } from "lucide-react"
 
+import { AgentBoxMark } from "@/components/agentbox-mark"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -17,6 +18,7 @@ import {
   useSidebar,
 } from "@/components/ui/sidebar"
 import type { Resource } from "@/lib/platform-schema"
+import { getProjectEmoji } from "@/lib/project-emoji"
 
 export function TeamSwitcher({
   projects,
@@ -40,8 +42,8 @@ export function TeamSwitcher({
               size="lg"
               className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
             >
-              <span className="flex aspect-square size-8 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
-                <BoxesIcon />
+              <span className="flex aspect-square size-8 items-center justify-center rounded-lg border border-sidebar-border bg-sidebar-accent text-sidebar-foreground">
+                <AgentBoxMark />
               </span>
               <span className="grid flex-1 text-left text-sm leading-tight">
                 <span className="truncate font-semibold">AgentBox</span>
@@ -67,7 +69,12 @@ export function TeamSwitcher({
                   key={project.id}
                   onClick={() => onProjectChange(project.id)}
                 >
-                  <BoxesIcon />
+                  <span
+                    aria-hidden="true"
+                    className="w-4 shrink-0 text-center text-sm leading-none"
+                  >
+                    {getProjectEmoji(project)}
+                  </span>
                   <span className="min-w-0 flex-1 truncate">
                     {project.name}
                   </span>

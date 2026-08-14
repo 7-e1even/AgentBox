@@ -3,7 +3,6 @@
 import { useMemo, useState } from "react"
 import {
   ActivityIcon,
-  CheckIcon,
   ChevronsUpIcon,
   ChevronDownIcon,
   EllipsisVerticalIcon,
@@ -848,10 +847,8 @@ function CredentialEditor({
           <CredentialModels
             credential={credential}
             models={credential?.models ?? []}
-            defaultModelId={input.modelId}
             busy={saving || pullingModels}
             pulling={pullingModels}
-            onSelect={(modelId) => update("modelId", modelId)}
             onPull={() => void pullModels()}
             onAdd={onAddModel}
             onDelete={onDeleteModel}
@@ -947,10 +944,8 @@ function ApiSettingsDialog({
 function CredentialModels({
   credential,
   models,
-  defaultModelId,
   busy,
   pulling,
-  onSelect,
   onPull,
   onAdd,
   onDelete,
@@ -958,10 +953,8 @@ function CredentialModels({
 }: {
   credential: ManagedCredential | null
   models: CredentialModel[]
-  defaultModelId: string
   busy: boolean
   pulling: boolean
-  onSelect: (modelId: string) => void
   onPull: () => void
   onAdd: AccessManagementProps["onAddModel"]
   onDelete: AccessManagementProps["onDeleteModel"]
@@ -1081,6 +1074,9 @@ function CredentialModels({
               </Tooltip>
             )}
           </CardTitle>
+          <CardDescription>
+            这里只维护可用模型；具体模型在创建或编辑沙箱时选择。
+          </CardDescription>
           <CardAction>
             <ButtonGroup aria-label="模型操作">
               <Button
@@ -1183,72 +1179,43 @@ function CredentialModels({
                     </CollapsibleTrigger>
                     <CollapsibleContent>
                       <CollectionList className="rounded-none border-x-0 border-b-0">
-                        {groupModels.map((model) => {
-                          const selected = model.id === defaultModelId
-                          return (
-                            <CollectionListItem
-                              key={model.id}
-                              variant={selected ? "muted" : "default"}
-                            >
-                              <button
-                                type="button"
-                                className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                                onClick={() => onSelect(model.id)}
-                              >
-                                <ItemMedia
-                                  className={cn(
-                                    "flex size-8 shrink-0 items-center justify-center rounded-lg border text-xs font-semibold",
-                                    selected &&
-                                      "border-primary bg-primary text-primary-foreground"
+                        {groupModels.map((model) => (
+                          <CollectionListItem key={model.id}>
+                            <div className="flex min-w-0 flex-1 items-center gap-3">
+                              <ItemMedia className="flex size-8 shrink-0 items-center justify-center rounded-lg border text-xs font-semibold">
+                                {model.name.slice(0, 1)}
+                              </ItemMedia>
+                              <ItemContent className="min-w-0">
+                                <ItemTitle>
+                                  {model.name}
+                                  {model.source === "manual" && (
+                                    <Badge variant="outline">手动</Badge>
                                   )}
-                                >
-                                  {selected ? (
-                                    <CheckIcon />
-                                  ) : (
-                                    model.name.slice(0, 1)
-                                  )}
-                                </ItemMedia>
-                                <ItemContent className="min-w-0">
-                                  <ItemTitle>
-                                    {model.name}
-                                    {selected && (
-                                      <Badge variant="secondary">默认</Badge>
-                                    )}
-                                    {model.source === "manual" && (
-                                      <Badge variant="outline">手动</Badge>
-                                    )}
-                                  </ItemTitle>
-                                  {model.name !== model.id && (
-                                    <ItemDescription>
-                                      {model.id}
-                                    </ItemDescription>
-                                  )}
-                                </ItemContent>
-                              </button>
-                              <ItemActions>
-                                <Tooltip>
-                                  <TooltipTrigger asChild>
-                                    <Button
-                                      type="button"
-                                      variant="ghost"
-                                      size="icon-sm"
-                                      aria-label={`删除 ${model.name}`}
-                                      disabled={
-                                        selected || deletingId === model.id
-                                      }
-                                      onClick={() => void deleteModel(model)}
-                                    >
-                                      <Trash2Icon />
-                                    </Button>
-                                  </TooltipTrigger>
-                                  <TooltipContent>
-                                    {selected ? "默认模型不能删除" : "删除模型"}
-                                  </TooltipContent>
-                                </Tooltip>
-                              </ItemActions>
-                            </CollectionListItem>
-                          )
-                        })}
+                                </ItemTitle>
+                                {model.name !== model.id && (
+                                  <ItemDescription>{model.id}</ItemDescription>
+                                )}
+                              </ItemContent>
+                            </div>
+                            <ItemActions>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon-sm"
+                                    aria-label={`删除 ${model.name}`}
+                                    disabled={deletingId === model.id}
+                                    onClick={() => void deleteModel(model)}
+                                  >
+                                    <Trash2Icon />
+                                  </Button>
+                                </TooltipTrigger>
+                                <TooltipContent>删除模型</TooltipContent>
+                              </Tooltip>
+                            </ItemActions>
+                          </CollectionListItem>
+                        ))}
                       </CollectionList>
                     </CollapsibleContent>
                   </Collapsible>
@@ -1375,7 +1342,7 @@ function inputFromCredential(credential: ManagedCredential): CredentialInput {
       credential.endpoint,
       credential.protocol
     ),
-    modelId: credential.modelId,
+    modelId: "",
     secret: "",
     enabled: credential.enabled,
   }
@@ -1430,7 +1397,6 @@ function isCredentialDirty(
     input.providerId !== credential.providerId ||
     input.protocol !== credential.protocol ||
     input.endpoint !== credential.endpoint ||
-    input.modelId !== credential.modelId ||
     input.enabled !== credential.enabled ||
     input.secret.length > 0
   )

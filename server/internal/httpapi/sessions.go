@@ -47,6 +47,7 @@ type sessionMessage struct {
 	Operation  string          `json:"operation,omitempty"`
 	Path       string          `json:"path,omitempty"`
 	Content    string          `json:"content,omitempty"`
+	UploadID   string          `json:"uploadId,omitempty"`
 	Cols       int             `json:"cols,omitempty"`
 	Rows       int             `json:"rows,omitempty"`
 	OK         bool            `json:"ok,omitempty"`
@@ -244,19 +245,21 @@ func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID stri
 	}
 	serverID, _ := sandbox.Spec["serverId"].(string)
 	externalID, _ := sandbox.Spec["externalId"].(string)
-	runtimeID, _ := sandbox.Spec["runtimeId"].(string)
-	driver := ""
-	for index := range resources {
-		if resources[index].Kind == platform.KindRuntime && resources[index].ID == runtimeID {
-			driver, _ = resources[index].Spec["driver"].(string)
-			break
+	driver, _ := sandbox.Spec["driver"].(string)
+	if driver == "" {
+		runtimeID, _ := sandbox.Spec["runtimeId"].(string)
+		for index := range resources {
+			if resources[index].Kind == platform.KindRuntime && resources[index].ID == runtimeID {
+				driver, _ = resources[index].Spec["driver"].(string)
+				break
+			}
 		}
 	}
 	if serverID == "" || externalID == "" || driver == "" {
 		return sandboxSessionTarget{}, fmt.Errorf("%w: sandbox session target is incomplete", store.ErrConflict)
 	}
-	if driver != "docker" {
-		return sandboxSessionTarget{}, fmt.Errorf("%w: %s sessions are not available because the runtime backend is not implemented", store.ErrConflict, driver)
+	if driver != "docker" && driver != "boxlite" && driver != "microsandbox" {
+		return sandboxSessionTarget{}, fmt.Errorf("%w: unsupported sandbox session driver: %s", store.ErrConflict, driver)
 	}
 	return sandboxSessionTarget{SandboxID: sandboxID, ServerID: serverID, ExternalID: externalID, Driver: driver}, nil
 }
@@ -374,11 +377,27 @@ func validBrowserSessionMessage(payload []byte) (sessionMessage, bool) {
 	case "resize":
 		return message, message.Cols >= 2 && message.Cols <= 1000 && message.Rows >= 1 && message.Rows <= 500
 	case "rpc":
-		if message.RequestID == "" || len(message.RequestID) > 100 || len(message.Path) > 4096 || len(message.Content) > 512*1024 {
+		if message.RequestID == "" || len(message.RequestID) > 100 || message.Path == "" || len(message.Path) > 4096 {
 			return sessionMessage{}, false
 		}
-		return message, message.Operation == "list" || message.Operation == "read" || message.Operation == "write"
+		switch message.Operation {
+		case "list", "read":
+			return message, message.Content == "" && message.UploadID == ""
+		case "write":
+			return message, len(message.Content) <= 512*1024 && message.UploadID == ""
+		case "upload-start", "upload-finish", "upload-cancel":
+			return message, message.Content == "" && validUploadID(message.UploadID)
+		case "upload-chunk":
+			return message, len(message.Content) <= 384*1024 && validUploadID(message.UploadID)
+		default:
+			return sessionMessage{}, false
+		}
 	default:
 		return sessionMessage{}, false
 	}
+}
+
+func validUploadID(value string) bool {
+	_, err := uuid.Parse(value)
+	return err == nil
 }

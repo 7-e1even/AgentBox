@@ -78,7 +78,7 @@ func TestParseCredentialModels(t *testing.T) {
 	}
 }
 
-func TestMergeCredentialModelsPreservesManualAndDefault(t *testing.T) {
+func TestMergeCredentialModelsPreservesManualModelsOnly(t *testing.T) {
 	existing := []platform.CredentialModel{
 		{ID: "manual-model", Name: "Manual", Group: "manual", Source: "manual"},
 		{ID: "old-default", Name: "Old Default", Group: "old", Source: "remote"},
@@ -90,9 +90,8 @@ func TestMergeCredentialModelsPreservesManualAndDefault(t *testing.T) {
 	want := []platform.CredentialModel{
 		{ID: "manual-model", Name: "Manual", Group: "manual", Source: "manual"},
 		{ID: "new-model", Name: "New", Group: "new", Source: "remote"},
-		{ID: "old-default", Name: "Old Default", Group: "old", Source: "remote"},
 	}
-	if got := mergeCredentialModels(existing, remote, "old-default"); !reflect.DeepEqual(got, want) {
+	if got := mergeCredentialModels(existing, remote); !reflect.DeepEqual(got, want) {
 		t.Fatalf("mergeCredentialModels() = %#v, want %#v", got, want)
 	}
 }

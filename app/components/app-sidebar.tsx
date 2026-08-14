@@ -1,11 +1,12 @@
 "use client"
 
 import {
-  BoxesIcon,
   BoxIcon,
+  FolderKanbanIcon,
   ImagesIcon,
   KeyRoundIcon,
   LayoutDashboardIcon,
+  LayoutTemplateIcon,
   PlugZapIcon,
   ServerIcon,
   SparklesIcon,
@@ -40,8 +41,9 @@ export function AppSidebar({
       title: "工作区",
       items: [
         { title: "概览", section: "overview", icon: LayoutDashboardIcon },
+        { title: "项目", section: "projects", icon: FolderKanbanIcon },
         { title: "沙箱", section: "sandboxes", icon: BoxIcon },
-        { title: "沙箱模板", section: "runtimes", icon: BoxesIcon },
+        { title: "沙箱模板", section: "runtimes", icon: LayoutTemplateIcon },
       ],
     },
     {

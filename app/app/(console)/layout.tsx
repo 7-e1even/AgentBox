@@ -1,9 +1,8 @@
 import { cookies } from "next/headers"
 import { redirect } from "next/navigation"
 
-import { AgentManagement } from "@/components/agent-management"
+import { ControlPlaneShell } from "@/components/control-plane-shell"
 import { BackendUnavailable } from "@/components/backend-unavailable"
-import { agentsResponseSchema } from "@/lib/agent-schema"
 import { catalogSchema } from "@/lib/catalog"
 import { credentialsResponseSchema } from "@/lib/credential-schema"
 import { resourcesResponseSchema } from "@/lib/platform-schema"
@@ -14,20 +13,17 @@ import { userResponseSchema, usersResponseSchema } from "@/lib/user-schema"
 async function loadPlatform(cookieHeader: string, isAdmin: boolean) {
   const apiOrigin = process.env.AGENTBOX_API_URL || "http://127.0.0.1:8091"
   const [
-    agentsResponse,
     catalogResponse,
     resourcesResponse,
     serversResponse,
     credentialsResponse,
   ] = await Promise.all([
-    fetch(`${apiOrigin}/api/agents`, requestOptions(cookieHeader)),
     fetch(`${apiOrigin}/api/catalog`, requestOptions(cookieHeader)),
     fetch(`${apiOrigin}/api/resources`, requestOptions(cookieHeader)),
     fetch(`${apiOrigin}/api/servers`, requestOptions(cookieHeader)),
     fetch(`${apiOrigin}/api/credentials`, requestOptions(cookieHeader)),
   ])
   if (
-    !agentsResponse.ok ||
     !catalogResponse.ok ||
     !resourcesResponse.ok ||
     !serversResponse.ok ||
@@ -35,7 +31,6 @@ async function loadPlatform(cookieHeader: string, isAdmin: boolean) {
   ) {
     throw new Error("Go API returned an error")
   }
-  const agentsBody = agentsResponseSchema.parse(await agentsResponse.json())
   const catalog = catalogSchema.parse(await catalogResponse.json())
   const resources = resourcesResponseSchema.parse(
     await resourcesResponse.json()
@@ -56,7 +51,6 @@ async function loadPlatform(cookieHeader: string, isAdmin: boolean) {
       ).users
     : []
   return {
-    agents: agentsBody.agents,
     catalog,
     resources: resources.resources,
     servers: servers.servers,
@@ -107,8 +101,7 @@ export default async function ConsoleLayout({
   )
 
   return (
-    <AgentManagement
-      initialAgents={platform.agents}
+    <ControlPlaneShell
       catalog={platform.catalog}
       initialResources={platform.resources}
       initialServers={platform.servers}
@@ -118,6 +111,6 @@ export default async function ConsoleLayout({
       initialProjectId={initialProjectId}
     >
       {children}
-    </AgentManagement>
+    </ControlPlaneShell>
   )
 }

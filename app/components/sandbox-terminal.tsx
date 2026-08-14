@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useRef } from "react"
+import { forwardRef, useEffect, useImperativeHandle, useRef } from "react"
 import { FitAddon } from "@xterm/addon-fit"
 import { Terminal } from "@xterm/xterm"
 
@@ -9,13 +9,33 @@ import {
   type SandboxSessionState,
 } from "@/lib/sandbox-session"
 
-export function SandboxTerminal({
-  session,
-}: {
-  session: SandboxSessionClient
-}) {
+export type SandboxTerminalHandle = {
+  pasteFromClipboard: () => Promise<boolean>
+}
+
+export const SandboxTerminal = forwardRef<
+  SandboxTerminalHandle,
+  {
+    session: SandboxSessionClient
+  }
+>(function SandboxTerminal({ session }, ref) {
   const containerRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
+
+  useImperativeHandle(ref, () => ({
+    async pasteFromClipboard() {
+      const terminal = terminalRef.current
+      if (!terminal) return false
+      const text = await navigator.clipboard.readText()
+      if (!text) {
+        terminal.focus()
+        return false
+      }
+      terminal.paste(text)
+      terminal.focus()
+      return true
+    },
+  }))
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -73,12 +93,13 @@ export function SandboxTerminal({
 
   return (
     <div
-      ref={containerRef}
       aria-label="沙箱 root 终端"
       className="h-full min-h-0 w-full bg-[#0c0c0c] p-2"
-    />
+    >
+      <div ref={containerRef} className="h-full min-h-0 w-full" />
+    </div>
   )
-}
+})
 
 function terminalTheme() {
   return {

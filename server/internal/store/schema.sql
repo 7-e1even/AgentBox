@@ -1,40 +1,10 @@
-CREATE TABLE IF NOT EXISTS agents (
-  id UUID PRIMARY KEY,
-  project_id TEXT NOT NULL,
-  name TEXT NOT NULL,
-  slug TEXT NOT NULL UNIQUE,
-  description TEXT NOT NULL DEFAULT '',
-  avatar TEXT NOT NULL,
-  provider_id TEXT NOT NULL,
-  model_id TEXT NOT NULL,
-  credential_id TEXT,
-  system_prompt TEXT NOT NULL,
-  skill_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-  mcp_server_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
-  temperature DOUBLE PRECISION NOT NULL DEFAULT 0.4,
-  max_steps INTEGER NOT NULL DEFAULT 12,
-  status TEXT NOT NULL CHECK (status IN ('draft', 'active', 'archived')),
-  version INTEGER NOT NULL DEFAULT 1,
-  created_at TIMESTAMPTZ NOT NULL,
-  updated_at TIMESTAMPTZ NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS agent_revisions (
-  id BIGSERIAL PRIMARY KEY,
-  agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-  version INTEGER NOT NULL,
-  snapshot JSONB NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL,
-  UNIQUE (agent_id, version)
-);
-
-CREATE INDEX IF NOT EXISTS idx_agents_project_status
-  ON agents(project_id, status, updated_at DESC);
+DROP TABLE IF EXISTS agent_revisions;
+DROP TABLE IF EXISTS agents;
 
 CREATE TABLE IF NOT EXISTS control_resources (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN (
-    'project', 'image', 'runtime', 'skill', 'mcp', 'sandbox', 'schedule', 'webhook', 'variable'
+    'project', 'image', 'runtime', 'skill', 'mcp', 'sandbox', 'variable'
   )),
   project_id TEXT,
   name TEXT NOT NULL,
@@ -49,8 +19,9 @@ CREATE INDEX IF NOT EXISTS idx_control_resources_kind_project
   ON control_resources(kind, project_id, updated_at DESC);
 
 ALTER TABLE control_resources DROP CONSTRAINT IF EXISTS control_resources_kind_check;
+DELETE FROM control_resources WHERE kind IN ('schedule', 'webhook');
 ALTER TABLE control_resources ADD CONSTRAINT control_resources_kind_check CHECK (kind IN (
-  'project', 'image', 'runtime', 'skill', 'mcp', 'sandbox', 'schedule', 'webhook', 'variable'
+  'project', 'image', 'runtime', 'skill', 'mcp', 'sandbox', 'variable'
 ));
 
 CREATE TABLE IF NOT EXISTS managed_servers (
@@ -108,6 +79,24 @@ ALTER TABLE provider_credentials ADD COLUMN IF NOT EXISTS last_check_at TIMESTAM
 ALTER TABLE provider_credentials ADD COLUMN IF NOT EXISTS last_check_ok BOOLEAN;
 ALTER TABLE provider_credentials ADD COLUMN IF NOT EXISTS last_check_error TEXT NOT NULL DEFAULT '';
 
+-- Move legacy credential defaults to the sandbox that actually consumes them.
+-- This is idempotent: existing explicit bindings are never overwritten.
+UPDATE control_resources sandbox
+SET spec = jsonb_set(
+  sandbox.spec,
+  '{modelBindings}',
+  COALESCE((
+    SELECT jsonb_object_agg(credential.id, credential.model_id)
+    FROM provider_credentials credential
+    WHERE credential.model_id <> ''
+      AND sandbox.spec->'credentialIds' ? credential.id
+  ), '{}'::jsonb),
+  TRUE
+)
+WHERE sandbox.kind = 'sandbox' AND NOT (sandbox.spec ? 'modelBindings');
+
+UPDATE provider_credentials SET model_id = '' WHERE model_id <> '';
+
 CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider
   ON provider_credentials(provider_id, enabled, updated_at DESC);
 
@@ -158,28 +147,6 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 CREATE INDEX IF NOT EXISTS idx_user_sessions_expiry
   ON user_sessions(expires_at);
 
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS runtime_id TEXT NOT NULL DEFAULT 'docker-agent';
-ALTER TABLE agents ALTER COLUMN runtime_id SET DEFAULT 'docker-agent';
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS variable_ids JSONB NOT NULL DEFAULT '[]'::jsonb;
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS custom_args JSONB NOT NULL DEFAULT '[]'::jsonb;
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS concurrency INTEGER NOT NULL DEFAULT 1;
-ALTER TABLE agents ADD COLUMN IF NOT EXISTS sandbox_policy TEXT NOT NULL DEFAULT 'new';
-
-UPDATE agents SET variable_ids = '[]'::jsonb WHERE variable_ids = 'null'::jsonb;
-UPDATE agents SET custom_args = '[]'::jsonb WHERE custom_args = 'null'::jsonb;
-
-UPDATE agents
-SET runtime_id = 'docker-agent'
-WHERE runtime_id IN (
-  SELECT id FROM control_resources WHERE kind = 'runtime' AND spec->>'driver' = 'process'
-);
-
-UPDATE agent_revisions
-SET snapshot = jsonb_set(snapshot, '{runtimeId}', to_jsonb('docker-agent'::text), TRUE)
-WHERE snapshot->>'runtimeId' IN (
-  SELECT id FROM control_resources WHERE kind = 'runtime' AND spec->>'driver' = 'process'
-);
-
 UPDATE control_resources
 SET spec = jsonb_set(spec, '{runtimeId}', to_jsonb('docker-agent'::text), TRUE)
 WHERE kind = 'sandbox' AND spec->>'runtimeId' IN (
@@ -214,10 +181,10 @@ SELECT
     'modes', CASE
       WHEN spec->>'image' = 'ubuntu:24.04'
         THEN '["docker", "vm"]'::jsonb
-      WHEN bool_or(spec->>'driver' = 'docker') AND bool_or(spec->>'driver' IN ('boxlite', 'microsandbox'))
+      WHEN bool_or(spec->>'driver' = 'vm') AND bool_or(spec->>'driver' IN ('docker', 'boxlite', 'microsandbox'))
         THEN '["docker", "vm"]'::jsonb
       WHEN bool_or(spec->>'driver' IN ('boxlite', 'microsandbox'))
-        THEN '["vm"]'::jsonb
+        THEN '["docker"]'::jsonb
       ELSE '["docker"]'::jsonb
     END
   ),
@@ -236,10 +203,6 @@ SET spec = (spec - 'image') || jsonb_build_object(
   END
 )
 WHERE kind = 'runtime' AND COALESCE(spec->>'image', '') <> '';
-
-UPDATE control_resources
-SET spec = jsonb_set(spec, '{driver}', to_jsonb('vm'::text), TRUE)
-WHERE kind = 'runtime' AND spec->>'driver' IN ('boxlite', 'microsandbox');
 
 UPDATE control_resources
 SET spec = jsonb_set(spec, '{imageId}', to_jsonb('image-ubuntu-2404'::text), TRUE)
@@ -276,7 +239,7 @@ SET
     'agentTools', '["codex"]'::jsonb,
     'skillIds', '["code-review", "task-planner"]'::jsonb,
     'mcpServerIds', '["filesystem"]'::jsonb,
-    'variableIds', '["github-token"]'::jsonb
+    'variableIds', '[]'::jsonb
   )
 WHERE id = 'docker-agent'
   AND kind = 'runtime'
@@ -288,6 +251,17 @@ SET description = 'Docker 与 VM 环境模板可复用的基础 OCI 镜像'
 WHERE id = 'image-ubuntu-2404'
   AND kind = 'image'
   AND description = 'Docker 与 VM Runtime 可用的基础 OCI 镜像';
+
+DELETE FROM control_resources runtime
+WHERE runtime.id = 'docker-agent'
+  AND runtime.kind = 'runtime'
+  AND COALESCE(runtime.spec->>'serverId', '') = ''
+  AND NOT EXISTS (
+    SELECT 1
+    FROM control_resources sandbox
+    WHERE sandbox.kind = 'sandbox'
+      AND sandbox.spec->>'runtimeId' = runtime.id
+  );
 
 UPDATE control_resources
 SET spec = jsonb_set(spec, '{url}', to_jsonb('runtime://' || id), TRUE)
@@ -315,11 +289,39 @@ UPDATE control_resources
 SET enabled = FALSE,
     spec = spec || jsonb_build_object(
       'transport', 'http',
-      'url', 'https://api.githubcopilot.com/mcp/',
-      'headers', 'Authorization=env://GITHUB_TOKEN'
+      'url', 'https://api.githubcopilot.com/mcp/'
     )
 WHERE id = 'github' AND kind = 'mcp'
   AND COALESCE(spec->>'url', '') IN ('', 'runtime://github');
+
+UPDATE control_resources
+SET spec = jsonb_set(
+  spec,
+  '{variableIds}',
+  COALESCE(
+    (
+      SELECT jsonb_agg(variable_id)
+      FROM jsonb_array_elements_text(COALESCE(spec->'variableIds', '[]'::jsonb)) AS variables(variable_id)
+      WHERE variable_id <> 'github-token'
+    ),
+    '[]'::jsonb
+  ),
+  TRUE
+)
+WHERE kind IN ('runtime', 'sandbox')
+  AND spec->'variableIds' ? 'github-token';
+
+UPDATE control_resources
+SET spec = spec - 'headers'
+WHERE id = 'github'
+  AND kind = 'mcp'
+  AND spec->>'headers' = 'Authorization=env://GITHUB_TOKEN';
+
+DELETE FROM control_resources
+WHERE id = 'github-token'
+  AND kind = 'variable'
+  AND name = 'GITHUB_TOKEN'
+  AND spec->>'reference' = 'env://GITHUB_TOKEN';
 
 UPDATE control_resources
 SET spec = '{}'::jsonb

@@ -3,7 +3,11 @@
 import { useState } from "react"
 import { CheckIcon, SaveIcon } from "lucide-react"
 
-import { createSlug, type Agent } from "@/lib/agent-schema"
+import {
+  agentToolOptions,
+  commonAgentToolIds,
+  multicaLinuxAgentToolIds,
+} from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
 import {
   resourceInputSchema,
@@ -50,8 +54,6 @@ const labels: Record<ResourceKind, string> = {
   skill: "Skill",
   mcp: "MCP Server",
   sandbox: "Sandbox",
-  schedule: "定时任务",
-  webhook: "Webhook",
   variable: "变量引用",
 }
 
@@ -69,71 +71,57 @@ type SpecField = {
   advanced?: boolean
 }
 
-const commonAgentToolIds = [
-  "codex",
-  "claude-code",
-  "gemini-cli",
-  "opencode",
-  "pi",
-  "copilot-cli",
-  "qwen-code",
-]
+function runtimeDriverOptions(server?: ManagedServer): Option[] {
+  if (!server) return []
+  return [
+    {
+      value: "docker",
+      label: server.capabilities.includes("docker")
+        ? "Docker 容器"
+        : "Docker 容器 · Worker 未就绪",
+      disabled: !server.capabilities.includes("docker"),
+    },
+    {
+      value: "boxlite",
+      label: server.capabilities.includes("boxlite")
+        ? "BoxLite MicroVM（推荐）"
+        : "BoxLite MicroVM · SDK 自检未通过",
+      disabled: !server.capabilities.includes("boxlite"),
+    },
+    {
+      value: "microsandbox",
+      label: server.capabilities.includes("microsandbox")
+        ? "Microsandbox（实验）"
+        : "Microsandbox · SDK 自检未通过",
+      disabled: !server.capabilities.includes("microsandbox"),
+    },
+  ]
+}
 
-const multicaLinuxAgentToolIds = [
-  "antigravity",
-  "claude-code",
-  "codebuddy",
-  "codex",
-  "copilot-cli",
-  "cursor",
-  "grok",
-  "kimi",
-  "omp",
-  "openclaw",
-  "opencode",
-  "pi",
-  "qoder-cli",
-  "qoder-cn",
-  "qwen-code",
-  "qwenpaw",
-  "reasonix",
-]
-
-const agentToolOptions: Option[] = [
-  { value: "antigravity", label: "Antigravity" },
-  { value: "claude-code", label: "Claude Code" },
-  { value: "codebuddy", label: "CodeBuddy" },
-  { value: "codex", label: "Codex" },
-  { value: "copilot-cli", label: "GitHub Copilot CLI" },
-  { value: "cursor", label: "Cursor CLI" },
-  { value: "deveco", label: "DevEco Code（Linux 不支持）", disabled: true },
-  { value: "gemini-cli", label: "Gemini CLI" },
-  { value: "grok", label: "Grok CLI" },
-  { value: "kimi", label: "Kimi Code CLI" },
-  { value: "omp", label: "Oh-My-Pi" },
-  { value: "openclaw", label: "OpenClaw" },
-  { value: "opencode", label: "OpenCode" },
-  { value: "pi", label: "Pi" },
-  { value: "qoder-cli", label: "Qoder CLI" },
-  { value: "qoder-cn", label: "Qoder CLI CN" },
-  { value: "qwen-code", label: "Qwen Code" },
-  { value: "qwenpaw", label: "QwenPaw" },
-  { value: "reasonix", label: "Reasonix" },
-  { value: "trae-cli", label: "TRAE CLI（需自带）", disabled: true },
-]
+function runtimeDriverDescription(server: ManagedServer, driver: string) {
+  if (
+    server.capabilities.includes("kvm-device") &&
+    !server.capabilities.includes("boxlite") &&
+    !server.capabilities.includes("microsandbox")
+  ) {
+    return "服务器已检测到 KVM，但两个 MicroVM SDK 尚未通过 Worker 自检；重新运行 Worker 安装脚本后会自动开放。"
+  }
+  if (driver === "boxlite") {
+    return "由 Worker 通过 BoxLite SDK 创建独立 MicroVM，兼顾硬件隔离和快速启动。"
+  }
+  if (driver === "microsandbox") {
+    return "由 Worker 通过 Microsandbox SDK 创建 MicroVM；当前按实验能力开放。"
+  }
+  return "由 Worker 通过 Docker 创建容器，适合兼容性优先的环境。"
+}
 
 function fields(
   kind: ResourceKind,
-  agents: Agent[],
   resources: Resource[],
   servers: ManagedServer[],
   credentials: ManagedCredential[],
   spec: Record<string, unknown>
 ): SpecField[] {
-  const agentOptions = agents.map((item) => ({
-    value: item.id,
-    label: item.name,
-  }))
   const runtimeOptions = resources
     .filter((item) => item.kind === "runtime" && item.enabled)
     .map((item) => ({ value: item.id, label: item.name }))
@@ -142,54 +130,49 @@ function fields(
     label: `${item.name} · ${item.status === "online" ? "在线" : "离线"}`,
   }))
   const server = servers.find((item) => item.id === spec.serverId)
-  const driverOptions = [
-    ...(!server || server.capabilities.includes("docker")
-      ? [{ value: "docker", label: "Docker 容器" }]
-      : []),
-    ...(!server || server.capabilities.includes("kvm")
-      ? [{ value: "vm", label: "VM 沙箱" }]
-      : []),
-  ]
+  const driverOptions = runtimeDriverOptions(server)
   const driver = typeof spec.driver === "string" ? spec.driver : "docker"
-  const serverImages =
-    driver === "vm"
-      ? (server?.inventory.vmImages ?? [])
-      : (server?.inventory.dockerImages ?? [])
+  const serverImages = server?.inventory.dockerImages ?? []
   const inventoryImageOptions = serverImages.map((item) => ({
-    value: driver === "vm" ? item.path || item.reference : item.reference,
+    value: item.reference,
     label: `${item.reference}${item.size ? ` · ${item.size}` : ""}`,
   }))
   const currentImageReference = String(spec.imageReference ?? "").trim()
-  const imageOptions =
-    driver === "vm"
-      ? inventoryImageOptions
+  const imageOptions = [
+    ...inventoryImageOptions,
+    ...(!currentImageReference ||
+    inventoryImageOptions.some(
+      (option) => option.value === currentImageReference
+    )
+      ? []
       : [
-          ...inventoryImageOptions,
-          ...(!currentImageReference ||
-          inventoryImageOptions.some(
-            (option) => option.value === currentImageReference
-          )
-            ? []
-            : [
-                {
-                  value: currentImageReference,
-                  label: `${currentImageReference} · 创建时自动拉取`,
-                },
-              ]),
-          ...(inventoryImageOptions.some(
-            (option) => option.value === "ubuntu:24.04"
-          ) || currentImageReference === "ubuntu:24.04"
-            ? []
-            : [
-                {
-                  value: "ubuntu:24.04",
-                  label: "ubuntu:24.04 · 创建时自动拉取",
-                },
-              ]),
-        ]
+          {
+            value: currentImageReference,
+            label: `${currentImageReference} · 创建时自动拉取`,
+          },
+        ]),
+    ...(inventoryImageOptions.some(
+      (option) => option.value === "ubuntu:24.04"
+    ) || currentImageReference === "ubuntu:24.04"
+      ? []
+      : [
+          {
+            value: "ubuntu:24.04",
+            label: "ubuntu:24.04 · 创建时自动拉取",
+          },
+        ]),
+  ]
   switch (kind) {
     case "project":
-      return []
+      return [
+        {
+          key: "emoji",
+          label: "项目图标",
+          placeholder: "📁",
+          description:
+            "使用系统输入法输入一个 Emoji；留空时使用默认文件夹图标。",
+        },
+      ]
     case "image":
       return [
         {
@@ -230,23 +213,16 @@ function fields(
           key: "driver",
           label: "隔离类型",
           options: driverOptions,
-          description:
-            driver === "vm"
-              ? "需要物理服务器支持 KVM。"
-              : "需要物理服务器安装并启用 Docker。",
+          description: server
+            ? runtimeDriverDescription(server, driver)
+            : "请先选择运行服务器；只显示已经通过 Worker 自检的驱动。",
         },
         {
           key: "imageReference",
           label: "系统镜像",
           options: imageOptions,
           description:
-            driver === "vm"
-              ? imageOptions.length > 0
-                ? "来自服务器 VM 镜像目录，创建时会启动独立虚拟机。"
-                : server
-                  ? "这台服务器尚未上报可用的 VM 镜像。"
-                  : "请先选择运行服务器。"
-              : "服务器没有该 Docker 镜像时会在首次创建沙箱时自动拉取。",
+            "使用 OCI 镜像引用；服务器没有该镜像时会在首次创建沙箱时自动拉取。",
         },
         {
           key: "agentTools",
@@ -261,15 +237,17 @@ function fields(
             { label: "清空", values: [] },
           ],
           description:
-            "只安装所选工具；首个沙箱会构建缓存镜像，之后同组合直接复用。部分工具仍需各自账号登录。",
+            driver === "docker"
+              ? "只安装所选工具；首个沙箱会构建缓存镜像，之后同组合直接复用。部分工具仍需各自账号登录。"
+              : "只安装所选工具；创建 MicroVM 后在隔离环境内完成安装。部分工具仍需各自账号登录。",
         },
         {
           key: "credentialIds",
-          label: "模型凭据",
+          label: "可用模型服务",
           multiOptions: credentials
             .filter((item) => item.enabled)
             .map((item) => ({ value: item.id, label: item.name })),
-          description: "创建沙箱时自动转换为各 Agent 工具需要的配置格式。",
+          description: "模板只限定可使用的模型服务；具体模型在创建沙箱时选择。",
         },
         {
           key: "workdir",
@@ -397,57 +375,13 @@ function fields(
           description: "为所选 Agent 注入需要的模型访问配置。",
         },
       ]
-    case "schedule":
-      return [
-        { key: "agentId", label: "目标 Agent", options: agentOptions },
-        {
-          key: "cron",
-          label: "Cron",
-          placeholder: "0 9 * * *",
-          description: "标准 5 段 Cron。",
-        },
-        { key: "timezone", label: "时区", placeholder: "Asia/Shanghai" },
-        {
-          key: "sandboxPolicy",
-          label: "Sandbox 策略",
-          options: values("new", "reuse", "sticky"),
-        },
-        {
-          key: "concurrency",
-          label: "并发策略",
-          options: values("skip", "parallel"),
-        },
-        {
-          key: "prompt",
-          label: "触发指令",
-          textarea: true,
-          placeholder: "检查仓库状态并输出报告。",
-        },
-      ]
-    case "webhook":
-      return [
-        { key: "agentId", label: "目标 Agent", options: agentOptions },
-        {
-          key: "path",
-          label: "接收路径",
-          placeholder: "/hooks/release-review",
-        },
-        { key: "event", label: "事件类型", placeholder: "push" },
-        {
-          key: "secretRef",
-          label: "签名密钥引用",
-          placeholder: "secret://GITHUB_WEBHOOK_SECRET",
-        },
-        {
-          key: "promptTemplate",
-          label: "指令模板",
-          textarea: true,
-          placeholder: "审查 {{event.repository}} 的最新变更。",
-        },
-      ]
     case "variable":
       return [
-        { key: "key", label: "环境变量名", placeholder: "GITHUB_TOKEN" },
+        {
+          key: "key",
+          label: "环境变量名",
+          placeholder: "CUSTOM_API_TOKEN",
+        },
         {
           key: "mode",
           label: "解析方式",
@@ -456,7 +390,7 @@ function fields(
         {
           key: "reference",
           label: "引用",
-          placeholder: "env://GITHUB_TOKEN",
+          placeholder: "env://CUSTOM_API_TOKEN",
           description: "平台只保存引用，不保存明文密钥。",
         },
       ]
@@ -467,9 +401,21 @@ function values(...items: string[]): Option[] {
   return items.map((value) => ({ value, label: value }))
 }
 
+function createSlug(value: string) {
+  return (
+    value
+      .normalize("NFKD")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 64) || "resource"
+  )
+}
+
 function defaults(kind: ResourceKind) {
   const common: Record<ResourceKind, Record<string, unknown>> = {
-    project: {},
+    project: { emoji: "" },
     image: {
       reference: "",
       architecture: "all",
@@ -496,13 +442,6 @@ function defaults(kind: ResourceKind) {
       agentTools: [],
       credentialIds: [],
     },
-    schedule: {
-      cron: "0 9 * * *",
-      timezone: "Asia/Shanghai",
-      sandboxPolicy: "new",
-      concurrency: "skip",
-    },
-    webhook: { event: "push" },
     variable: { mode: "secret-ref" },
   }
   return common[kind]
@@ -590,7 +529,11 @@ function SpecFieldEditor({
             <SelectGroup>
               <SelectLabel>{field.label}</SelectLabel>
               {field.options.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
+                <SelectItem
+                  key={option.value}
+                  value={option.value}
+                  disabled={option.disabled}
+                >
                   {option.label}
                 </SelectItem>
               ))}
@@ -650,32 +593,23 @@ function nextSpec(
   }
 
   const server = servers.find((item) => item.id === next.serverId)
-  const availableDrivers = [
-    ...(!server || server.capabilities.includes("docker") ? ["docker"] : []),
-    ...(!server || server.capabilities.includes("kvm") ? ["vm"] : []),
-  ]
+  const availableDrivers = runtimeDriverOptions(server)
+    .filter((option) => !option.disabled)
+    .map((option) => option.value)
   if (!availableDrivers.includes(String(next.driver ?? ""))) {
     next.driver = availableDrivers[0] ?? ""
   }
 
-  const images =
-    next.driver === "vm"
-      ? (server?.inventory.vmImages ?? [])
-      : (server?.inventory.dockerImages ?? [])
+  const images = server?.inventory.dockerImages ?? []
   const currentReference = String(next.imageReference ?? "")
   const currentExists =
-    (next.driver === "docker" &&
-      key !== "driver" &&
-      Boolean(currentReference.trim())) ||
+    (key !== "driver" && Boolean(currentReference.trim())) ||
     images.some((image) =>
       [image.reference, image.path, image.id].includes(currentReference)
     )
   if (!currentExists) {
     const first = images[0]
-    next.imageReference =
-      first && next.driver === "vm"
-        ? first.path || first.reference
-        : (first?.reference ?? "ubuntu:24.04")
+    next.imageReference = first?.reference ?? "ubuntu:24.04"
   }
   return next
 }
@@ -719,18 +653,13 @@ function initialEditorSpec(
     servers.find((item) => item.status === "online") ??
     servers[0]
   if (server) spec.serverId = server.id
-  const selectedDriverSupported =
-    spec.driver === "docker"
-      ? server?.capabilities.includes("docker")
-      : spec.driver === "vm"
-        ? server?.capabilities.includes("kvm")
-        : false
+  const selectedDriverSupported = runtimeDriverOptions(server).some(
+    (option) => option.value === spec.driver && !option.disabled
+  )
   if (server && !selectedDriverSupported) {
-    spec.driver = server.capabilities.includes("docker")
-      ? "docker"
-      : server.capabilities.includes("kvm")
-        ? "vm"
-        : ""
+    spec.driver =
+      runtimeDriverOptions(server).find((option) => !option.disabled)?.value ??
+      ""
   }
   const legacyImage = resources.find(
     (item) => item.kind === "image" && item.id === spec.imageId
@@ -738,24 +667,18 @@ function initialEditorSpec(
   if (!spec.imageReference && legacyImage) {
     spec.imageReference = legacyImage.spec.reference
   }
-  const images =
-    spec.driver === "vm"
-      ? (server?.inventory.vmImages ?? [])
-      : (server?.inventory.dockerImages ?? [])
+  const images = server?.inventory.dockerImages ?? []
   const currentReference = String(spec.imageReference ?? "")
   if (
-    spec.driver !== "docker" &&
+    spec.driver !== "" &&
     !images.some((image) =>
       [image.reference, image.path, image.id].includes(currentReference)
     )
   ) {
     const image = images[0]
-    spec.imageReference =
-      image && spec.driver === "vm"
-        ? image.path || image.reference
-        : (image?.reference ?? "ubuntu:24.04")
+    spec.imageReference = image?.reference ?? "ubuntu:24.04"
   }
-  if (spec.driver === "docker" && !currentReference.trim()) {
+  if (spec.driver && !currentReference.trim()) {
     spec.imageReference = images[0]?.reference ?? "ubuntu:24.04"
   }
   return spec
@@ -775,9 +698,6 @@ function specAfterProjectChange(
     next.runtimeId = ""
     next.serverId = ""
   }
-  if (kind === "schedule" || kind === "webhook") {
-    next.agentId = ""
-  }
   return next
 }
 
@@ -786,7 +706,6 @@ export function ResourceEditorDialog({
   resource,
   projectId,
   resources,
-  agents,
   servers,
   credentials,
   initialSpec,
@@ -797,7 +716,6 @@ export function ResourceEditorDialog({
   resource: Resource | null
   projectId: string
   resources: Resource[]
-  agents: Agent[]
   servers: ManagedServer[]
   credentials: ManagedCredential[]
   initialSpec?: Record<string, unknown>
@@ -827,9 +745,6 @@ export function ResourceEditorDialog({
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const projects = resources.filter((item) => item.kind === "project")
-  const projectAgents = agents.filter(
-    (item) => item.projectId === input.projectId
-  )
   const projectResources = resources.filter(
     (item) =>
       item.kind === "image" ||
@@ -838,7 +753,6 @@ export function ResourceEditorDialog({
   )
   const specFields = fields(
     kind,
-    projectAgents,
     projectResources,
     servers,
     credentials,
@@ -883,15 +797,6 @@ export function ResourceEditorDialog({
           ])
         )
       )
-      return
-    }
-    if (
-      kind === "schedule" &&
-      String(input.spec.cron ?? "")
-        .trim()
-        .split(/\s+/).length !== 5
-    ) {
-      setErrors({ spec: "Cron 表达式需要 5 段" })
       return
     }
     if (kind === "image" && stringArray(input.spec.modes).length === 0) {

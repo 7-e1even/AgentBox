@@ -22,8 +22,8 @@ func TestWorkerSetupChecksDependenciesBeforeRegistration(t *testing.T) {
 
 func TestWorkerOnlyAdvertisesUsableDocker(t *testing.T) {
 	const capabilityCheck = `command -v docker >/dev/null && docker info >/dev/null 2>&1 && CAPS='"docker"'`
-	if got := strings.Count(workerDaemon, capabilityCheck); got != 2 {
-		t.Fatalf("usable Docker capability checks = %d, want 2", got)
+	if got := strings.Count(workerDaemon, capabilityCheck); got != 1 {
+		t.Fatalf("usable Docker capability checks = %d, want 1 shared capability probe", got)
 	}
 	if !strings.Contains(workerDaemon, `docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable"`) {
 		t.Fatal("sandbox creation does not fail fast when the Docker daemon is unavailable")
@@ -132,6 +132,35 @@ func TestWorkerCreatesSandboxWithExplicitRootUser(t *testing.T) {
 	}
 }
 
+func TestWorkerRestartReappliesSandboxConfiguration(t *testing.T) {
+	for _, expected := range []string{
+		`restart_sandbox()`,
+		`restart-sandbox) OPERATION=restart_sandbox`,
+		`configure_credentials "$TARGET" "$JOB_FILE"`,
+		`install_agent_wrappers "$TARGET" "$JOB_FILE"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("sandbox restart support is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerSessionSupportsAtomicChunkedUploads(t *testing.T) {
+	for _, expected := range []string{
+		`MAX_UPLOAD_SIZE = 50 * 1024 * 1024`,
+		`def rpc_upload_start`,
+		`def rpc_upload_chunk`,
+		`def rpc_upload_finish`,
+		`def rpc_upload_cancel`,
+		`base64.b64decode(content, validate=True)`,
+		`mv "$temp" "$final"`,
+	} {
+		if !strings.Contains(workerSessionDaemon, expected) {
+			t.Fatalf("chunked upload support is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerConfiguresExtendedAgentCredentials(t *testing.T) {
 	for _, expected := range []string{
 		`append_env "$ENV_FILE" COPILOT_PROVIDER_API_KEY "$COPILOT_SECRET"`,
@@ -161,14 +190,16 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 	for _, expected := range []string{
 		`/api/worker/agentbox-session-worker`,
 		`/usr/local/lib/agentbox/session_worker.py`,
-		`python3 is required for interactive sessions`,
+		`install_host_dependencies`,
+		`migrate_existing_config`,
+		`printf '%s\n%s\n%s\n' "$SERVER_URL" "$SERVER_ID" "$CREDENTIAL" > "$CONFIG"`,
 		`systemctl restart agentbox-worker.service`,
 	} {
 		if !strings.Contains(workerInstall, expected) {
 			t.Fatalf("interactive worker installer is missing %q", expected)
 		}
 	}
-	if !strings.Contains(workerDaemon, `python3 /usr/local/lib/agentbox/session_worker.py "$CONFIG" &`) {
+	if !strings.Contains(workerDaemon, `"$SESSION_PYTHON" /usr/local/lib/agentbox/session_worker.py "$CONFIG" &`) {
 		t.Fatal("worker service does not start the interactive session daemon")
 	}
 	if !strings.Contains(workerDaemon, `CAPS="$CAPS\"interactive-session\""`) {
@@ -176,6 +207,43 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 	}
 	if strings.Contains(workerDaemon, "workspace-exec") {
 		t.Fatal("legacy queued terminal execution must not remain in the worker")
+	}
+}
+
+func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
+	for _, expected := range []string{
+		`/api/worker/agentbox-runtime-driver`,
+		`/usr/local/lib/agentbox/runtime_driver.py`,
+		`"boxlite==0.9.7"`,
+		`/api/worker/agentbox-microsandbox-driver.go`,
+		`github.com/superradcompany/microsandbox/sdk/go v0.6.8`,
+		`GOPROXY=https://goproxy.cn,direct go mod download`,
+		`CGO_ENABLED=1 go build -tags agentbox_driver`,
+		`/usr/local/bin/agentbox-microsandbox-driver`,
+		`Runtime capabilities will be published after self-test`,
+	} {
+		if !strings.Contains(workerInstall, expected) {
+			t.Fatalf("runtime SDK installer is missing %q", expected)
+		}
+	}
+	for _, expected := range []string{
+		`runtime_probe boxlite`,
+		`CAPS="$CAPS\"boxlite\""`,
+		`runtime_probe microsandbox`,
+		`CAPS="$CAPS\"microsandbox\""`,
+		`runtime_call "$DRIVER" create`,
+		`AgentBox Microsandbox Go driver is unavailable`,
+		`/usr/local/bin/agentbox-microsandbox-driver "$@"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("runtime SDK worker integration is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerInstall, `"microsandbox==`) {
+		t.Fatal("Microsandbox must be installed through the Go SDK driver, not Python")
+	}
+	if strings.Contains(workerRuntimeDriver, "import microsandbox") {
+		t.Fatal("legacy Python Microsandbox driver must not remain after the Go SDK migration")
 	}
 }
 
@@ -196,5 +264,44 @@ func TestWorkerSessionDaemonHasValidPythonSyntax(t *testing.T) {
 	}
 	if output, err := exec.Command(python, "-m", "py_compile", path).CombinedOutput(); err != nil {
 		t.Fatalf("session worker syntax: %v\n%s", err, output)
+	}
+}
+
+func TestWorkerRuntimeDriverHasValidPythonSyntax(t *testing.T) {
+	python := ""
+	for _, candidate := range []string{"python3", "python"} {
+		if path, err := exec.LookPath(candidate); err == nil && exec.Command(path, "--version").Run() == nil {
+			python = path
+			break
+		}
+	}
+	if python == "" {
+		t.Skip("Python is not available on this test host")
+	}
+	path := filepath.Join(t.TempDir(), "runtime_driver.py")
+	if err := os.WriteFile(path, []byte(workerRuntimeDriver), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if output, err := exec.Command(python, "-m", "py_compile", path).CombinedOutput(); err != nil {
+		t.Fatalf("runtime driver syntax: %v\n%s", err, output)
+	}
+}
+
+func TestWorkerShellScriptsHaveValidSyntax(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available on this test host")
+	}
+	for name, script := range map[string]string{
+		"install.sh":      workerInstall,
+		"agentbox-worker": workerDaemon,
+	} {
+		path := filepath.Join(t.TempDir(), name)
+		if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if output, err := exec.Command(sh, "-n", path).CombinedOutput(); err != nil {
+			t.Fatalf("%s syntax: %v\n%s", name, err, output)
+		}
 	}
 }
