@@ -101,6 +101,11 @@ func (s *Server) workerScript(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(workerDaemon))
 }
 
+func (s *Server) workerSessionScript(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/x-python; charset=utf-8")
+	_, _ = w.Write([]byte(workerSessionDaemon))
+}
+
 const workerInstall = `#!/bin/sh
 set -eu
 
@@ -110,11 +115,19 @@ case "$SERVER_URL" in
   *) echo "usage: install.sh <agentbox-url>" >&2; exit 2 ;;
 esac
 
-tmp=$(mktemp)
-trap 'rm -f "$tmp"' EXIT
-curl -fsSL "$SERVER_URL/api/worker/agentbox-worker" -o "$tmp"
-install -m 0755 "$tmp" /usr/local/bin/agentbox-worker
-echo "AgentBox Worker installed."
+worker_tmp=$(mktemp)
+session_tmp=$(mktemp)
+trap 'rm -f "$worker_tmp" "$session_tmp"' EXIT
+curl -fsSL "$SERVER_URL/api/worker/agentbox-worker" -o "$worker_tmp"
+curl -fsSL "$SERVER_URL/api/worker/agentbox-session-worker" -o "$session_tmp"
+command -v python3 >/dev/null || { echo "python3 is required for interactive sessions" >&2; exit 1; }
+install -m 0755 "$worker_tmp" /usr/local/bin/agentbox-worker
+install -d -m 0755 /usr/local/lib/agentbox
+install -m 0644 "$session_tmp" /usr/local/lib/agentbox/session_worker.py
+if command -v systemctl >/dev/null && systemctl is-active --quiet agentbox-worker.service; then
+  systemctl restart agentbox-worker.service
+fi
+echo "AgentBox Worker installed with interactive session support."
 `
 
 const workerDaemon = `#!/bin/sh
@@ -144,6 +157,7 @@ setup_worker() {
   case "$SERVER_URL" in http://*|https://*) ;; *) usage ;; esac
   [ -n "$TOKEN" ] || usage
   command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
+  command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
   command -v systemctl >/dev/null || { echo "systemd is required" >&2; exit 1; }
 
   mkdir -p "$STATE_DIR"
@@ -161,7 +175,7 @@ setup_worker() {
     *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
   esac
   CAPS=''
-  command -v docker >/dev/null && CAPS='"docker"'
+  command -v docker >/dev/null && docker info >/dev/null 2>&1 && CAPS='"docker"'
   if [ -c /dev/kvm ]; then
     [ -n "$CAPS" ] && CAPS="$CAPS,"
     CAPS="$CAPS\"kvm-device\""
@@ -173,6 +187,10 @@ setup_worker() {
   if command -v virsh >/dev/null; then
     [ -n "$CAPS" ] && CAPS="$CAPS,"
     CAPS="$CAPS\"libvirt\""
+  fi
+  if command -v python3 >/dev/null && [ -r /usr/local/lib/agentbox/session_worker.py ]; then
+    [ -n "$CAPS" ] && CAPS="$CAPS,"
+    CAPS="$CAPS\"interactive-session\""
   fi
   BODY=$(printf '{"pairingToken":"%s","serverId":"%s","name":"%s","hostname":"%s","os":"linux","arch":"%s","capabilities":[%s]}' "$TOKEN" "$SERVER_ID" "$HOST" "$HOST" "$ARCH" "$CAPS")
   RESPONSE=$(curl -fsS -X POST "$SERVER_URL/api/servers/register" -H 'Content-Type: application/json' --data "$BODY")
@@ -203,7 +221,7 @@ UNIT
 
 worker_capabilities() {
   CAPS=
-  command -v docker >/dev/null && CAPS='"docker"'
+  command -v docker >/dev/null && docker info >/dev/null 2>&1 && CAPS='"docker"'
   if [ -c /dev/kvm ]; then
     [ -n "$CAPS" ] && CAPS="$CAPS,"
     CAPS="$CAPS\"kvm-device\""
@@ -216,6 +234,10 @@ worker_capabilities() {
     [ -n "$CAPS" ] && CAPS="$CAPS,"
     CAPS="$CAPS\"libvirt\""
   fi
+  if command -v python3 >/dev/null && [ -r /usr/local/lib/agentbox/session_worker.py ]; then
+    [ -n "$CAPS" ] && CAPS="$CAPS,"
+    CAPS="$CAPS\"interactive-session\""
+  fi
   printf '[%s]' "$CAPS"
 }
 
@@ -224,9 +246,9 @@ worker_inventory() {
   [ "$ARCH" = x86_64 ] && ARCH=amd64
   [ "$ARCH" = aarch64 ] && ARCH=arm64
   DOCKER_IMAGES='[]'
-  if command -v docker >/dev/null; then
+  if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     DOCKER_IMAGES=$(docker image ls --no-trunc --format '{{json .}}' 2>/dev/null | jq -s --arg arch "$ARCH" '
-      map({
+      map(select((.Repository | startswith("agentbox/runtime-")) | not) | {
         id: .ID,
         reference: (if .Repository == "<none>" or .Tag == "<none>" then .ID else (.Repository + ":" + .Tag) end),
         architecture: $arch,
@@ -280,23 +302,220 @@ complete_job() {
     --data "$BODY" >/dev/null
 }
 
+agent_tool_command() {
+  case "$1" in
+    antigravity) printf '%s' agy ;;
+    claude-code) printf '%s' claude ;;
+    codebuddy) printf '%s' codebuddy ;;
+    codex) printf '%s' codex ;;
+    copilot-cli) printf '%s' copilot ;;
+    cursor) printf '%s' cursor-agent ;;
+    deveco) printf '%s' deveco ;;
+    gemini-cli) printf '%s' gemini ;;
+    grok) printf '%s' grok ;;
+    kimi) printf '%s' kimi ;;
+    omp) printf '%s' omp ;;
+    openclaw) printf '%s' openclaw ;;
+    opencode) printf '%s' opencode ;;
+    pi) printf '%s' pi ;;
+    qoder-cli) printf '%s' qodercli ;;
+    qoder-cn) printf '%s' qoderclicn ;;
+    qwen-code) printf '%s' qwen ;;
+    qwenpaw) printf '%s' qwenpaw ;;
+    reasonix) printf '%s' reasonix ;;
+    trae-cli) printf '%s' traecli ;;
+    *) return 1 ;;
+  esac
+}
+
 install_agent_tools() {
   CONTAINER=$1
   JOB_FILE=$2
-  TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE")
+  TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u)
   [ -n "$TOOLS" ] || return 0
   docker exec "$CONTAINER" sh -lc \
-    'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git; curl -fsSL https://deb.nodesource.com/setup_22.x | sh; apt-get install -y nodejs' >&2
-  printf '%s\n' "$TOOLS" | while IFS= read -r TOOL; do
+    'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git jq unzip python3' >&2
+  set --
+  for TOOL in $TOOLS; do
+    COMMAND=$(agent_tool_command "$TOOL") || { echo "unsupported Agent tool: $TOOL" >&2; return 1; }
+    if docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
+      continue
+    fi
     case "$TOOL" in
+      antigravity|cursor|qwenpaw) continue ;;
       codex) PACKAGE='@openai/codex' ;;
       claude-code) PACKAGE='@anthropic-ai/claude-code' ;;
+      codebuddy) PACKAGE='@tencent-ai/codebuddy-code' ;;
       gemini-cli) PACKAGE='@google/gemini-cli' ;;
+      grok) PACKAGE='@xai-official/grok' ;;
+      kimi) PACKAGE='@moonshot-ai/kimi-code' ;;
+      omp) PACKAGE='@oh-my-pi/pi-coding-agent' ;;
+      openclaw) PACKAGE='openclaw' ;;
       opencode) PACKAGE='opencode-ai' ;;
+      pi) PACKAGE='@mariozechner/pi-coding-agent' ;;
+      copilot-cli) PACKAGE='@github/copilot' ;;
+      qoder-cli) PACKAGE='@qoder-ai/qodercli' ;;
+      qoder-cn) PACKAGE='@qodercn-ai/qoderclicn' ;;
+      qwen-code) PACKAGE='@qwen-code/qwen-code' ;;
+      reasonix) PACKAGE='reasonix' ;;
+      deveco) echo "DevEco Code does not support Linux sandboxes; use a custom prebuilt environment" >&2; return 1 ;;
+      trae-cli) echo "TRAE CLI has no verified unattended Linux installer; use a custom prebuilt environment" >&2; return 1 ;;
       *) echo "unsupported Agent tool: $TOOL" >&2; return 1 ;;
     esac
-    docker exec "$CONTAINER" npm install -g "$PACKAGE" >&2
+    set -- "$@" "$PACKAGE@latest"
   done
+
+  if printf '%s\n' "$TOOLS" | grep -qx omp &&
+     ! docker exec "$CONTAINER" sh -lc 'command -v bun >/dev/null'; then
+    docker exec "$CONTAINER" sh -lc \
+      'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://bun.sh/install -o "$INSTALLER"; bash "$INSTALLER" >/dev/null; test -x /root/.bun/bin/bun; ln -sf /root/.bun/bin/bun /usr/bin/bun' >&2
+  fi
+  if [ "$#" -gt 0 ]; then
+    docker exec "$CONTAINER" sh -lc \
+      'if ! node --version 2>/dev/null | grep -q "^v22\."; then curl -fsSL https://deb.nodesource.com/setup_22.x | sh; export DEBIAN_FRONTEND=noninteractive; apt-get install -y nodejs; fi' >&2
+    docker exec "$CONTAINER" npm install -g "$@" >&2
+  fi
+
+  for TOOL in $TOOLS; do
+    COMMAND=$(agent_tool_command "$TOOL") || return 1
+    if docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
+      continue
+    fi
+    case "$TOOL" in
+      antigravity)
+        docker exec "$CONTAINER" sh -lc \
+          'set -eu; case "$(uname -m)" in x86_64|amd64) PLATFORM=linux_amd64 ;; aarch64|arm64) PLATFORM=linux_arm64 ;; *) exit 1 ;; esac; TMP_DIR=$(mktemp -d); trap '\''rm -rf "$TMP_DIR"'\'' EXIT; MANIFEST=$(curl --connect-timeout 15 --max-time 60 -fsSL "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/$PLATFORM.json"); URL=$(printf "%s" "$MANIFEST" | jq -r .url); SHA512=$(printf "%s" "$MANIFEST" | jq -r .sha512); curl --connect-timeout 15 --max-time 300 -fsSL "$URL" -o "$TMP_DIR/agy.tar.gz"; printf "%s  %s\n" "$SHA512" "$TMP_DIR/agy.tar.gz" | sha512sum -c -; tar -xzf "$TMP_DIR/agy.tar.gz" -C "$TMP_DIR" antigravity; install -m 0755 "$TMP_DIR/antigravity" /usr/bin/agy' >&2
+        ;;
+      cursor)
+        docker exec "$CONTAINER" sh -lc \
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://cursor.com/install -o "$INSTALLER"; bash "$INSTALLER"; if [ -x /root/.local/bin/cursor-agent ]; then ln -sf /root/.local/bin/cursor-agent /usr/bin/cursor-agent; elif [ -x /root/.cursor/bin/cursor-agent ]; then ln -sf /root/.cursor/bin/cursor-agent /usr/bin/cursor-agent; else exit 1; fi' >&2
+        ;;
+      qwenpaw)
+        docker exec "$CONTAINER" sh -lc \
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -LsSf https://astral.sh/uv/install.sh -o "$INSTALLER"; sh "$INSTALLER" >/dev/null; timeout 3600 /root/.local/bin/uv tool install --python 3.12 qwenpaw; test -x /root/.local/bin/qwenpaw; ln -sf /root/.local/bin/qwenpaw /usr/bin/qwenpaw' >&2
+        ;;
+    esac
+  done
+
+  VERSION_FILE=$(mktemp)
+  printf '{}\n' > "$VERSION_FILE"
+  for TOOL in $TOOLS; do
+    COMMAND=$(agent_tool_command "$TOOL") || { rm -f "$VERSION_FILE"; return 1; }
+    docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null" || {
+      echo "Agent tool $TOOL was installed but command $COMMAND is unavailable" >&2
+      rm -f "$VERSION_FILE"
+      return 1
+    }
+    VERSION=$(docker exec "$CONTAINER" sh -lc "timeout 20 $COMMAND --version 2>&1 | head -n 1" 2>/dev/null || true)
+    [ -n "$VERSION" ] || VERSION=installed
+    NEXT_VERSION_FILE=$(mktemp)
+    jq --arg tool "$TOOL" --arg version "$VERSION" '. + {($tool): $version}' \
+      "$VERSION_FILE" > "$NEXT_VERSION_FILE"
+    mv "$NEXT_VERSION_FILE" "$VERSION_FILE"
+  done
+  docker exec "$CONTAINER" mkdir -p /opt/agentbox
+  docker cp "$VERSION_FILE" "$CONTAINER:/opt/agentbox/agent-versions.json" >/dev/null
+  rm -f "$VERSION_FILE"
+}
+
+best_cached_agent_base() {
+  BASE_IMAGE=$1
+  REQUESTED_TOOLS=$2
+  NOW=$3
+  TTL_SECONDS=$4
+  REQUESTED_COUNT=$(printf '%s\n' "$REQUESTED_TOOLS" | grep -c .)
+  BEST_IMAGE=$BASE_IMAGE
+  BEST_COUNT=0
+  for IMAGE_ID in $(docker image ls -q --filter label=agentbox.runtime.cache=true | sort -u); do
+    CANDIDATE_BASE=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.base" }}' "$IMAGE_ID" 2>/dev/null || true)
+    [ "$CANDIDATE_BASE" = "$BASE_IMAGE" ] || continue
+    CANDIDATE_REFRESHED=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.refreshed" }}' "$IMAGE_ID" 2>/dev/null || true)
+    case "$CANDIDATE_REFRESHED" in ''|*[!0-9]*) continue ;; esac
+    CANDIDATE_AGE=$((NOW - CANDIDATE_REFRESHED))
+    [ "$CANDIDATE_AGE" -ge 0 ] && [ "$CANDIDATE_AGE" -lt "$TTL_SECONDS" ] || continue
+    CANDIDATE_TOOLS=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.tools" }}' "$IMAGE_ID" 2>/dev/null || true)
+    [ -n "$CANDIDATE_TOOLS" ] || continue
+    CANDIDATE_COUNT=0
+    COMPATIBLE=true
+    for CANDIDATE_TOOL in $(printf '%s' "$CANDIDATE_TOOLS" | tr ',' ' '); do
+      if ! printf '%s\n' "$REQUESTED_TOOLS" | grep -qx "$CANDIDATE_TOOL"; then
+        COMPATIBLE=false
+        break
+      fi
+      CANDIDATE_COUNT=$((CANDIDATE_COUNT + 1))
+    done
+    [ "$COMPATIBLE" = true ] || continue
+    [ "$CANDIDATE_COUNT" -lt "$REQUESTED_COUNT" ] || continue
+    if [ "$CANDIDATE_COUNT" -gt "$BEST_COUNT" ]; then
+      BEST_IMAGE=$IMAGE_ID
+      BEST_COUNT=$CANDIDATE_COUNT
+    fi
+  done
+  printf '%s' "$BEST_IMAGE"
+}
+
+prepare_agent_image() {
+  BASE_IMAGE=$1
+  JOB_FILE=$2
+  TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u)
+  [ -n "$TOOLS" ] || { printf '%s' "$BASE_IMAGE"; return 0; }
+  command -v sha256sum >/dev/null || { echo "sha256sum is required for Agent runtime caching" >&2; return 1; }
+  command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
+
+  TOOL_SET=$(printf '%s\n' "$TOOLS" | paste -sd, -)
+  CACHE_KEY=$(printf '%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" | sha256sum | cut -c1-16)
+  CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
+  REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
+  BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY"
+  NOW=$(date +%s)
+  TTL_HOURS=${AGENTBOX_AGENT_IMAGE_TTL_HOURS:-24}
+  case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=24 ;; esac
+  TTL_SECONDS=$((TTL_HOURS * 3600))
+
+  CACHED_AT=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.refreshed" }}' "$CACHE_IMAGE" 2>/dev/null || true)
+  case "$CACHED_AT" in
+    ''|*[!0-9]*) ;;
+    *)
+      AGE=$((NOW - CACHED_AT))
+      if [ "$AGE" -ge 0 ] && [ "$AGE" -lt "$TTL_SECONDS" ]; then
+        printf '%s' "$CACHE_IMAGE"
+        return 0
+      fi
+      ;;
+  esac
+
+  BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS")
+
+  if docker inspect "$BUILD_CONTAINER" >/dev/null 2>&1; then
+    docker start "$BUILD_CONTAINER" >/dev/null
+  else
+    docker run -d --name "$BUILD_CONTAINER" \
+      --label "agentbox.runtime.build=$CACHE_KEY" \
+      "$BUILD_BASE_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait' >/dev/null
+  fi
+  if install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE" &&
+     docker commit \
+       --change "LABEL agentbox.runtime.cache=true" \
+       --change "LABEL agentbox.runtime.refreshed=$NOW" \
+       --change "LABEL agentbox.runtime.base=$BASE_IMAGE" \
+       --change "LABEL agentbox.runtime.tools=$TOOL_SET" \
+       "$BUILD_CONTAINER" "$REFRESH_IMAGE" >/dev/null &&
+     docker tag "$REFRESH_IMAGE" "$CACHE_IMAGE"; then
+    docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
+    docker image rm "$REFRESH_IMAGE" >/dev/null 2>&1 || true
+    printf '%s' "$CACHE_IMAGE"
+    return 0
+  fi
+
+  docker stop --time 10 "$BUILD_CONTAINER" >/dev/null 2>&1 || true
+  docker image rm "$REFRESH_IMAGE" >/dev/null 2>&1 || true
+  if docker image inspect "$CACHE_IMAGE" >/dev/null 2>&1; then
+    echo "Agent runtime refresh failed; using the last working cached image" >&2
+    printf '%s' "$CACHE_IMAGE"
+    return 0
+  fi
+  echo "Agent runtime image build failed" >&2
+  return 1
 }
 
 append_env() {
@@ -321,8 +540,8 @@ configure_credentials() {
     SECRET=$(printf '%s' "$SECRET_B64" | base64 -d)
     ENV_ID=$(printf '%s' "$ID" | tr '[:lower:]-' '[:upper:]_')
     append_env "$ENV_FILE" "AGENTBOX_KEY_$ENV_ID" "$SECRET"
-    case "$PROVIDER" in
-      openai)
+    case "$PROTOCOL" in
+      openai-responses|openai-chat)
         grep -q '^OPENAI_API_KEY=' "$ENV_FILE" || {
           append_env "$ENV_FILE" OPENAI_API_KEY "$SECRET"
           [ -z "$ENDPOINT" ] || append_env "$ENV_FILE" OPENAI_BASE_URL "$ENDPOINT"
@@ -336,22 +555,73 @@ configure_credentials() {
           [ -z "$MODEL" ] || append_env "$ENV_FILE" ANTHROPIC_MODEL "$MODEL"
         }
         ;;
-      google)
+      gemini)
         grep -q '^GEMINI_API_KEY=' "$ENV_FILE" || {
           append_env "$ENV_FILE" GEMINI_API_KEY "$SECRET"
           [ -z "$ENDPOINT" ] || append_env "$ENV_FILE" GOOGLE_GEMINI_BASE_URL "$ENDPOINT"
           [ -z "$MODEL" ] || append_env "$ENV_FILE" GEMINI_MODEL "$MODEL"
         }
         ;;
-      deepseek)
-        grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE" || {
-          append_env "$ENV_FILE" DEEPSEEK_API_KEY "$SECRET"
-          [ -z "$ENDPOINT" ] || append_env "$ENV_FILE" DEEPSEEK_BASE_URL "$ENDPOINT"
-          [ -z "$MODEL" ] || append_env "$ENV_FILE" DEEPSEEK_MODEL "$MODEL"
-        }
-        ;;
     esac
+    if [ "$PROVIDER" = deepseek ] && ! grep -q '^DEEPSEEK_API_KEY=' "$ENV_FILE"; then
+      append_env "$ENV_FILE" DEEPSEEK_API_KEY "$SECRET"
+      [ -z "$ENDPOINT" ] || append_env "$ENV_FILE" DEEPSEEK_BASE_URL "$ENDPOINT"
+      [ -z "$MODEL" ] || append_env "$ENV_FILE" DEEPSEEK_MODEL "$MODEL"
+    fi
+    if [ "$PROVIDER" = cursor ] && ! grep -q '^CURSOR_API_KEY=' "$ENV_FILE"; then
+      append_env "$ENV_FILE" CURSOR_API_KEY "$SECRET"
+    fi
+    if { [ "$PROVIDER" = xai ] || [ "$PROVIDER" = grok ]; } && ! grep -q '^XAI_API_KEY=' "$ENV_FILE"; then
+      append_env "$ENV_FILE" XAI_API_KEY "$SECRET"
+      [ -z "$ENDPOINT" ] || append_env "$ENV_FILE" XAI_BASE_URL "$ENDPOINT"
+      [ -z "$MODEL" ] || append_env "$ENV_FILE" XAI_MODEL "$MODEL"
+    fi
+    if { [ "$PROVIDER" = qodercn ] || [ "$PROVIDER" = qoder-cn ]; } && ! grep -q '^QODERCN_PERSONAL_ACCESS_TOKEN=' "$ENV_FILE"; then
+      append_env "$ENV_FILE" QODERCN_PERSONAL_ACCESS_TOKEN "$SECRET"
+    fi
   done
+
+  if jq -e '.job.payload.agentTools | index("copilot-cli")' "$JOB_FILE" >/dev/null; then
+    COPILOT_CREDENTIAL=$(jq -c '[.job.payload.credentials[] |
+      select((.protocol == "anthropic" or .protocol == "openai-chat") and
+        (.endpoint // "") != "" and (.modelId // "") != "")][0] // empty' "$JOB_FILE")
+    if [ -n "$COPILOT_CREDENTIAL" ]; then
+      COPILOT_PROTOCOL=$(printf '%s' "$COPILOT_CREDENTIAL" | jq -r '.protocol')
+      COPILOT_SECRET=$(printf '%s' "$COPILOT_CREDENTIAL" | jq -r '.secret')
+      COPILOT_ENDPOINT=$(printf '%s' "$COPILOT_CREDENTIAL" | jq -r '.endpoint')
+      COPILOT_MODEL=$(printf '%s' "$COPILOT_CREDENTIAL" | jq -r '.modelId')
+      [ "$COPILOT_PROTOCOL" = anthropic ] && COPILOT_TYPE=anthropic || COPILOT_TYPE=openai
+      append_env "$ENV_FILE" COPILOT_PROVIDER_TYPE "$COPILOT_TYPE"
+      append_env "$ENV_FILE" COPILOT_PROVIDER_API_KEY "$COPILOT_SECRET"
+      append_env "$ENV_FILE" COPILOT_PROVIDER_BASE_URL "$COPILOT_ENDPOINT"
+      append_env "$ENV_FILE" COPILOT_MODEL "$COPILOT_MODEL"
+    fi
+  fi
+
+  if jq -e '.job.payload.agentTools | index("kimi")' "$JOB_FILE" >/dev/null; then
+    KIMI_CREDENTIAL=$(jq -c '[.job.payload.credentials[] |
+      select((.protocol == "anthropic" or .protocol == "openai-chat") and
+        (.endpoint // "") != "" and (.modelId // "") != "")][0] // empty' "$JOB_FILE")
+    if [ -n "$KIMI_CREDENTIAL" ]; then
+      KIMI_PROVIDER=$(printf '%s' "$KIMI_CREDENTIAL" | jq -r '.providerId')
+      KIMI_PROTOCOL=$(printf '%s' "$KIMI_CREDENTIAL" | jq -r '.protocol')
+      KIMI_SECRET=$(printf '%s' "$KIMI_CREDENTIAL" | jq -r '.secret')
+      KIMI_ENDPOINT=$(printf '%s' "$KIMI_CREDENTIAL" | jq -r '.endpoint')
+      KIMI_MODEL=$(printf '%s' "$KIMI_CREDENTIAL" | jq -r '.modelId')
+      if [ "$KIMI_PROVIDER" = kimi ] || [ "$KIMI_PROVIDER" = moonshot ]; then
+        KIMI_PROVIDER_TYPE=kimi
+      elif [ "$KIMI_PROTOCOL" = anthropic ]; then
+        KIMI_PROVIDER_TYPE=anthropic
+      else
+        KIMI_PROVIDER_TYPE=openai
+      fi
+      append_env "$ENV_FILE" KIMI_MODEL_NAME "$KIMI_MODEL"
+      append_env "$ENV_FILE" KIMI_MODEL_API_KEY "$KIMI_SECRET"
+      append_env "$ENV_FILE" KIMI_MODEL_PROVIDER_TYPE "$KIMI_PROVIDER_TYPE"
+      append_env "$ENV_FILE" KIMI_MODEL_BASE_URL "$KIMI_ENDPOINT"
+    fi
+  fi
+
   docker exec "$CONTAINER" mkdir -p /opt/agentbox/secrets
   docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /opt/agentbox/secrets/agentbox.env' < "$ENV_FILE"
   rm -f "$ENV_FILE"
@@ -364,17 +634,17 @@ configure_credentials() {
     CODEX_MODEL=$(printf '%s' "$CODEX_CREDENTIAL" | jq -r '.modelId // empty')
     CODEX_CONFIG=$(mktemp)
     [ -z "$CODEX_MODEL" ] || printf 'model = %s\n' "$(printf '%s' "$CODEX_MODEL" | jq -Rs .)" >> "$CODEX_CONFIG"
-    if [ -n "$CODEX_ENDPOINT" ]; then
-      printf 'model_provider = "agentbox"\n\n[model_providers.agentbox]\n' >> "$CODEX_CONFIG"
-      printf 'name = "AgentBox"\nbase_url = %s\nenv_key = "AGENTBOX_KEY_%s"\nwire_api = "responses"\n' \
-        "$(printf '%s' "$CODEX_ENDPOINT" | jq -Rs .)" "$CODEX_ENV_ID" >> "$CODEX_CONFIG"
-    fi
+    [ -n "$CODEX_ENDPOINT" ] || CODEX_ENDPOINT=https://api.openai.com/v1
+    printf 'model_provider = "agentbox"\n\n[model_providers.agentbox]\n' >> "$CODEX_CONFIG"
+    printf 'name = "AgentBox"\nbase_url = %s\nenv_key = "AGENTBOX_KEY_%s"\nwire_api = "responses"\n' \
+      "$(printf '%s' "$CODEX_ENDPOINT" | jq -Rs .)" "$CODEX_ENV_ID" >> "$CODEX_CONFIG"
     docker exec "$CONTAINER" mkdir -p /root/.codex
     docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.codex/config.toml' < "$CODEX_CONFIG"
     rm -f "$CODEX_CONFIG"
   fi
 
-  if jq -e '.job.payload.agentTools | index("gemini-cli")' "$JOB_FILE" >/dev/null; then
+  if jq -e '.job.payload.agentTools | index("gemini-cli")' "$JOB_FILE" >/dev/null &&
+     jq -e '.job.payload.credentials | any(.protocol == "gemini")' "$JOB_FILE" >/dev/null; then
     docker exec "$CONTAINER" mkdir -p /root/.gemini
     docker exec "$CONTAINER" sh -c 'umask 077; cp /opt/agentbox/secrets/agentbox.env /root/.gemini/.env'
     printf '{"security":{"auth":{"selectedType":"gemini-api-key"}}}\n' | \
@@ -387,13 +657,17 @@ configure_credentials() {
       "$schema": "https://opencode.ai/config.json",
       provider: (reduce .job.payload.credentials[] as $credential ({};
         ($credential.id | ascii_upcase | gsub("-"; "_")) as $envId |
+        (($credential.endpoint // "") | rtrimstr("/") |
+          if $credential.protocol == "anthropic" and . != "" and (endswith("/v1") | not)
+          then . + "/v1" else . end) as $baseURL |
         .[$credential.id] = ({
           npm: (if $credential.protocol == "anthropic" then "@ai-sdk/anthropic"
                 elif $credential.protocol == "gemini" then "@ai-sdk/google"
+                elif $credential.protocol == "openai-responses" then "@ai-sdk/openai"
                 else "@ai-sdk/openai-compatible" end),
           name: $credential.id,
           options: ({apiKey: ("{env:AGENTBOX_KEY_" + $envId + "}")}
-            + (if ($credential.endpoint // "") == "" then {} else {baseURL: $credential.endpoint} end)),
+            + (if $baseURL == "" then {} else {baseURL: $baseURL} end)),
           models: (if ($credential.modelId // "") == "" then {}
             else {($credential.modelId): {name: $credential.modelId}} end)
         })
@@ -403,6 +677,63 @@ configure_credentials() {
     docker exec "$CONTAINER" mkdir -p /root/.config/opencode
     docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.config/opencode/opencode.json' < "$OPENCODE_CONFIG"
     rm -f "$OPENCODE_CONFIG"
+  fi
+
+  if jq -e '.job.payload.agentTools | index("pi")' "$JOB_FILE" >/dev/null; then
+    PI_CONFIG=$(mktemp)
+    jq '
+      def env_id: ascii_upcase | gsub("-"; "_");
+      def pi_api:
+        if . == "anthropic" then "anthropic-messages"
+        elif . == "openai-responses" then "openai-responses"
+        elif . == "openai-chat" then "openai-completions"
+        elif . == "gemini" then "google-generative-ai"
+        else empty end;
+      [.job.payload.credentials[] |
+        select((.protocol == "anthropic" or .protocol == "openai-responses" or
+          .protocol == "openai-chat" or .protocol == "gemini") and
+          (.endpoint // "") != "" and (.modelId // "") != "") |
+        {provider: ("agentbox-" + .id), model: .modelId,
+         value: {baseUrl: (.endpoint | rtrimstr("/")), api: (.protocol | pi_api),
+           apiKey: ("AGENTBOX_KEY_" + (.id | env_id)),
+           models: [{id: .modelId, name: .modelId}]}}] as $entries |
+      {providers: ($entries | map({key: .provider, value: .value}) | from_entries),
+       defaultProvider: ($entries[0].provider // ""), defaultModel: ($entries[0].model // "")}
+    ' "$JOB_FILE" > "$PI_CONFIG"
+    if [ "$(jq '.providers | length' "$PI_CONFIG")" -gt 0 ]; then
+      docker exec "$CONTAINER" mkdir -p /root/.pi/agent
+      jq '{providers}' "$PI_CONFIG" | docker exec -i "$CONTAINER" sh -c \
+        'umask 077; cat > /root/.pi/agent/models.json'
+      jq '{defaultProvider,defaultModel}' "$PI_CONFIG" | docker exec -i "$CONTAINER" sh -c \
+        'umask 077; cat > /root/.pi/agent/settings.json'
+    fi
+    rm -f "$PI_CONFIG"
+  fi
+
+  if jq -e '.job.payload.agentTools | index("qwen-code")' "$JOB_FILE" >/dev/null; then
+    QWEN_CONFIG=$(mktemp)
+    jq '
+      def env_id: ascii_upcase | gsub("-"; "_");
+      [.job.payload.credentials[] |
+        select((.protocol == "anthropic" or .protocol == "openai-chat" or
+          .protocol == "gemini") and (.endpoint // "") != "" and (.modelId // "") != "") |
+        {type: (if .protocol == "openai-chat" then "openai" else .protocol end),
+         model: .modelId,
+         value: {id: .modelId, name: .modelId,
+           envKey: ("AGENTBOX_KEY_" + (.id | env_id)),
+           baseUrl: (.endpoint | rtrimstr("/"))}}] as $entries |
+      {security: {auth: {selectedType: ($entries[0].type // "qwen-oauth")}},
+       model: {name: ($entries[0].model // "")},
+       modelProviders: {
+         openai: [$entries[] | select(.type == "openai") | .value],
+         anthropic: [$entries[] | select(.type == "anthropic") | .value],
+         gemini: [$entries[] | select(.type == "gemini") | .value]}}
+    ' "$JOB_FILE" > "$QWEN_CONFIG"
+    if [ "$(jq '[.modelProviders[] | length] | add' "$QWEN_CONFIG")" -gt 0 ]; then
+      docker exec "$CONTAINER" mkdir -p /root/.qwen
+      docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.qwen/settings.json' < "$QWEN_CONFIG"
+    fi
+    rm -f "$QWEN_CONFIG"
   fi
 }
 
@@ -424,10 +755,27 @@ configure_skills() {
     docker exec "$CONTAINER" mkdir -p "/opt/agentbox/skills/$ID"
     docker exec -i "$CONTAINER" sh -c "cat > /opt/agentbox/skills/$ID/SKILL.md" < "$SKILL_FILE"
     for TARGET in \
+      "/root/.agents/skills/$ID" \
+      "/root/.gemini/antigravity-cli/skills/$ID" \
       "/root/.codex/skills/$ID" \
       "/root/.claude/skills/$ID" \
+      "/root/.codebuddy/skills/$ID" \
       "/root/.gemini/skills/$ID" \
-      "/root/.config/opencode/skill/$ID"; do
+      "/root/.config/opencode/skills/$ID" \
+      "/root/.config/deveco/skills/$ID" \
+      "/root/.openclaw/skills/$ID" \
+      "/root/.pi/agent/skills/$ID" \
+      "/root/.omp/agent/skills/$ID" \
+      "/root/.copilot/skills/$ID" \
+      "/root/.cursor/skills/$ID" \
+      "/root/.kimi/skills/$ID" \
+      "/root/.reasonix/skills/$ID" \
+      "/root/.qoder/skills/$ID" \
+      "/root/.qoder-cn/skills/$ID" \
+      "/root/.traecli/skills/$ID" \
+      "/root/.grok/skills/$ID" \
+      "/root/.qwen/skills/$ID" \
+      "/root/.qwenpaw/skill_pool/$ID"; do
       docker exec "$CONTAINER" mkdir -p "$TARGET"
       docker exec -i "$CONTAINER" sh -c "cat > $TARGET/SKILL.md" < "$SKILL_FILE"
     done
@@ -521,13 +869,7 @@ install_agent_wrappers() {
   docker exec "$CONTAINER" test -f /opt/agentbox/secrets/agentbox.env || return 0
   TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE")
   printf '%s\n' "$TOOLS" | while IFS= read -r TOOL; do
-    case "$TOOL" in
-      codex) COMMAND=codex ;;
-      claude-code) COMMAND=claude ;;
-      gemini-cli) COMMAND=gemini ;;
-      opencode) COMMAND=opencode ;;
-      *) continue ;;
-    esac
+    COMMAND=$(agent_tool_command "$TOOL") || continue
     docker exec "$CONTAINER" test -x "/usr/bin/$COMMAND" || continue
     WRAPPER=$(mktemp)
     printf '#!/bin/sh\nset -a\n. /opt/agentbox/secrets/agentbox.env\nset +a\nexec /usr/bin/%s "$@"\n' "$COMMAND" > "$WRAPPER"
@@ -545,6 +887,7 @@ create_sandbox() {
     return 1
   }
   command -v docker >/dev/null || { echo "Docker is not installed" >&2; return 1; }
+  docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; return 1; }
   IMAGE=$(jq -r '.job.payload.image' "$JOB_FILE")
   WORKDIR=$(jq -r '.job.payload.workdir // "/workspace"' "$JOB_FILE")
   CPU=$(jq -r '.job.payload.cpu // empty' "$JOB_FILE")
@@ -559,14 +902,15 @@ create_sandbox() {
     [ "$OWNER" = "$SANDBOX_ID" ] || { echo "container name collision: $CONTAINER" >&2; return 1; }
     docker start "$CONTAINER" >/dev/null
   else
+    RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")
     set -- docker run -d --name "$CONTAINER" \
       --label "agentbox.sandbox=$SANDBOX_ID" \
-      --restart unless-stopped --workdir "$WORKDIR" \
+      --restart unless-stopped --user 0:0 --workdir "$WORKDIR" \
       -v "$VOLUME:$WORKDIR"
     [ -n "$CPU" ] && set -- "$@" --cpus "$CPU"
     [ -n "$MEMORY" ] && set -- "$@" --memory "$MEMORY"
     [ "$NETWORK" = none ] && set -- "$@" --network none
-    set -- "$@" "$IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait'
+    set -- "$@" "$RUNTIME_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait'
     "$@" >/dev/null
   fi
 
@@ -575,7 +919,6 @@ create_sandbox() {
   jq '.job.payload | del(.credentials)' "$JOB_FILE" > "$MANIFEST"
   docker cp "$MANIFEST" "$CONTAINER:/opt/agentbox/manifest.json" >/dev/null
   rm -f "$MANIFEST"
-  install_agent_tools "$CONTAINER" "$JOB_FILE"
   configure_credentials "$CONTAINER" "$JOB_FILE"
   configure_skills "$CONTAINER" "$JOB_FILE"
   configure_mcp_servers "$CONTAINER" "$JOB_FILE"
@@ -725,7 +1068,12 @@ run_worker() {
   CREDENTIAL=$(sed -n '3p' "$CONFIG")
   heartbeat_loop &
   HEARTBEAT_PID=$!
-  trap 'kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true' EXIT INT TERM
+  SESSION_PID=
+  if command -v python3 >/dev/null && [ -r /usr/local/lib/agentbox/session_worker.py ]; then
+    python3 /usr/local/lib/agentbox/session_worker.py "$CONFIG" &
+    SESSION_PID=$!
+  fi
+  trap 'kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true; [ -z "$SESSION_PID" ] || kill "$SESSION_PID" >/dev/null 2>&1 || true' EXIT INT TERM
   while :; do
     JOB_FILE=$(mktemp)
     HTTP_STATUS=$(curl -sS -o "$JOB_FILE" -w '%{http_code}' -X POST \

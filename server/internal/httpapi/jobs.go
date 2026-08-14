@@ -30,7 +30,7 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 	if !s.decodeJSON(w, request, &result) {
 		return
 	}
-	if len(result.Message) > 4000 || len(result.ExternalID) > 255 {
+	if len(result.Message) > 768<<10 || len(result.ExternalID) > 255 {
 		s.writeError(w, http.StatusBadRequest, "Worker 结果过长")
 		return
 	}

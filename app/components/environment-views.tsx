@@ -2,6 +2,7 @@
 
 import { useMemo, useState } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
+import Link from "next/link"
 import {
   BotIcon,
   BoxIcon,
@@ -27,7 +28,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react"
 
-import type { AppSection } from "@/components/agent-management"
+import type { AppSection } from "@/lib/app-section"
 import {
   CollectionContent,
   CollectionTablePrimaryContent,
@@ -69,19 +70,16 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 import { Progress } from "@/components/ui/progress"
-import type { Agent } from "@/lib/agent-schema"
 import type { Resource } from "@/lib/platform-schema"
 import type { ManagedServer } from "@/lib/server-schema"
 
 type EnvironmentProps = {
   resources: Resource[]
-  agents: Agent[]
   servers: ManagedServer[]
 }
 
 export function DashboardView({
   resources,
-  agents,
   servers,
   configuredCredentials,
   onNavigate,
@@ -103,7 +101,10 @@ export function DashboardView({
       server.inventory.vmImages.length,
     0
   )
-  const activeAgents = agents.filter((item) => item.status === "active")
+  const canPullDockerImage = onlineServers.some((server) =>
+    server.capabilities.includes("docker")
+  )
+  const enabledEnvironments = environments.filter((item) => item.enabled)
   const readiness = [
     {
       label: "可用服务器",
@@ -113,15 +114,15 @@ export function DashboardView({
     },
     {
       label: "基础镜像",
-      ready: imageCount > 0,
-      value: `${imageCount} 个可用`,
+      ready: imageCount > 0 || canPullDockerImage,
+      value: imageCount > 0 ? `${imageCount} 个可用` : "Docker 可自动拉取",
       section: "images" as const,
     },
     {
-      label: "智能体配置",
-      ready: activeAgents.length > 0,
-      value: `${activeAgents.length} 个启用`,
-      section: "agents" as const,
+      label: "沙箱模板",
+      ready: enabledEnvironments.length > 0,
+      value: `${enabledEnvironments.length} 个可用`,
+      section: "runtimes" as const,
     },
     {
       label: "访问凭据",
@@ -140,16 +141,16 @@ export function DashboardView({
           <div className="flex flex-col gap-4 border-b pb-6 lg:flex-row lg:items-end lg:justify-between">
             <div className="flex max-w-3xl flex-col gap-1.5">
               <h2 className="text-xl font-semibold tracking-tight text-pretty">
-                运行环境状态
+                Agent 沙箱运行底座
               </h2>
               <p className="text-sm leading-6 text-pretty text-muted-foreground">
-                集中查看环境模板、沙箱、服务器与访问凭据，并从这里开始日常环境操作。
+                先配置可复用的沙箱模板，再按需创建隔离沙箱。
               </p>
             </div>
             <div className="flex shrink-0 flex-wrap gap-2">
               <Button variant="outline" onClick={onCreateEnvironment}>
                 <PlusIcon data-icon="inline-start" />
-                新建环境模板
+                新建沙箱模板
               </Button>
               <Button onClick={onCreateSandbox}>
                 <BoxIcon data-icon="inline-start" />
@@ -161,9 +162,9 @@ export function DashboardView({
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <StatCard
               icon={MonitorIcon}
-              label="环境模板"
+              label="沙箱模板"
               value={environments.length}
-              detail="可复用的预配环境"
+              detail="镜像、工具与凭据组合"
               onClick={() => onNavigate("runtimes")}
             />
             <StatCard
@@ -174,11 +175,11 @@ export function DashboardView({
               onClick={() => onNavigate("sandboxes")}
             />
             <StatCard
-              icon={BotIcon}
-              label="智能体"
-              value={agents.length}
-              detail={`${activeAgents.length} 个已启用`}
-              onClick={() => onNavigate("agents")}
+              icon={KeyRoundIcon}
+              label="模型凭据"
+              value={configuredCredentials}
+              detail="注入基座后自动生效"
+              onClick={() => onNavigate("access")}
             />
             <StatCard
               icon={ServerIcon}
@@ -192,9 +193,9 @@ export function DashboardView({
           <div className="grid gap-6 xl:grid-cols-[minmax(0,1.45fr)_minmax(320px,0.75fr)]">
             <Card>
               <CardHeader>
-                <CardTitle>环境模板</CardTitle>
+                <CardTitle>沙箱模板</CardTitle>
                 <CardDescription>
-                  最近配置的环境。模板只是声明，创建沙箱后才会在服务器上实例化。
+                  可复用的沙箱蓝图，包含镜像、Agent 工具、Skills、MCP 与凭据。
                 </CardDescription>
                 <CardAction>
                   <Button
@@ -236,16 +237,16 @@ export function DashboardView({
                   ))
                 ) : (
                   <div className="rounded-lg border border-dashed p-8 text-center">
-                    <p className="font-medium">还没有环境模板</p>
+                    <p className="font-medium">还没有沙箱模板</p>
                     <p className="mt-1 text-sm text-muted-foreground">
-                      从一个镜像开始，加入 Agent 工具与能力配置。
+                      选择服务器和镜像，再加入需要的 Agent 工具与凭据。
                     </p>
                     <Button
                       size="sm"
                       className="mt-4"
                       onClick={onCreateEnvironment}
                     >
-                      创建第一个模板
+                      创建第一个基座
                     </Button>
                   </div>
                 )}
@@ -336,7 +337,6 @@ function StatCard({
 
 export function EnvironmentTemplatesView({
   resources,
-  agents,
   servers,
   onCreate,
   onEdit,
@@ -352,24 +352,23 @@ export function EnvironmentTemplatesView({
   const columns = useMemo(
     () =>
       environmentColumns({
-        agents,
         servers,
         onEdit,
         onDelete,
         onLaunch,
       }),
-    [agents, onDelete, onEdit, onLaunch, servers]
+    [onDelete, onEdit, onLaunch, servers]
   )
 
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <CollectionHeader
-        title="环境模板"
+        title="沙箱模板"
         count={environments.length}
         action={
           <Button size="sm" onClick={onCreate}>
             <PlusIcon data-icon="inline-start" />
-            新建环境模板
+            新建沙箱模板
           </Button>
         }
       />
@@ -380,14 +379,14 @@ export function EnvironmentTemplatesView({
               <EmptyMedia variant="icon">
                 <MonitorIcon />
               </EmptyMedia>
-              <EmptyTitle>还没有环境模板</EmptyTitle>
+              <EmptyTitle>还没有沙箱模板</EmptyTitle>
               <EmptyDescription>
                 预先选择隔离方式与镜像，并装好 Agent 工具、Skills、MCP
-                和环境变量。
+                与模型凭据。
               </EmptyDescription>
             </EmptyHeader>
             <EmptyContent>
-              <Button onClick={onCreate}>创建第一个环境模板</Button>
+              <Button onClick={onCreate}>创建第一个沙箱模板</Button>
             </EmptyContent>
           </Empty>
         ) : (
@@ -396,7 +395,7 @@ export function EnvironmentTemplatesView({
             columns={columns}
             getRowId={(environment) => environment.id}
             initialPageSize={8}
-            searchPlaceholder="搜索环境模板…"
+            searchPlaceholder="搜索沙箱模板…"
             searchValue={(environment) =>
               `${environment.name} ${environment.description}`
             }
@@ -427,7 +426,6 @@ export function EnvironmentTemplatesView({
 
 export function SandboxesView({
   resources,
-  agents,
   servers,
   onCreate,
   busyId,
@@ -448,14 +446,13 @@ export function SandboxesView({
     () =>
       sandboxColumns({
         resources,
-        agents,
         servers,
         busyId,
         onOpen: (sandbox) => setSelectedId(sandbox.id),
         onAction,
         onDelete,
       }),
-    [agents, busyId, onAction, onDelete, resources, servers, setSelectedId]
+    [busyId, onAction, onDelete, resources, servers, setSelectedId]
   )
   const selected = sandboxes.find((item) => item.id === selectedId) ?? null
   return (
@@ -479,7 +476,7 @@ export function SandboxesView({
               </EmptyMedia>
               <EmptyTitle>还没有沙箱</EmptyTitle>
               <EmptyDescription>
-                沙箱是环境模板在某台服务器上的实例。当前控制面会先保存创建请求。
+                选择一个沙箱模板即可创建；服务器、工具和凭据会自动继承。
               </EmptyDescription>
             </EmptyHeader>
             <EmptyContent>
@@ -514,7 +511,6 @@ export function SandboxesView({
       {selected && (
         <SandboxDetailsDialog
           sandbox={selected}
-          agent={agents.find((item) => item.id === selected.spec.agentId)}
           environment={resources.find(
             (item) => item.id === selected.spec.runtimeId
           )}
@@ -530,13 +526,11 @@ export function SandboxesView({
 }
 
 function environmentColumns({
-  agents,
   servers,
   onEdit,
   onDelete,
   onLaunch,
 }: {
-  agents: Agent[]
   servers: ManagedServer[]
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
@@ -547,7 +541,7 @@ function environmentColumns({
       id: "name",
       accessorFn: (environment) => environment.name,
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="环境模板" />
+        <DataTableColumnHeader column={column} title="沙箱模板" />
       ),
       cell: ({ row }) => {
         const driver = specString(row.original.spec, "driver")
@@ -555,14 +549,12 @@ function environmentColumns({
           <CollectionTablePrimaryContent
             icon={driver === "vm" ? MonitorIcon : ContainerIcon}
             title={row.original.name}
-            description={
-              row.original.description || "可复用的 Agent 工作环境"
-            }
+            description={row.original.description || "可复用的 Agent 工作环境"}
             onClick={() => onEdit(row.original)}
           />
         )
       },
-      meta: { label: "环境模板" },
+      meta: { label: "沙箱模板" },
       enableHiding: false,
     },
     {
@@ -612,21 +604,18 @@ function environmentColumns({
       meta: { label: "隔离方式", className: "hidden lg:table-cell" },
     },
     {
-      id: "agents",
+      id: "tools",
       accessorFn: (environment) =>
-        agents.filter((agent) => agent.runtimeId === environment.id).length,
+        stringList(environment.spec.agentTools).join(" · "),
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="智能体" />
+        <DataTableColumnHeader column={column} title="已装 Agent" />
       ),
-      cell: ({ getValue }) => {
-        const count = Number(getValue())
-        return (
-          <span className="text-muted-foreground">
-            {count ? `${count} 个智能体` : "未使用"}
-          </span>
-        )
-      },
-      meta: { label: "智能体", className: "hidden xl:table-cell" },
+      cell: ({ getValue }) => (
+        <span className="block max-w-56 truncate text-muted-foreground">
+          {String(getValue()) || "未安装"}
+        </span>
+      ),
+      meta: { label: "已装 Agent", className: "hidden xl:table-cell" },
     },
     {
       id: "actions",
@@ -679,7 +668,6 @@ function environmentColumns({
 
 function sandboxColumns({
   resources,
-  agents,
   servers,
   busyId,
   onOpen,
@@ -687,7 +675,6 @@ function sandboxColumns({
   onDelete,
 }: {
   resources: Resource[]
-  agents: Agent[]
   servers: ManagedServer[]
   busyId: string | null
   onOpen: (sandbox: Resource) => void
@@ -738,34 +725,40 @@ function sandboxColumns({
       meta: { label: "状态" },
     },
     {
-      id: "agent",
-      accessorFn: (sandbox) =>
-        agents.find((agent) => agent.id === sandbox.spec.agentId)?.name ??
-        "未绑定",
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="智能体" />
-      ),
-      cell: ({ getValue }) => (
-        <span className="block max-w-40 truncate text-muted-foreground">
-          {String(getValue())}
-        </span>
-      ),
-      meta: { label: "智能体", className: "hidden md:table-cell" },
-    },
-    {
       id: "environment",
       accessorFn: (sandbox) =>
         resources.find((resource) => resource.id === sandbox.spec.runtimeId)
           ?.name ?? "未绑定",
       header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="环境模板" />
+        <DataTableColumnHeader column={column} title="沙箱模板" />
       ),
       cell: ({ getValue }) => (
         <span className="block max-w-40 truncate text-muted-foreground">
           {String(getValue())}
         </span>
       ),
-      meta: { label: "环境模板", className: "hidden lg:table-cell" },
+      meta: { label: "沙箱模板", className: "hidden md:table-cell" },
+    },
+    {
+      id: "tools",
+      accessorFn: (sandbox) => {
+        const inherited = resources.find(
+          (resource) => resource.id === sandbox.spec.runtimeId
+        )?.spec.agentTools
+        const tools = Array.isArray(sandbox.spec.agentTools)
+          ? sandbox.spec.agentTools
+          : inherited
+        return stringList(tools).join(" · ")
+      },
+      header: ({ column }) => (
+        <DataTableColumnHeader column={column} title="沙箱内 Agent" />
+      ),
+      cell: ({ getValue }) => (
+        <span className="block max-w-56 truncate text-muted-foreground">
+          {String(getValue()) || "未安装"}
+        </span>
+      ),
+      meta: { label: "沙箱内 Agent", className: "hidden lg:table-cell" },
     },
     {
       id: "server",
@@ -790,19 +783,27 @@ function sandboxColumns({
         return (
           <div className="flex items-center justify-end gap-1">
             {sandbox.spec.status === "running" ? (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={busy}
-                onClick={() => void onAction(sandbox, "stop")}
-              >
-                {busy ? (
-                  <LoaderCircleIcon className="animate-spin" />
-                ) : (
-                  <SquareIcon />
-                )}
-                停止
-              </Button>
+              <>
+                <Button size="sm" variant="outline" asChild>
+                  <Link href={`/sandboxes/${sandbox.id}`}>
+                    <MonitorIcon data-icon="inline-start" />
+                    工作台
+                  </Link>
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={busy}
+                  onClick={() => void onAction(sandbox, "stop")}
+                >
+                  {busy ? (
+                    <LoaderCircleIcon className="animate-spin" />
+                  ) : (
+                    <SquareIcon />
+                  )}
+                  停止
+                </Button>
+              </>
             ) : sandbox.spec.status === "stopped" ||
               sandbox.spec.status === "error" ? (
               <Button
@@ -857,7 +858,7 @@ function sandboxColumns({
       },
       enableSorting: false,
       enableHiding: false,
-      meta: { className: "w-28" },
+      meta: { className: "w-48" },
     },
   ]
 }
@@ -871,7 +872,6 @@ function sandboxFilterStatus(sandbox: Resource) {
 
 function SandboxDetailsDialog({
   sandbox,
-  agent,
   environment,
   server,
   resources,
@@ -880,7 +880,6 @@ function SandboxDetailsDialog({
   onOpenChange,
 }: {
   sandbox: Resource
-  agent?: Agent
   environment?: Resource
   server?: ManagedServer
   resources: Resource[]
@@ -888,7 +887,16 @@ function SandboxDetailsDialog({
   onLogin: () => void
   onOpenChange: (open: boolean) => void
 }) {
-  const tools = stringList(environment?.spec.agentTools)
+  const tools = stringList(
+    Array.isArray(sandbox.spec.agentTools)
+      ? sandbox.spec.agentTools
+      : environment?.spec.agentTools
+  )
+  const credentials = stringList(
+    Array.isArray(sandbox.spec.credentialIds)
+      ? sandbox.spec.credentialIds
+      : environment?.spec.credentialIds
+  )
   const skills = stringList(environment?.spec.skillIds).map(
     (id) => resources.find((item) => item.id === id)?.name ?? id
   )
@@ -911,20 +919,25 @@ function SandboxDetailsDialog({
         <DialogHeader>
           <DialogTitle>{sandbox.name}</DialogTitle>
           <DialogDescription>
-            管理这个沙箱的运行位置、预装能力和 Agent 登录状态。
+            查看这个沙箱的基座、运行位置和已配置能力。
           </DialogDescription>
         </DialogHeader>
 
         <div className="grid gap-4">
           <div className="grid gap-3 rounded-xl border p-4 sm:grid-cols-3">
             <Detail label="状态" value={sandboxStatus(sandbox)} />
-            <Detail label="智能体" value={agent?.name ?? "未绑定"} />
             <Detail label="服务器" value={server?.name ?? "未知服务器"} />
-            <Detail label="环境模板" value={environment?.name ?? "未绑定"} />
+            <Detail label="沙箱模板" value={environment?.name ?? "未绑定"} />
             <Detail label="实例" value={externalId} mono />
             <Detail
-              label="Agent 工具"
+              label="沙箱内 Agent"
               value={tools.length > 0 ? tools.join(" · ") : "未预装"}
+            />
+            <Detail
+              label="模型凭据"
+              value={
+                credentials.length > 0 ? `${credentials.length} 个` : "未配置"
+              }
             />
           </div>
 
@@ -939,7 +952,7 @@ function SandboxDetailsDialog({
                 <div>
                   <p className="font-medium">Codex 账号登录</p>
                   <p className="mt-1 text-sm leading-5 text-muted-foreground">
-                    API Key 已由环境模板自动注入；如果要使用 ChatGPT
+                    模型凭据已由 Sandbox 配置自动注入；如果要使用 ChatGPT
                     订阅账号，可在这个沙箱内单独发起设备登录。
                   </p>
                 </div>
@@ -990,6 +1003,14 @@ function SandboxDetailsDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             关闭
           </Button>
+          {sandbox.spec.status === "running" && (
+            <Button asChild>
+              <Link href={`/sandboxes/${sandbox.id}`}>
+                <MonitorIcon data-icon="inline-start" />
+                打开工作台
+              </Link>
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>
@@ -1060,14 +1081,14 @@ function EnvironmentBadges({
           {specString(resource.spec, "driver") === "vm" ? "VM" : "Docker"}
         </Badge>
         {tools.length > 0 && (
-          <Badge variant="outline">{tools.length} Agent</Badge>
+          <Badge variant="outline">{tools.length} 个 Agent</Badge>
         )}
       </div>
     )
   }
 
   const items = [
-    { icon: BotIcon, label: `${tools.length} Agent 工具` },
+    { icon: BotIcon, label: `${tools.length} 个 Agent` },
     { icon: SparklesIcon, label: `${skills.length} Skills` },
     { icon: PlugZapIcon, label: `${mcp.length} MCP` },
     {

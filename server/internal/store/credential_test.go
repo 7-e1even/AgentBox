@@ -2,6 +2,9 @@ package store
 
 import (
 	"bytes"
+	"context"
+	"io"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -91,5 +94,85 @@ func TestMergeCredentialModelsPreservesManualAndDefault(t *testing.T) {
 	}
 	if got := mergeCredentialModels(existing, remote, "old-default"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("mergeCredentialModels() = %#v, want %#v", got, want)
+	}
+}
+
+func TestKimiCodingConnectionUsesMessagesEndpoint(t *testing.T) {
+	request, err := providerCheckRequest(
+		context.Background(),
+		"anthropic",
+		"anthropic",
+		"https://api.kimi.com/coding/",
+		"sk-kimi-example",
+	)
+	if err != nil {
+		t.Fatalf("providerCheckRequest() returned error: %v", err)
+	}
+	if request.Method != http.MethodPost {
+		t.Fatalf("method = %q, want POST", request.Method)
+	}
+	if got := request.URL.String(); got != "https://api.kimi.com/coding/v1/messages" {
+		t.Fatalf("url = %q", got)
+	}
+	if got := request.Header.Get("x-api-key"); got != "sk-kimi-example" {
+		t.Fatalf("x-api-key = %q", got)
+	}
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		t.Fatalf("read request body: %v", err)
+	}
+	if !strings.Contains(string(body), `"model":"kimi-for-coding"`) {
+		t.Fatalf("body = %s", body)
+	}
+}
+
+func TestKimiCodingModelsAreAvailableWithoutModelsEndpoint(t *testing.T) {
+	models := knownCredentialModels("anthropic", "https://api.kimi.com/coding")
+	if len(models) != 4 {
+		t.Fatalf("len(models) = %d, want 4", len(models))
+	}
+	if models[2].ID != "kimi-for-coding" {
+		t.Fatalf("models[2].ID = %q", models[2].ID)
+	}
+	if models[2].Name != "Kimi K2.7 Code" || models[2].Group != "Kimi Code" {
+		t.Fatalf("models[2] = %#v", models[2])
+	}
+	if got := knownCredentialModels("anthropic", "https://api.kimi.com.evil.example/coding"); got != nil {
+		t.Fatalf("lookalike host returned models: %#v", got)
+	}
+}
+
+func TestNormalizeKnownProviderEndpointKeepsProtocolAndKimiPathAligned(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol string
+		endpoint string
+		want     string
+	}{
+		{
+			name:     "anthropic removes openai suffix",
+			protocol: "anthropic",
+			endpoint: "https://api.kimi.com/coding/v1",
+			want:     "https://api.kimi.com/coding/",
+		},
+		{
+			name:     "openai adds v1 suffix",
+			protocol: "openai-chat",
+			endpoint: "https://api.kimi.com/coding/",
+			want:     "https://api.kimi.com/coding/v1",
+		},
+		{
+			name:     "unrecognized host is untouched",
+			protocol: "anthropic",
+			endpoint: "https://api.kimi.com.evil.example/coding/v1",
+			want:     "https://api.kimi.com.evil.example/coding/v1",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := normalizeKnownProviderEndpoint(test.protocol, test.endpoint); got != test.want {
+				t.Fatalf("normalizeKnownProviderEndpoint() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

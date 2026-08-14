@@ -181,6 +181,15 @@ func (s *Server) deleteUser(w http.ResponseWriter, request *http.Request) {
 
 func (s *Server) requireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if s.disableAuth {
+			user, err := s.debugUser(request.Context())
+			if err != nil {
+				s.handleError(w, err)
+				return
+			}
+			next.ServeHTTP(w, request.WithContext(context.WithValue(request.Context(), userContextKey{}, user)))
+			return
+		}
 		tokenHash, ok := sessionHash(request)
 		if !ok {
 			s.writeError(w, http.StatusUnauthorized, "请先登录")
@@ -198,6 +207,29 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, request.WithContext(context.WithValue(request.Context(), userContextKey{}, user)))
 	})
+}
+
+func (s *Server) debugUser(ctx context.Context) (platform.User, error) {
+	users, err := s.store.ListUsers(ctx)
+	if err != nil {
+		return platform.User{}, err
+	}
+	for _, user := range users {
+		if user.Role == platform.UserRoleAdmin && user.Status == platform.UserStatusActive {
+			return user, nil
+		}
+	}
+	now := time.Now().UTC()
+	return platform.User{
+		ID:          "00000000-0000-0000-0000-000000000001",
+		Name:        "Debug Admin",
+		Email:       "debug@agentbox.local",
+		Role:        platform.UserRoleAdmin,
+		Status:      platform.UserStatusActive,
+		Preferences: platform.DefaultUserPreferences(),
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}, nil
 }
 
 func (s *Server) requireAdmin(next http.Handler) http.Handler {

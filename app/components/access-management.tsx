@@ -6,6 +6,7 @@ import {
   CheckIcon,
   ChevronsUpIcon,
   ChevronDownIcon,
+  EllipsisVerticalIcon,
   EyeIcon,
   EyeOffIcon,
   LockKeyholeIcon,
@@ -13,6 +14,7 @@ import {
   RefreshCwIcon,
   SaveIcon,
   SearchIcon,
+  Settings2Icon,
   Trash2Icon,
   XIcon,
 } from "lucide-react"
@@ -36,7 +38,14 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ButtonGroup } from "@/components/ui/button-group"
-import { Checkbox } from "@/components/ui/checkbox"
+import {
+  Card,
+  CardAction,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from "@/components/ui/card"
 import {
   Collapsible,
   CollapsibleContent,
@@ -58,6 +67,13 @@ import {
   EmptyMedia,
   EmptyTitle,
 } from "@/components/ui/empty"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import {
   Field,
   FieldDescription,
@@ -84,7 +100,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { Separator } from "@/components/ui/separator"
+import { Switch } from "@/components/ui/switch"
 import {
   Tooltip,
   TooltipContent,
@@ -119,7 +135,7 @@ type AccessManagementProps = {
   onDelete: (credential: ManagedCredential) => Promise<void>
 }
 
-const MODEL_PAGE_SIZE = 10
+const MODEL_PAGE_SIZE = 24
 
 export function AccessManagement({
   credentials,
@@ -131,9 +147,10 @@ export function AccessManagement({
   onDeleteModel,
   onDelete,
 }: AccessManagementProps) {
-  const [selection, setSelection] = useState<string | "new" | null>(
+  const [selection, setSelection] = useState<string | null>(
     credentials[0]?.id ?? null
   )
+  const [creating, setCreating] = useState(false)
   const [query, setQuery] = useState("")
   const [deleting, setDeleting] = useState<ManagedCredential | null>(null)
   const [deletingBusy, setDeletingBusy] = useState(false)
@@ -149,10 +166,9 @@ export function AccessManagement({
         .includes(normalized)
     })
   }, [credentials, providers, query])
-  const selectedCredential =
-    selection && selection !== "new"
-      ? (credentials.find((item) => item.id === selection) ?? null)
-      : null
+  const selectedCredential = selection
+    ? (credentials.find((item) => item.id === selection) ?? null)
+    : null
 
   async function confirmDelete() {
     if (!deleting) return
@@ -175,14 +191,14 @@ export function AccessManagement({
         title="模型服务"
         count={credentials.length}
         action={
-          <Button size="sm" onClick={() => setSelection("new")}>
+          <Button size="sm" onClick={() => setCreating(true)}>
             <PlusIcon data-icon="inline-start" />
             添加服务
           </Button>
         }
       />
 
-      <div className="mx-auto grid min-h-0 w-full max-w-[1600px] flex-1 md:grid-cols-[17rem_minmax(0,1fr)]">
+      <div className="grid min-h-0 w-full flex-1 md:grid-cols-[17rem_minmax(0,1fr)]">
         <aside className="flex min-h-0 flex-col border-b bg-muted/20 md:border-r md:border-b-0">
           <div className="shrink-0 p-3">
             <div className="relative">
@@ -196,16 +212,8 @@ export function AccessManagement({
             </div>
           </div>
 
-          <ScrollArea className="h-52 px-2 pb-2 md:h-auto md:min-h-0 md:flex-1">
+          <ScrollArea className="h-24 px-2 pb-2 md:h-auto md:min-h-0 md:flex-1">
             <ItemGroup className="gap-1">
-              {selection === "new" && (
-                <ServiceListItem
-                  selected
-                  mark="+"
-                  name="新模型服务"
-                  detail="尚未保存"
-                />
-              )}
               {visibleCredentials.map((credential) => {
                 const provider = providers.find(
                   (item) => item.id === credential.providerId
@@ -223,10 +231,11 @@ export function AccessManagement({
                     detail={provider?.name ?? credential.providerId}
                     status={status}
                     onClick={() => setSelection(credential.id)}
+                    onDelete={() => setDeleting(credential)}
                   />
                 )
               })}
-              {visibleCredentials.length === 0 && selection !== "new" && (
+              {visibleCredentials.length === 0 && (
                 <p className="px-3 py-8 text-center text-sm text-muted-foreground">
                   {credentials.length === 0 ? "还没有模型服务" : "没有匹配结果"}
                 </p>
@@ -238,7 +247,7 @@ export function AccessManagement({
             <Button
               variant="outline"
               className="w-full"
-              onClick={() => setSelection("new")}
+              onClick={() => setCreating(true)}
             >
               <PlusIcon data-icon="inline-start" />
               添加服务
@@ -247,7 +256,7 @@ export function AccessManagement({
         </aside>
 
         <div className="flex min-h-0 overflow-hidden">
-          {selection === "new" || selectedCredential ? (
+          {selectedCredential ? (
             <CredentialEditor
               key={selection}
               credential={selectedCredential}
@@ -259,9 +268,6 @@ export function AccessManagement({
               onAddModel={onAddModel}
               onDeleteModel={onDeleteModel}
               onSaved={(credential) => setSelection(credential.id)}
-              onDelete={() =>
-                selectedCredential && setDeleting(selectedCredential)
-              }
             />
           ) : (
             <Empty className="min-h-full border-0">
@@ -275,7 +281,7 @@ export function AccessManagement({
                 </EmptyDescription>
               </EmptyHeader>
               <EmptyContent>
-                <Button size="sm" onClick={() => setSelection("new")}>
+                <Button size="sm" onClick={() => setCreating(true)}>
                   <PlusIcon data-icon="inline-start" />
                   添加服务
                 </Button>
@@ -293,7 +299,8 @@ export function AccessManagement({
           <AlertDialogHeader>
             <AlertDialogTitle>删除 {deleting?.name}？</AlertDialogTitle>
             <AlertDialogDescription>
-              密钥和已保存的模型列表会永久删除。仍被智能体或环境模板引用时不能删除。
+              密钥和已保存的模型列表会永久删除。仍被沙箱模板、Sandbox
+              或旧智能体引用时不能删除。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -308,6 +315,19 @@ export function AccessManagement({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {creating && (
+        <CreateCredentialDialog
+          credentials={credentials}
+          providers={providers}
+          onSave={onSave}
+          onCancel={() => setCreating(false)}
+          onCreated={(credential) => {
+            setCreating(false)
+            setSelection(credential.id)
+          }}
+        />
+      )}
     </section>
   )
 }
@@ -319,6 +339,7 @@ function ServiceListItem({
   detail,
   status,
   onClick,
+  onDelete,
 }: {
   selected: boolean
   mark: string
@@ -326,15 +347,16 @@ function ServiceListItem({
   detail: string
   status?: { label: string; dotClassName: string }
   onClick?: () => void
+  onDelete: () => void
 }) {
   return (
     <CollectionListItem
-      asChild
       variant={selected ? "muted" : "default"}
-      className="rounded-lg border-0 px-3 py-2.5 hover:bg-muted/70"
+      className="group rounded-lg border-0 px-3 py-2.5 hover:bg-muted/70"
     >
       <button
         type="button"
+        className="flex min-w-0 flex-1 items-center gap-3 text-left"
         aria-current={selected ? "page" : undefined}
         onClick={onClick}
       >
@@ -355,7 +377,221 @@ function ServiceListItem({
           <ItemDescription>{detail}</ItemDescription>
         </ItemContent>
       </button>
+      <ItemActions>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon-sm"
+              className={cn(
+                "opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100",
+                selected && "opacity-100"
+              )}
+              aria-label={`管理 ${name}`}
+            >
+              <EllipsisVerticalIcon />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-36">
+            <DropdownMenuGroup>
+              <DropdownMenuItem variant="destructive" onSelect={onDelete}>
+                <Trash2Icon />
+                删除服务
+              </DropdownMenuItem>
+            </DropdownMenuGroup>
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </ItemActions>
     </CollectionListItem>
+  )
+}
+
+function CreateCredentialDialog({
+  credentials,
+  providers,
+  onSave,
+  onCancel,
+  onCreated,
+}: {
+  credentials: ManagedCredential[]
+  providers: Provider[]
+  onSave: AccessManagementProps["onSave"]
+  onCancel: () => void
+  onCreated: (credential: ManagedCredential) => void
+}) {
+  const [input, setInput] = useState<CredentialInput>(() =>
+    newCredentialInput(providers, credentials)
+  )
+  const [showSecret, setShowSecret] = useState(false)
+  const [error, setError] = useState("")
+  const [saving, setSaving] = useState(false)
+
+  function update<K extends keyof CredentialInput>(
+    key: K,
+    value: CredentialInput[K]
+  ) {
+    setInput((current) => ({ ...current, [key]: value }))
+    setError("")
+  }
+
+  function updateProtocol(protocol: CredentialInput["protocol"]) {
+    setInput((current) => ({
+      ...current,
+      providerId: providerIdForProtocol(protocol, current.providerId),
+      protocol,
+      endpoint: canonicalEndpointForProtocol(current.endpoint, protocol),
+    }))
+    setError("")
+  }
+
+  function updateEndpoint(endpoint: string) {
+    setInput((current) => {
+      const protocol = inferProtocolFromEndpoint(endpoint) ?? current.protocol
+      return {
+        ...current,
+        endpoint,
+        protocol,
+        providerId: providerIdForProtocol(protocol, current.providerId),
+      }
+    })
+    setError("")
+  }
+
+  async function submit() {
+    const parsed = credentialInputSchema.safeParse(input)
+    if (!parsed.success) {
+      setError(parsed.error.issues[0]?.message ?? "请检查表单")
+      return
+    }
+    if (!parsed.data.secret) {
+      setError("请填写 API Key")
+      return
+    }
+    setSaving(true)
+    try {
+      onCreated(await onSave(parsed.data, null))
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : "添加失败")
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && !saving && onCancel()}>
+      <DialogContent className="sm:max-w-xl">
+        <DialogHeader>
+          <DialogTitle>添加模型服务</DialogTitle>
+          <DialogDescription>
+            填写服务名称、API Key 和根地址，保存后即可检测连接或获取模型。
+          </DialogDescription>
+        </DialogHeader>
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="new-credential-name">服务名称</FieldLabel>
+            <Input
+              id="new-credential-name"
+              value={input.name}
+              placeholder="例如 Kimi Code"
+              onChange={(event) => {
+                const name = event.target.value
+                update("name", name)
+                update("id", nextNamedCredentialId(name, credentials))
+              }}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="new-credential-secret">API Key</FieldLabel>
+            <div className="relative">
+              <Input
+                id="new-credential-secret"
+                type={showSecret ? "text" : "password"}
+                autoComplete="new-password"
+                value={input.secret}
+                placeholder="输入 API Key"
+                className="pr-10 font-mono"
+                onChange={(event) => update("secret", event.target.value)}
+              />
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className="absolute top-1/2 right-1 -translate-y-1/2"
+                aria-label={showSecret ? "隐藏 API Key" : "显示 API Key"}
+                onClick={() => setShowSecret((current) => !current)}
+              >
+                {showSecret ? <EyeOffIcon /> : <EyeIcon />}
+              </Button>
+            </div>
+          </Field>
+          <Field>
+            <FieldLabel>API 类型</FieldLabel>
+            <ProtocolSelect
+              value={input.protocol}
+              onValueChange={updateProtocol}
+            />
+          </Field>
+          <Field>
+            <FieldLabel htmlFor="new-credential-endpoint">API 地址</FieldLabel>
+            <Input
+              id="new-credential-endpoint"
+              value={input.endpoint}
+              placeholder={defaultEndpointHint(input.providerId)}
+              onChange={(event) => updateEndpoint(event.target.value)}
+              onBlur={() =>
+                update(
+                  "endpoint",
+                  canonicalEndpointForProtocol(input.endpoint, input.protocol)
+                )
+              }
+            />
+            <FieldDescription>
+              {actualRequestHint(input.protocol, input.endpoint)}
+            </FieldDescription>
+          </Field>
+          {error && <FieldError>{error}</FieldError>}
+        </FieldGroup>
+        <DialogFooter>
+          <Button variant="outline" disabled={saving} onClick={onCancel}>
+            取消
+          </Button>
+          <Button disabled={saving} onClick={() => void submit()}>
+            {saving ? "正在添加…" : "添加"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function ProtocolSelect({
+  value,
+  onValueChange,
+}: {
+  value: CredentialInput["protocol"]
+  onValueChange: (value: CredentialInput["protocol"]) => void
+}) {
+  return (
+    <Select
+      value={value}
+      onValueChange={(next) =>
+        onValueChange(next as CredentialInput["protocol"])
+      }
+    >
+      <SelectTrigger className="w-full">
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent>
+        <SelectGroup>
+          <SelectLabel>API 类型</SelectLabel>
+          <SelectItem value="openai-responses">OpenAI Responses</SelectItem>
+          <SelectItem value="openai-chat">OpenAI Chat Completions</SelectItem>
+          <SelectItem value="anthropic">Anthropic Messages</SelectItem>
+          <SelectItem value="gemini">Gemini API</SelectItem>
+        </SelectGroup>
+      </SelectContent>
+    </Select>
   )
 }
 
@@ -369,21 +605,18 @@ function CredentialEditor({
   onAddModel,
   onDeleteModel,
   onSaved,
-  onDelete,
 }: Omit<AccessManagementProps, "credentials" | "onDelete"> & {
   credential: ManagedCredential | null
   credentials: ManagedCredential[]
   onSaved: (credential: ManagedCredential) => void
-  onDelete: () => void
 }) {
   const [input, setInput] = useState<CredentialInput>(() =>
     credential
       ? inputFromCredential(credential)
       : newCredentialInput(providers, credentials)
   )
-  const [identityEdited, setIdentityEdited] = useState(Boolean(credential))
-  const [slugEdited, setSlugEdited] = useState(Boolean(credential))
   const [showSecret, setShowSecret] = useState(false)
+  const [apiSettingsOpen, setApiSettingsOpen] = useState(false)
   const [error, setError] = useState("")
   const [saving, setSaving] = useState(false)
   const [checking, setChecking] = useState(false)
@@ -399,20 +632,20 @@ function CredentialEditor({
     setError("")
   }
 
-  function updateProvider(providerId: string) {
-    const nextProvider = providers.find((item) => item.id === providerId)
-    setInput((current) => ({
-      ...current,
-      providerId,
-      protocol: defaultProtocol(providerId),
-      modelId: "",
-      ...(!credential && !identityEdited
-        ? {
-            name: defaultCredentialName(nextProvider),
-            id: nextCredentialId(providerId, credentials),
-          }
-        : {}),
-    }))
+  function updateEndpoint(endpoint: string) {
+    setInput((current) => {
+      const protocol = inferProtocolFromEndpoint(endpoint)
+      return {
+        ...current,
+        endpoint,
+        ...(protocol
+          ? {
+              protocol,
+              providerId: providerIdForProtocol(protocol, current.providerId),
+            }
+          : {}),
+      }
+    })
     setError("")
   }
 
@@ -484,203 +717,230 @@ function CredentialEditor({
           </span>
           <div className="min-w-0">
             <h2 className="truncate font-semibold">
-              {credential ? credential.name : "新模型服务"}
+              {input.name || "新模型服务"}
             </h2>
             <p className="truncate text-sm text-muted-foreground">
               {credentialStatusText(credential)}
             </p>
           </div>
         </div>
-        <label className="flex cursor-pointer items-center gap-2 text-sm">
-          <Checkbox
-            checked={input.enabled}
-            onCheckedChange={(checked) => update("enabled", checked === true)}
-          />
-          启用
-        </label>
+        <div className="flex items-center gap-3">
+          <Field orientation="horizontal" className="w-auto gap-2">
+            <FieldLabel htmlFor="credential-enabled">启用</FieldLabel>
+            <Switch
+              id="credential-enabled"
+              checked={input.enabled}
+              onCheckedChange={(checked) => update("enabled", checked)}
+            />
+          </Field>
+          <Button
+            size="sm"
+            disabled={
+              saving ||
+              checking ||
+              pullingModels ||
+              (Boolean(credential) && !dirty)
+            }
+            onClick={() => void persist()}
+          >
+            <SaveIcon data-icon="inline-start" />
+            {saving ? "正在保存…" : "保存"}
+          </Button>
+        </div>
       </div>
 
-      <div className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col gap-6 overflow-y-auto p-4 sm:p-6 md:overflow-hidden lg:p-8">
-        <section className="grid shrink-0 gap-4">
-          <h3 className="text-sm font-semibold">连接配置</h3>
-          <FieldGroup>
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <FieldLabel>Agent Provider</FieldLabel>
-                <Select value={input.providerId} onValueChange={updateProvider}>
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder="选择 Provider" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectLabel>Providers</SelectLabel>
-                      {providers.map((item) => (
-                        <SelectItem key={item.id} value={item.id}>
-                          {item.name}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
-              </Field>
-              <Field>
-                <FieldLabel>接口协议</FieldLabel>
-                <Select
-                  value={input.protocol}
-                  onValueChange={(value) =>
-                    update("protocol", value as CredentialInput["protocol"])
-                  }
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="openai-responses">
-                      OpenAI Responses
-                    </SelectItem>
-                    <SelectItem value="openai-chat">
-                      OpenAI Chat Completions
-                    </SelectItem>
-                    <SelectItem value="anthropic">
-                      Anthropic Messages
-                    </SelectItem>
-                    <SelectItem value="gemini">Gemini API</SelectItem>
-                  </SelectContent>
-                </Select>
-              </Field>
-            </div>
-
-            <Field>
-              <FieldLabel htmlFor="credential-secret">API Key</FieldLabel>
-              <div className="flex flex-col gap-2 sm:flex-row">
-                <div className="relative min-w-0 flex-1">
-                  <Input
-                    id="credential-secret"
-                    type={showSecret ? "text" : "password"}
-                    autoComplete="new-password"
-                    value={input.secret}
-                    placeholder={
-                      credential
-                        ? `当前 ${credential.maskedSecret}；输入新值可替换`
-                        : "输入 API Key"
-                    }
-                    className="pr-10 font-mono"
-                    onChange={(event) => update("secret", event.target.value)}
-                  />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-sm"
-                    className="absolute top-1/2 right-1 -translate-y-1/2"
-                    aria-label={showSecret ? "隐藏 API Key" : "显示 API Key"}
-                    onClick={() => setShowSecret((current) => !current)}
-                  >
-                    {showSecret ? <EyeOffIcon /> : <EyeIcon />}
-                  </Button>
-                </div>
+      <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-5 lg:p-6">
+        <div className="grid w-full items-start gap-5 2xl:grid-cols-[minmax(20rem,0.85fr)_minmax(30rem,1.15fr)]">
+          <Card size="sm" className="min-w-0">
+            <CardHeader>
+              <CardTitle>连接设置</CardTitle>
+              <CardDescription>
+                {protocolLabel(input.protocol)} ·{" "}
+                {actualRequestPath(input.protocol)}
+              </CardDescription>
+              <CardAction>
                 <Button
                   type="button"
                   variant="outline"
-                  disabled={saving || checking || pullingModels}
-                  onClick={() => void checkConnection()}
+                  size="sm"
+                  onClick={() => setApiSettingsOpen(true)}
                 >
-                  <ActivityIcon data-icon="inline-start" />
-                  {checking ? "正在检测…" : "检测连接"}
+                  <Settings2Icon data-icon="inline-start" />
+                  API 设置
                 </Button>
-              </div>
-            </Field>
+              </CardAction>
+            </CardHeader>
+            <CardContent>
+              <FieldGroup>
+                <Field>
+                  <FieldLabel htmlFor="credential-secret">API Key</FieldLabel>
+                  <div className="flex flex-col gap-2 sm:flex-row">
+                    <div className="relative min-w-0 flex-1">
+                      <Input
+                        id="credential-secret"
+                        type={showSecret ? "text" : "password"}
+                        autoComplete="new-password"
+                        value={input.secret}
+                        placeholder={
+                          credential
+                            ? `当前 ${credential.maskedSecret}；输入新值可替换`
+                            : "输入 API Key"
+                        }
+                        className="pr-10 font-mono"
+                        onChange={(event) =>
+                          update("secret", event.target.value)
+                        }
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        className="absolute top-1/2 right-1 -translate-y-1/2"
+                        aria-label={
+                          showSecret ? "隐藏 API Key" : "显示 API Key"
+                        }
+                        onClick={() => setShowSecret((current) => !current)}
+                      >
+                        {showSecret ? <EyeOffIcon /> : <EyeIcon />}
+                      </Button>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={saving || checking || pullingModels}
+                      onClick={() => void checkConnection()}
+                    >
+                      <ActivityIcon data-icon="inline-start" />
+                      {checking ? "正在检测…" : "检测连接"}
+                    </Button>
+                  </div>
+                </Field>
 
-            <Field>
-              <FieldLabel htmlFor="credential-endpoint">API 地址</FieldLabel>
-              <Input
-                id="credential-endpoint"
-                value={input.endpoint}
-                placeholder={defaultEndpointHint(input.providerId)}
-                onChange={(event) => update("endpoint", event.target.value)}
-              />
-              <FieldDescription>
-                留空使用 Provider 官方地址；兼容服务可以填写自定义地址。
-              </FieldDescription>
-            </Field>
-
-            <div className="grid gap-4 sm:grid-cols-2">
-              <Field>
-                <FieldLabel htmlFor="credential-name">配置名称</FieldLabel>
-                <Input
-                  id="credential-name"
-                  value={input.name}
-                  onChange={(event) => {
-                    setIdentityEdited(true)
-                    update("name", event.target.value)
-                    if (!credential && !slugEdited) {
-                      update("id", slug(event.target.value))
+                <Field>
+                  <FieldLabel htmlFor="credential-endpoint">
+                    API 地址
+                  </FieldLabel>
+                  <Input
+                    id="credential-endpoint"
+                    value={input.endpoint}
+                    placeholder={defaultEndpointHint(input.providerId)}
+                    onChange={(event) => updateEndpoint(event.target.value)}
+                    onBlur={() =>
+                      update(
+                        "endpoint",
+                        canonicalEndpointForProtocol(
+                          input.endpoint,
+                          input.protocol
+                        )
+                      )
                     }
-                  }}
-                />
-              </Field>
-              <Field>
-                <FieldLabel htmlFor="credential-id">唯一标识</FieldLabel>
-                <Input
-                  id="credential-id"
-                  value={input.id}
-                  disabled={Boolean(credential)}
-                  onChange={(event) => {
-                    setIdentityEdited(true)
-                    setSlugEdited(true)
-                    update("id", event.target.value.toLowerCase())
-                  }}
-                />
-              </Field>
-            </div>
+                  />
+                  <FieldDescription>
+                    {actualRequestHint(input.protocol, input.endpoint)}
+                  </FieldDescription>
+                </Field>
 
-            {error && <FieldError>{error}</FieldError>}
-          </FieldGroup>
-        </section>
+                {error && <FieldError>{error}</FieldError>}
+              </FieldGroup>
+            </CardContent>
+          </Card>
 
-        <Separator className="shrink-0" />
-
-        <CredentialModels
-          credential={credential}
-          models={credential?.models ?? []}
-          defaultModelId={input.modelId}
-          busy={saving || pullingModels}
-          pulling={pullingModels}
-          onSelect={(modelId) => update("modelId", modelId)}
-          onPull={() => void pullModels()}
-          onAdd={onAddModel}
-          onDelete={onDeleteModel}
-          onError={setError}
-        />
-
-        <div className="flex shrink-0 flex-wrap items-center justify-between gap-3 border-t pt-5">
-          <div>
-            {credential && (
-              <Button variant="ghost" onClick={onDelete}>
-                <Trash2Icon data-icon="inline-start" />
-                删除服务
-              </Button>
-            )}
-          </div>
-          <div className="flex items-center gap-3">
-            {credential && !dirty && (
-              <span className="text-xs text-muted-foreground">已保存</span>
-            )}
-            <Button
-              disabled={
-                saving ||
-                checking ||
-                pullingModels ||
-                (Boolean(credential) && !dirty)
-              }
-              onClick={() => void persist()}
-            >
-              <SaveIcon data-icon="inline-start" />
-              {saving ? "正在保存…" : "保存配置"}
-            </Button>
-          </div>
+          <CredentialModels
+            credential={credential}
+            models={credential?.models ?? []}
+            defaultModelId={input.modelId}
+            busy={saving || pullingModels}
+            pulling={pullingModels}
+            onSelect={(modelId) => update("modelId", modelId)}
+            onPull={() => void pullModels()}
+            onAdd={onAddModel}
+            onDelete={onDeleteModel}
+            onError={setError}
+          />
         </div>
       </div>
+
+      {apiSettingsOpen && (
+        <ApiSettingsDialog
+          open
+          input={input}
+          onOpenChange={setApiSettingsOpen}
+          onApply={(settings) => {
+            setInput((current) => ({
+              ...current,
+              name: settings.name,
+              protocol: settings.protocol,
+              providerId: providerIdForProtocol(
+                settings.protocol,
+                current.providerId
+              ),
+              endpoint: canonicalEndpointForProtocol(
+                current.endpoint,
+                settings.protocol
+              ),
+            }))
+            setError("")
+          }}
+        />
+      )}
     </div>
+  )
+}
+
+function ApiSettingsDialog({
+  open,
+  input,
+  onOpenChange,
+  onApply,
+}: {
+  open: boolean
+  input: CredentialInput
+  onOpenChange: (open: boolean) => void
+  onApply: (settings: Pick<CredentialInput, "name" | "protocol">) => void
+}) {
+  const [name, setName] = useState(input.name)
+  const [protocol, setProtocol] = useState(input.protocol)
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>API 设置</DialogTitle>
+          <DialogDescription>
+            API 类型决定鉴权头和请求路径。切换后会同步修正已识别服务的根地址。
+          </DialogDescription>
+        </DialogHeader>
+        <FieldGroup>
+          <Field>
+            <FieldLabel htmlFor="credential-settings-name">服务名称</FieldLabel>
+            <Input
+              id="credential-settings-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+            />
+          </Field>
+          <Field>
+            <FieldLabel>API 类型</FieldLabel>
+            <ProtocolSelect value={protocol} onValueChange={setProtocol} />
+            <FieldDescription>{actualRequestPath(protocol)}</FieldDescription>
+          </Field>
+        </FieldGroup>
+        <DialogFooter>
+          <Button variant="outline" onClick={() => onOpenChange(false)}>
+            取消
+          </Button>
+          <Button
+            disabled={!name.trim()}
+            onClick={() => {
+              onApply({ name: name.trim(), protocol })
+              onOpenChange(false)
+            }}
+          >
+            应用
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -732,7 +992,7 @@ function CredentialModels({
   )
   const groups = Object.entries(
     currentModels.reduce<Record<string, CredentialModel[]>>((result, model) => {
-      const group = model.group || "models"
+      const group = credentialModelGroupLabel(credential, model)
       result[group] = [...(result[group] ?? []), model]
       return result
     }, {})
@@ -752,246 +1012,260 @@ function CredentialModels({
   }
 
   return (
-    <section className="flex min-h-[28rem] flex-none flex-col gap-4 md:min-h-0 md:flex-1">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="flex min-w-0 items-center gap-1">
-          <h3 className="mr-1 text-sm font-semibold">模型</h3>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-sm"
-                aria-label="全部折叠"
-                disabled={groups.length === 0}
-                onClick={() =>
-                  setCollapsed(
-                    Object.fromEntries(groups.map(([group]) => [group, true]))
-                  )
-                }
-              >
-                <ChevronsUpIcon />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>全部折叠</TooltipContent>
-          </Tooltip>
-          {searching ? (
-            <div className="relative ml-1 w-52 max-w-[45vw]">
-              <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
-              <Input
-                autoFocus
-                value={query}
-                placeholder="搜索模型…"
-                className="h-8 pr-8 pl-8"
-                onChange={(event) => {
-                  setQuery(event.target.value)
-                  setPage(1)
-                }}
-              />
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon-xs"
-                className="absolute top-1/2 right-1 -translate-y-1/2"
-                aria-label="关闭搜索"
-                onClick={() => {
-                  setSearching(false)
-                  setQuery("")
-                  setPage(1)
-                }}
-              >
-                <XIcon />
-              </Button>
-            </div>
-          ) : (
+    <>
+      <Card size="sm" className="min-w-0">
+        <CardHeader>
+          <CardTitle className="flex min-w-0 items-center gap-1">
+            <span className="mr-1">模型</span>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
                   type="button"
                   variant="ghost"
                   size="icon-sm"
-                  aria-label="搜索模型"
-                  onClick={() => setSearching(true)}
+                  aria-label="全部折叠"
+                  disabled={groups.length === 0}
+                  onClick={() =>
+                    setCollapsed(
+                      Object.fromEntries(groups.map(([group]) => [group, true]))
+                    )
+                  }
                 >
-                  <SearchIcon />
+                  <ChevronsUpIcon />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>搜索模型</TooltipContent>
+              <TooltipContent>全部折叠</TooltipContent>
             </Tooltip>
-          )}
-        </div>
-
-        <ButtonGroup aria-label="模型操作">
-          <Button
-            type="button"
-            variant="outline"
-            disabled={!credential || busy}
-            onClick={onPull}
-          >
-            <RefreshCwIcon
-              data-icon="inline-start"
-              className={pulling ? "animate-spin" : undefined}
-            />
-            {pulling ? "正在获取…" : "获取模型列表"}
-          </Button>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant="outline"
-                size="icon"
-                aria-label="添加模型"
-                disabled={!credential || busy}
-                onClick={() => setAdding(true)}
-              >
-                <PlusIcon />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>手动添加模型</TooltipContent>
-          </Tooltip>
-        </ButtonGroup>
-      </div>
-
-      <div className="min-h-0 flex-1 overflow-y-auto pr-1">
-        {!credential ? (
-          <Empty className="min-h-52 rounded-xl border">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <SaveIcon />
-              </EmptyMedia>
-              <EmptyTitle>先保存模型服务</EmptyTitle>
-              <EmptyDescription>
-                保存连接后，就可以获取远程模型或手动添加模型。
-              </EmptyDescription>
-            </EmptyHeader>
-          </Empty>
-        ) : models.length === 0 ? (
-          <Empty className="min-h-52 rounded-xl border">
-            <EmptyHeader>
-              <EmptyMedia variant="icon">
-                <RefreshCwIcon />
-              </EmptyMedia>
-              <EmptyTitle>还没有模型</EmptyTitle>
-              <EmptyDescription>
-                从服务端获取模型列表，或使用右上角的加号手动添加。
-              </EmptyDescription>
-            </EmptyHeader>
-            <EmptyContent>
-              <Button variant="outline" disabled={busy} onClick={onPull}>
-                <RefreshCwIcon data-icon="inline-start" />
-                获取模型列表
-              </Button>
-            </EmptyContent>
-          </Empty>
-        ) : groups.length === 0 ? (
-          <Empty className="min-h-40 rounded-xl border">
-            <EmptyHeader>
-              <EmptyTitle>没有匹配的模型</EmptyTitle>
-            </EmptyHeader>
-          </Empty>
-        ) : (
-          <div className="grid gap-3">
-            {groups.map(([group, groupModels]) => (
-              <Collapsible
-                key={group}
-                open={normalized ? true : !collapsed[group]}
-                onOpenChange={(open) =>
-                  setCollapsed((current) => ({ ...current, [group]: !open }))
-                }
-                className="overflow-hidden rounded-xl border bg-card"
-              >
-                <CollapsibleTrigger asChild>
+            {searching ? (
+              <div className="relative ml-1 w-52 max-w-[45vw]">
+                <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  autoFocus
+                  value={query}
+                  placeholder="搜索模型…"
+                  className="h-8 pr-8 pl-8"
+                  onChange={(event) => {
+                    setQuery(event.target.value)
+                    setPage(1)
+                  }}
+                />
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  className="absolute top-1/2 right-1 -translate-y-1/2"
+                  aria-label="关闭搜索"
+                  onClick={() => {
+                    setSearching(false)
+                    setQuery("")
+                    setPage(1)
+                  }}
+                >
+                  <XIcon />
+                </Button>
+              </div>
+            ) : (
+              <Tooltip>
+                <TooltipTrigger asChild>
                   <Button
                     type="button"
                     variant="ghost"
-                    className="group h-11 w-full justify-between rounded-none px-4"
+                    size="icon-sm"
+                    aria-label="搜索模型"
+                    onClick={() => setSearching(true)}
                   >
-                    <span className="flex min-w-0 items-center gap-2">
-                      <ChevronDownIcon className="transition-transform group-data-[state=closed]:-rotate-90" />
-                      <span className="truncate font-medium">{group}</span>
-                      <span className="text-xs text-muted-foreground">
-                        {groupModels.length}
-                      </span>
-                    </span>
+                    <SearchIcon />
                   </Button>
-                </CollapsibleTrigger>
-                <CollapsibleContent>
-                  <CollectionList className="rounded-none border-x-0 border-b-0">
-                    {groupModels.map((model) => {
-                      const selected = model.id === defaultModelId
-                      return (
-                        <CollectionListItem
-                          key={model.id}
-                          variant={selected ? "muted" : "default"}
-                        >
-                          <button
-                            type="button"
-                            className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                            onClick={() => onSelect(model.id)}
-                          >
-                            <ItemMedia
-                              className={cn(
-                                "flex size-8 shrink-0 items-center justify-center rounded-lg border text-xs font-semibold",
-                                selected &&
-                                  "border-primary bg-primary text-primary-foreground"
-                              )}
+                </TooltipTrigger>
+                <TooltipContent>搜索模型</TooltipContent>
+              </Tooltip>
+            )}
+          </CardTitle>
+          <CardAction>
+            <ButtonGroup aria-label="模型操作">
+              <Button
+                type="button"
+                variant="outline"
+                disabled={!credential || busy}
+                onClick={onPull}
+              >
+                <RefreshCwIcon
+                  data-icon="inline-start"
+                  className={pulling ? "animate-spin" : undefined}
+                />
+                {pulling ? "正在获取…" : "获取模型列表"}
+              </Button>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="icon"
+                    aria-label="添加模型"
+                    disabled={!credential || busy}
+                    onClick={() => setAdding(true)}
+                  >
+                    <PlusIcon />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>手动添加模型</TooltipContent>
+              </Tooltip>
+            </ButtonGroup>
+          </CardAction>
+        </CardHeader>
+
+        <CardContent className="flex flex-col gap-3">
+          <div>
+            {!credential ? (
+              <Empty className="min-h-52 rounded-xl border">
+                <EmptyHeader>
+                  <EmptyMedia variant="icon">
+                    <SaveIcon />
+                  </EmptyMedia>
+                  <EmptyTitle>先保存模型服务</EmptyTitle>
+                  <EmptyDescription>
+                    保存连接后，就可以获取远程模型或手动添加模型。
+                  </EmptyDescription>
+                </EmptyHeader>
+              </Empty>
+            ) : models.length === 0 ? (
+              <Empty className="min-h-52 rounded-xl border">
+                <EmptyHeader>
+                  <EmptyMedia variant="icon">
+                    <RefreshCwIcon />
+                  </EmptyMedia>
+                  <EmptyTitle>还没有模型</EmptyTitle>
+                  <EmptyDescription>
+                    从服务端获取模型列表，或使用右上角的加号手动添加。
+                  </EmptyDescription>
+                </EmptyHeader>
+                <EmptyContent>
+                  <Button variant="outline" disabled={busy} onClick={onPull}>
+                    <RefreshCwIcon data-icon="inline-start" />
+                    获取模型列表
+                  </Button>
+                </EmptyContent>
+              </Empty>
+            ) : groups.length === 0 ? (
+              <Empty className="min-h-40 rounded-xl border">
+                <EmptyHeader>
+                  <EmptyTitle>没有匹配的模型</EmptyTitle>
+                </EmptyHeader>
+              </Empty>
+            ) : (
+              <div className="grid gap-3">
+                {groups.map(([group, groupModels]) => (
+                  <Collapsible
+                    key={group}
+                    open={normalized ? true : !collapsed[group]}
+                    onOpenChange={(open) =>
+                      setCollapsed((current) => ({
+                        ...current,
+                        [group]: !open,
+                      }))
+                    }
+                    className="overflow-hidden rounded-lg border bg-background"
+                  >
+                    <CollapsibleTrigger asChild>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        className="group h-11 w-full justify-between rounded-none px-4"
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <ChevronDownIcon className="transition-transform group-data-[state=closed]:-rotate-90" />
+                          <span className="truncate font-medium">{group}</span>
+                          <span className="text-xs text-muted-foreground">
+                            {groupModels.length}
+                          </span>
+                        </span>
+                      </Button>
+                    </CollapsibleTrigger>
+                    <CollapsibleContent>
+                      <CollectionList className="rounded-none border-x-0 border-b-0">
+                        {groupModels.map((model) => {
+                          const selected = model.id === defaultModelId
+                          return (
+                            <CollectionListItem
+                              key={model.id}
+                              variant={selected ? "muted" : "default"}
                             >
-                              {selected ? (
-                                <CheckIcon />
-                              ) : (
-                                model.name.slice(0, 1)
-                              )}
-                            </ItemMedia>
-                            <ItemContent className="min-w-0">
-                              <ItemTitle>
-                                {model.name}
-                                {selected && (
-                                  <Badge variant="secondary">默认</Badge>
-                                )}
-                                {model.source === "manual" && (
-                                  <Badge variant="outline">手动</Badge>
-                                )}
-                              </ItemTitle>
-                              {model.name !== model.id && (
-                                <ItemDescription>{model.id}</ItemDescription>
-                              )}
-                            </ItemContent>
-                          </button>
-                          <ItemActions>
-                            <Tooltip>
-                              <TooltipTrigger asChild>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="icon-sm"
-                                  aria-label={`删除 ${model.name}`}
-                                  disabled={selected || deletingId === model.id}
-                                  onClick={() => void deleteModel(model)}
+                              <button
+                                type="button"
+                                className="flex min-w-0 flex-1 items-center gap-3 text-left"
+                                onClick={() => onSelect(model.id)}
+                              >
+                                <ItemMedia
+                                  className={cn(
+                                    "flex size-8 shrink-0 items-center justify-center rounded-lg border text-xs font-semibold",
+                                    selected &&
+                                      "border-primary bg-primary text-primary-foreground"
+                                  )}
                                 >
-                                  <Trash2Icon />
-                                </Button>
-                              </TooltipTrigger>
-                              <TooltipContent>
-                                {selected ? "默认模型不能删除" : "删除模型"}
-                              </TooltipContent>
-                            </Tooltip>
-                          </ItemActions>
-                        </CollectionListItem>
-                      )
-                    })}
-                  </CollectionList>
-                </CollapsibleContent>
-              </Collapsible>
-            ))}
+                                  {selected ? (
+                                    <CheckIcon />
+                                  ) : (
+                                    model.name.slice(0, 1)
+                                  )}
+                                </ItemMedia>
+                                <ItemContent className="min-w-0">
+                                  <ItemTitle>
+                                    {model.name}
+                                    {selected && (
+                                      <Badge variant="secondary">默认</Badge>
+                                    )}
+                                    {model.source === "manual" && (
+                                      <Badge variant="outline">手动</Badge>
+                                    )}
+                                  </ItemTitle>
+                                  {model.name !== model.id && (
+                                    <ItemDescription>
+                                      {model.id}
+                                    </ItemDescription>
+                                  )}
+                                </ItemContent>
+                              </button>
+                              <ItemActions>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      aria-label={`删除 ${model.name}`}
+                                      disabled={
+                                        selected || deletingId === model.id
+                                      }
+                                      onClick={() => void deleteModel(model)}
+                                    >
+                                      <Trash2Icon />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>
+                                    {selected ? "默认模型不能删除" : "删除模型"}
+                                  </TooltipContent>
+                                </Tooltip>
+                              </ItemActions>
+                            </CollectionListItem>
+                          )
+                        })}
+                      </CollectionList>
+                    </CollapsibleContent>
+                  </Collapsible>
+                ))}
+              </div>
+            )}
           </div>
-        )}
-      </div>
-      <CollectionPagination
-        currentPage={currentPage}
-        pageSize={MODEL_PAGE_SIZE}
-        totalItems={visibleModels.length}
-        onPageChange={setPage}
-      />
+          {totalPages > 1 && (
+            <CollectionPagination
+              currentPage={currentPage}
+              pageSize={MODEL_PAGE_SIZE}
+              totalItems={visibleModels.length}
+              onPageChange={setPage}
+            />
+          )}
+        </CardContent>
+      </Card>
 
       {credential && (
         <AddModelDialog
@@ -1002,7 +1276,7 @@ function CredentialModels({
           onError={onError}
         />
       )}
-    </section>
+    </>
   )
 }
 
@@ -1097,7 +1371,10 @@ function inputFromCredential(credential: ManagedCredential): CredentialInput {
     name: credential.name,
     providerId: credential.providerId,
     protocol: credential.protocol,
-    endpoint: credential.endpoint,
+    endpoint: canonicalEndpointForProtocol(
+      credential.endpoint,
+      credential.protocol
+    ),
     modelId: credential.modelId,
     secret: "",
     enabled: credential.enabled,
@@ -1108,11 +1385,10 @@ function newCredentialInput(
   providers: Provider[],
   credentials: ManagedCredential[]
 ): CredentialInput {
-  const provider = providers[0]
-  const providerId = provider?.id ?? ""
+  const providerId = providers[0]?.id ?? ""
   return {
     id: nextCredentialId(providerId, credentials),
-    name: defaultCredentialName(provider),
+    name: "",
     providerId,
     protocol: defaultProtocol(providerId),
     endpoint: "",
@@ -1120,10 +1396,6 @@ function newCredentialInput(
     secret: "",
     enabled: true,
   }
-}
-
-function defaultCredentialName(provider?: Provider) {
-  return provider ? `${provider.name} 主连接` : "新模型服务"
 }
 
 function nextCredentialId(
@@ -1137,6 +1409,16 @@ function nextCredentialId(
     index += 1
   }
   return `${prefix}-${index}`
+}
+
+function nextNamedCredentialId(name: string, credentials: ManagedCredential[]) {
+  const base = slug(name)
+  if (!credentials.some((item) => item.id === base)) return base
+  let index = 2
+  while (credentials.some((item) => item.id === `${base}-${index}`)) {
+    index += 1
+  }
+  return `${base}-${index}`
 }
 
 function isCredentialDirty(
@@ -1201,4 +1483,103 @@ function defaultEndpointHint(providerId: string) {
       deepseek: "留空使用 https://api.deepseek.com",
     }[providerId] ?? "输入兼容服务的 API 地址"
   )
+}
+
+function protocolLabel(protocol: CredentialInput["protocol"]) {
+  return {
+    "openai-responses": "OpenAI Responses",
+    "openai-chat": "OpenAI Chat Completions",
+    anthropic: "Anthropic Messages",
+    gemini: "Gemini API",
+  }[protocol]
+}
+
+function actualRequestPath(protocol: CredentialInput["protocol"]) {
+  return {
+    "openai-responses": "POST /responses",
+    "openai-chat": "POST /chat/completions",
+    anthropic: "POST /v1/messages",
+    gemini: "POST /models/{model}:generateContent",
+  }[protocol]
+}
+
+function actualRequestHint(
+  protocol: CredentialInput["protocol"],
+  endpoint: string
+) {
+  const fallback = {
+    "openai-responses": "https://api.openai.com/v1",
+    "openai-chat": "https://api.openai.com/v1",
+    anthropic: "https://api.anthropic.com",
+    gemini: "https://generativelanguage.googleapis.com/v1beta",
+  }[protocol]
+  const base = (endpoint.trim() || fallback).replace(/\/+$/, "")
+  const suffix = (() => {
+    if (protocol === "anthropic") {
+      return base.endsWith("/v1") ? "/messages" : "/v1/messages"
+    }
+    if (protocol === "openai-chat") return "/chat/completions"
+    if (protocol === "openai-responses") return "/responses"
+    return "/models/{model}:generateContent"
+  })()
+  return `实际请求：POST ${base}${suffix}`
+}
+
+function providerIdForProtocol(
+  protocol: CredentialInput["protocol"],
+  currentProviderId: string
+) {
+  if (protocol === "anthropic") return "anthropic"
+  if (protocol === "gemini") return "google"
+  if (protocol === "openai-responses") return "openai"
+  return currentProviderId === "deepseek" ? "deepseek" : "openai"
+}
+
+function inferProtocolFromEndpoint(
+  endpoint: string
+): CredentialInput["protocol"] | null {
+  const path = knownKimiCodingPath(endpoint)
+  if (path === "/coding") return "anthropic"
+  if (path === "/coding/v1") return "openai-chat"
+  return null
+}
+
+function canonicalEndpointForProtocol(
+  endpoint: string,
+  protocol: CredentialInput["protocol"]
+) {
+  if (!knownKimiCodingPath(endpoint)) return endpoint
+  if (protocol === "anthropic") return "https://api.kimi.com/coding/"
+  if (protocol === "openai-chat" || protocol === "openai-responses") {
+    return "https://api.kimi.com/coding/v1"
+  }
+  return endpoint
+}
+
+function credentialModelGroupLabel(
+  credential: ManagedCredential | null,
+  model: CredentialModel
+) {
+  return credential && knownKimiCodingPath(credential.endpoint)
+    ? "Kimi Code"
+    : model.group || "其他"
+}
+
+function knownKimiCodingPath(endpoint: string) {
+  try {
+    const url = new URL(endpoint)
+    const path = url.pathname.replace(/\/+$/, "")
+    if (
+      url.protocol === "https:" &&
+      url.hostname === "api.kimi.com" &&
+      url.port === "" &&
+      url.search === "" &&
+      url.hash === ""
+    ) {
+      return path === "/coding" || path === "/coding/v1" ? path : null
+    }
+    return null
+  } catch {
+    return null
+  }
 }

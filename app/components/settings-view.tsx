@@ -636,8 +636,8 @@ function DisplaySettings({
               }
             />
             <SidebarGroupSwitch
-              label="组织与治理"
-              description="项目、自动化和用户管理。"
+              label="管理员入口"
+              description="显示用户管理。"
               checked={next.showGovernance}
               onCheckedChange={(checked) =>
                 setNext((current) => ({

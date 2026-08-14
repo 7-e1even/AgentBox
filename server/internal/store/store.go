@@ -43,6 +43,8 @@ var (
 	ErrProviderUnavailable = errors.New("Provider 服务不可用")
 )
 
+const workerJobLeaseDuration = 2 * time.Hour
+
 const columns = `
   id, project_id, runtime_id, name, slug, description, avatar, provider_id, model_id,
   credential_id, system_prompt, skill_ids, mcp_server_ids, variable_ids, custom_args,
@@ -733,6 +735,7 @@ func scanCredential(row pgx.Row) (platform.ManagedCredential, error) {
 	if result.Models == nil {
 		result.Models = []platform.CredentialModel{}
 	}
+	result.Endpoint = normalizeKnownProviderEndpoint(result.Protocol, result.Endpoint)
 	result.MaskedSecret = "••••" + lastFour
 	if lastCheckAt.Valid {
 		result.LastCheckAt = &lastCheckAt.Time
@@ -763,6 +766,7 @@ func (s *Store) ListCredentials(ctx context.Context) ([]platform.ManagedCredenti
 
 func (s *Store) CreateCredential(ctx context.Context, input platform.CredentialInput) (platform.ManagedCredential, error) {
 	platform.NormalizeCredential(&input)
+	input.Endpoint = normalizeKnownProviderEndpoint(input.Protocol, input.Endpoint)
 	if err := platform.ValidateCredential(input, true); err != nil {
 		return platform.ManagedCredential{}, err
 	}
@@ -790,6 +794,7 @@ func (s *Store) CreateCredential(ctx context.Context, input platform.CredentialI
 
 func (s *Store) UpdateCredential(ctx context.Context, id string, input platform.CredentialInput) (platform.ManagedCredential, error) {
 	platform.NormalizeCredential(&input)
+	input.Endpoint = normalizeKnownProviderEndpoint(input.Protocol, input.Endpoint)
 	if input.ID != id {
 		return platform.ManagedCredential{}, &platform.ValidationError{Message: "凭据标识不能修改"}
 	}
@@ -839,7 +844,7 @@ func (s *Store) DeleteCredential(ctx context.Context, id string) error {
 	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
     SELECT 1 FROM agents WHERE credential_id = $1
     UNION ALL
-    SELECT 1 FROM control_resources WHERE kind = 'runtime' AND spec->'credentialIds' ? $1
+    SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'credentialIds' ? $1
   )`, id).Scan(&referenced); err != nil {
 		return fmt.Errorf("check credential bindings: %w", err)
 	}
@@ -904,6 +909,11 @@ func (s *Store) PullCredentialModels(ctx context.Context, id string) ([]platform
 	secret, err := decryptSecret(s.secretKey, ciphertext, nonce)
 	if err != nil {
 		return nil, err
+	}
+	if models := knownCredentialModels(protocol, endpoint); len(models) > 0 {
+		return s.mutateCredentialModels(ctx, id, func(existing []platform.CredentialModel, defaultModelID string) ([]platform.CredentialModel, error) {
+			return mergeCredentialModels(existing, models, defaultModelID), nil
+		})
 	}
 	request, err := providerModelsRequest(ctx, providerID, protocol, endpoint, secret)
 	if err != nil {
@@ -1075,7 +1085,7 @@ func credentialModelGroup(id, owner string) string {
 }
 
 func checkProviderCredential(ctx context.Context, providerID, protocol, endpoint, secret string) error {
-	request, err := providerModelsRequest(ctx, providerID, protocol, endpoint, secret)
+	request, err := providerCheckRequest(ctx, providerID, protocol, endpoint, secret)
 	if err != nil {
 		return err
 	}
@@ -1088,6 +1098,70 @@ func checkProviderCredential(ctx context.Context, providerID, protocol, endpoint
 		return fmt.Errorf("Provider 返回 HTTP %d", response.StatusCode)
 	}
 	return nil
+}
+
+func providerCheckRequest(ctx context.Context, providerID, protocol, endpoint, secret string) (*http.Request, error) {
+	endpoint = normalizeKnownProviderEndpoint(protocol, endpoint)
+	if protocol == "anthropic" && isKimiCodingEndpoint(endpoint) {
+		body := strings.NewReader(`{"model":"kimi-for-coding","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}`)
+		request, err := http.NewRequestWithContext(
+			ctx,
+			http.MethodPost,
+			strings.TrimRight(endpoint, "/")+"/v1/messages",
+			body,
+		)
+		if err != nil {
+			return nil, errors.New("无法创建连接检测请求")
+		}
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("x-api-key", secret)
+		request.Header.Set("anthropic-version", "2023-06-01")
+		return request, nil
+	}
+	return providerModelsRequest(ctx, providerID, protocol, endpoint, secret)
+}
+
+func knownCredentialModels(protocol, endpoint string) []platform.CredentialModel {
+	if protocol != "anthropic" || !isKimiCodingEndpoint(endpoint) {
+		return nil
+	}
+	return []platform.CredentialModel{
+		{ID: "k3", Name: "Kimi K3", Group: "Kimi Code", Source: "remote"},
+		{ID: "k3-256k", Name: "Kimi K3 256K", Group: "Kimi Code", Source: "remote"},
+		{ID: "kimi-for-coding", Name: "Kimi K2.7 Code", Group: "Kimi Code", Source: "remote"},
+		{ID: "kimi-for-coding-highspeed", Name: "Kimi K2.7 Code HighSpeed", Group: "Kimi Code", Source: "remote"},
+	}
+}
+
+func normalizeKnownProviderEndpoint(protocol, endpoint string) string {
+	if kimiCodingEndpointPath(endpoint) == "" {
+		return endpoint
+	}
+	switch protocol {
+	case "anthropic":
+		return "https://api.kimi.com/coding/"
+	case "openai-chat", "openai-responses":
+		return "https://api.kimi.com/coding/v1"
+	default:
+		return endpoint
+	}
+}
+
+func isKimiCodingEndpoint(endpoint string) bool {
+	return kimiCodingEndpointPath(endpoint) == "/coding"
+}
+
+func kimiCodingEndpointPath(endpoint string) string {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") ||
+		!strings.EqualFold(parsed.Hostname(), "api.kimi.com") || parsed.Port() != "" {
+		return ""
+	}
+	path := strings.TrimRight(parsed.EscapedPath(), "/")
+	if (path != "/coding" && path != "/coding/v1") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	return path
 }
 
 func providerModelsRequest(ctx context.Context, providerID, protocol, endpoint, secret string) (*http.Request, error) {
@@ -1385,8 +1459,18 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET
     status = 'leased', lease_until = $1, attempts = attempts + 1, updated_at = $2
-    WHERE id = $3`, now.Add(15*time.Minute), now, job.ID); err != nil {
+    WHERE id = $3`, now.Add(workerJobLeaseDuration), now, job.ID); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("lease worker job: %w", err)
+	}
+	if job.Action == "create-sandbox" {
+		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
+      spec = spec || jsonb_build_object(
+        'status', 'starting'::text,
+        'message', 'Worker 正在预配沙箱'::text
+      ), updated_at = $1
+      WHERE id = $2 AND kind = 'sandbox'`, now, job.ResourceID); err != nil {
+			return platform.WorkerJob{}, fmt.Errorf("update claimed sandbox status: %w", err)
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("commit worker job claim: %w", err)
@@ -1415,6 +1499,7 @@ func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, payload 
 		if err != nil {
 			return err
 		}
+		endpoint = normalizeKnownProviderEndpoint(protocol, endpoint)
 		credentials = append(credentials, map[string]any{
 			"id": id, "providerId": providerID, "protocol": protocol,
 			"endpoint": endpoint, "modelId": modelID, "secret": secret,
@@ -1484,6 +1569,9 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		); err != nil {
 			return fmt.Errorf("update sandbox login status: %w", err)
 		}
+		return tx.Commit(ctx)
+	}
+	if strings.HasPrefix(action, "workspace-") {
 		return tx.Commit(ctx)
 	}
 	sandboxStatus := "error"
@@ -1618,6 +1706,14 @@ func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource
 			return fmt.Errorf("load sandbox image: %w", err)
 		}
 	}
+	agentTools := runtimeSpec["agentTools"]
+	if sandboxTools, ok := sandbox.Spec["agentTools"]; ok {
+		agentTools = sandboxTools
+	}
+	credentialIDs := runtimeSpec["credentialIds"]
+	if sandboxCredentials, ok := sandbox.Spec["credentialIds"]; ok {
+		credentialIDs = sandboxCredentials
+	}
 	payload := map[string]any{
 		"sandboxId":     sandbox.ID,
 		"name":          sandbox.Name,
@@ -1628,11 +1724,11 @@ func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource
 		"cpu":           runtimeSpec["cpu"],
 		"memory":        runtimeSpec["memory"],
 		"network":       runtimeSpec["network"],
-		"agentTools":    runtimeSpec["agentTools"],
+		"agentTools":    agentTools,
 		"skillIds":      runtimeSpec["skillIds"],
 		"mcpServerIds":  runtimeSpec["mcpServerIds"],
 		"variableIds":   runtimeSpec["variableIds"],
-		"credentialIds": runtimeSpec["credentialIds"],
+		"credentialIds": credentialIDs,
 		"workspace":     sandbox.Spec["workspace"],
 	}
 	for _, definitions := range []struct {
@@ -1650,30 +1746,6 @@ func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource
 		}
 		payload[definitions.payloadKey] = resources
 	}
-	credentialIDs := specStringList(payload, "credentialIds")
-	agentID, _ := sandbox.Spec["agentId"].(string)
-	var agentCredential pgtype.Text
-	if err := tx.QueryRow(ctx, `SELECT credential_id FROM agents WHERE id = $1`, agentID).Scan(&agentCredential); err != nil {
-		return fmt.Errorf("load sandbox Agent credential: %w", err)
-	}
-	if agentCredential.Valid {
-		var managed bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(
-      SELECT 1 FROM provider_credentials WHERE id = $1 AND enabled = TRUE
-    )`, agentCredential.String).Scan(&managed); err != nil {
-			return fmt.Errorf("check sandbox Agent credential: %w", err)
-		}
-		if managed {
-			found := false
-			for _, id := range credentialIDs {
-				found = found || id == agentCredential.String
-			}
-			if !found {
-				credentialIDs = append(credentialIDs, agentCredential.String)
-			}
-		}
-	}
-	payload["credentialIds"] = credentialIDs
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
     (id, server_id, resource_id, action, status, payload, created_at, updated_at)
@@ -1948,11 +2020,7 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 			return fmt.Errorf("decode environment server inventory: %w", err)
 		}
 		imageReference, _ := input.Spec["imageReference"].(string)
-		images := inventory.DockerImages
-		if driver == "vm" {
-			images = inventory.VMImages
-		}
-		if !serverInventoryHasImage(images, imageReference, serverArch) {
+		if !runtimeImageIsAvailable(driver, inventory, imageReference, serverArch) {
 			return &platform.ValidationError{Message: "所选镜像已不在运行服务器上，请刷新后重新选择"}
 		}
 		for kind, key := range map[platform.Kind]string{
@@ -1989,16 +2057,18 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 	if input.Kind != platform.KindSandbox && input.Kind != platform.KindSchedule && input.Kind != platform.KindWebhook {
 		return nil
 	}
-	agentID, _ := input.Spec["agentId"].(string)
-	if _, err := uuid.Parse(agentID); err != nil {
-		return &platform.ValidationError{Message: "目标 Agent 无效"}
-	}
-	var agentExists bool
-	if err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND project_id = $2)", agentID, input.ProjectID).Scan(&agentExists); err != nil {
-		return fmt.Errorf("check target agent: %w", err)
-	}
-	if !agentExists {
-		return &platform.ValidationError{Message: "目标 Agent 不存在或不属于当前 Project"}
+	if input.Kind != platform.KindSandbox {
+		agentID, _ := input.Spec["agentId"].(string)
+		if _, err := uuid.Parse(agentID); err != nil {
+			return &platform.ValidationError{Message: "目标 Agent 无效"}
+		}
+		var agentExists bool
+		if err := s.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM agents WHERE id = $1 AND project_id = $2)", agentID, input.ProjectID).Scan(&agentExists); err != nil {
+			return fmt.Errorf("check target agent: %w", err)
+		}
+		if !agentExists {
+			return &platform.ValidationError{Message: "目标 Agent 不存在或不属于当前 Project"}
+		}
 	}
 	if input.Kind == platform.KindSandbox {
 		runtimeID, _ := input.Spec["runtimeId"].(string)
@@ -2047,15 +2117,29 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 		if err := json.Unmarshal(inventoryJSON, &inventory); err != nil {
 			return fmt.Errorf("decode sandbox server inventory: %w", err)
 		}
-		images := inventory.DockerImages
-		if driver == "vm" {
-			images = inventory.VMImages
-		}
-		if !serverInventoryHasImage(images, imageReference, serverArch) {
+		if !runtimeImageIsAvailable(driver, inventory, imageReference, serverArch) {
 			return &platform.ValidationError{Message: "环境模板使用的镜像已不在目标服务器上"}
+		}
+		for _, credentialID := range specStringList(input.Spec, "credentialIds") {
+			var exists bool
+			if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+          SELECT 1 FROM provider_credentials WHERE id = $1 AND enabled = TRUE
+        )`, credentialID).Scan(&exists); err != nil {
+				return fmt.Errorf("check sandbox credential: %w", err)
+			}
+			if !exists {
+				return &platform.ValidationError{Message: "沙箱包含不存在或已停用的模型凭据"}
+			}
 		}
 	}
 	return nil
+}
+
+func runtimeImageIsAvailable(driver string, inventory platform.ServerInventory, reference, serverArch string) bool {
+	if driver == "docker" {
+		return strings.TrimSpace(reference) != ""
+	}
+	return serverInventoryHasImage(inventory.VMImages, reference, serverArch)
 }
 
 func serverInventoryHasImage(images []platform.ServerImage, reference, serverArch string) bool {

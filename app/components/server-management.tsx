@@ -510,14 +510,14 @@ function ServerDetail({
           <section className="grid gap-3">
             <div className="flex items-center justify-between gap-3">
               <div>
-                <h2 className="font-medium">默认环境模板</h2>
+                <h2 className="font-medium">沙箱模板</h2>
                 <p className="text-sm text-muted-foreground">
-                  以这台服务器作为默认目标的模板，仍可在创建沙箱时改选。
+                  使用这台服务器运行的可复用沙箱基座。
                 </p>
               </div>
               <Button size="sm" onClick={onCreateRuntime}>
                 <PlusIcon data-icon="inline-start" />
-                新建环境模板
+                新建沙箱模板
               </Button>
             </div>
 
@@ -527,14 +527,14 @@ function ServerDetail({
                   <EmptyMedia variant="icon">
                     <BoxIcon />
                   </EmptyMedia>
-                  <EmptyTitle>还没有默认环境模板</EmptyTitle>
+                  <EmptyTitle>还没有沙箱模板</EmptyTitle>
                   <EmptyDescription>
                     新建时会把当前服务器设为默认目标。
                   </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent>
                   <Button variant="outline" size="sm" onClick={onCreateRuntime}>
-                    创建第一个环境模板
+                    创建第一个沙箱模板
                   </Button>
                 </EmptyContent>
               </Empty>
@@ -584,7 +584,7 @@ function ServerDetail({
             <AlertDialogTitle>移除 {server.name}？</AlertDialogTitle>
             <AlertDialogDescription>
               {runtimes.length > 0
-                ? `这台服务器仍是 ${runtimes.length} 个环境模板的默认目标，请先修改模板。`
+                ? `这台服务器仍被 ${runtimes.length} 个沙箱模板使用，请先修改模板。`
                 : "移除后 Worker 将不能再向平台上报；服务器本身和其中的数据不会被删除。"}
             </AlertDialogDescription>
           </AlertDialogHeader>

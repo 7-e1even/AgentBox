@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@import "@xterm/xterm/css/xterm.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -48,8 +49,8 @@
 }
 
 :root {
-  --background: oklch(0.985 0.004 260);
-  --foreground: oklch(0.17 0.015 260);
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
   --card-foreground: oklch(0.145 0 0);
   --popover: oklch(1 0 0);
@@ -72,7 +73,7 @@
   --chart-4: oklch(0.371 0 0);
   --chart-5: oklch(0.269 0 0);
   --radius: 0.625rem;
-  --sidebar: oklch(0.975 0.006 260);
+  --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.205 0 0);
   --sidebar-primary-foreground: oklch(0.985 0 0);
@@ -80,6 +81,12 @@
   --sidebar-accent-foreground: oklch(0.205 0 0);
   --sidebar-border: oklch(0.922 0 0);
   --sidebar-ring: oklch(0.708 0 0);
+  --terminal-background: oklch(0.145 0 0);
+  --terminal-input: oklch(0.205 0 0);
+  --terminal-foreground: oklch(0.922 0 0);
+  --terminal-muted: oklch(0.708 0 0);
+  --terminal-accent: oklch(0.845 0.143 164.978);
+  --terminal-border: oklch(1 0 0 / 12%);
 }
 
 .dark {

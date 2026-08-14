@@ -27,6 +27,15 @@ const (
 
 var idPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
+var allowedAgentTools = map[string]bool{
+	"antigravity": true, "claude-code": true, "codebuddy": true,
+	"codex": true, "copilot-cli": true, "cursor": true,
+	"gemini-cli": true, "grok": true, "kimi": true, "omp": true,
+	"openclaw": true, "opencode": true,
+	"pi": true, "qoder-cli": true, "qoder-cn": true,
+	"qwen-code": true, "qwenpaw": true, "reasonix": true,
+}
+
 type Input struct {
 	ID          string         `json:"id"`
 	Kind        Kind           `json:"kind"`
@@ -278,6 +287,9 @@ func ValidateCredential(input CredentialInput, requireSecret bool) error {
 	if n := utf8.RuneCountInString(input.ModelID); n > 160 {
 		return &ValidationError{Message: "模型名称过长"}
 	}
+	if strings.ContainsAny(input.ModelID, "\r\n") {
+		return &ValidationError{Message: "模型 ID 不能包含换行符"}
+	}
 	if requireSecret && input.Secret == "" {
 		return &ValidationError{Message: "请填写 API Key"}
 	}
@@ -379,25 +391,20 @@ func Validate(input Input) error {
 		if err := require(input.Spec, "imageReference", "请选择服务器上的镜像"); err != nil {
 			return err
 		}
-		allowedTools := map[string]bool{
-			"codex": true, "claude-code": true, "gemini-cli": true, "opencode": true,
-		}
-		for _, tool := range stringList(input.Spec["agentTools"]) {
-			if !allowedTools[tool] {
-				return &ValidationError{Message: "预装 Agent 工具无效"}
-			}
+		if err := validateAgentTools(input.Spec); err != nil {
+			return err
 		}
 	}
 	if input.Kind == KindSandbox {
-		if err := require(input.Spec, "agentId", "请选择 Agent"); err != nil {
-			return err
-		}
-		if err := require(input.Spec, "runtimeId", "请选择环境模板"); err != nil {
+		if err := require(input.Spec, "runtimeId", "请选择沙箱模板"); err != nil {
 			return err
 		}
 		serverID, _ := input.Spec["serverId"].(string)
 		if _, err := uuid.Parse(serverID); err != nil {
 			return &ValidationError{Message: "请选择目标服务器"}
+		}
+		if err := validateAgentTools(input.Spec); err != nil {
+			return err
 		}
 	}
 	if input.Kind == KindWebhook {
@@ -414,6 +421,15 @@ func Validate(input Input) error {
 			return err
 		}
 		return require(input.Spec, "reference", "请填写变量或密钥引用")
+	}
+	return nil
+}
+
+func validateAgentTools(spec map[string]any) error {
+	for _, tool := range stringList(spec["agentTools"]) {
+		if !allowedAgentTools[tool] {
+			return &ValidationError{Message: "Agent 工具无效"}
+		}
 	}
 	return nil
 }

@@ -46,7 +46,7 @@ import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 const labels: Record<ResourceKind, string> = {
   project: "项目",
   image: "镜像",
-  runtime: "环境模板",
+  runtime: "沙箱模板",
   skill: "Skill",
   mcp: "MCP Server",
   sandbox: "Sandbox",
@@ -55,7 +55,8 @@ const labels: Record<ResourceKind, string> = {
   variable: "变量引用",
 }
 
-type Option = { value: string; label: string }
+type Option = { value: string; label: string; disabled?: boolean }
+type Preset = { label: string; values: string[] }
 type SpecField = {
   key: string
   label: string
@@ -64,7 +65,62 @@ type SpecField = {
   textarea?: boolean
   options?: Option[]
   multiOptions?: Option[]
+  presets?: Preset[]
+  advanced?: boolean
 }
+
+const commonAgentToolIds = [
+  "codex",
+  "claude-code",
+  "gemini-cli",
+  "opencode",
+  "pi",
+  "copilot-cli",
+  "qwen-code",
+]
+
+const multicaLinuxAgentToolIds = [
+  "antigravity",
+  "claude-code",
+  "codebuddy",
+  "codex",
+  "copilot-cli",
+  "cursor",
+  "grok",
+  "kimi",
+  "omp",
+  "openclaw",
+  "opencode",
+  "pi",
+  "qoder-cli",
+  "qoder-cn",
+  "qwen-code",
+  "qwenpaw",
+  "reasonix",
+]
+
+const agentToolOptions: Option[] = [
+  { value: "antigravity", label: "Antigravity" },
+  { value: "claude-code", label: "Claude Code" },
+  { value: "codebuddy", label: "CodeBuddy" },
+  { value: "codex", label: "Codex" },
+  { value: "copilot-cli", label: "GitHub Copilot CLI" },
+  { value: "cursor", label: "Cursor CLI" },
+  { value: "deveco", label: "DevEco Code（Linux 不支持）", disabled: true },
+  { value: "gemini-cli", label: "Gemini CLI" },
+  { value: "grok", label: "Grok CLI" },
+  { value: "kimi", label: "Kimi Code CLI" },
+  { value: "omp", label: "Oh-My-Pi" },
+  { value: "openclaw", label: "OpenClaw" },
+  { value: "opencode", label: "OpenCode" },
+  { value: "pi", label: "Pi" },
+  { value: "qoder-cli", label: "Qoder CLI" },
+  { value: "qoder-cn", label: "Qoder CLI CN" },
+  { value: "qwen-code", label: "Qwen Code" },
+  { value: "qwenpaw", label: "QwenPaw" },
+  { value: "reasonix", label: "Reasonix" },
+  { value: "trae-cli", label: "TRAE CLI（需自带）", disabled: true },
+]
 
 function fields(
   kind: ResourceKind,
@@ -79,7 +135,7 @@ function fields(
     label: item.name,
   }))
   const runtimeOptions = resources
-    .filter((item) => item.kind === "runtime")
+    .filter((item) => item.kind === "runtime" && item.enabled)
     .map((item) => ({ value: item.id, label: item.name }))
   const serverOptions = servers.map((item) => ({
     value: item.id,
@@ -99,10 +155,38 @@ function fields(
     driver === "vm"
       ? (server?.inventory.vmImages ?? [])
       : (server?.inventory.dockerImages ?? [])
-  const imageOptions = serverImages.map((item) => ({
+  const inventoryImageOptions = serverImages.map((item) => ({
     value: driver === "vm" ? item.path || item.reference : item.reference,
     label: `${item.reference}${item.size ? ` · ${item.size}` : ""}`,
   }))
+  const currentImageReference = String(spec.imageReference ?? "").trim()
+  const imageOptions =
+    driver === "vm"
+      ? inventoryImageOptions
+      : [
+          ...inventoryImageOptions,
+          ...(!currentImageReference ||
+          inventoryImageOptions.some(
+            (option) => option.value === currentImageReference
+          )
+            ? []
+            : [
+                {
+                  value: currentImageReference,
+                  label: `${currentImageReference} · 创建时自动拉取`,
+                },
+              ]),
+          ...(inventoryImageOptions.some(
+            (option) => option.value === "ubuntu:24.04"
+          ) || currentImageReference === "ubuntu:24.04"
+            ? []
+            : [
+                {
+                  value: "ubuntu:24.04",
+                  label: "ubuntu:24.04 · 创建时自动拉取",
+                },
+              ]),
+        ]
   switch (kind) {
     case "project":
       return []
@@ -140,7 +224,7 @@ function fields(
           key: "serverId",
           label: "运行服务器",
           options: serverOptions,
-          description: "镜像和虚拟化能力都来自这台物理服务器的实时盘点。",
+          description: "基座会使用这台服务器的镜像与隔离能力。",
         },
         {
           key: "driver",
@@ -156,38 +240,62 @@ function fields(
           label: "系统镜像",
           options: imageOptions,
           description:
-            imageOptions.length > 0
-              ? driver === "vm"
+            driver === "vm"
+              ? imageOptions.length > 0
                 ? "来自服务器 VM 镜像目录，创建时会启动独立虚拟机。"
-                : "来自服务器当前已有的 Docker 镜像，不是平台手填目录。"
-              : server
-                ? "这台服务器尚未上报可用镜像。"
-                : "请先选择运行服务器。",
+                : server
+                  ? "这台服务器尚未上报可用的 VM 镜像。"
+                  : "请先选择运行服务器。"
+              : "服务器没有该 Docker 镜像时会在首次创建沙箱时自动拉取。",
         },
         {
           key: "agentTools",
-          label: "预装 Agent 工具",
-          multiOptions: [
-            { value: "codex", label: "Codex" },
-            { value: "claude-code", label: "Claude Code" },
-            { value: "gemini-cli", label: "Gemini CLI" },
-            { value: "opencode", label: "OpenCode" },
+          label: "Agent 工具",
+          multiOptions: agentToolOptions,
+          presets: [
+            { label: "常用 7 个", values: commonAgentToolIds },
+            {
+              label: "全部 17 个（重型）",
+              values: multicaLinuxAgentToolIds,
+            },
+            { label: "清空", values: [] },
           ],
-          description: "创建沙箱时安装并写入所选 Agent 工具的配置。",
+          description:
+            "只安装所选工具；首个沙箱会构建缓存镜像，之后同组合直接复用。部分工具仍需各自账号登录。",
         },
-        { key: "workdir", label: "工作目录", placeholder: "/workspace" },
+        {
+          key: "credentialIds",
+          label: "模型凭据",
+          multiOptions: credentials
+            .filter((item) => item.enabled)
+            .map((item) => ({ value: item.id, label: item.name })),
+          description: "创建沙箱时自动转换为各 Agent 工具需要的配置格式。",
+        },
+        {
+          key: "workdir",
+          label: "工作目录",
+          placeholder: "/workspace",
+          advanced: true,
+        },
         {
           key: "setup",
           label: "初始化命令",
           placeholder: "apt-get update && apt-get install -y git",
           textarea: true,
+          advanced: true,
         },
-        { key: "cpu", label: "CPU", placeholder: "2" },
-        { key: "memory", label: "内存", placeholder: "4 GiB" },
+        { key: "cpu", label: "CPU", placeholder: "2", advanced: true },
+        {
+          key: "memory",
+          label: "内存",
+          placeholder: "4 GiB",
+          advanced: true,
+        },
         {
           key: "network",
           label: "网络策略",
           options: values("none", "restricted", "egress"),
+          advanced: true,
         },
         {
           key: "skillIds",
@@ -195,6 +303,7 @@ function fields(
           multiOptions: resources
             .filter((item) => item.kind === "skill" && item.enabled)
             .map((item) => ({ value: item.id, label: item.name })),
+          advanced: true,
         },
         {
           key: "mcpServerIds",
@@ -202,6 +311,7 @@ function fields(
           multiOptions: resources
             .filter((item) => item.kind === "mcp" && item.enabled)
             .map((item) => ({ value: item.id, label: item.name })),
+          advanced: true,
         },
         {
           key: "variableIds",
@@ -209,14 +319,7 @@ function fields(
           multiOptions: resources
             .filter((item) => item.kind === "variable" && item.enabled)
             .map((item) => ({ value: item.id, label: item.name })),
-        },
-        {
-          key: "credentialIds",
-          label: "注入 API Keys",
-          multiOptions: credentials
-            .filter((item) => item.enabled)
-            .map((item) => ({ value: item.id, label: item.name })),
-          description: "只保存凭据标识；明文会在创建沙箱时解密注入。",
+          advanced: true,
         },
       ]
     case "skill":
@@ -263,28 +366,35 @@ function fields(
       ]
     case "sandbox":
       return [
-        { key: "agentId", label: "Agent", options: agentOptions },
-        { key: "runtimeId", label: "环境模板", options: runtimeOptions },
         {
-          key: "serverId",
-          label: "目标服务器",
-          options: serverOptions,
-          description: "沙箱会在这台物理服务器上创建。",
-        },
-        {
-          key: "policy",
-          label: "实例策略",
-          options: values("new", "reuse", "sticky"),
+          key: "runtimeId",
+          label: "沙箱模板",
+          options: runtimeOptions,
+          description: "先继承基座配置，再按这个沙箱的需要调整。",
         },
         {
           key: "workspace",
-          label: "工作区目录",
+          label: "工作区挂载点（可选）",
           placeholder: "/workspace/project",
         },
         {
-          key: "status",
-          label: "期望状态",
-          options: values("requested", "running", "stopped"),
+          key: "agentTools",
+          label: "沙箱内的 Agent（可多选）",
+          multiOptions: agentToolOptions,
+          presets: [
+            { label: "常用 7 个", values: commonAgentToolIds },
+            { label: "全部", values: multicaLinuxAgentToolIds },
+            { label: "清空", values: [] },
+          ],
+          description: "同一个沙箱可以同时安装并运行多个 Agent CLI。",
+        },
+        {
+          key: "credentialIds",
+          label: "模型凭据",
+          multiOptions: credentials
+            .filter((item) => item.enabled)
+            .map((item) => ({ value: item.id, label: item.name })),
+          description: "为所选 Agent 注入需要的模型访问配置。",
         },
       ]
     case "schedule":
@@ -367,6 +477,7 @@ function defaults(kind: ResourceKind) {
     },
     runtime: {
       driver: "docker",
+      imageReference: "ubuntu:24.04",
       agentTools: ["codex"],
       workdir: "/workspace",
       cpu: "2",
@@ -379,7 +490,12 @@ function defaults(kind: ResourceKind) {
     },
     skill: { version: "1.0.0", source: "inline" },
     mcp: { transport: "stdio" },
-    sandbox: { policy: "new", status: "requested" },
+    sandbox: {
+      policy: "new",
+      status: "requested",
+      agentTools: [],
+      credentialIds: [],
+    },
     schedule: {
       cron: "0 9 * * *",
       timezone: "Asia/Shanghai",
@@ -398,6 +514,117 @@ function stringArray(value: unknown) {
     : []
 }
 
+function SpecFieldEditor({
+  field,
+  kind,
+  spec,
+  invalid,
+  onChange,
+}: {
+  field: SpecField
+  kind: ResourceKind
+  spec: Record<string, unknown>
+  invalid: boolean
+  onChange: (key: string, value: unknown) => void
+}) {
+  return (
+    <Field
+      className={
+        field.textarea || field.multiOptions ? "sm:col-span-2" : undefined
+      }
+      data-invalid={invalid}
+    >
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <FieldLabel htmlFor={`spec-${field.key}`}>{field.label}</FieldLabel>
+        {field.presets && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {field.presets.map((preset) => (
+              <Button
+                key={preset.label}
+                type="button"
+                variant="outline"
+                size="xs"
+                onClick={() => onChange(field.key, preset.values)}
+              >
+                {preset.label}
+              </Button>
+            ))}
+          </div>
+        )}
+      </div>
+      {field.multiOptions ? (
+        <ToggleGroup
+          type="multiple"
+          variant="selection"
+          size="sm"
+          className="flex flex-wrap justify-start"
+          value={stringArray(spec[field.key])}
+          onValueChange={(value) => onChange(field.key, value)}
+        >
+          {field.multiOptions.map((option) => (
+            <ToggleGroupItem
+              key={option.value}
+              value={option.value}
+              disabled={option.disabled}
+            >
+              {stringArray(spec[field.key]).includes(option.value) && (
+                <CheckIcon data-icon="inline-start" />
+              )}
+              {option.label}
+            </ToggleGroupItem>
+          ))}
+        </ToggleGroup>
+      ) : field.options ? (
+        <Select
+          value={
+            kind === "runtime" && field.key === "serverId" && !spec.serverId
+              ? "__launch__"
+              : String(spec[field.key] ?? "")
+          }
+          onValueChange={(value) => onChange(field.key, value)}
+        >
+          <SelectTrigger id={`spec-${field.key}`} className="w-full">
+            <SelectValue placeholder="请选择" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              <SelectLabel>{field.label}</SelectLabel>
+              {field.options.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+      ) : field.textarea ? (
+        <Textarea
+          id={`spec-${field.key}`}
+          className="min-h-28 font-mono text-sm"
+          value={String(spec[field.key] ?? "")}
+          placeholder={field.placeholder}
+          onChange={(event) => onChange(field.key, event.target.value)}
+        />
+      ) : (
+        <Input
+          id={`spec-${field.key}`}
+          value={String(spec[field.key] ?? "")}
+          placeholder={field.placeholder}
+          onChange={(event) => onChange(field.key, event.target.value)}
+        />
+      )}
+      {(field.description || field.multiOptions) && (
+        <FieldDescription aria-live="polite">
+          {field.multiOptions &&
+            `已选择 ${stringArray(spec[field.key]).length} 个`}
+          {field.multiOptions && field.description && " · "}
+          {field.description}
+        </FieldDescription>
+      )}
+    </Field>
+  )
+}
+
 function nextSpec(
   kind: ResourceKind,
   spec: Record<string, unknown>,
@@ -411,7 +638,11 @@ function nextSpec(
     const runtime = resources.find(
       (item) => item.kind === "runtime" && item.id === value
     )
-    if (runtime?.spec.serverId) next.serverId = runtime.spec.serverId
+    if (runtime) {
+      next.serverId = runtime.spec.serverId
+      next.agentTools = stringArray(runtime.spec.agentTools)
+      next.credentialIds = stringArray(runtime.spec.credentialIds)
+    }
     return next
   }
   if (kind !== "runtime" || (key !== "driver" && key !== "serverId")) {
@@ -432,15 +663,19 @@ function nextSpec(
       ? (server?.inventory.vmImages ?? [])
       : (server?.inventory.dockerImages ?? [])
   const currentReference = String(next.imageReference ?? "")
-  const currentExists = images.some((image) =>
-    [image.reference, image.path, image.id].includes(currentReference)
-  )
+  const currentExists =
+    (next.driver === "docker" &&
+      key !== "driver" &&
+      Boolean(currentReference.trim())) ||
+    images.some((image) =>
+      [image.reference, image.path, image.id].includes(currentReference)
+    )
   if (!currentExists) {
     const first = images[0]
     next.imageReference =
       first && next.driver === "vm"
         ? first.path || first.reference
-        : (first?.reference ?? "")
+        : (first?.reference ?? "ubuntu:24.04")
   }
   return next
 }
@@ -449,9 +684,33 @@ function initialEditorSpec(
   kind: ResourceKind,
   resources: Resource[],
   servers: ManagedServer[],
+  projectId: string,
   initialSpec?: Record<string, unknown>
 ) {
   const spec = { ...defaults(kind), ...initialSpec }
+  if (kind === "sandbox") {
+    const runtime =
+      resources.find(
+        (item) =>
+          item.kind === "runtime" &&
+          item.enabled &&
+          item.projectId === projectId &&
+          item.id === spec.runtimeId
+      ) ??
+      resources.find(
+        (item) =>
+          item.kind === "runtime" &&
+          item.enabled &&
+          item.projectId === projectId
+      )
+    if (runtime) {
+      spec.runtimeId = runtime.id
+      spec.serverId = runtime.spec.serverId
+      spec.agentTools = stringArray(runtime.spec.agentTools)
+      spec.credentialIds = stringArray(runtime.spec.credentialIds)
+    }
+    return spec
+  }
   if (kind !== "runtime") return spec
 
   const selectedServer = servers.find((item) => item.id === spec.serverId)
@@ -485,6 +744,7 @@ function initialEditorSpec(
       : (server?.inventory.dockerImages ?? [])
   const currentReference = String(spec.imageReference ?? "")
   if (
+    spec.driver !== "docker" &&
     !images.some((image) =>
       [image.reference, image.path, image.id].includes(currentReference)
     )
@@ -493,7 +753,10 @@ function initialEditorSpec(
     spec.imageReference =
       image && spec.driver === "vm"
         ? image.path || image.reference
-        : (image?.reference ?? "")
+        : (image?.reference ?? "ubuntu:24.04")
+  }
+  if (spec.driver === "docker" && !currentReference.trim()) {
+    spec.imageReference = images[0]?.reference ?? "ubuntu:24.04"
   }
   return spec
 }
@@ -509,8 +772,8 @@ function specAfterProjectChange(
     next.variableIds = []
   }
   if (kind === "sandbox") {
-    next.agentId = ""
     next.runtimeId = ""
+    next.serverId = ""
   }
   if (kind === "schedule" || kind === "webhook") {
     next.agentId = ""
@@ -551,7 +814,13 @@ export function ResourceEditorDialog({
           name: "",
           description: "",
           enabled: true,
-          spec: initialEditorSpec(kind, resources, servers, initialSpec),
+          spec: initialEditorSpec(
+            kind,
+            resources,
+            servers,
+            projectId,
+            initialSpec
+          ),
         }
   )
   const [slugEdited, setSlugEdited] = useState(Boolean(resource))
@@ -567,6 +836,16 @@ export function ResourceEditorDialog({
       item.kind === "project" ||
       item.projectId === input.projectId
   )
+  const specFields = fields(
+    kind,
+    projectAgents,
+    projectResources,
+    servers,
+    credentials,
+    input.spec
+  )
+  const primarySpecFields = specFields.filter((field) => !field.advanced)
+  const advancedSpecFields = specFields.filter((field) => field.advanced)
 
   function update<K extends keyof ResourceInput>(
     key: K,
@@ -627,6 +906,10 @@ export function ResourceEditorDialog({
       setErrors({ spec: "请选择服务器上实际存在的系统镜像" })
       return
     }
+    if (kind === "sandbox" && !String(input.spec.runtimeId ?? "").trim()) {
+      setErrors({ spec: "请先创建并选择一个沙箱模板" })
+      return
+    }
     if (kind === "sandbox" && !String(input.spec.serverId ?? "").trim()) {
       setErrors({ spec: "请选择创建沙箱的目标服务器" })
       return
@@ -643,7 +926,11 @@ export function ResourceEditorDialog({
 
   return (
     <Dialog open onOpenChange={(open) => !saving && onOpenChange(open)}>
-      <DialogContent className="max-h-[92svh] overflow-y-auto sm:max-w-2xl">
+      <DialogContent
+        className={`max-h-[92svh] overflow-y-auto ${
+          kind === "sandbox" ? "sm:max-w-xl" : "sm:max-w-4xl"
+        }`}
+      >
         <DialogHeader>
           <DialogTitle>
             {resource ? "编辑 " : "创建 "}
@@ -653,36 +940,41 @@ export function ResourceEditorDialog({
             {kind === "project"
               ? "项目只用于组织智能体和相关配置。"
               : kind === "image"
-                ? "镜像是平台级 OCI 引用，可供 Docker 与 VM 环境模板复用。"
+                ? "镜像是平台级 OCI 引用，可供 Docker 与 VM 沙箱模板复用。"
                 : kind === "runtime"
-                  ? "先选择运行服务器和它实际拥有的镜像，再配置 Agent 工具与能力。"
-                  : "配置会保存在平台控制面，并由沙箱创建流程消费。"}
+                  ? "把服务器、镜像、Agent 工具与模型凭据保存成可复用基座。"
+                  : kind === "sandbox"
+                    ? "从基座继承默认配置，并为这个沙箱选择一个或多个 Agent。"
+                    : "配置会保存在平台控制面，并由沙箱创建流程消费。"}
           </DialogDescription>
         </DialogHeader>
         <FieldGroup>
-          {kind !== "project" && kind !== "image" && (
-            <Field>
-              <FieldLabel>所属项目</FieldLabel>
-              <Select
-                value={input.projectId ?? ""}
-                onValueChange={changeProject}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="选择项目" />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectGroup>
-                    <SelectLabel>Projects</SelectLabel>
-                    {projects.map((item) => (
-                      <SelectItem key={item.id} value={item.id}>
-                        {item.name}
-                      </SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            </Field>
-          )}
+          {kind !== "project" &&
+            kind !== "image" &&
+            kind !== "runtime" &&
+            kind !== "sandbox" && (
+              <Field>
+                <FieldLabel>所属项目</FieldLabel>
+                <Select
+                  value={input.projectId ?? ""}
+                  onValueChange={changeProject}
+                >
+                  <SelectTrigger className="w-full">
+                    <SelectValue placeholder="选择项目" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectGroup>
+                      <SelectLabel>Projects</SelectLabel>
+                      {projects.map((item) => (
+                        <SelectItem key={item.id} value={item.id}>
+                          {item.name}
+                        </SelectItem>
+                      ))}
+                    </SelectGroup>
+                  </SelectContent>
+                </Select>
+              </Field>
+            )}
           <div className="grid gap-4 sm:grid-cols-2">
             <Field data-invalid={Boolean(errors.name)}>
               <FieldLabel htmlFor="resource-name">名称</FieldLabel>
@@ -713,110 +1005,52 @@ export function ResourceEditorDialog({
               <FieldError>{errors.id}</FieldError>
             </Field>
           </div>
-          <Field>
-            <FieldLabel htmlFor="resource-description">简介</FieldLabel>
-            <Textarea
-              id="resource-description"
-              value={input.description}
-              className="min-h-20"
-              onChange={(event) => update("description", event.target.value)}
-            />
-          </Field>
+          {kind !== "sandbox" && (
+            <Field>
+              <FieldLabel htmlFor="resource-description">简介</FieldLabel>
+              <Textarea
+                id="resource-description"
+                value={input.description}
+                className="min-h-20"
+                onChange={(event) => update("description", event.target.value)}
+              />
+            </Field>
+          )}
           <div className="grid gap-4 sm:grid-cols-2">
-            {fields(
-              kind,
-              projectAgents,
-              projectResources,
-              servers,
-              credentials,
-              input.spec
-            ).map((field) => (
-              <Field
+            {primarySpecFields.map((field) => (
+              <SpecFieldEditor
                 key={field.key}
-                className={
-                  field.textarea || field.multiOptions
-                    ? "sm:col-span-2"
-                    : undefined
-                }
-                data-invalid={Boolean(errors.spec)}
-              >
-                <FieldLabel htmlFor={`spec-${field.key}`}>
-                  {field.label}
-                </FieldLabel>
-                {field.multiOptions ? (
-                  <ToggleGroup
-                    type="multiple"
-                    variant="selection"
-                    className="flex flex-wrap justify-start"
-                    value={stringArray(input.spec[field.key])}
-                    onValueChange={(value) => updateSpec(field.key, value)}
-                  >
-                    {field.multiOptions.map((option) => (
-                      <ToggleGroupItem key={option.value} value={option.value}>
-                        {stringArray(input.spec[field.key]).includes(
-                          option.value
-                        ) && <CheckIcon data-icon="inline-start" />}
-                        {option.label}
-                      </ToggleGroupItem>
-                    ))}
-                  </ToggleGroup>
-                ) : field.options ? (
-                  <Select
-                    value={
-                      kind === "runtime" &&
-                      field.key === "serverId" &&
-                      !input.spec.serverId
-                        ? "__launch__"
-                        : String(input.spec[field.key] ?? "")
-                    }
-                    onValueChange={(value) => updateSpec(field.key, value)}
-                  >
-                    <SelectTrigger id={`spec-${field.key}`} className="w-full">
-                      <SelectValue placeholder="请选择" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectGroup>
-                        <SelectLabel>{field.label}</SelectLabel>
-                        {field.options.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectGroup>
-                    </SelectContent>
-                  </Select>
-                ) : field.textarea ? (
-                  <Textarea
-                    id={`spec-${field.key}`}
-                    className="min-h-28 font-mono text-sm"
-                    value={String(input.spec[field.key] ?? "")}
-                    placeholder={field.placeholder}
-                    onChange={(event) =>
-                      updateSpec(field.key, event.target.value)
-                    }
-                  />
-                ) : (
-                  <Input
-                    id={`spec-${field.key}`}
-                    value={String(input.spec[field.key] ?? "")}
-                    placeholder={field.placeholder}
-                    onChange={(event) =>
-                      updateSpec(field.key, event.target.value)
-                    }
-                  />
-                )}
-                {(field.description || field.multiOptions) && (
-                  <FieldDescription aria-live="polite">
-                    {field.multiOptions &&
-                      `已选择 ${stringArray(input.spec[field.key]).length} 个`}
-                    {field.multiOptions && field.description && " · "}
-                    {field.description}
-                  </FieldDescription>
-                )}
-              </Field>
+                field={field}
+                kind={kind}
+                spec={input.spec}
+                invalid={Boolean(errors.spec)}
+                onChange={updateSpec}
+              />
             ))}
           </div>
-          {kind !== "project" && (
+          {advancedSpecFields.length > 0 && (
+            <details className="group rounded-xl border">
+              <summary className="cursor-pointer list-none px-4 py-3 text-sm font-medium">
+                高级配置
+                <span className="ml-2 font-normal text-muted-foreground">
+                  工作目录、资源、网络与扩展能力
+                </span>
+              </summary>
+              <div className="grid gap-4 border-t p-4 sm:grid-cols-2">
+                {advancedSpecFields.map((field) => (
+                  <SpecFieldEditor
+                    key={field.key}
+                    field={field}
+                    kind={kind}
+                    spec={input.spec}
+                    invalid={Boolean(errors.spec)}
+                    onChange={updateSpec}
+                  />
+                ))}
+              </div>
+            </details>
+          )}
+          {kind !== "project" && kind !== "sandbox" && (
             <Field orientation="horizontal" className="rounded-lg border p-3">
               <Checkbox
                 id="resource-enabled"

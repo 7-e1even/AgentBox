@@ -63,14 +63,22 @@ type Server struct {
 	catalog        agent.Catalog
 	logger         *slog.Logger
 	allowedOrigins map[string]struct{}
+	disableAuth    bool
+	sessions       *sessionHub
 }
 
-func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, origins []string) http.Handler {
+type Config struct {
+	DisableAuth bool
+}
+
+func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, origins []string, config Config) http.Handler {
 	server := &Server{
 		store:          repository,
 		catalog:        catalog,
 		logger:         logger,
 		allowedOrigins: make(map[string]struct{}, len(origins)),
+		disableAuth:    config.DisableAuth,
+		sessions:       newSessionHub(origins),
 	}
 	for _, origin := range origins {
 		if trimmed := strings.TrimSpace(origin); trimmed != "" {
@@ -109,6 +117,7 @@ func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, orig
 	authenticated("PATCH /api/resources/{id}", server.updateResource)
 	authenticated("DELETE /api/resources/{id}", server.deleteResource)
 	authenticated("POST /api/sandboxes/{id}/actions/{action}", server.operateSandbox)
+	authenticated("POST /api/sandboxes/{id}/session-ticket", server.createSandboxSessionTicket)
 	authenticated("GET /api/credentials", server.listCredentials)
 	authenticated("POST /api/credentials", server.createCredential)
 	authenticated("PATCH /api/credentials/{id}", server.updateCredential)
@@ -125,8 +134,11 @@ func New(repository AgentStore, catalog agent.Catalog, logger *slog.Logger, orig
 	mux.HandleFunc("POST /api/servers/{id}/heartbeat", server.heartbeatServer)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/claim", server.claimWorkerJob)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/{jobId}/complete", server.completeWorkerJob)
+	mux.HandleFunc("GET /api/servers/{id}/sessions/connect", server.connectWorkerSessions)
+	mux.HandleFunc("GET /api/sandboxes/{id}/session", server.connectSandboxSession)
 	mux.HandleFunc("GET /api/worker/install.sh", server.workerInstallScript)
 	mux.HandleFunc("GET /api/worker/agentbox-worker", server.workerScript)
+	mux.HandleFunc("GET /api/worker/agentbox-session-worker", server.workerSessionScript)
 
 	return server.recoverPanic(server.cors(server.logRequests(mux)))
 }

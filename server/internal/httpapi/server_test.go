@@ -17,6 +17,12 @@ import (
 
 type fakeStore struct{}
 
+type emptyUsersStore struct{ fakeStore }
+
+func (emptyUsersStore) ListUsers(context.Context) ([]platform.User, error) {
+	return []platform.User{}, nil
+}
+
 func (fakeStore) List(context.Context) ([]agent.Agent, error)      { return []agent.Agent{}, nil }
 func (fakeStore) Get(context.Context, string) (agent.Agent, error) { return agent.Agent{}, nil }
 func (fakeStore) Create(_ context.Context, input agent.Input) (agent.Agent, error) {
@@ -114,7 +120,15 @@ func (fakeStore) DeleteUser(context.Context, string) error { return nil }
 func (fakeStore) Ping(context.Context) error               { return nil }
 
 func rawTestHandler() http.Handler {
-	return New(fakeStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	return New(fakeStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{})
+}
+
+func debugTestHandler() http.Handler {
+	return New(fakeStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
+}
+
+func emptyDebugTestHandler() http.Handler {
+	return New(emptyUsersStore{}, agent.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
 }
 
 func testHandler() http.Handler {
@@ -150,6 +164,39 @@ func TestCatalogRequiresAuthentication(t *testing.T) {
 	rawTestHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestDevelopmentAuthBypassInjectsAdminWithoutCookie(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	response := httptest.NewRecorder()
+	debugTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"role":"admin"`) {
+		t.Fatalf("debug user is not an admin: %s", response.Body.String())
+	}
+}
+
+func TestDevelopmentAuthBypassAllowsProtectedEndpointWithoutCookie(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/catalog", nil)
+	response := httptest.NewRecorder()
+	debugTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestDevelopmentAuthBypassWorksBeforeAdminSetup(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
+	response := httptest.NewRecorder()
+	emptyDebugTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"email":"debug@agentbox.local"`) {
+		t.Fatalf("missing fallback debug user: %s", response.Body.String())
 	}
 }
 
@@ -264,6 +311,19 @@ func TestSandboxCodexLoginActionIsAccepted(t *testing.T) {
 	testHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusAccepted {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusAccepted)
+	}
+}
+
+func TestLegacyQueuedWorkspaceRoutesAreRemoved(t *testing.T) {
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandboxes/sandbox-one/workspace/operations",
+		strings.NewReader(`{"kind":"exec","command":"pwd"}`),
+	)
+	response := httptest.NewRecorder()
+	testHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
 	}
 }
 

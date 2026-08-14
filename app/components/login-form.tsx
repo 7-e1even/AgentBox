@@ -86,7 +86,7 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
             从统一控制面配置、预配并管理 Agent 环境。
           </p>
           <p className="mt-4 text-sm leading-6 text-muted-foreground">
-            账号、服务器、环境模板、模型服务和自动化均由同一权限边界管理。
+            统一管理服务器、沙箱模板、模型凭据与隔离沙箱。
           </p>
         </div>
         <p className="text-xs text-muted-foreground">AgentBox Control Plane</p>

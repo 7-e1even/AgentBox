@@ -30,6 +30,11 @@ func main() {
 		port = "8091"
 	}
 	origins := strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",")
+	disableAuth := strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_DISABLE_AUTH")), "true")
+	if disableAuth && !strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_ENV")), "development") {
+		logger.Error("AGENTBOX_DISABLE_AUTH is only allowed when AGENTBOX_ENV=development")
+		os.Exit(1)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -42,7 +47,7 @@ func main() {
 
 	server := &http.Server{
 		Addr:              ":" + port,
-		Handler:           httpapi.New(repository, agent.BuiltinCatalog, logger, origins),
+		Handler:           httpapi.New(repository, agent.BuiltinCatalog, logger, origins, httpapi.Config{DisableAuth: disableAuth}),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -50,6 +55,9 @@ func main() {
 	}
 
 	go func() {
+		if disableAuth {
+			logger.Warn("authentication disabled for development")
+		}
 		logger.Info("agentbox api listening", "address", server.Addr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("serve api", "error", err)

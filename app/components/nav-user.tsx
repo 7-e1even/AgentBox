@@ -1,5 +1,6 @@
 "use client"
 
+import { useSyncExternalStore } from "react"
 import {
   BadgeCheckIcon,
   LogOutIcon,
@@ -35,8 +36,14 @@ export function TopbarAccountActions({
   onLogout: () => void
 }) {
   const { resolvedTheme, setTheme } = useTheme()
+  const mounted = useSyncExternalStore(
+    noopSubscribe,
+    () => true,
+    () => false
+  )
   const fallback = initials(user.name)
-  const nextTheme = resolvedTheme === "dark" ? "light" : "dark"
+  const isDark = mounted && resolvedTheme === "dark"
+  const nextTheme = isDark ? "light" : "dark"
 
   return (
     <div className="flex items-center gap-1">
@@ -46,7 +53,7 @@ export function TopbarAccountActions({
         aria-label={nextTheme === "dark" ? "切换到深色模式" : "切换到浅色模式"}
         onClick={() => setTheme(nextTheme)}
       >
-        {resolvedTheme === "dark" ? <SunIcon /> : <MoonIcon />}
+        {isDark ? <SunIcon /> : <MoonIcon />}
       </Button>
 
       <Button
@@ -110,6 +117,10 @@ export function TopbarAccountActions({
       </DropdownMenu>
     </div>
   )
+}
+
+function noopSubscribe() {
+  return () => undefined
 }
 
 function initials(name: string) {

@@ -61,9 +61,20 @@ func TestEnvironmentTemplateRequiresServerInventorySelection(t *testing.T) {
 		t.Fatalf("Validate() error = %v, want missing server error", err)
 	}
 	input.Spec["serverId"] = "7b20f83b-6418-4a9f-8477-3dc7c35d6310"
+	input.Spec["agentTools"] = []any{
+		"antigravity", "claude-code", "codebuddy", "codex", "copilot-cli",
+		"cursor", "gemini-cli", "grok", "kimi", "omp",
+		"openclaw", "opencode", "pi", "qoder-cli", "qoder-cn", "qwen-code",
+		"qwenpaw", "reasonix",
+	}
 	if err := Validate(input); err != nil {
 		t.Fatalf("Validate() returned error: %v", err)
 	}
+	input.Spec["agentTools"] = []any{"unknown-agent"}
+	if err := Validate(input); !IsValidationError(err) {
+		t.Fatalf("Validate() error = %v, want unsupported Agent tool rejection", err)
+	}
+	input.Spec["agentTools"] = []any{"pi"}
 	input.Spec["driver"] = "boxlite"
 	if err := Validate(input); !IsValidationError(err) {
 		t.Fatalf("Validate() error = %v, want internal driver rejection", err)
@@ -78,8 +89,8 @@ func TestSandboxRequiresTargetServer(t *testing.T) {
 		ProjectID: &projectID,
 		Name:      "Sandbox One",
 		Spec: map[string]any{
-			"agentId":   "7b20f83b-6418-4a9f-8477-3dc7c35d6310",
-			"runtimeId": "runtime-one",
+			"runtimeId":  "runtime-one",
+			"agentTools": []any{"kimi", "codex", "pi"},
 		},
 	}
 	if err := Validate(input); !IsValidationError(err) {
@@ -87,7 +98,25 @@ func TestSandboxRequiresTargetServer(t *testing.T) {
 	}
 	input.Spec["serverId"] = "7b20f83b-6418-4a9f-8477-3dc7c35d6310"
 	if err := Validate(input); err != nil {
-		t.Fatalf("Validate() returned error: %v", err)
+		t.Fatalf("expected sandbox without Agent binding to be valid, got %v", err)
+	}
+}
+
+func TestSandboxRejectsUnknownAgentTool(t *testing.T) {
+	projectID := "default"
+	input := Input{
+		ID:        "sandbox-one",
+		Kind:      KindSandbox,
+		ProjectID: &projectID,
+		Name:      "Sandbox One",
+		Spec: map[string]any{
+			"runtimeId":  "runtime-one",
+			"serverId":   "7b20f83b-6418-4a9f-8477-3dc7c35d6310",
+			"agentTools": []any{"kimi", "unknown-agent"},
+		},
+	}
+	if err := Validate(input); !IsValidationError(err) {
+		t.Fatalf("Validate() error = %v, want unknown Agent tool rejection", err)
 	}
 }
 
@@ -131,6 +160,11 @@ func TestValidateCredential(t *testing.T) {
 		t.Fatalf("ValidateCredential() error = %v, want invalid endpoint", err)
 	}
 	input.Endpoint = "https://api.openai.com/v1"
+	input.ModelID = "gpt-5.3-codex\nOPENAI_API_KEY=overridden"
+	if err := ValidateCredential(input, true); !IsValidationError(err) {
+		t.Fatalf("ValidateCredential() error = %v, want model newline rejection", err)
+	}
+	input.ModelID = "gpt-5.3-codex"
 	input.Secret = "line-one\nline-two"
 	if err := ValidateCredential(input, true); !IsValidationError(err) {
 		t.Fatalf("ValidateCredential() error = %v, want newline rejection", err)

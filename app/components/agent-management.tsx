@@ -1,6 +1,13 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   ArchiveIcon,
@@ -13,6 +20,7 @@ import {
   RotateCcwIcon,
   Trash2Icon,
 } from "lucide-react"
+import { useRouter } from "next/navigation"
 
 import { AgentEditorDialog } from "@/components/agent-editor-dialog"
 import { AccessManagement } from "@/components/access-management"
@@ -108,22 +116,7 @@ import {
 } from "@/components/ui/empty"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
 import { Spinner } from "@/components/ui/spinner"
-
-export type AppSection =
-  | "overview"
-  | "projects"
-  | "automations"
-  | "agents"
-  | "sandboxes"
-  | "servers"
-  | "runtimes"
-  | "images"
-  | "skills"
-  | "mcp"
-  | "access"
-  | "settings"
-  | "variables"
-  | "users"
+import { appSectionPath, type AppSection } from "@/lib/app-section"
 
 const sectionKinds: Partial<
   Record<AppSection, "project" | "runtime" | "skill" | "variable">
@@ -148,6 +141,20 @@ const statusMeta: Record<AgentStatus, { label: string }> = {
   archived: { label: "已归档" },
 }
 
+type SectionRenderer = (section: AppSection) => ReactNode
+
+const SectionRendererContext = createContext<SectionRenderer | null>(null)
+
+export function AgentManagementSection({ section }: { section: AppSection }) {
+  const renderSection = useContext(SectionRendererContext)
+  if (!renderSection) {
+    throw new Error(
+      "AgentManagementSection must be rendered inside AgentManagement"
+    )
+  }
+  return renderSection(section)
+}
+
 export function AgentManagement({
   initialAgents,
   initialResources,
@@ -157,6 +164,7 @@ export function AgentManagement({
   initialUsers,
   initialProjectId,
   catalog,
+  children,
 }: {
   initialAgents: Agent[]
   initialResources: Resource[]
@@ -166,14 +174,15 @@ export function AgentManagement({
   initialUsers: ManagedUser[]
   initialProjectId: string
   catalog: Catalog
+  children: ReactNode
 }) {
+  const router = useRouter()
   const [agents, setAgents] = useState(() => ordered(initialAgents))
   const [resources, setResources] = useState(initialResources)
   const [servers, setServers] = useState(initialServers)
   const [credentials, setCredentials] = useState(initialCredentials)
   const [users, setUsers] = useState(initialUsers)
   const [sessionUser, setSessionUser] = useState(currentUser)
-  const [section, setSection] = useState<AppSection>("overview")
   const [projectId, setProjectId] = useState(initialProjectId)
   const [editor, setEditor] = useState<{ open: boolean; agent: Agent | null }>({
     open: false,
@@ -656,299 +665,295 @@ export function AgentManagement({
     }
   }
 
-  const kind = sectionKinds[section]
+  function navigate(section: AppSection) {
+    router.push(appSectionPath(section))
+  }
+
+  function renderSection(section: AppSection) {
+    const kind = sectionKinds[section]
+
+    return section === "overview" ? (
+      <DashboardView
+        key={projectId}
+        resources={scopedResources}
+        servers={servers}
+        configuredCredentials={
+          credentials.filter((credential) => credential.enabled).length
+        }
+        onNavigate={navigate}
+        onCreateEnvironment={() =>
+          setResourceEditor({ kind: "runtime", resource: null })
+        }
+        onCreateSandbox={() =>
+          setResourceEditor({ kind: "sandbox", resource: null })
+        }
+      />
+    ) : section === "runtimes" ? (
+      <EnvironmentTemplatesView
+        key={projectId}
+        resources={scopedResources}
+        servers={servers}
+        onCreate={() => setResourceEditor({ kind: "runtime", resource: null })}
+        onEdit={(resource) => setResourceEditor({ kind: "runtime", resource })}
+        onDelete={setDeletingResource}
+        onLaunch={(environment) =>
+          setResourceEditor({
+            kind: "sandbox",
+            resource: null,
+            initialSpec: {
+              runtimeId: environment.id,
+              serverId: environment.spec.serverId,
+            },
+          })
+        }
+      />
+    ) : section === "sandboxes" ? (
+      <SandboxesView
+        key={projectId}
+        resources={scopedResources}
+        servers={servers}
+        onCreate={() => setResourceEditor({ kind: "sandbox", resource: null })}
+        busyId={sandboxBusyId}
+        onAction={operateSandbox}
+        onDelete={setDeletingResource}
+      />
+    ) : section === "agents" ? (
+      <AgentsView
+        key={projectId}
+        agents={scopedAgents}
+        resources={scopedResources}
+        busyId={busyId}
+        onCreate={() => setEditor({ open: true, agent: null })}
+        onEdit={(agent) => setEditor({ open: true, agent })}
+        onDuplicate={duplicate}
+        onStatusChange={changeStatus}
+        onDelete={setDeleting}
+      />
+    ) : section === "automations" ? (
+      <AutomationsView
+        key={projectId}
+        resources={scopedResources}
+        agents={scopedAgents}
+        onCreate={(automationKind) =>
+          setResourceEditor({ kind: automationKind, resource: null })
+        }
+        onEdit={(resource) =>
+          setResourceEditor({ kind: resource.kind, resource })
+        }
+        onDelete={setDeletingResource}
+      />
+    ) : section === "servers" ? (
+      <ServerManagement
+        servers={servers}
+        runtimes={resources.filter((item) => item.kind === "runtime")}
+        onServersChange={setServers}
+        onCreateRuntime={(serverId) =>
+          setResourceEditor({
+            kind: "runtime",
+            resource: null,
+            initialSpec: { serverId },
+          })
+        }
+        onEditRuntime={(resource) =>
+          setResourceEditor({ kind: "runtime", resource })
+        }
+      />
+    ) : section === "images" ? (
+      <ImageManagement
+        servers={servers}
+        onServersChange={setServers}
+        onCreateRuntime={(serverId, imageReference, driver) =>
+          setResourceEditor({
+            kind: "runtime",
+            resource: null,
+            initialSpec: { serverId, imageReference, driver },
+          })
+        }
+      />
+    ) : section === "access" ? (
+      <AccessManagement
+        credentials={credentials}
+        providers={catalog.providers}
+        onSave={saveCredential}
+        onCheck={checkCredential}
+        onPullModels={pullCredentialModels}
+        onAddModel={addCredentialModel}
+        onDeleteModel={deleteCredentialModel}
+        onDelete={deleteCredential}
+      />
+    ) : section === "settings" ? (
+      <SettingsView
+        user={sessionUser}
+        projectName={currentProject?.name ?? projectId}
+        variableCount={
+          scopedResources.filter((item) => item.kind === "variable").length
+        }
+        onSaveUser={saveCurrentUser}
+        onSavePreferences={saveCurrentUserPreferences}
+        onManageVariables={() => navigate("variables")}
+      />
+    ) : section === "mcp" ? (
+      <ResourceView
+        key={projectId}
+        resources={scopedResources}
+        kind="mcp"
+        agents={scopedAgents}
+        servers={servers}
+        onCreate={() => setResourceEditor({ kind: "mcp", resource: null })}
+        onEdit={(resource) =>
+          setResourceEditor({ kind: resource.kind, resource })
+        }
+        onDelete={setDeletingResource}
+      />
+    ) : section === "users" && sessionUser.role === "admin" ? (
+      <UserManagement
+        users={users}
+        currentUser={sessionUser}
+        busyId={userBusyId}
+        onSave={saveUser}
+        onDelete={deleteUser}
+      />
+    ) : kind ? (
+      <ResourceView
+        key={kind === "project" ? "projects" : `${kind}:${projectId}`}
+        kind={kind}
+        resources={kind === "project" ? resources : scopedResources}
+        agents={kind === "project" ? agents : scopedAgents}
+        servers={servers}
+        onCreate={() => setResourceEditor({ kind, resource: null })}
+        onEdit={(resource) =>
+          setResourceEditor({ kind: resource.kind, resource })
+        }
+        onDelete={setDeletingResource}
+      />
+    ) : null
+  }
 
   return (
-    <SidebarProvider className="h-svh min-h-0 overflow-hidden">
-      <SiteHeaderProvider
-        user={sessionUser}
-        onSettings={() => setSection("settings")}
-        onManageUsers={() => setSection("users")}
-        onLogout={() => void logout()}
-      >
-        <a
-          href="#main-content"
-          className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:ring-2 focus:ring-ring"
+    <SectionRendererContext.Provider value={renderSection}>
+      <SidebarProvider className="h-svh min-h-0 overflow-hidden">
+        <SiteHeaderProvider
+          user={sessionUser}
+          onSettings={() => navigate("settings")}
+          onManageUsers={() => navigate("users")}
+          onLogout={() => void logout()}
         >
-          跳到主要内容
-        </a>
-        <AppSidebar
-          section={section}
-          onSectionChange={setSection}
-          currentUser={sessionUser}
-          projects={projectResources}
-          projectId={projectId}
-          onProjectChange={selectProject}
-        />
-        <SidebarInset
-          id="main-content"
-          tabIndex={-1}
-          className="min-w-0 overflow-hidden focus:outline-none"
-        >
-          <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-            {section === "overview" ? (
-              <DashboardView
-                key={projectId}
-                resources={scopedResources}
-                agents={scopedAgents}
-                servers={servers}
-                configuredCredentials={
-                  credentials.filter((credential) => credential.enabled).length
-                }
-                onNavigate={setSection}
-                onCreateEnvironment={() =>
-                  setResourceEditor({ kind: "runtime", resource: null })
-                }
-                onCreateSandbox={() =>
-                  setResourceEditor({ kind: "sandbox", resource: null })
-                }
-              />
-            ) : section === "runtimes" ? (
-              <EnvironmentTemplatesView
-                key={projectId}
-                resources={scopedResources}
-                agents={scopedAgents}
-                servers={servers}
-                onCreate={() =>
-                  setResourceEditor({ kind: "runtime", resource: null })
-                }
-                onEdit={(resource) =>
-                  setResourceEditor({ kind: "runtime", resource })
-                }
-                onDelete={setDeletingResource}
-                onLaunch={(environment) =>
-                  setResourceEditor({
-                    kind: "sandbox",
-                    resource: null,
-                    initialSpec: {
-                      runtimeId: environment.id,
-                      serverId: environment.spec.serverId,
-                    },
-                  })
-                }
-              />
-            ) : section === "sandboxes" ? (
-              <SandboxesView
-                key={projectId}
-                resources={scopedResources}
-                agents={scopedAgents}
-                servers={servers}
-                onCreate={() =>
-                  setResourceEditor({ kind: "sandbox", resource: null })
-                }
-                busyId={sandboxBusyId}
-                onAction={operateSandbox}
-                onDelete={setDeletingResource}
-              />
-            ) : section === "agents" ? (
-              <AgentsView
-                key={projectId}
-                agents={scopedAgents}
-                resources={scopedResources}
-                busyId={busyId}
-                onCreate={() => setEditor({ open: true, agent: null })}
-                onEdit={(agent) => setEditor({ open: true, agent })}
-                onDuplicate={duplicate}
-                onStatusChange={changeStatus}
-                onDelete={setDeleting}
-              />
-            ) : section === "automations" ? (
-              <AutomationsView
-                key={projectId}
-                resources={scopedResources}
-                agents={scopedAgents}
-                onCreate={(automationKind) =>
-                  setResourceEditor({ kind: automationKind, resource: null })
-                }
-                onEdit={(resource) =>
-                  setResourceEditor({ kind: resource.kind, resource })
-                }
-                onDelete={setDeletingResource}
-              />
-            ) : section === "servers" ? (
-              <ServerManagement
-                servers={servers}
-                runtimes={resources.filter((item) => item.kind === "runtime")}
-                onServersChange={setServers}
-                onCreateRuntime={(serverId) =>
-                  setResourceEditor({
-                    kind: "runtime",
-                    resource: null,
-                    initialSpec: { serverId },
-                  })
-                }
-                onEditRuntime={(resource) =>
-                  setResourceEditor({ kind: "runtime", resource })
-                }
-              />
-            ) : section === "images" ? (
-              <ImageManagement
-                servers={servers}
-                onServersChange={setServers}
-                onCreateRuntime={(serverId, imageReference, driver) =>
-                  setResourceEditor({
-                    kind: "runtime",
-                    resource: null,
-                    initialSpec: { serverId, imageReference, driver },
-                  })
-                }
-              />
-            ) : section === "access" ? (
-              <AccessManagement
-                credentials={credentials}
-                providers={catalog.providers}
-                onSave={saveCredential}
-                onCheck={checkCredential}
-                onPullModels={pullCredentialModels}
-                onAddModel={addCredentialModel}
-                onDeleteModel={deleteCredentialModel}
-                onDelete={deleteCredential}
-              />
-            ) : section === "settings" ? (
-              <SettingsView
-                user={sessionUser}
-                projectName={currentProject?.name ?? projectId}
-                variableCount={
-                  scopedResources.filter((item) => item.kind === "variable")
-                    .length
-                }
-                onSaveUser={saveCurrentUser}
-                onSavePreferences={saveCurrentUserPreferences}
-                onManageVariables={() => setSection("variables")}
-              />
-            ) : section === "mcp" ? (
-              <ResourceView
-                key={projectId}
-                resources={scopedResources}
-                kind="mcp"
-                agents={scopedAgents}
-                servers={servers}
-                onCreate={() =>
-                  setResourceEditor({ kind: "mcp", resource: null })
-                }
-                onEdit={(resource) =>
-                  setResourceEditor({ kind: resource.kind, resource })
-                }
-                onDelete={setDeletingResource}
-              />
-            ) : section === "users" && sessionUser.role === "admin" ? (
-              <UserManagement
-                users={users}
-                currentUser={sessionUser}
-                busyId={userBusyId}
-                onSave={saveUser}
-                onDelete={deleteUser}
-              />
-            ) : kind ? (
-              <ResourceView
-                key={kind === "project" ? "projects" : `${kind}:${projectId}`}
-                kind={kind}
-                resources={kind === "project" ? resources : scopedResources}
-                agents={kind === "project" ? agents : scopedAgents}
-                servers={servers}
-                onCreate={() => setResourceEditor({ kind, resource: null })}
-                onEdit={(resource) =>
-                  setResourceEditor({ kind: resource.kind, resource })
-                }
-                onDelete={setDeletingResource}
-              />
-            ) : null}
-          </div>
-        </SidebarInset>
-
-        {editor.open && (
-          <AgentEditorDialog
-            key={editor.agent?.id ?? `new:${projectId}`}
-            agent={editor.agent}
-            catalog={agentCatalog}
+          <a
+            href="#main-content"
+            className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:ring-2 focus:ring-ring"
+          >
+            跳到主要内容
+          </a>
+          <AppSidebar
+            currentUser={sessionUser}
+            projects={projectResources}
             projectId={projectId}
-            onOpenChange={(open) =>
-              setEditor({ open, agent: open ? editor.agent : null })
-            }
-            onSave={saveAgent}
+            onProjectChange={selectProject}
           />
-        )}
+          <SidebarInset
+            id="main-content"
+            tabIndex={-1}
+            className="min-w-0 overflow-hidden focus:outline-none"
+          >
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              {children}
+            </div>
+          </SidebarInset>
 
-        {resourceEditor && (
-          <ResourceEditorDialog
-            key={resourceEditor.resource?.id ?? resourceEditor.kind}
-            kind={resourceEditor.kind}
-            resource={resourceEditor.resource}
-            projectId={projectId}
-            resources={resources}
-            agents={agents}
-            servers={servers}
-            credentials={credentials}
-            initialSpec={resourceEditor.initialSpec}
-            onOpenChange={(open) => !open && setResourceEditor(null)}
-            onSave={saveResource}
-          />
-        )}
+          {editor.open && (
+            <AgentEditorDialog
+              key={editor.agent?.id ?? `new:${projectId}`}
+              agent={editor.agent}
+              catalog={agentCatalog}
+              projectId={projectId}
+              onOpenChange={(open) =>
+                setEditor({ open, agent: open ? editor.agent : null })
+              }
+              onSave={saveAgent}
+            />
+          )}
 
-        <AlertDialog
-          open={Boolean(deleting)}
-          onOpenChange={(open) => !open && setDeleting(null)}
-        >
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogMedia>
-                <Trash2Icon />
-              </AlertDialogMedia>
-              <AlertDialogTitle>永久删除 {deleting?.name}？</AlertDialogTitle>
-              <AlertDialogDescription>
-                此操作会同时删除该智能体的修订历史，无法恢复。仍被沙箱、定时任务或
-                Webhook 引用时，平台会阻止删除。
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>取消</AlertDialogCancel>
-              <AlertDialogAction
-                variant="destructive"
-                onClick={permanentlyDeleteAgent}
-                disabled={Boolean(busyId)}
-              >
-                {busyId ? (
-                  <Spinner data-icon="inline-start" />
-                ) : (
-                  <Trash2Icon data-icon="inline-start" />
-                )}
-                永久删除
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
+          {resourceEditor && (
+            <ResourceEditorDialog
+              key={resourceEditor.resource?.id ?? resourceEditor.kind}
+              kind={resourceEditor.kind}
+              resource={resourceEditor.resource}
+              projectId={projectId}
+              resources={resources}
+              agents={agents}
+              servers={servers}
+              credentials={credentials}
+              initialSpec={resourceEditor.initialSpec}
+              onOpenChange={(open) => !open && setResourceEditor(null)}
+              onSave={saveResource}
+            />
+          )}
 
-        <AlertDialog
-          open={Boolean(deletingResource)}
-          onOpenChange={(open) => !open && setDeletingResource(null)}
-        >
-          <AlertDialogContent>
-            <AlertDialogHeader>
-              <AlertDialogMedia>
-                <Trash2Icon />
-              </AlertDialogMedia>
-              <AlertDialogTitle>
-                删除 {deletingResource?.name}？
-              </AlertDialogTitle>
-              <AlertDialogDescription>
-                {deletingResource?.kind === "sandbox"
-                  ? "沙箱容器、独立工作区卷和控制面记录都会被永久删除，无法恢复。"
-                  : "该配置会从 PostgreSQL 永久删除，无法恢复。"}
-              </AlertDialogDescription>
-            </AlertDialogHeader>
-            <AlertDialogFooter>
-              <AlertDialogCancel>取消</AlertDialogCancel>
-              <AlertDialogAction
-                variant="destructive"
-                onClick={permanentlyDeleteResource}
-              >
-                永久删除
-              </AlertDialogAction>
-            </AlertDialogFooter>
-          </AlertDialogContent>
-        </AlertDialog>
-      </SiteHeaderProvider>
-    </SidebarProvider>
+          <AlertDialog
+            open={Boolean(deleting)}
+            onOpenChange={(open) => !open && setDeleting(null)}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogMedia>
+                  <Trash2Icon />
+                </AlertDialogMedia>
+                <AlertDialogTitle>永久删除 {deleting?.name}？</AlertDialogTitle>
+                <AlertDialogDescription>
+                  此操作会同时删除该智能体的修订历史，无法恢复。仍被沙箱、定时任务或
+                  Webhook 引用时，平台会阻止删除。
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  variant="destructive"
+                  onClick={permanentlyDeleteAgent}
+                  disabled={Boolean(busyId)}
+                >
+                  {busyId ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <Trash2Icon data-icon="inline-start" />
+                  )}
+                  永久删除
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+
+          <AlertDialog
+            open={Boolean(deletingResource)}
+            onOpenChange={(open) => !open && setDeletingResource(null)}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogMedia>
+                  <Trash2Icon />
+                </AlertDialogMedia>
+                <AlertDialogTitle>
+                  删除 {deletingResource?.name}？
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  {deletingResource?.kind === "sandbox"
+                    ? "沙箱容器、独立工作区卷和控制面记录都会被永久删除，无法恢复。"
+                    : "该配置会从 PostgreSQL 永久删除，无法恢复。"}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>取消</AlertDialogCancel>
+                <AlertDialogAction
+                  variant="destructive"
+                  onClick={permanentlyDeleteResource}
+                >
+                  永久删除
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </SiteHeaderProvider>
+      </SidebarProvider>
+    </SectionRendererContext.Provider>
   )
 }
 
