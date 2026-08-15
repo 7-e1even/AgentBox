@@ -12,6 +12,7 @@ import { useRouter } from "next/navigation"
 
 import { AccessManagement } from "@/components/access-management"
 import { AppSidebar } from "@/components/app-sidebar"
+import { AutomationManagement } from "@/components/automation-management"
 import {
   DashboardView,
   EnvironmentTemplatesView,
@@ -484,6 +485,13 @@ export function ControlPlaneShell({
           setResourceEditor({ kind: "runtime", resource: null })
         }
         onCreateSandbox={() => setSandboxEditor({ resource: null })}
+      />
+    ) : section === "automations" ? (
+      <AutomationManagement
+        key={projectId}
+        projectId={projectId}
+        resources={resources}
+        credentials={credentials}
       />
     ) : section === "runtimes" ? (
       <EnvironmentTemplatesView

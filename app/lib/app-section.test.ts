@@ -14,14 +14,14 @@ describe("app section routes", () => {
     expect(appSectionPath("overview")).toBe("/overview")
     expect(appSectionPath("projects")).toBe("/projects")
     expect(appSectionPath("runtimes")).toBe("/environment-templates")
+    expect(appSectionPath("automations")).toBe("/automations")
     expect(appSectionPath("mcp")).toBe("/mcp-servers")
     expect(appSectionPath("access")).toBe("/model-services")
   })
 
-  it("does not expose the removed Agent configuration routes", () => {
+  it("does not expose the removed Agent configuration route", () => {
     const paths = Object.values(APP_SECTION_PATHS)
 
     expect(paths).not.toContain("/agents")
-    expect(paths).not.toContain("/automations")
   })
 })

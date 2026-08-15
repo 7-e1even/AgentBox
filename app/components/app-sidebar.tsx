@@ -11,6 +11,7 @@ import {
   ServerIcon,
   SparklesIcon,
   UsersIcon,
+  WorkflowIcon,
 } from "lucide-react"
 
 import { NavMain, type NavigationGroup } from "@/components/nav-main"
@@ -44,6 +45,7 @@ export function AppSidebar({
         { title: "项目", section: "projects", icon: FolderKanbanIcon },
         { title: "沙箱", section: "sandboxes", icon: BoxIcon },
         { title: "沙箱模板", section: "runtimes", icon: LayoutTemplateIcon },
+        { title: "自动化", section: "automations", icon: WorkflowIcon },
       ],
     },
     {

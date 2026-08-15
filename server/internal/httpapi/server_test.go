@@ -41,6 +41,51 @@ func (fakeStore) OperateSandbox(_ context.Context, id, action string) (platform.
 	}
 	return platform.Resource{Input: platform.Input{ID: id, Kind: platform.KindSandbox, Name: action}}, nil
 }
+func (fakeStore) ListAutomations(context.Context, string) ([]platform.Automation, error) {
+	return []platform.Automation{}, nil
+}
+func (fakeStore) GetAutomation(context.Context, string) (platform.Automation, error) {
+	return platform.Automation{ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", ProjectID: "default"}, nil
+}
+func (fakeStore) CreateAutomation(_ context.Context, input platform.AutomationInput, userID string) (platform.Automation, string, error) {
+	return platform.Automation{
+		ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", ProjectID: input.ProjectID,
+		Name: input.Name, Description: input.Description, Enabled: input.Enabled,
+		Trigger: input.Trigger, Action: input.Action,
+		EndpointID: "75778270-bdbf-4e2f-bbeb-b3133447a367", SecretLastFour: "test",
+	}, "abx_wh_test", nil
+}
+func (fakeStore) UpdateAutomation(_ context.Context, id string, input platform.AutomationInput, userID string) (platform.Automation, error) {
+	return platform.Automation{
+		ID: id, ProjectID: input.ProjectID, Name: input.Name, Description: input.Description,
+		Enabled: input.Enabled, Trigger: input.Trigger, Action: input.Action,
+	}, nil
+}
+func (fakeStore) DeleteAutomation(context.Context, string) error { return nil }
+func (fakeStore) RotateAutomationSecret(context.Context, string, string) (platform.Automation, string, error) {
+	return platform.Automation{ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", EndpointID: "75778270-bdbf-4e2f-bbeb-b3133447a367"}, "abx_wh_rotated", nil
+}
+func (fakeStore) PreviewAutomation(context.Context, platform.AutomationPreviewInput) (platform.ResourceInputPreview, error) {
+	return platform.ResourceInputPreview{ID: "auto-preview", Kind: platform.KindSandbox, Name: "Preview", Enabled: true, Spec: map[string]any{}}, nil
+}
+func (fakeStore) TriggerAutomation(context.Context, platform.AutomationDelivery) (platform.AutomationTriggerResult, error) {
+	sandboxID := "auto-webhook"
+	return platform.AutomationTriggerResult{Run: platform.AutomationRun{
+		ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunQueued,
+		SandboxID: &sandboxID,
+	}}, nil
+}
+func (fakeStore) TestAutomation(context.Context, string, []byte) (platform.AutomationTriggerResult, error) {
+	return platform.AutomationTriggerResult{Run: platform.AutomationRun{
+		ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunQueued,
+	}}, nil
+}
+func (fakeStore) ListAutomationRuns(context.Context, string, string, int) ([]platform.AutomationRun, error) {
+	return []platform.AutomationRun{}, nil
+}
+func (fakeStore) GetAutomationRun(context.Context, string) (platform.AutomationRun, error) {
+	return platform.AutomationRun{ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunSucceeded}, nil
+}
 func (fakeStore) ListCredentials(context.Context) ([]platform.ManagedCredential, error) {
 	return []platform.ManagedCredential{}, nil
 }
@@ -163,6 +208,31 @@ func TestCatalogRequiresAuthentication(t *testing.T) {
 	rawTestHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestCreateAutomationReturnsOneTimeSecret(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/automations", strings.NewReader(`{
+    "projectId":"default",
+    "name":"PR Preview",
+    "description":"Create a sandbox",
+    "enabled":true,
+    "trigger":{"type":"webhook","authMode":"bearer"},
+    "action":{"type":"create-sandbox","templateId":"runtime-one","inputTemplate":"{}"}
+  }`))
+	response := httptest.NewRecorder()
+	testHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"secret":"abx_wh_test"`) {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAutomationWebhookDoesNotRequireUserSession(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/webhooks/75778270-bdbf-4e2f-bbeb-b3133447a367", strings.NewReader(`{"event":"pull_request"}`))
+	response := httptest.NewRecorder()
+	rawTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"status":"queued"`) {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
 }
 

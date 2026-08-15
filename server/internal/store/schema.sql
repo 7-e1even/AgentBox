@@ -350,3 +350,72 @@ WHERE id = 'github-token'
 UPDATE control_resources
 SET spec = '{}'::jsonb
 WHERE kind = 'project' AND spec <> '{}'::jsonb;
+
+CREATE TABLE IF NOT EXISTS automations (
+  id UUID PRIMARY KEY,
+  project_id TEXT NOT NULL REFERENCES control_resources(id) ON DELETE RESTRICT,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  trigger_type TEXT NOT NULL CHECK (trigger_type = 'webhook'),
+  action_type TEXT NOT NULL CHECK (action_type = 'create-sandbox'),
+  auth_mode TEXT NOT NULL CHECK (auth_mode IN ('bearer', 'hmac-sha256')),
+  endpoint_id UUID NOT NULL UNIQUE,
+  secret_hash BYTEA NOT NULL,
+  secret_ciphertext BYTEA NOT NULL,
+  secret_nonce BYTEA NOT NULL,
+  secret_last_four TEXT NOT NULL,
+  template_id TEXT NOT NULL REFERENCES control_resources(id) ON DELETE RESTRICT,
+  model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb,
+  input_template TEXT NOT NULL,
+  created_by UUID,
+  updated_by UUID,
+  last_triggered_at TIMESTAMPTZ,
+  secret_rotated_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+ALTER TABLE automations
+  ADD COLUMN IF NOT EXISTS model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+CREATE INDEX IF NOT EXISTS idx_automations_project_updated
+  ON automations(project_id, enabled DESC, updated_at DESC);
+
+ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_created_by_fkey;
+ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_updated_by_fkey;
+
+CREATE TABLE IF NOT EXISTS automation_runs (
+  id UUID PRIMARY KEY,
+  automation_id UUID REFERENCES automations(id) ON DELETE SET NULL,
+  project_id TEXT NOT NULL,
+  automation_name TEXT NOT NULL,
+  template_id TEXT NOT NULL,
+  template_name TEXT NOT NULL,
+  trigger_source TEXT NOT NULL CHECK (trigger_source IN ('webhook', 'manual-test')),
+  auth_mode TEXT NOT NULL CHECK (auth_mode IN ('bearer', 'hmac-sha256')),
+  idempotency_hash BYTEA,
+  idempotency_fingerprint TEXT NOT NULL DEFAULT '',
+  payload_sha256 BYTEA NOT NULL,
+  payload_bytes INTEGER NOT NULL,
+  input_sha256 BYTEA,
+  status TEXT NOT NULL CHECK (status IN ('evaluating', 'queued', 'provisioning', 'succeeded', 'failed')),
+  sandbox_id TEXT,
+  worker_job_id UUID REFERENCES worker_jobs(id) ON DELETE SET NULL,
+  error_code TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  received_at TIMESTAMPTZ NOT NULL,
+  queued_at TIMESTAMPTZ,
+  started_at TIMESTAMPTZ,
+  finished_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_runs_idempotency
+  ON automation_runs(automation_id, idempotency_hash)
+  WHERE idempotency_hash IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_automation_runs_project_received
+  ON automation_runs(project_id, received_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_received
+  ON automation_runs(automation_id, received_at DESC, id DESC);

@@ -1184,6 +1184,11 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
       WHERE id = $2 AND kind = 'sandbox'`, now, job.ResourceID); err != nil {
 			return platform.WorkerJob{}, fmt.Errorf("update claimed sandbox status: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `UPDATE automation_runs SET
+      status = 'provisioning', started_at = COALESCE(started_at, $1)
+      WHERE sandbox_id = $2 AND status = 'queued'`, now, job.ResourceID); err != nil {
+			return platform.WorkerJob{}, fmt.Errorf("update claimed automation run: %w", err)
+		}
 	}
 	if job.Action == "update-worker" {
 		if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
@@ -1436,6 +1441,23 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
+	if action == "create-sandbox" {
+		runStatus := "failed"
+		errorCode := "worker_failed"
+		errorMessage := result.Message
+		if result.Success {
+			runStatus = "succeeded"
+			errorCode = ""
+			errorMessage = ""
+		}
+		if _, err := tx.Exec(ctx, `UPDATE automation_runs SET
+      status = $1, error_code = $2, error_message = $3, finished_at = $4
+      WHERE sandbox_id = $5 AND status IN ('queued', 'provisioning')`,
+			runStatus, errorCode, errorMessage, time.Now().UTC(), resourceIDValue,
+		); err != nil {
+			return fmt.Errorf("update completed automation run: %w", err)
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit worker job completion: %w", err)
 	}
@@ -1518,7 +1540,7 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 		return platform.Resource{}, mapResourceError(err)
 	}
 	if input.Kind == platform.KindSandbox {
-		if err := enqueueSandboxJob(ctx, tx, result); err != nil {
+		if _, err := enqueueSandboxJob(ctx, tx, result); err != nil {
 			return platform.Resource{}, err
 		}
 	}
@@ -1528,25 +1550,26 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 	return result, nil
 }
 
-func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource) error {
+func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource) (string, error) {
 	payload, driver, imageReference, err := buildSandboxJobPayload(ctx, tx, sandbox)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE control_resources
     SET spec = spec || jsonb_build_object('driver', $1::text, 'imageReference', $2::text)
-    WHERE id = $3 AND kind = 'sandbox'`, driver, imageReference, sandbox.ID); err != nil {
-		return fmt.Errorf("persist sandbox runtime snapshot: %w", err)
+	    WHERE id = $3 AND kind = 'sandbox'`, driver, imageReference, sandbox.ID); err != nil {
+		return "", fmt.Errorf("persist sandbox runtime snapshot: %w", err)
 	}
 	now := time.Now().UTC()
+	jobID := uuid.NewString()
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
     (id, server_id, resource_id, action, status, payload, created_at, updated_at)
     VALUES ($1, $2, $3, 'create-sandbox', 'pending', $4::jsonb, $5, $5)`,
-		uuid.NewString(), sandbox.Spec["serverId"], sandbox.ID, mustMapJSON(payload), now,
+		jobID, sandbox.Spec["serverId"], sandbox.ID, mustMapJSON(payload), now,
 	); err != nil {
-		return fmt.Errorf("enqueue sandbox creation: %w", err)
+		return "", fmt.Errorf("enqueue sandbox creation: %w", err)
 	}
-	return nil
+	return jobID, nil
 }
 
 func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Resource) (map[string]any, string, string, error) {
@@ -1810,11 +1833,11 @@ func (s *Store) DeleteResource(ctx context.Context, id string) error {
 	var referenceQuery string
 	switch kind {
 	case platform.KindProject:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE project_id = $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE project_id = $1) OR EXISTS(SELECT 1 FROM automations WHERE project_id = $1)"
 	case platform.KindImage:
 		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->>'imageId' = $1)"
 	case platform.KindRuntime:
-		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind = 'sandbox' AND spec->>'runtimeId' = $1)"
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind = 'sandbox' AND spec->>'runtimeId' = $1) OR EXISTS(SELECT 1 FROM automations WHERE template_id = $1)"
 	case platform.KindSkill:
 		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'skillIds' ? $1)"
 	case platform.KindMCP:
