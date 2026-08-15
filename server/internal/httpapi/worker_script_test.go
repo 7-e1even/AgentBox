@@ -140,7 +140,7 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 		`AGENTBOX_AGENT_IMAGE_TTL_HOURS:-24`,
 		`LABEL agentbox.runtime.cache=true`,
 		`LABEL agentbox.runtime.refreshed=$NOW`,
-		`$CONTAINER:/opt/agentbox/agent-versions.json`,
+		`cat > /opt/agentbox/agent-versions.json`,
 		`Agent tool $TOOL was installed but command $COMMAND is unavailable`,
 		`RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")`,
 		`set -- "$@" "$RUNTIME_IMAGE"`,
@@ -161,6 +161,23 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 	}
 	if got := strings.Count(workerDaemon, `install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE"`); got != 1 {
 		t.Fatalf("cached image install calls = %d, want 1", got)
+	}
+}
+
+func TestWorkerWritesSmallRuntimeFilesThroughStdin(t *testing.T) {
+	for _, expected := range []string{
+		`docker exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json`,
+		`docker exec -i "$CONTAINER" sh -c 'cat > /opt/agentbox/agent-versions.json' < "$VERSION_FILE"`,
+		`docker exec "$TARGET" rm -rf /opt/agentbox/manifest.json`,
+		`docker exec -i "$TARGET" sh -c 'cat > /opt/agentbox/manifest.json' < "$MANIFEST"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("runtime file provisioning is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerDaemon, `$CONTAINER:/opt/agentbox/agent-versions.json`) ||
+		strings.Contains(workerDaemon, `$TARGET:/opt/agentbox/manifest.json`) {
+		t.Fatal("small runtime files must not use BoxLite's archive-oriented copy path")
 	}
 }
 

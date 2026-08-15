@@ -1211,7 +1211,8 @@ install_agent_tools() {
     mv "$NEXT_VERSION_FILE" "$VERSION_FILE"
   done
   docker exec "$CONTAINER" mkdir -p /opt/agentbox
-  docker cp "$VERSION_FILE" "$CONTAINER:/opt/agentbox/agent-versions.json" >/dev/null
+  docker exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json
+  docker exec -i "$CONTAINER" sh -c 'cat > /opt/agentbox/agent-versions.json' < "$VERSION_FILE"
   rm -f "$VERSION_FILE"
 }
 
@@ -1890,8 +1891,9 @@ create_sandbox() {
     runtime_call "$DRIVER" fs-mkdir "$TARGET" /opt/agentbox >/dev/null
   fi
   MANIFEST=$(mktemp)
-  if ! jq '.job.payload | del(.credentials)' "$JOB_FILE" > "$MANIFEST" ||
-     ! docker cp "$MANIFEST" "$TARGET:/opt/agentbox/manifest.json" >/dev/null; then
+  if ! docker exec "$TARGET" rm -rf /opt/agentbox/manifest.json ||
+     ! jq '.job.payload | del(.credentials)' "$JOB_FILE" > "$MANIFEST" ||
+     ! docker exec -i "$TARGET" sh -c 'cat > /opt/agentbox/manifest.json' < "$MANIFEST"; then
     rm -f "$MANIFEST"
     cleanup_failed_create
     echo "stage manifest-write failed: could not provision the sandbox manifest" >&2
