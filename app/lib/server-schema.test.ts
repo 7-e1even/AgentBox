@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { managedServerSchema } from "./server-schema"
+import { managedServerSchema, serverInventorySchema } from "./server-schema"
 
 describe("managedServerSchema", () => {
   it("parses Worker image inventory", () => {
@@ -23,6 +23,8 @@ describe("managedServerSchema", () => {
             path: "",
           },
         ],
+        boxliteImages: [],
+        microsandboxImages: [],
         vmImages: [],
         vmImageDirectory: "/var/lib/agentbox/vm-images",
       },
@@ -37,6 +39,19 @@ describe("managedServerSchema", () => {
     })
 
     expect(server.inventory.dockerImages[0]?.reference).toBe("ubuntu:24.04")
+    expect(server.inventory.dockerImages[0]?.source).toBe("")
+    expect(server.inventory.boxliteImages).toEqual([])
     expect(server.capabilities).toContain("kvm-device")
+  })
+
+  it("defaults new runtime inventories for older Worker records", () => {
+    const inventory = serverInventorySchema.parse({
+      dockerImages: [],
+      vmImages: [],
+      vmImageDirectory: "/var/lib/agentbox/vm-images",
+    })
+
+    expect(inventory.boxliteImages).toEqual([])
+    expect(inventory.microsandboxImages).toEqual([])
   })
 })

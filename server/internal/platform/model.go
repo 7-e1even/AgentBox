@@ -82,12 +82,15 @@ type ServerImage struct {
 	Created      string `json:"created"`
 	Format       string `json:"format"`
 	Path         string `json:"path"`
+	Source       string `json:"source"`
 }
 
 type ServerInventory struct {
-	DockerImages     []ServerImage `json:"dockerImages"`
-	VMImages         []ServerImage `json:"vmImages"`
-	VMImageDirectory string        `json:"vmImageDirectory"`
+	DockerImages       []ServerImage `json:"dockerImages"`
+	BoxLiteImages      []ServerImage `json:"boxliteImages"`
+	MicrosandboxImages []ServerImage `json:"microsandboxImages"`
+	VMImages           []ServerImage `json:"vmImages"`
+	VMImageDirectory   string        `json:"vmImageDirectory"`
 }
 
 type ServerPairing struct {
@@ -243,6 +246,12 @@ func NormalizeServerInventory(inventory *ServerInventory) {
 	if inventory.DockerImages == nil {
 		inventory.DockerImages = []ServerImage{}
 	}
+	if inventory.BoxLiteImages == nil {
+		inventory.BoxLiteImages = []ServerImage{}
+	}
+	if inventory.MicrosandboxImages == nil {
+		inventory.MicrosandboxImages = []ServerImage{}
+	}
 	if inventory.VMImages == nil {
 		inventory.VMImages = []ServerImage{}
 	}
@@ -250,14 +259,19 @@ func NormalizeServerInventory(inventory *ServerInventory) {
 }
 
 func ValidateServerInventory(inventory ServerInventory) error {
-	if len(inventory.DockerImages) > 2000 || len(inventory.VMImages) > 2000 {
+	if len(inventory.DockerImages) > 2000 || len(inventory.BoxLiteImages) > 2000 ||
+		len(inventory.MicrosandboxImages) > 2000 || len(inventory.VMImages) > 2000 {
 		return &ValidationError{Message: "服务器镜像数量过多"}
 	}
 	if utf8.RuneCountInString(inventory.VMImageDirectory) > 500 {
 		return &ValidationError{Message: "VM 镜像目录过长"}
 	}
-	for _, image := range append(append([]ServerImage{}, inventory.DockerImages...), inventory.VMImages...) {
-		for _, value := range []string{image.ID, image.Reference, image.Architecture, image.Size, image.Created, image.Format, image.Path} {
+	images := append([]ServerImage{}, inventory.DockerImages...)
+	images = append(images, inventory.BoxLiteImages...)
+	images = append(images, inventory.MicrosandboxImages...)
+	images = append(images, inventory.VMImages...)
+	for _, image := range images {
+		for _, value := range []string{image.ID, image.Reference, image.Architecture, image.Size, image.Created, image.Format, image.Path, image.Source} {
 			if utf8.RuneCountInString(value) > 1000 || strings.ContainsRune(value, '\x00') {
 				return &ValidationError{Message: "服务器镜像信息无效"}
 			}

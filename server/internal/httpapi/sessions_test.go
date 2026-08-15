@@ -62,6 +62,23 @@ func TestSandboxSessionTicketIsSingleUse(t *testing.T) {
 	}
 }
 
+func TestSessionAcceptOptionsAllowForwardedGatewayHost(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://server:8091/api/sessions/connect", nil)
+	request.Header.Set("X-Forwarded-Host", "agentbox.example:3000")
+	patterns := newSessionHub(nil).acceptOptions(request).OriginPatterns
+	if len(patterns) != 1 || patterns[0] != "agentbox.example:3000" {
+		t.Fatalf("origin patterns = %#v", patterns)
+	}
+}
+
+func TestSessionAcceptOptionsRejectInvalidForwardedGatewayHost(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet, "http://server:8091/api/sessions/connect", nil)
+	request.Header.Set("X-Forwarded-Host", "*")
+	if patterns := newSessionHub(nil).acceptOptions(request).OriginPatterns; len(patterns) != 0 {
+		t.Fatalf("origin patterns = %#v", patterns)
+	}
+}
+
 func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 	server := newSessionTestServer(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -94,7 +111,12 @@ func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 		t.Fatalf("ticket status = %d, ticket = %q", response.StatusCode, ticketBody.Ticket)
 	}
 
-	browser, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/sandboxes/sandbox-one/session?ticket="+ticketBody.Ticket), nil)
+	browser, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/sandboxes/sandbox-one/session?ticket="+ticketBody.Ticket), &websocket.DialOptions{
+		HTTPHeader: http.Header{
+			"Origin":           []string{"http://agentbox.example:3000"},
+			"X-Forwarded-Host": []string{"agentbox.example:3000"},
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

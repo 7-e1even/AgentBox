@@ -45,6 +45,15 @@ func TestValidateServerInventoryRejectsOversizedValues(t *testing.T) {
 	}
 }
 
+func TestNormalizeServerInventoryInitializesRuntimeSpecificImages(t *testing.T) {
+	inventory := ServerInventory{}
+	NormalizeServerInventory(&inventory)
+	if inventory.DockerImages == nil || inventory.BoxLiteImages == nil ||
+		inventory.MicrosandboxImages == nil || inventory.VMImages == nil {
+		t.Fatalf("NormalizeServerInventory() left nil image inventories: %#v", inventory)
+	}
+}
+
 func TestEnvironmentTemplateRequiresServerInventorySelection(t *testing.T) {
 	projectID := "default"
 	input := Input{

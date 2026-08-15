@@ -29,7 +29,7 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-agentbox}:${POSTGRES_PASSWORD:-change-me-before-deploy}@postgres:5432/${POSTGRES_DB:-agentbox}?sslmode=disable
       PORT: "8091"
       AGENTBOX_BIND_HOST: 0.0.0.0
-      ALLOWED_ORIGINS: ${AGENTBOX_ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+      ALLOWED_ORIGINS: "${AGENTBOX_ALLOWED_ORIGINS:-}"
       AGENTBOX_SECRET_KEY_FILE: /var/lib/agentbox/secret-key
       AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS: ${AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS:-false}
       AGENTBOX_ENV: production
@@ -62,7 +62,7 @@ services:
     restart: unless-stopped
     environment:
       AGENTBOX_API_URL: http://server:8091
-      AGENTBOX_PUBLIC_URL: ${AGENTBOX_PUBLIC_URL:-http://localhost:3000}
+      AGENTBOX_PUBLIC_URL: "${AGENTBOX_PUBLIC_URL:-}"
       HOSTNAME: 0.0.0.0
       PORT: "3000"
     ports:

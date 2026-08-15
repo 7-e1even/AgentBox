@@ -8,10 +8,13 @@ export const serverImageSchema = z.object({
   created: z.string(),
   format: z.string(),
   path: z.string(),
+  source: z.string().default(""),
 })
 
 export const serverInventorySchema = z.object({
   dockerImages: z.array(serverImageSchema),
+  boxliteImages: z.array(serverImageSchema).default([]),
+  microsandboxImages: z.array(serverImageSchema).default([]),
   vmImages: z.array(serverImageSchema),
   vmImageDirectory: z.string(),
 })
@@ -25,7 +28,13 @@ export const managedServerSchema = z.object({
   capabilities: z.array(z.string()),
   inventory: serverInventorySchema,
   workerVersion: z.string(),
-  workerUpdateStatus: z.enum(["", "pending", "updating", "succeeded", "failed"]),
+  workerUpdateStatus: z.enum([
+    "",
+    "pending",
+    "updating",
+    "succeeded",
+    "failed",
+  ]),
   workerUpdateTarget: z.string(),
   workerUpdateMessage: z.string(),
   status: z.enum(["online", "offline"]),

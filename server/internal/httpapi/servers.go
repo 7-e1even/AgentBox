@@ -171,6 +171,9 @@ install_host_dependencies
 install -m 0755 "$worker_tmp" /usr/local/bin/agentbox-worker
 install -d -m 0755 /usr/local/lib/agentbox
 install -d -m 0700 /var/lib/agentbox-worker
+if [ ! -e /etc/agentbox-worker-runtime.env ]; then
+  install -m 0600 /dev/null /etc/agentbox-worker-runtime.env
+fi
 rm -f /usr/local/bin/agentbox-session-worker
 rm -f /usr/local/lib/agentbox/session_worker.py /usr/local/lib/agentbox/runtime_driver.py
 rm -rf /opt/agentbox/runtime
@@ -273,6 +276,12 @@ set -eu
 
 CONFIG=/etc/agentbox-worker.conf
 STATE_DIR=/var/lib/agentbox-worker
+BOXLITE_CONFIG=$STATE_DIR/boxlite.json
+BOXLITE_URL=http://127.0.0.1:48100
+BOXLITE_LOG=$STATE_DIR/boxlite-serve.log
+BOXLITE_IMAGES_FILE=$STATE_DIR/boxlite-images.json
+WORKER_OCI_IMAGE_DIR=$STATE_DIR/oci-images
+BOXLITE_SERVER_PID_FILE=$STATE_DIR/boxlite-serve.pid
 
 usage() {
   echo "usage: agentbox-worker setup --server <url> --token <pairing-token>" >&2
@@ -330,6 +339,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+EnvironmentFile=-/etc/agentbox-worker-runtime.env
 ExecStart=/usr/local/bin/agentbox-worker run
 Restart=always
 RestartSec=5
@@ -342,35 +352,368 @@ UNIT
   echo "Server connected to AgentBox."
 }
 
+prepare_boxlite_config() {
+  mkdir -p "$STATE_DIR"
+  REGISTRY_FILE=$(mktemp "$STATE_DIR/boxlite-registries.XXXXXX")
+  CONFIG_FILE=$(mktemp "$STATE_DIR/boxlite-config.XXXXXX")
+  {
+    printf '%s' "${AGENTBOX_IMAGE_REGISTRIES:-}" | tr ',' '\n'
+    if [ -r /etc/docker/daemon.json ]; then
+      jq -r '."registry-mirrors"[]? // empty' /etc/docker/daemon.json 2>/dev/null || true
+    fi
+    printf '%s\n' docker.io
+  } | while IFS= read -r REGISTRY; do
+    REGISTRY=$(printf '%s' "$REGISTRY" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+      -e 's#^https\{0,1\}://##' -e 's#/*$##')
+    case "$REGISTRY" in ''|*/*|*[!A-Za-z0-9.:-]*) continue ;; esac
+    printf '%s\n' "$REGISTRY"
+  done > "$REGISTRY_FILE"
+  jq -Rn '[inputs | select(length > 0)] | reduce .[] as $host ([]; if index($host) then . else . + [$host] end) | {image_registries: map({host: ., search: true})}' \
+    < "$REGISTRY_FILE" > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  mv "$CONFIG_FILE" "$BOXLITE_CONFIG"
+  rm -f "$REGISTRY_FILE"
+}
+
+boxlite_server_ready() {
+  curl -fsS "$BOXLITE_URL/v1/config" 2>/dev/null |
+    jq -e '.capabilities.snapshots_enabled == true' >/dev/null 2>&1
+}
+
+stop_boxlite_server() {
+  BOXLITE_SERVER_PID=
+  if [ -s "$BOXLITE_SERVER_PID_FILE" ]; then
+    BOXLITE_SERVER_PID=$(tr -d '\r\n' < "$BOXLITE_SERVER_PID_FILE")
+  fi
+  case "$BOXLITE_SERVER_PID" in ''|*[!0-9]*) rm -f "$BOXLITE_SERVER_PID_FILE"; return 0 ;; esac
+  if kill -0 "$BOXLITE_SERVER_PID" >/dev/null 2>&1 &&
+     tr '\000' ' ' < "/proc/$BOXLITE_SERVER_PID/cmdline" 2>/dev/null |
+       grep -Fq '/usr/local/bin/boxlite'; then
+    kill "$BOXLITE_SERVER_PID" >/dev/null 2>&1 || true
+    ATTEMPT=0
+    while kill -0 "$BOXLITE_SERVER_PID" >/dev/null 2>&1 && [ "$ATTEMPT" -lt 20 ]; do
+      ATTEMPT=$((ATTEMPT + 1))
+      sleep 1
+    done
+    kill -9 "$BOXLITE_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$BOXLITE_SERVER_PID" >/dev/null 2>&1 || true
+  fi
+  rm -f "$BOXLITE_SERVER_PID_FILE"
+}
+
+ensure_boxlite_server() {
+  [ -c /dev/kvm ] && [ -x /usr/local/bin/boxlite ] || return 0
+  boxlite_server_ready && return 0
+  stop_boxlite_server
+  prepare_boxlite_config
+  : > "$BOXLITE_LOG"
+  /usr/local/bin/boxlite --config "$BOXLITE_CONFIG" serve \
+    --host 127.0.0.1 --port 48100 >> "$BOXLITE_LOG" 2>&1 &
+  BOXLITE_SERVER_PID=$!
+  printf '%s\n' "$BOXLITE_SERVER_PID" > "$BOXLITE_SERVER_PID_FILE"
+  ATTEMPT=0
+  while [ "$ATTEMPT" -lt 20 ]; do
+    boxlite_server_ready && return 0
+    kill -0 "$BOXLITE_SERVER_PID" >/dev/null 2>&1 || break
+    ATTEMPT=$((ATTEMPT + 1))
+    sleep 1
+  done
+  rm -f "$BOXLITE_SERVER_PID_FILE"
+  tail -c 3500 "$BOXLITE_LOG" >&2 || true
+  return 1
+}
+
+boxlite_cli() {
+  /usr/local/bin/boxlite --url "$BOXLITE_URL" "$@"
+}
+
+boxlite_local_cli() {
+  [ -s "$BOXLITE_CONFIG" ] || prepare_boxlite_config
+  /usr/local/bin/boxlite --config "$BOXLITE_CONFIG" "$@"
+}
+
+worker_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    *) uname -m ;;
+  esac
+}
+
+refresh_boxlite_images() {
+  IMAGES_FILE=$(mktemp "$STATE_DIR/boxlite-images.XXXXXX") || return 1
+  CACHED_IMAGES_FILE=$(mktemp "$STATE_DIR/boxlite-cached-images.XXXXXX") || { rm -f "$IMAGES_FILE"; return 1; }
+  LOCAL_IMAGES_FILE=$(mktemp "$STATE_DIR/worker-oci-images.XXXXXX") || {
+    rm -f "$IMAGES_FILE" "$CACHED_IMAGES_FILE"
+    return 1
+  }
+  printf '[]\n' > "$CACHED_IMAGES_FILE"
+  printf '[]\n' > "$LOCAL_IMAGES_FILE"
+  if ! [ -c /dev/kvm ] || ! [ -x /usr/local/bin/boxlite ]; then
+    printf '[]\n' > "$IMAGES_FILE"
+    mv "$IMAGES_FILE" "$BOXLITE_IMAGES_FILE"
+    rm -f "$CACHED_IMAGES_FILE" "$LOCAL_IMAGES_FILE"
+    return 0
+  fi
+  if boxlite_local_cli images --all --format json 2>/dev/null | jq -e --arg arch "$(worker_arch)" '
+    def humanbytes:
+      . as $raw | (try tonumber catch null) as $bytes |
+      if $bytes == null then ($raw | tostring)
+      elif $bytes < 1024 then (($bytes | tostring) + " B")
+      elif $bytes < 1048576 then (((($bytes / 1024) * 10 | round) / 10 | tostring) + " KiB")
+      elif $bytes < 1073741824 then (((($bytes / 1048576) * 10 | round) / 10 | tostring) + " MiB")
+      else (((($bytes / 1073741824) * 10 | round) / 10 | tostring) + " GiB") end;
+    if type != "array" then error("BoxLite image inventory is not an array") else
+      (map({
+        id: (.ID // ""),
+        reference: (if (.Repository // "") == "" or .Repository == "<none>" then (.ID // "")
+          elif (.Tag // "") == "" or .Tag == "<none>" then .Repository
+          else (.Repository + ":" + .Tag) end),
+        architecture: $arch,
+        size: ((.size // .Size // "") | humanbytes),
+        created: (.CreatedAt // ""),
+        format: "oci",
+        path: "",
+        source: "registry-cache"
+      }) | unique_by(.id, .reference))
+    end
+  ' > "$CACHED_IMAGES_FILE"; then
+    if [ -d "$WORKER_OCI_IMAGE_DIR" ]; then
+      find "$WORKER_OCI_IMAGE_DIR" -mindepth 2 -maxdepth 2 -type f -name '.agentbox-image.json' \
+        -exec cat {} \; 2>/dev/null | jq -s '
+          [ .[] | select(type == "object") | . as $item |
+            ($item.references // [])[] | {
+              id: ($item.id // ""),
+              reference: .,
+              architecture: ($item.architecture // ""),
+              size: ($item.size // ""),
+              created: ($item.created // ""),
+              format: ($item.format // "oci"),
+              path: ($item.path // ""),
+              source: "worker-oci"
+            }
+          ]
+        ' > "$LOCAL_IMAGES_FILE" || printf '[]\n' > "$LOCAL_IMAGES_FILE"
+    fi
+    if jq -s 'add | unique_by(.source, .id, .reference)' \
+      "$CACHED_IMAGES_FILE" "$LOCAL_IMAGES_FILE" > "$IMAGES_FILE"; then
+      mv "$IMAGES_FILE" "$BOXLITE_IMAGES_FILE"
+      rm -f "$CACHED_IMAGES_FILE" "$LOCAL_IMAGES_FILE"
+      return 0
+    fi
+  fi
+  rm -f "$IMAGES_FILE" "$CACHED_IMAGES_FILE" "$LOCAL_IMAGES_FILE"
+  return 1
+}
+
+worker_local_oci_image() {
+  IMAGE=$1
+  command -v docker >/dev/null || return 2
+  command docker info >/dev/null 2>&1 || return 2
+  IMAGE_JSON=$(command docker image inspect "$IMAGE" 2>/dev/null) || return 2
+  IMAGE_ID=$(printf '%s' "$IMAGE_JSON" | jq -r '.[0].Id // empty')
+  IMAGE_OS=$(printf '%s' "$IMAGE_JSON" | jq -r '.[0].Os // empty')
+  IMAGE_ARCH=$(printf '%s' "$IMAGE_JSON" | jq -r '.[0].Architecture // empty')
+  [ "$IMAGE_OS" = linux ] || { echo "OCI sandbox runtimes require a Linux image; $IMAGE is $IMAGE_OS" >&2; return 1; }
+  [ "$IMAGE_ARCH" = "$(worker_arch)" ] || {
+    echo "OCI image architecture mismatch: $IMAGE is $IMAGE_ARCH, Worker is $(worker_arch)" >&2
+    return 1
+  }
+  IMAGE_KEY=${IMAGE_ID#sha256:}
+  case "$IMAGE_KEY" in ''|*[!0-9a-f]*) echo "Docker returned an invalid image ID for $IMAGE" >&2; return 1 ;; esac
+  mkdir -p "$WORKER_OCI_IMAGE_DIR"
+  chmod 700 "$WORKER_OCI_IMAGE_DIR"
+  ROOTFS_PATH=$WORKER_OCI_IMAGE_DIR/$IMAGE_KEY
+  if [ -s "$ROOTFS_PATH/oci-layout" ] && [ -s "$ROOTFS_PATH/index.json" ]; then
+    /usr/local/bin/agentbox-worker image-to-oci \
+      --output "$ROOTFS_PATH" --reference "$IMAGE" >/dev/null || return 1
+    printf '%s' "$ROOTFS_PATH"
+    return 0
+  fi
+  ARCHIVE_PATH=$(mktemp "$STATE_DIR/docker-image.XXXXXX.tar") || return 1
+  if command docker image save -o "$ARCHIVE_PATH" "$IMAGE" &&
+     /usr/local/bin/agentbox-worker image-to-oci --archive "$ARCHIVE_PATH" \
+       --output "$ROOTFS_PATH" --reference "$IMAGE" >/dev/null; then
+    rm -f "$ARCHIVE_PATH"
+    printf '%s' "$ROOTFS_PATH"
+    return 0
+  else
+    STATUS=$?
+  fi
+  rm -f "$ARCHIVE_PATH"
+  return "$STATUS"
+}
+
+boxlite_start() {
+  TARGET=$1
+  START_LOG=$(mktemp "$STATE_DIR/boxlite-start.XXXXXX") || return 1
+  if boxlite_cli start "$TARGET" 2>"$START_LOG"; then
+    rm -f "$START_LOG"
+    return 0
+  fi
+  if grep -Fq 'Handle invalidated after stop()' "$START_LOG"; then
+    rm -f "$START_LOG"
+    stop_boxlite_server
+    ensure_boxlite_server
+    boxlite_cli start "$TARGET"
+    return
+  fi
+  cat "$START_LOG" >&2
+  rm -f "$START_LOG"
+  return 1
+}
+
+boxlite_prepare_image() {
+  IMAGE=$1
+  stop_boxlite_server
+  if ROOTFS_PATH=$(worker_local_oci_image "$IMAGE"); then
+    refresh_boxlite_images || true
+    ensure_boxlite_server
+    return
+  else
+    STATUS=$?
+  fi
+  if [ "$STATUS" -ne 2 ]; then
+    ensure_boxlite_server || true
+    return "$STATUS"
+  fi
+  if boxlite_local_cli pull "$IMAGE"; then
+    refresh_boxlite_images || true
+    ensure_boxlite_server
+    return
+  else
+    STATUS=$?
+  fi
+  ensure_boxlite_server || true
+  return "$STATUS"
+}
+
+microsandbox_prepare_image() {
+  IMAGE=$1
+  if runtime_call microsandbox images 2>/dev/null |
+      jq -e --arg reference "$IMAGE" 'any(.[]; .reference == $reference)' >/dev/null 2>&1; then
+    return 0
+  fi
+  if OCI_PATH=$(worker_local_oci_image "$IMAGE"); then
+    OCI_ARCHIVE=$(mktemp "$STATE_DIR/microsandbox-oci.XXXXXX.tar") || return 1
+    if tar -C "$OCI_PATH" -cf "$OCI_ARCHIVE" oci-layout index.json blobs &&
+       runtime_call microsandbox prepare-image "$IMAGE" --archive "$OCI_ARCHIVE"; then
+      STATUS=0
+    else
+      STATUS=$?
+    fi
+    rm -f "$OCI_ARCHIVE"
+    return "$STATUS"
+  else
+    STATUS=$?
+  fi
+  [ "$STATUS" -eq 2 ] || return "$STATUS"
+  runtime_call microsandbox prepare-image "$IMAGE"
+}
+
+boxlite_create_with_rootfs() {
+  TARGET=$1; IMAGE=$2; ROOTFS_PATH=$3; CPUS=$4; MEMORY=$5; DISK_SIZE=$6; NETWORK=$7
+  BODY=$(jq -n --arg name "$TARGET" --arg image "$IMAGE" --arg rootfsPath "$ROOTFS_PATH" \
+    --argjson cpus "$CPUS" --argjson memory "$MEMORY" --argjson diskSize "$DISK_SIZE" \
+    --arg network "$NETWORK" '
+      {
+        name: $name,
+        image: $image,
+        rootfs_path: $rootfsPath,
+        cpus: $cpus,
+        memory_mib: $memory,
+        disk_size_gb: $diskSize,
+        working_dir: "/",
+        network: {mode: $network, allow_net: []},
+        detach: true
+      }
+    ')
+  curl -fsS -X POST "$BOXLITE_URL/v1/boxes" -H 'Content-Type: application/json' --data "$BODY"
+}
+
+install_boxlite_guest() {
+  TARGET=$1
+  WORKDIR=${2:-/workspace}
+  if boxlite_cli exec -u 0:0 "$TARGET" -- \
+      /opt/agentbox/agentbox-guest guest-fs exists /opt/agentbox/agentbox-guest >/dev/null 2>&1; then
+    boxlite_cli exec -u 0:0 "$TARGET" -- \
+      /opt/agentbox/agentbox-guest guest-fs mkdir "$WORKDIR"
+    return
+  fi
+
+  # BoxLite 0.9.7's REST upload endpoint buffers only small request bodies.
+  # Provision the self-contained guest helper through the local runtime, then
+  # restore the shared server used by concurrent terminal and file sessions.
+  stop_boxlite_server
+  if boxlite_local_cli cp /usr/local/bin/agentbox-worker \
+      "$TARGET:/opt/agentbox/agentbox-guest" &&
+     boxlite_local_cli exec -u 0:0 "$TARGET" -- \
+      /opt/agentbox/agentbox-guest guest-fs mkdir "$WORKDIR"; then
+    ensure_boxlite_server
+    return
+  else
+    STATUS=$?
+  fi
+  ensure_boxlite_server || true
+  return "$STATUS"
+}
+
 boxlite_call() {
   ACTION=${1:-}
   [ "$#" -gt 0 ] && shift
   case "$ACTION" in
     probe)
-      [ -c /dev/kvm ] && [ -x /usr/local/bin/boxlite ] && /usr/local/bin/boxlite info
+      if [ "${AGENTBOX_BOXLITE_SERVER_MODE:-}" = 1 ]; then
+        [ -c /dev/kvm ] && [ -x /usr/local/bin/boxlite ] && boxlite_server_ready
+      else
+        [ -c /dev/kvm ] && [ -x /usr/local/bin/boxlite ] && boxlite_local_cli info
+      fi
       ;;
     create)
       TARGET=${1:-}; IMAGE=${2:-}; shift 2
-      CPUS=2; MEMORY=4096; WORKDIR=/workspace; NETWORK=enabled
+      CPUS=2; MEMORY=4096; DISK_SIZE=${AGENTBOX_BOXLITE_DISK_SIZE_GB:-20}; WORKDIR=/workspace; NETWORK=enabled
       while [ "$#" -gt 0 ]; do
         case "$1" in
           --cpus) CPUS=${2:-2}; shift 2 ;;
           --memory) MEMORY=${2:-4096}; shift 2 ;;
+          --disk-size) DISK_SIZE=${2:-20}; shift 2 ;;
           --workdir) WORKDIR=${2:-/workspace}; shift 2 ;;
           --network) [ "${2:-}" = none ] && NETWORK=disabled || NETWORK=enabled; shift 2 ;;
           *) echo "unsupported BoxLite create option: $1" >&2; return 2 ;;
         esac
       done
-      if ! /usr/local/bin/boxlite inspect "$TARGET" >/dev/null 2>&1; then
-        /usr/local/bin/boxlite create --detach --name "$TARGET" --cpus "$CPUS" --memory "$MEMORY" \
-          --workdir "$WORKDIR" --network "$NETWORK" "$IMAGE" >/dev/null
+      case "$DISK_SIZE" in ''|*[!0-9]*|0) echo "invalid BoxLite disk size: $DISK_SIZE" >&2; return 2 ;; esac
+      if ! boxlite_cli inspect "$TARGET" >/dev/null 2>&1; then
+        if ROOTFS_PATH=$(worker_local_oci_image "$IMAGE"); then
+          boxlite_create_with_rootfs "$TARGET" "$IMAGE" "$ROOTFS_PATH" \
+            "$CPUS" "$MEMORY" "$DISK_SIZE" "$NETWORK" >/dev/null
+        else
+          STATUS=$?
+          if [ "$STATUS" -ne 2 ]; then
+            return "$STATUS"
+          fi
+          boxlite_cli create --detach --name "$TARGET" --cpus "$CPUS" --memory "$MEMORY" \
+            --disk-size "$DISK_SIZE" --workdir / --network "$NETWORK" "$IMAGE" >/dev/null
+        fi
       fi
-      /usr/local/bin/boxlite start "$TARGET"
+      boxlite_start "$TARGET" || return 1
+      install_boxlite_guest "$TARGET" "$WORKDIR"
       ;;
-    inspect) /usr/local/bin/boxlite inspect "$1" ;;
-    start) /usr/local/bin/boxlite start "$1" ;;
-    stop) /usr/local/bin/boxlite stop "$1" ;;
-    delete) /usr/local/bin/boxlite rm --force "$1" ;;
+    inspect) boxlite_cli inspect "$1" ;;
+    prepare-image) boxlite_prepare_image "$1" ;;
+    start) boxlite_start "$1" ;;
+    stop) boxlite_cli stop "$1" ;;
+    delete)
+      if ! HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$BOXLITE_URL/v1/boxes/$1"); then
+        echo "BoxLite service is unavailable" >&2
+        return 1
+      fi
+      case "$HTTP_STATUS" in
+        200) boxlite_cli rm --force "$1" ;;
+        404) return 0 ;;
+        *) echo "BoxLite inspect returned HTTP $HTTP_STATUS" >&2; return 1 ;;
+      esac
+      ;;
     exec)
       USE_STDIN=false; WORKDIR=
       while [ "$#" -gt 0 ]; do
@@ -383,14 +726,30 @@ boxlite_call() {
       TARGET=${1:-}; [ -n "$TARGET" ] || { echo "BoxLite exec target is required" >&2; return 2; }; shift
       [ "${1:-}" = -- ] && shift
       if [ "$USE_STDIN" = true ] && [ -n "$WORKDIR" ]; then
-        /usr/local/bin/boxlite exec -i -u 0:0 -w "$WORKDIR" "$TARGET" -- "$@"
+        boxlite_cli exec -i -u 0:0 -w "$WORKDIR" "$TARGET" -- "$@"
       elif [ "$USE_STDIN" = true ]; then
-        /usr/local/bin/boxlite exec -i -u 0:0 "$TARGET" -- "$@"
+        boxlite_cli exec -i -u 0:0 "$TARGET" -- "$@"
       elif [ -n "$WORKDIR" ]; then
-        /usr/local/bin/boxlite exec -u 0:0 -w "$WORKDIR" "$TARGET" -- "$@"
+        boxlite_cli exec -u 0:0 -w "$WORKDIR" "$TARGET" -- "$@"
       else
-        /usr/local/bin/boxlite exec -u 0:0 "$TARGET" -- "$@"
+        boxlite_cli exec -u 0:0 "$TARGET" -- "$@"
       fi
+      ;;
+    fs-list|fs-read|fs-write|fs-mkdir|fs-stat|fs-exists|fs-remove)
+      TARGET=${1:-}; PATH_VALUE=${2:-}
+      [ -n "$TARGET" ] && [ -n "$PATH_VALUE" ] || { echo "$ACTION requires target and path" >&2; return 2; }
+      HELPER_ACTION=${ACTION#fs-}
+      if [ "$ACTION" = fs-write ]; then
+        boxlite_cli exec -i -u 0:0 "$TARGET" -- /opt/agentbox/agentbox-guest guest-fs "$HELPER_ACTION" "$PATH_VALUE"
+      else
+        boxlite_cli exec -u 0:0 "$TARGET" -- /opt/agentbox/agentbox-guest guest-fs "$HELPER_ACTION" "$PATH_VALUE"
+      fi
+      ;;
+    fs-rename)
+      boxlite_cli exec -u 0:0 "$1" -- /opt/agentbox/agentbox-guest guest-fs rename "$2" "$3"
+      ;;
+    fs-copy-from-host)
+      boxlite_cli cp "$2" "$1:$3"
       ;;
     *) echo "unsupported BoxLite action: $ACTION" >&2; return 2 ;;
   esac
@@ -458,10 +817,7 @@ docker() {
         *:/*)
           TARGET=${DESTINATION%%:*}
           PATH_VALUE=${DESTINATION#*:}
-          PARENT=${PATH_VALUE%/*}
-          [ -n "$PARENT" ] || PARENT=/
-          runtime_call "$AGENTBOX_RUNTIME_DRIVER" exec --stdin "$TARGET" -- \
-            sh -c 'set -eu; mkdir -p "$1"; cat > "$2"' sh "$PARENT" "$PATH_VALUE" < "$SOURCE"
+          runtime_call "$AGENTBOX_RUNTIME_DRIVER" fs-copy-from-host "$TARGET" "$SOURCE" "$PATH_VALUE"
           ;;
         *) echo "only host-to-sandbox copy is supported" >&2; return 2 ;;
       esac
@@ -493,10 +849,8 @@ worker_capabilities() {
 }
 
 worker_inventory() {
-  ARCH=$(uname -m)
-  [ "$ARCH" = x86_64 ] && ARCH=amd64
-  [ "$ARCH" = aarch64 ] && ARCH=arm64
-  DOCKER_IMAGES='[]'
+	ARCH=$(worker_arch)
+	DOCKER_IMAGES='[]'
   if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
     DOCKER_IMAGES=$(docker image ls --no-trunc --format '{{json .}}' 2>/dev/null | jq -s --arg arch "$ARCH" '
       map(select((.Repository | startswith("agentbox/runtime-")) | not) | {
@@ -506,9 +860,21 @@ worker_inventory() {
         size: .Size,
         created: .CreatedSince,
         format: "oci",
-        path: ""
+        path: "",
+        source: "docker-local"
       })
     ' 2>/dev/null || printf '[]')
+  fi
+
+  BOXLITE_IMAGES='[]'
+  if [ -s "$BOXLITE_IMAGES_FILE" ]; then
+    BOXLITE_IMAGES=$(jq -c 'if type == "array" then . else [] end' "$BOXLITE_IMAGES_FILE" 2>/dev/null || printf '[]')
+  fi
+
+  MICROSANDBOX_IMAGES='[]'
+  if [ -x /usr/local/bin/agentbox-microsandbox-driver ] && [ -c /dev/kvm ]; then
+    MICROSANDBOX_IMAGES=$(runtime_call microsandbox images 2>/dev/null || printf '[]')
+    MICROSANDBOX_IMAGES=$(printf '%s' "$MICROSANDBOX_IMAGES" | jq -c 'if type == "array" then . else [] end' 2>/dev/null || printf '[]')
   fi
 
   VM_DIR=${AGENTBOX_VM_IMAGE_DIR:-/var/lib/agentbox/vm-images}
@@ -525,15 +891,17 @@ worker_inventory() {
         NEXT_FILE="$VM_FILE.next"
         jq --arg id "$PATH_VALUE" --arg reference "$NAME" --arg arch "$ARCH" \
           --arg size "$SIZE" --arg created "$CREATED" --arg format "$FORMAT" --arg path "$PATH_VALUE" \
-          '. + [{id:$id,reference:$reference,architecture:$arch,size:$size,created:$created,format:$format,path:$path}]' \
+          '. + [{id:$id,reference:$reference,architecture:$arch,size:$size,created:$created,format:$format,path:$path,source:"disk-local"}]' \
           "$VM_FILE" > "$NEXT_FILE"
         mv "$NEXT_FILE" "$VM_FILE"
       done
   fi
   VM_IMAGES=$(cat "$VM_FILE")
   rm -f "$VM_FILE"
-  jq -n --argjson dockerImages "$DOCKER_IMAGES" --argjson vmImages "$VM_IMAGES" --arg vmImageDirectory "$VM_DIR" \
-    '{dockerImages:$dockerImages,vmImages:$vmImages,vmImageDirectory:$vmImageDirectory}'
+  jq -n --argjson dockerImages "$DOCKER_IMAGES" --argjson boxliteImages "$BOXLITE_IMAGES" \
+    --argjson microsandboxImages "$MICROSANDBOX_IMAGES" --argjson vmImages "$VM_IMAGES" \
+    --arg vmImageDirectory "$VM_DIR" \
+    '{dockerImages:$dockerImages,boxliteImages:$boxliteImages,microsandboxImages:$microsandboxImages,vmImages:$vmImages,vmImageDirectory:$vmImageDirectory}'
 }
 
 complete_job() {
@@ -581,6 +949,46 @@ restore_worker_binary() {
   mv -f "$RESTORE_TMP" /usr/local/bin/agentbox-worker
 }
 
+refresh_microsandbox_driver() {
+  [ -c /dev/kvm ] || return 0
+  command -v go >/dev/null || { echo "Go is required to update the Microsandbox driver" >&2; return 1; }
+  command -v gcc >/dev/null || { echo "a C compiler is required to update the Microsandbox driver" >&2; return 1; }
+  install -d -m 0700 "$STATE_DIR/go" "$STATE_DIR/go-mod-cache" "$STATE_DIR/go-build-cache"
+  BUILD_DIR=$(mktemp -d "$STATE_DIR/microsandbox-driver.XXXXXX") || return 1
+  if ! curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$BUILD_DIR/main.go"; then
+    rm -rf "$BUILD_DIR"
+    return 1
+  fi
+  cat > "$BUILD_DIR/go.mod" <<'EOF'
+module agentbox/microsandbox-driver
+
+go 1.22
+
+require github.com/superradcompany/microsandbox/sdk/go v0.6.8
+EOF
+  if ! (
+    cd "$BUILD_DIR"
+    export GOPATH="$STATE_DIR/go"
+    export GOMODCACHE="$STATE_DIR/go-mod-cache"
+    export GOCACHE="$STATE_DIR/go-build-cache"
+    if ! go mod tidy; then
+      GOPROXY=https://goproxy.cn,direct go mod tidy
+    fi
+    CGO_ENABLED=1 go build -tags agentbox_driver -trimpath -ldflags '-s -w' -o agentbox-microsandbox-driver .
+    ./agentbox-microsandbox-driver probe >/dev/null
+  ); then
+    rm -rf "$BUILD_DIR"
+    return 1
+  fi
+  DRIVER_NEXT=/usr/local/bin/.agentbox-microsandbox-driver-next
+  install -m 0755 "$BUILD_DIR/agentbox-microsandbox-driver" "$DRIVER_NEXT" || {
+    rm -rf "$BUILD_DIR" "$DRIVER_NEXT"
+    return 1
+  }
+  mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver
+  rm -rf "$BUILD_DIR"
+}
+
 update_worker() {
   JOB_FILE=$1
   JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
@@ -608,6 +1016,11 @@ update_worker() {
   [ "$DOWNLOADED_VERSION" = "$TARGET_VERSION" ] || {
     echo "downloaded Worker version mismatch: $DOWNLOADED_VERSION" >&2
     rm -f "$WORKER_TMP"
+    return 1
+  }
+  refresh_microsandbox_driver || {
+    rm -f "$WORKER_TMP"
+    echo "failed to refresh the Microsandbox driver" >&2
     return 1
   }
 
@@ -712,10 +1125,11 @@ install_agent_tools() {
   [ -n "$TOOLS" ] || return 0
   docker exec "$CONTAINER" sh -lc \
     'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git jq unzip python3' >&2
+  INSTALL_PI=false
   set --
   for TOOL in $TOOLS; do
     COMMAND=$(agent_tool_command "$TOOL") || { echo "unsupported Agent tool: $TOOL" >&2; return 1; }
-    if docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
+    if [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
       continue
     fi
     case "$TOOL" in
@@ -729,7 +1143,7 @@ install_agent_tools() {
       omp) PACKAGE='@oh-my-pi/pi-coding-agent' ;;
       openclaw) PACKAGE='openclaw' ;;
       opencode) PACKAGE='opencode-ai' ;;
-      pi) PACKAGE='@mariozechner/pi-coding-agent' ;;
+      pi) INSTALL_PI=true; continue ;;
       copilot-cli) PACKAGE='@github/copilot' ;;
       qoder-cli) PACKAGE='@qoder-ai/qodercli' ;;
       qoder-cn) PACKAGE='@qodercn-ai/qoderclicn' ;;
@@ -747,10 +1161,16 @@ install_agent_tools() {
     docker exec "$CONTAINER" sh -lc \
       'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://bun.sh/install -o "$INSTALLER"; bash "$INSTALLER" >/dev/null; test -x /root/.bun/bin/bun; ln -sf /root/.bun/bin/bun /usr/bin/bun' >&2
   fi
-  if [ "$#" -gt 0 ]; then
+  if [ "$#" -gt 0 ] || [ "$INSTALL_PI" = true ]; then
     docker exec "$CONTAINER" sh -lc \
-      'if ! node --version 2>/dev/null | grep -q "^v22\."; then curl -fsSL https://deb.nodesource.com/setup_22.x | sh; export DEBIAN_FRONTEND=noninteractive; apt-get install -y nodejs; fi' >&2
+      'if ! node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\'' 2>/dev/null; then curl -fsSL https://deb.nodesource.com/setup_22.x | sh; export DEBIAN_FRONTEND=noninteractive; apt-get install -y nodejs; fi; node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\''' >&2
+  fi
+  if [ "$#" -gt 0 ]; then
     docker exec "$CONTAINER" npm install -g "$@" >&2
+  fi
+  if [ "$INSTALL_PI" = true ]; then
+    docker exec "$CONTAINER" npm uninstall -g @mariozechner/pi-coding-agent >&2 || true
+    docker exec "$CONTAINER" npm install -g --force @earendil-works/pi-coding-agent@latest >&2
   fi
 
   for TOOL in $TOOLS; do
@@ -840,7 +1260,8 @@ prepare_agent_image() {
   command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
 
   TOOL_SET=$(printf '%s\n' "$TOOLS" | paste -sd, -)
-  CACHE_KEY=$(printf '%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" | sha256sum | cut -c1-16)
+  INSTALLER_REVISION=2
+  CACHE_KEY=$(printf '%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
   CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
   BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY"
@@ -876,6 +1297,7 @@ prepare_agent_image() {
        --change "LABEL agentbox.runtime.refreshed=$NOW" \
        --change "LABEL agentbox.runtime.base=$BASE_IMAGE" \
        --change "LABEL agentbox.runtime.tools=$TOOL_SET" \
+       --change "LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION" \
        "$BUILD_CONTAINER" "$REFRESH_IMAGE" >/dev/null &&
      docker tag "$REFRESH_IMAGE" "$CACHE_IMAGE"; then
     docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
@@ -1394,12 +1816,24 @@ create_sandbox() {
   SETUP=$(jq -r '.job.payload.setup // empty' "$JOB_FILE")
   TARGET="agentbox-$SANDBOX_ID"
   VOLUME="agentbox-$SANDBOX_ID-workspace"
+  SANDBOX_PREEXISTED=false
+
+  cleanup_failed_create() {
+    [ "$SANDBOX_PREEXISTED" = false ] || return 0
+    if [ "$DRIVER" = docker ]; then
+      command docker rm -f "$TARGET" >/dev/null 2>&1 || true
+      command docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+    else
+      runtime_call "$DRIVER" delete "$TARGET" >/dev/null 2>&1 || true
+    fi
+  }
 
   if [ "$DRIVER" = docker ]; then
     command -v docker >/dev/null || { echo "Docker is not installed" >&2; return 1; }
     docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; return 1; }
     MEMORY=$(printf '%s' "$MEMORY_VALUE" | tr -d ' ' | sed -e 's/GiB$/g/' -e 's/MiB$/m/')
     if docker inspect "$TARGET" >/dev/null 2>&1; then
+      SANDBOX_PREEXISTED=true
       OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET")
       [ "$OWNER" = "$SANDBOX_ID" ] || { echo "container name collision: $TARGET" >&2; return 1; }
       docker start "$TARGET" >/dev/null
@@ -1416,25 +1850,79 @@ create_sandbox() {
       "$@" >/dev/null
     fi
   else
-    runtime_probe "$DRIVER" || { echo "$DRIVER SDK self-test failed" >&2; return 1; }
+    runtime_probe "$DRIVER" || { echo "stage runtime-probe failed: $DRIVER self-test failed" >&2; return 1; }
+    if runtime_call "$DRIVER" inspect "$TARGET" >/dev/null 2>&1; then
+      SANDBOX_PREEXISTED=true
+    fi
     CPU_COUNT=$(printf '%s' "${CPU:-2}" | sed 's/\..*$//')
     case "$CPU_COUNT" in ''|*[!0-9]*) CPU_COUNT=2 ;; esac
     MEMORY_MIB=$(memory_mib "$MEMORY_VALUE")
-    runtime_call "$DRIVER" create "$TARGET" "$IMAGE" --cpus "$CPU_COUNT" \
-      --memory "$MEMORY_MIB" --workdir "$WORKDIR" --network "$NETWORK" >/dev/null
-    install_agent_tools "$TARGET" "$JOB_FILE"
+    if [ "$DRIVER" = microsandbox ]; then
+      if ! microsandbox_prepare_image "$IMAGE" >/dev/null; then
+        echo "stage image-prepare failed: $DRIVER could not prepare $IMAGE" >&2
+        return 1
+      fi
+    elif ! runtime_call "$DRIVER" prepare-image "$IMAGE" >/dev/null; then
+      echo "stage image-prepare failed: $DRIVER could not prepare $IMAGE" >&2
+      return 1
+    fi
+    if ! runtime_call "$DRIVER" create "$TARGET" "$IMAGE" --cpus "$CPU_COUNT" \
+      --memory "$MEMORY_MIB" --workdir "$WORKDIR" --network "$NETWORK" >/dev/null; then
+      cleanup_failed_create
+      echo "stage runtime-create failed: $DRIVER could not create the sandbox" >&2
+      return 1
+    fi
+    if ! runtime_call "$DRIVER" fs-mkdir "$TARGET" "$WORKDIR" >/dev/null; then
+      cleanup_failed_create
+      echo "stage workspace-init failed: $DRIVER could not prepare $WORKDIR" >&2
+      return 1
+    fi
+    if ! install_agent_tools "$TARGET" "$JOB_FILE"; then
+      cleanup_failed_create
+      echo "stage agent-tools failed: image $IMAGE is not compatible with the selected Agent tools" >&2
+      return 1
+    fi
   fi
 
-  docker exec "$TARGET" mkdir -p /opt/agentbox
+  if [ "$DRIVER" = docker ]; then
+    docker exec "$TARGET" mkdir -p /opt/agentbox
+  else
+    runtime_call "$DRIVER" fs-mkdir "$TARGET" /opt/agentbox >/dev/null
+  fi
   MANIFEST=$(mktemp)
-  jq '.job.payload | del(.credentials)' "$JOB_FILE" > "$MANIFEST"
-  docker cp "$MANIFEST" "$TARGET:/opt/agentbox/manifest.json" >/dev/null
+  if ! jq '.job.payload | del(.credentials)' "$JOB_FILE" > "$MANIFEST" ||
+     ! docker cp "$MANIFEST" "$TARGET:/opt/agentbox/manifest.json" >/dev/null; then
+    rm -f "$MANIFEST"
+    cleanup_failed_create
+    echo "stage manifest-write failed: could not provision the sandbox manifest" >&2
+    return 1
+  fi
   rm -f "$MANIFEST"
-  configure_credentials "$TARGET" "$JOB_FILE"
-  configure_skills "$TARGET" "$JOB_FILE"
-  configure_mcp_servers "$TARGET" "$JOB_FILE"
-  install_agent_wrappers "$TARGET" "$JOB_FILE"
-  [ -z "$SETUP" ] || docker exec "$TARGET" sh -lc "$SETUP" >&2
+  if ! configure_credentials "$TARGET" "$JOB_FILE"; then
+    cleanup_failed_create
+    echo "stage credentials failed: image $IMAGE could not accept AgentBox configuration" >&2
+    return 1
+  fi
+  if ! configure_skills "$TARGET" "$JOB_FILE"; then
+    cleanup_failed_create
+    echo "stage skills failed: image $IMAGE could not accept AgentBox skills" >&2
+    return 1
+  fi
+  if ! configure_mcp_servers "$TARGET" "$JOB_FILE"; then
+    cleanup_failed_create
+    echo "stage mcp failed: image $IMAGE could not accept MCP configuration" >&2
+    return 1
+  fi
+  if ! install_agent_wrappers "$TARGET" "$JOB_FILE"; then
+    cleanup_failed_create
+    echo "stage agent-wrappers failed: image $IMAGE could not install Agent wrappers" >&2
+    return 1
+  fi
+  if [ -n "$SETUP" ] && ! docker exec "$TARGET" sh -lc "$SETUP" >&2; then
+    cleanup_failed_create
+    echo "stage setup-command failed: image $IMAGE must provide a POSIX shell for setup commands" >&2
+    return 1
+  fi
   printf '%s' "$TARGET"
 }
 
@@ -1460,6 +1948,12 @@ start_sandbox() {
     docker start "$TARGET" >/dev/null
   else
     runtime_call "$DRIVER" start "$TARGET" >/dev/null
+    WORKDIR=$(jq -r '.job.payload.workdir // "/workspace"' "$JOB_FILE")
+    if [ "$DRIVER" = boxlite ]; then
+      install_boxlite_guest "$TARGET" "$WORKDIR" >/dev/null
+    else
+      runtime_call "$DRIVER" fs-mkdir "$TARGET" "$WORKDIR" >/dev/null
+    fi
   fi
 
   if jq -e '.job.payload.credentials? and .job.payload.agentTools?' "$JOB_FILE" >/dev/null; then
@@ -1577,6 +2071,14 @@ run_worker() {
   SERVER_URL=$(sed -n '1p' "$CONFIG")
   SERVER_ID=$(sed -n '2p' "$CONFIG")
   CREDENTIAL=$(sed -n '3p' "$CONFIG")
+  prepare_boxlite_config
+  refresh_boxlite_images || {
+    [ -s "$BOXLITE_IMAGES_FILE" ] || printf '[]\n' > "$BOXLITE_IMAGES_FILE"
+    echo "warning: BoxLite image inventory is unavailable" >&2
+  }
+  AGENTBOX_BOXLITE_SERVER_MODE=1
+  export AGENTBOX_BOXLITE_SERVER_MODE
+  ensure_boxlite_server || echo "warning: BoxLite service is unavailable" >&2
   finalize_worker_update || true
   heartbeat_loop &
   HEARTBEAT_PID=$!
@@ -1585,9 +2087,18 @@ run_worker() {
     /usr/local/bin/agentbox-worker session "$CONFIG" &
     SESSION_PID=$!
   fi
-  trap 'kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true; [ -z "$SESSION_PID" ] || kill "$SESSION_PID" >/dev/null 2>&1 || true' EXIT INT TERM
+  cleanup_worker() {
+    kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    [ -z "$SESSION_PID" ] || kill "$SESSION_PID" >/dev/null 2>&1 || true
+    stop_boxlite_server
+    wait "$HEARTBEAT_PID" >/dev/null 2>&1 || true
+    [ -z "$SESSION_PID" ] || wait "$SESSION_PID" >/dev/null 2>&1 || true
+  }
+  trap cleanup_worker EXIT
+  trap 'exit 0' INT TERM
   while :; do
     finalize_worker_update || true
+    [ "${AGENTBOX_BOXLITE_SERVER_MODE:-}" != 1 ] || ensure_boxlite_server || true
     JOB_FILE=$(mktemp)
     HTTP_STATUS=$(curl -sS -o "$JOB_FILE" -w '%{http_code}' -X POST \
       "$SERVER_URL/api/servers/$SERVER_ID/jobs/claim" \

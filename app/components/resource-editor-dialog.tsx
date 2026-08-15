@@ -15,10 +15,11 @@ import {
 import {
   normalizeRuntimeImageReference,
   runtimeImageChoices,
-  usesRuntimeImageInventory,
+  type RuntimeImageChoices,
 } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
+import { RuntimeImageCombobox } from "@/components/runtime-image-combobox"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import {
@@ -69,6 +70,8 @@ type SpecField = {
   textarea?: boolean
   options?: Option[]
   optionGroupLabel?: string
+  imageChoices?: RuntimeImageChoices
+  imageDriver?: string
   multiOptions?: Option[]
   environmentVariables?: boolean
   advanced?: boolean
@@ -120,15 +123,15 @@ function runtimeDriverDescription(server: ManagedServer, driver: string) {
 
 function runtimeImageDescription(driver: string) {
   if (driver === "boxlite") {
-    return "填写 BoxLite 独立拉取的 OCI Registry 引用；不会复用 Docker 本地镜像。"
+    return "可搜索当前服务器的容器镜像；未缓存的 Registry 引用由 BoxLite 在创建时拉取。"
   }
   if (driver === "microsandbox") {
-    return "填写 Microsandbox 使用的 OCI Registry 引用；Worker 可将匹配的 Docker 本地镜像导入其独立缓存。"
+    return "可搜索当前服务器的容器镜像；Microsandbox 会导入可复用内容或从 Registry 拉取。"
   }
   if (driver === "vm") {
     return "只允许选择 Worker 已盘点到的本地 qcow2/raw VM 镜像。"
   }
-  return "优先选择 Docker 本地镜像；未缓存的 Registry 引用会在首次创建时拉取。"
+  return "可搜索当前服务器的容器镜像；未缓存的 Registry 引用会在首次创建时拉取。"
 }
 
 function fields(
@@ -149,9 +152,6 @@ function fields(
   const driverOptions = runtimeDriverOptions(server)
   const driver = typeof spec.driver === "string" ? spec.driver : "docker"
   const imageChoices = runtimeImageChoices(server, driver, spec.imageReference)
-  const imageOptions = usesRuntimeImageInventory(driver)
-    ? [...imageChoices.local, ...imageChoices.registry]
-    : undefined
   switch (kind) {
     case "project":
       return [
@@ -210,15 +210,8 @@ function fields(
         {
           key: "imageReference",
           label: "系统镜像",
-          options: imageOptions,
-          optionGroupLabel:
-            driver === "vm"
-              ? "Worker 本地 VM 镜像"
-              : "Docker 本地镜像与 Registry 引用",
-          placeholder:
-            driver === "boxlite" || driver === "microsandbox"
-              ? "ubuntu:24.04 或 registry.example.com/agent:latest"
-              : undefined,
+          imageChoices,
+          imageDriver: driver,
           description: runtimeImageDescription(driver),
         },
         {
@@ -493,6 +486,15 @@ function SpecFieldEditor({
       ) : field.environmentVariables ? (
         <EnvironmentVariablesEditor
           value={spec[field.key]}
+          onChange={(value) => onChange(field.key, value)}
+        />
+      ) : field.imageChoices ? (
+        <RuntimeImageCombobox
+          id={`spec-${field.key}`}
+          value={String(spec[field.key] ?? "")}
+          choices={field.imageChoices}
+          driver={field.imageDriver ?? "docker"}
+          invalid={invalid}
           onChange={(value) => onChange(field.key, value)}
         />
       ) : field.options ? (
@@ -828,6 +830,15 @@ export function ResourceEditorDialog({
         className={`max-h-[92svh] overflow-y-auto ${
           kind === "sandbox" ? "sm:max-w-xl" : "sm:max-w-4xl"
         }`}
+        onEscapeKeyDown={(event) => {
+          if (
+            document.querySelector(
+              '[data-slot="combobox-content"][data-open]'
+            )
+          ) {
+            event.preventDefault()
+          }
+        }}
       >
         <DialogHeader>
           <DialogTitle>

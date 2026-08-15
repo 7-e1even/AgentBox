@@ -17,6 +17,20 @@ func main() {
 		_, _ = fmt.Fprintln(os.Stdout, version)
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "guest-fs" {
+		if err := runGuestFS(os.Args[2:], os.Stdin, os.Stdout); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "image-to-oci" {
+		if err := runImageToOCI(os.Args[2:], os.Stdout); err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "session" {
 		runSessionWorker()
 		return

@@ -21,6 +21,28 @@ const server = {
         path: "",
       },
     ],
+    boxliteImages: [
+      {
+        id: "boxlite",
+        reference: "alpine:3.20",
+        architecture: "amd64",
+        size: "8 MiB",
+        created: "today",
+        format: "oci",
+        path: "",
+      },
+    ],
+    microsandboxImages: [
+      {
+        id: "sha256:micro",
+        reference: "python:3.12",
+        architecture: "amd64",
+        size: "125 MiB",
+        created: "today",
+        format: "oci",
+        path: "",
+      },
+    ],
     vmImages: [
       {
         id: "vm-one",
@@ -37,10 +59,20 @@ const server = {
 } as ManagedServer
 
 describe("runtime images", () => {
-  it("only exposes Docker inventory to the Docker driver", () => {
-    expect(runtimeInventoryImages(server, "docker")).toHaveLength(1)
-    expect(runtimeInventoryImages(server, "boxlite")).toEqual([])
-    expect(runtimeInventoryImages(server, "microsandbox")).toEqual([])
+  it("shares the unified OCI inventory across container runtimes", () => {
+    const expected = ["ubuntu:24.04", "alpine:3.20", "python:3.12"]
+
+    expect(
+      runtimeInventoryImages(server, "docker").map((image) => image.reference)
+    ).toEqual(expected)
+    expect(
+      runtimeInventoryImages(server, "boxlite").map((image) => image.reference)
+    ).toEqual(expected)
+    expect(
+      runtimeInventoryImages(server, "microsandbox").map(
+        (image) => image.reference
+      )
+    ).toEqual(expected)
   })
 
   it("keeps uncached Docker registry references separate", () => {
@@ -52,15 +84,39 @@ describe("runtime images", () => {
 
     expect(choices.local.map((option) => option.value)).toEqual([
       "ubuntu:24.04",
+      "alpine:3.20",
+      "python:3.12",
     ])
     expect(choices.registry.map((option) => option.value)).toEqual([
       "registry.example.com/agent:latest",
     ])
   })
 
-  it("uses registry input instead of Docker inventory for MicroVM drivers", () => {
-    expect(usesRuntimeImageInventory("boxlite")).toBe(false)
-    expect(usesRuntimeImageInventory("microsandbox")).toBe(false)
+  it("uses the same local choices for Microsandbox", () => {
+    const choices = runtimeImageChoices(
+      server,
+      "microsandbox",
+      "registry.example.com/agent:latest"
+    )
+
+    expect(choices.local.map((option) => option.value)).toEqual([
+      "ubuntu:24.04",
+      "alpine:3.20",
+      "python:3.12",
+    ])
+    expect(choices.registry).toEqual([
+      {
+        value: "registry.example.com/agent:latest",
+        label:
+          "registry.example.com/agent:latest · 创建时导入或拉取",
+      },
+    ])
+  })
+
+  it("exposes searchable inventory for all runtimes", () => {
+    expect(usesRuntimeImageInventory("docker")).toBe(true)
+    expect(usesRuntimeImageInventory("boxlite")).toBe(true)
+    expect(usesRuntimeImageInventory("microsandbox")).toBe(true)
     expect(normalizeRuntimeImageReference(server, "boxlite", "")).toBe(
       "ubuntu:24.04"
     )

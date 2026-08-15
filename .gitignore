@@ -1,5 +1,4 @@
 # Local references and preserved scaffold metadata
-/参考/
 /reference/
 /.scaffold-git-backup/
 
@@ -20,10 +19,13 @@ app/coverage/
 server/agentbox.exe
 server/agentbox-server.exe
 
+# Local runtime logs
+/logs/
+*.log
+
 # Editors and operating systems
 .DS_Store
 Thumbs.db
-*.log
 *.tsbuildinfo
 .code-review-graph/
 skills-lock.json

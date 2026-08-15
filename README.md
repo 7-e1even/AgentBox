@@ -13,31 +13,16 @@ git clone https://github.com/7-e1even/AgentBox.git
 cd AgentBox
 ```
 
-首次启动前复制 `.env.example` 为 `.env`，正式环境只需确认以下配置：
+本机或可信内网体验无需创建 `.env`，直接启动即可。Compose 会拉取 GHCR 中已构建的镜像，不需要在目标机编译 Go 或前端：
 
 ```sh
-cp .env.example .env
-```
-
-```env
-POSTGRES_PASSWORD=请替换为强密码
-AGENTBOX_PUBLIC_URL=http://<服务器地址>:3000
-AGENTBOX_ALLOWED_ORIGINS=http://<服务器地址>:3000
-# 建议固定到 Releases 页面中的版本标签
-AGENTBOX_VERSION=latest
-```
-
-需要可重复部署时，将 `latest` 替换为 Releases 页面中实际存在的 `v*` 标签。
-
-正式部署直接拉取 GHCR 中已构建的镜像，不需要在目标机编译 Go 或前端：
-
-```sh
-docker compose pull
 docker compose up -d
 docker compose ps
 ```
 
-打开 `AGENTBOX_PUBLIC_URL` 创建首个管理员，再到“服务器”页面复制命令安装并配对 Linux Worker。安装脚本会经由 AgentBox Server 下载当前 Release 中对应 `amd64` / `arm64` 的单个 Go Worker 二进制并校验 SHA-256；目标机不需要 Python，也不需要直接访问 GitHub。
+长期或生产部署请先将 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`；需要固定版本、端口或公开地址时也在该文件中覆盖。
+
+打开 `http://<服务器地址>:3000` 创建首个管理员，再到“服务器”页面复制命令安装并配对 Linux Worker。安装脚本会经由 AgentBox Server 下载当前 Release 中对应 `amd64` / `arm64` 的单个 Go Worker 二进制并校验 SHA-256；目标机不需要 Python，也不需要直接访问 GitHub。
 
 Worker 上线后，服务器详情页会显示当前版本。发布新版本并升级 AgentBox Server 后，可在同一页面点击“更新 Worker”：Server 会缓存 Release 资产，Worker 原子替换二进制并重启；新版不能正常启动时会自动恢复上一版。
 
@@ -53,13 +38,13 @@ docker compose down
 
 数据、Worker 缓存和凭据加密主密钥保存在 Docker 命名卷中。普通更新不要执行 `docker compose down -v`。
 
-仅在本机从源码体验或开发时才需要构建镜像：
+仅在需要使用当前源码构建镜像时添加 `--build`：
 
 ```sh
 docker compose up -d --build
 ```
 
-源码构建的 Server 版本默认为 `dev`，不会提供 Web 在线更新。需要联调发布版 Worker 时，在 `.env` 中将 `AGENTBOX_VERSION` 固定到已有的 Release 标签。
+源码构建的 Server 版本默认为 `dev`，不会提供 Web 在线更新。
 
 ## 核心能力
 
@@ -84,35 +69,7 @@ Linux Worker 的调度、交互会话和文件操作收敛在同一个 Go 二进
 
 ## 发布
 
-推送 `v*` 标签会触发发布流水线：先运行 Go 测试，再生成两个架构的 Worker、`SHA256SUMS` 和 GitHub Release，最后将 Server/Web 多架构镜像发布到 GHCR。部署端固定同一个版本标签，Server 与它分发的 Worker 就会保持一致。
-
-## 本地开发
-
-启动 Go API：
-
-```powershell
-Copy-Item server/.env.example server/.env
-cd server
-go run ./cmd/agentbox
-```
-
-启动 Next.js：
-
-```powershell
-cd app
-Copy-Item .env.example .env.local
-pnpm install
-pnpm dev
-```
-
-访问 `http://localhost:3000`。本地免登录调试可在 `server/.env` 中同时设置：
-
-```env
-AGENTBOX_ENV=development
-AGENTBOX_DISABLE_AUTH=true
-```
-
-该开关在生产环境下会被拒绝。
+推送 `v*` 标签会触发发布流水线：先运行 Go 测试，再生成两个架构的 Worker、`SHA256SUMS` 和 GitHub Release，最后将 Server/Web 多架构镜像发布到 GHCR。同一 Release 中的 Server 与 Worker 会保持版本一致。
 
 ## 验证
 

@@ -27,6 +27,18 @@ describe("buildWorkerAddressCandidates", () => {
     ])
   })
 
+  it("uses the incoming public gateway without explicit configuration", () => {
+    expect(
+      buildWorkerAddressCandidates({
+        gatewayOrigin: "http://192.168.31.83:3000",
+        interfaceAddresses: ["172.18.0.3"],
+      })
+    ).toEqual([
+      { url: "http://192.168.31.83:3000", source: "gateway" },
+      { url: "http://172.18.0.3:3000", source: "network-interface" },
+    ])
+  })
+
   it("uses an explicitly configured public gateway before inferred addresses", () => {
     expect(
       buildWorkerAddressCandidates({

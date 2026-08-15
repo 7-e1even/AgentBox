@@ -71,6 +71,7 @@ import {
 } from "@/components/ui/empty"
 import { Progress } from "@/components/ui/progress"
 import type { Resource } from "@/lib/platform-schema"
+import { runtimeInventoryImages } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 
 type EnvironmentProps = {
@@ -97,7 +98,7 @@ export function DashboardView({
   const imageCount = onlineServers.reduce(
     (total, server) =>
       total +
-      server.inventory.dockerImages.length +
+      runtimeInventoryImages(server, "docker").length +
       server.inventory.vmImages.length,
     0
   )
@@ -939,6 +940,10 @@ function SandboxDetailsDialog({
     typeof sandbox.spec.externalId === "string"
       ? sandbox.spec.externalId
       : `agentbox-${sandbox.id}`
+  const failureMessage =
+    sandbox.spec.status === "error" && typeof sandbox.spec.message === "string"
+      ? sandbox.spec.message.trim()
+      : ""
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
@@ -967,6 +972,18 @@ function SandboxDetailsDialog({
               }
             />
           </div>
+
+          {failureMessage && (
+            <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-4">
+              <div className="flex items-center gap-2 text-sm font-medium text-destructive">
+                <TriangleAlertIcon className="size-4" />
+                失败原因
+              </div>
+              <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-foreground">
+                {failureMessage}
+              </pre>
+            </div>
+          )}
 
           <div className="grid gap-3 sm:grid-cols-2">
             <CapabilityList title="Skills" values={skills} />

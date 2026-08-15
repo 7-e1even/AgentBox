@@ -7,6 +7,38 @@ import (
 	"testing"
 )
 
+func TestParseImagesCommand(t *testing.T) {
+	parsed, err := parseCommand([]string{"microsandbox", "images"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.action != "images" {
+		t.Fatalf("action = %q, want images", parsed.action)
+	}
+}
+
+func TestParsePrepareImageWithOCIArchive(t *testing.T) {
+	parsed, err := parseCommand([]string{
+		"prepare-image", "alpine:3.20", "--archive", "/var/lib/agentbox/oci-image.tar",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.image != "alpine:3.20" || parsed.path != "/var/lib/agentbox/oci-image.tar" {
+		t.Fatalf("unexpected prepare-image command: %#v", parsed)
+	}
+}
+
+func TestFormatImageSize(t *testing.T) {
+	bytes := int64(1572864)
+	if got := formatImageSize(&bytes); got != "1.5 MiB" {
+		t.Fatalf("formatImageSize() = %q, want 1.5 MiB", got)
+	}
+	if got := formatImageSize(nil); got != "" {
+		t.Fatalf("formatImageSize(nil) = %q, want empty", got)
+	}
+}
+
 func TestParseCreateCommand(t *testing.T) {
 	parsed, err := parseCommand([]string{
 		"microsandbox", "create", "agentbox-test", "ubuntu:24.04",
@@ -35,5 +67,23 @@ func TestParseExecCommand(t *testing.T) {
 	}
 	if !reflect.DeepEqual(parsed.command, []string{"sh", "-c", "cat"}) {
 		t.Fatalf("command = %#v", parsed.command)
+	}
+}
+
+func TestParseFilesystemCommands(t *testing.T) {
+	parsed, err := parseCommand([]string{"fs-write", "agentbox-test", "/workspace/file.txt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.target != "agentbox-test" || parsed.path != "/workspace/file.txt" {
+		t.Fatalf("unexpected filesystem command: %#v", parsed)
+	}
+
+	renamed, err := parseCommand([]string{"fs-rename", "agentbox-test", "/tmp/source", "/workspace/final"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if renamed.path != "/tmp/source" || renamed.dest != "/workspace/final" {
+		t.Fatalf("unexpected rename command: %#v", renamed)
 	}
 }

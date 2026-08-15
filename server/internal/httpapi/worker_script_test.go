@@ -86,7 +86,7 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 		`kimi) PACKAGE='@moonshot-ai/kimi-code'`,
 		`omp) PACKAGE='@oh-my-pi/pi-coding-agent'`,
 		`openclaw) PACKAGE='openclaw'`,
-		`pi) PACKAGE='@mariozechner/pi-coding-agent'`,
+		`docker exec "$CONTAINER" npm install -g --force @earendil-works/pi-coding-agent@latest`,
 		`copilot-cli) PACKAGE='@github/copilot'`,
 		`qoder-cli) PACKAGE='@qoder-ai/qodercli'`,
 		`qoder-cn) PACKAGE='@qodercn-ai/qoderclicn'`,
@@ -111,6 +111,26 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("extended Agent support is missing %q", expected)
 		}
+	}
+}
+
+func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
+	for _, expected := range []string{
+		`if [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"`,
+		`pi) INSTALL_PI=true; continue ;;`,
+		`npm uninstall -g @mariozechner/pi-coding-agent`,
+		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
+		`major === 22 && minor >= 19`,
+		`apiKey: ("$AGENTBOX_KEY_" + (.id | env_id))`,
+		`INSTALLER_REVISION=2`,
+		`LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Pi installer compatibility is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerDaemon, `pi) PACKAGE='@mariozechner/pi-coding-agent'`) {
+		t.Fatal("Pi must not be installed from the deprecated package")
 	}
 }
 
@@ -252,12 +272,20 @@ func TestWorkerSupportsVersionedAtomicSelfUpdate(t *testing.T) {
 		`LEGACY_HEARTBEAT=$(printf '%s' "$HEARTBEAT" | jq 'del(.workerVersion)')`,
 		`update-worker)`,
 		`/api/worker/agentbox-worker?arch=$ARCH&version=$TARGET_VERSION`,
+		`refresh_microsandbox_driver`,
+		`/api/worker/agentbox-microsandbox-driver.go`,
+		`export GOPATH="$STATE_DIR/go"`,
+		`export GOMODCACHE="$STATE_DIR/go-mod-cache"`,
+		`export GOCACHE="$STATE_DIR/go-build-cache"`,
 		`DOWNLOADED_VERSION=$("$WORKER_TMP" version`,
 		`/usr/local/lib/agentbox/agentbox-worker.previous`,
 		`mv -f "$NEXT" /usr/local/bin/agentbox-worker`,
 		`systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=20s`,
 		`systemd-run --quiet --unit="agentbox-worker-restart-$JOB_ID" --on-active=1s`,
 		`finalize_worker_update`,
+		`trap cleanup_worker EXIT`,
+		`trap 'exit 0' INT TERM`,
+		`stop_boxlite_server`,
 		`Worker 更新已回滚`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
@@ -287,10 +315,34 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 		`runtime_probe boxlite`,
 		`CAPS="$CAPS\"boxlite\""`,
 		`boxlite_call`,
-		`/usr/local/bin/boxlite create --detach`,
-		`/usr/local/bin/boxlite exec`,
+		`prepare_boxlite_config`,
+		`boxlite_server_ready`,
+		`Handle invalidated after stop()`,
+		`boxlite_start "$TARGET"`,
+		`--host 127.0.0.1 --port 48100`,
+		`/usr/local/bin/boxlite --url "$BOXLITE_URL"`,
+		`boxlite_cli create --detach`,
+		`WORKER_OCI_IMAGE_DIR=$STATE_DIR/oci-images`,
+		`command docker image save -o "$ARCHIVE_PATH" "$IMAGE"`,
+		`agentbox-worker image-to-oci --archive "$ARCHIVE_PATH"`,
+		`boxlite_create_with_rootfs`,
+		`rootfs_path: $rootfsPath`,
+		`source: "worker-oci"`,
+		`boxlite_local_cli pull "$IMAGE"`,
+		`boxlite_local_cli images --all --format json`,
+		`BOXLITE_IMAGES_FILE=$STATE_DIR/boxlite-images.json`,
+		`refresh_boxlite_images`,
+		`boxlite_cli exec`,
+		`boxlite_local_cli cp /usr/local/bin/agentbox-worker`,
+		`guest-fs exists /opt/agentbox/agentbox-guest`,
+		`guest-fs mkdir "$WORKDIR"`,
 		`runtime_probe microsandbox`,
 		`CAPS="$CAPS\"microsandbox\""`,
+		`runtime_call microsandbox images`,
+		`microsandbox_prepare_image`,
+		`tar -C "$OCI_PATH" -cf "$OCI_ARCHIVE" oci-layout index.json blobs`,
+		`prepare-image "$IMAGE" --archive "$OCI_ARCHIVE"`,
+		`microsandboxImages:$microsandboxImages`,
 		`runtime_call "$DRIVER" create`,
 		`AgentBox Microsandbox Go driver is unavailable`,
 		`/usr/local/bin/agentbox-microsandbox-driver "$@"`,
@@ -303,6 +355,92 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 		if strings.Contains(workerInstall, removed) {
 			t.Fatalf("Worker installer still depends on Python runtime path %q", removed)
 		}
+	}
+}
+
+func TestWorkerBoxLitePrefersLocalDockerBeforeRegistry(t *testing.T) {
+	prepareStart := strings.Index(workerDaemon, "boxlite_prepare_image()")
+	prepareEnd := strings.Index(workerDaemon[prepareStart:], "install_boxlite_guest()")
+	if prepareStart < 0 || prepareEnd < 0 {
+		t.Fatal("BoxLite image preparation function was not found")
+	}
+	prepareBody := workerDaemon[prepareStart : prepareStart+prepareEnd]
+	localIndex := strings.Index(prepareBody, `worker_local_oci_image "$IMAGE"`)
+	registryIndex := strings.Index(prepareBody, `boxlite_local_cli pull "$IMAGE"`)
+	if localIndex < 0 || registryIndex < 0 || localIndex >= registryIndex {
+		t.Fatalf("BoxLite image preparation must check Worker-local Docker before Registry pull")
+	}
+
+	for _, expected := range []string{
+		`POST "$BOXLITE_URL/v1/boxes"`,
+		`rootfs_path: $rootfsPath`,
+		`disk_size_gb: $diskSize`,
+		`DISK_SIZE=${AGENTBOX_BOXLITE_DISK_SIZE_GB:-20}`,
+		`--disk-size "$DISK_SIZE"`,
+		`unique_by(.source, .id, .reference)`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite local-image bridge is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerBoxLiteServerLifecycleIsOwnedByMainLoop(t *testing.T) {
+	heartbeatStart := strings.Index(workerDaemon, "heartbeat_loop()")
+	heartbeatEnd := strings.Index(workerDaemon[heartbeatStart:], "run_worker()")
+	if heartbeatStart < 0 || heartbeatEnd < 0 {
+		t.Fatal("Worker heartbeat function was not found")
+	}
+	heartbeatBody := workerDaemon[heartbeatStart : heartbeatStart+heartbeatEnd]
+	if strings.Contains(heartbeatBody, "ensure_boxlite_server") {
+		t.Fatal("background heartbeat must not race the main loop for the BoxLite runtime lock")
+	}
+
+	runStart := strings.Index(workerDaemon, "run_worker()")
+	if runStart < 0 {
+		t.Fatal("Worker main loop was not found")
+	}
+	runBody := workerDaemon[runStart:]
+	ensureIndex := strings.LastIndex(runBody, `ensure_boxlite_server || true`)
+	claimIndex := strings.LastIndex(runBody, `/jobs/claim`)
+	if ensureIndex < 0 || claimIndex < 0 || ensureIndex >= claimIndex {
+		t.Fatal("Worker main loop must restore the BoxLite server before claiming the next job")
+	}
+	for _, expected := range []string{
+		`BOXLITE_SERVER_PID_FILE=$STATE_DIR/boxlite-serve.pid`,
+		`BOXLITE_SERVER_PID=$(tr -d '\r\n' < "$BOXLITE_SERVER_PID_FILE")`,
+		`printf '%s\n' "$BOXLITE_SERVER_PID" > "$BOXLITE_SERVER_PID_FILE"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite cross-job PID management is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerBoxLiteDeleteIsIdempotent(t *testing.T) {
+	for _, expected := range []string{
+		`HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$BOXLITE_URL/v1/boxes/$1")`,
+		`404) return 0 ;;`,
+		`boxlite_cli rm --force "$1"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite idempotent delete is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerMicrosandboxImportsSharedOCIImageBeforeRegistryFallback(t *testing.T) {
+	prepareStart := strings.Index(workerDaemon, "microsandbox_prepare_image()")
+	prepareEnd := strings.Index(workerDaemon[prepareStart:], "boxlite_create_with_rootfs()")
+	if prepareStart < 0 || prepareEnd < 0 {
+		t.Fatal("Microsandbox image preparation function was not found")
+	}
+	prepareBody := workerDaemon[prepareStart : prepareStart+prepareEnd]
+	localIndex := strings.Index(prepareBody, `worker_local_oci_image "$IMAGE"`)
+	archiveIndex := strings.Index(prepareBody, `prepare-image "$IMAGE" --archive "$OCI_ARCHIVE"`)
+	registryIndex := strings.LastIndex(prepareBody, `runtime_call microsandbox prepare-image "$IMAGE"`)
+	if localIndex < 0 || archiveIndex < localIndex || registryIndex < archiveIndex {
+		t.Fatalf("Microsandbox must import the shared Worker OCI image before Registry fallback")
 	}
 }
 

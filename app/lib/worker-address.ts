@@ -1,5 +1,6 @@
 export type WorkerAddressSource =
   | "configured"
+  | "gateway"
   | "network-interface"
 
 export type WorkerAddressCandidate = {
@@ -29,6 +30,10 @@ export function buildWorkerAddressCandidates({
 
   const parsedGateway = parseHttpURL(gatewayOrigin)
   if (!parsedGateway) return candidates
+
+  if (!isLoopbackHostname(parsedGateway.hostname)) {
+    add(parsedGateway.origin, "gateway")
+  }
 
   for (const address of interfaceAddresses) {
     if (!isLoopbackHostname(address)) {

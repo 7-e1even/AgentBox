@@ -48,6 +48,13 @@ var (
 const (
 	workerJobLeaseDuration = 2 * time.Hour
 	runtimeLLMTokenTTL     = 30 * 24 * time.Hour
+	resourceUpdateSpecSQL  = `CASE WHEN kind = 'sandbox' THEN
+		($5::jsonb - 'status' - 'message' - 'externalId') || jsonb_build_object(
+			'status', spec->'status',
+			'message', spec->'message',
+			'externalId', spec->'externalId'
+		)
+	ELSE $5::jsonb END`
 )
 
 type Store struct {
@@ -334,8 +341,11 @@ func (s *Store) HeartbeatServer(
 	inventoryJSON := mustMapJSON(map[string]any{})
 	if inventory != nil {
 		inventoryJSON = mustMapJSON(map[string]any{
-			"dockerImages": inventory.DockerImages, "vmImages": inventory.VMImages,
-			"vmImageDirectory": inventory.VMImageDirectory,
+			"dockerImages":       inventory.DockerImages,
+			"boxliteImages":      inventory.BoxLiteImages,
+			"microsandboxImages": inventory.MicrosandboxImages,
+			"vmImages":           inventory.VMImages,
+			"vmImageDirectory":   inventory.VMImageDirectory,
 		})
 	}
 	result, err := s.pool.Exec(ctx, `UPDATE managed_servers SET
@@ -1710,8 +1720,9 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 		return platform.Resource{}, err
 	}
 	result, err := scanResource(s.pool.QueryRow(ctx, `UPDATE control_resources SET
-    project_id = $1, name = $2, description = $3, enabled = $4, spec = $5::jsonb,
-    updated_at = $6 WHERE id = $7 AND kind = $8 RETURNING `+resourceColumns,
+		project_id = $1, name = $2, description = $3, enabled = $4,
+		spec = `+resourceUpdateSpecSQL+`,
+		updated_at = $6 WHERE id = $7 AND kind = $8 RETURNING `+resourceColumns,
 		input.ProjectID, input.Name, input.Description, input.Enabled, mustMapJSON(input.Spec),
 		time.Now().UTC(), id, input.Kind))
 	if errors.Is(err, pgx.ErrNoRows) {

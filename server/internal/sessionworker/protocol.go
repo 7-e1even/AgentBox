@@ -11,7 +11,7 @@ const (
 	maxFileSize        = 512 * 1024
 	maxUploadChunkSize = 192 * 1024
 	maxUploadSize      = 50 * 1024 * 1024
-	loginShellCommand  = "if [ -r /opt/agentbox/secrets/agentbox.env ]; then set -a; . /opt/agentbox/secrets/agentbox.env; set +a; fi; cd /root 2>/dev/null || cd /; if command -v bash >/dev/null 2>&1; then exec bash -l; else exec sh -l; fi"
+	loginShellCommand  = "if [ -r /opt/agentbox/secrets/agentbox.env ]; then set -a; . /opt/agentbox/secrets/agentbox.env; set +a; fi; cd /workspace 2>/dev/null || cd /root 2>/dev/null || cd /; if command -v bash >/dev/null 2>&1; then exec bash -l; else exec /bin/sh -l; fi"
 )
 
 type message struct {

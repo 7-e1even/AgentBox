@@ -5,7 +5,9 @@ package sessionworker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,7 +34,10 @@ const (
 	sessionReadLimit    = 1024 * 1024
 	sessionWriteTimeout = 10 * time.Second
 	boxliteBinary       = "/usr/local/bin/boxlite"
+	boxliteURL          = "http://127.0.0.1:48100"
+	boxliteGuestHelper  = "/opt/agentbox/agentbox-guest"
 	microsandboxBinary  = "/usr/local/bin/agentbox-microsandbox-driver"
+	uploadStagingDir    = "/var/lib/agentbox-worker/uploads"
 )
 
 func Run(ctx context.Context, configPath string, stderr io.Writer) error {
@@ -272,12 +278,12 @@ func normalizedSize(columns, rows int) (int, int) {
 }
 
 func terminalCommand(driver, target string) (*exec.Cmd, error) {
-	guestCommand := []string{"env", "HOME=/root", "USER=root", "LOGNAME=root", "TERM=xterm-256color", "sh", "-c", loginShellCommand}
+	guestCommand := []string{"/usr/bin/env", "HOME=/root", "USER=root", "LOGNAME=root", "TERM=xterm-256color", "/bin/sh", "-c", loginShellCommand}
 	switch driver {
 	case "docker":
 		return exec.Command("docker", append([]string{"exec", "-it", "-u", "0:0", target}, guestCommand...)...), nil
 	case "boxlite":
-		args := []string{"exec", "-it", "-u", "0:0", target, "--"}
+		args := []string{"--url", boxliteURL, "exec", "-it", "-u", "0:0", target, "--"}
 		return exec.Command(boxliteBinary, append(args, guestCommand...)...), nil
 	case "microsandbox":
 		return exec.Command(microsandboxBinary, "terminal", target), nil
@@ -376,7 +382,7 @@ func runtimeInspect(ctx context.Context, driver, target string) error {
 	case "docker":
 		command = exec.CommandContext(ctx, "docker", "inspect", target)
 	case "boxlite":
-		command = exec.CommandContext(ctx, boxliteBinary, "inspect", target)
+		command = exec.CommandContext(ctx, boxliteBinary, "--url", boxliteURL, "inspect", target)
 	case "microsandbox":
 		command = exec.CommandContext(ctx, microsandboxBinary, "inspect", target)
 	default:
@@ -402,7 +408,7 @@ func runtimeRun(driver, target, script, containerPath string, input []byte, time
 		args = append(args, target)
 		command = exec.CommandContext(ctx, "docker", append(args, guestCommand...)...)
 	case "boxlite":
-		args := []string{"exec", "-u", "0:0"}
+		args := []string{"--url", boxliteURL, "exec", "-u", "0:0"}
 		if input != nil {
 			args = append(args, "-i")
 		}
@@ -443,7 +449,76 @@ type fileEntry struct {
 	Name       string  `json:"name"`
 }
 
+type runtimeFileExistsResult struct {
+	Exists bool `json:"exists"`
+}
+
+func runtimeFileRun(driver, target, action, containerPath string, input io.Reader, timeout time.Duration, extraPaths ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	var command *exec.Cmd
+	switch driver {
+	case "boxlite":
+		args := []string{"--url", boxliteURL, "exec"}
+		if input != nil {
+			args = append(args, "-i")
+		}
+		args = append(args, "-u", "0:0", target, "--", boxliteGuestHelper, "guest-fs", action, containerPath)
+		args = append(args, extraPaths...)
+		command = exec.CommandContext(ctx, boxliteBinary, args...)
+	case "microsandbox":
+		args := []string{"fs-" + action, target, containerPath}
+		args = append(args, extraPaths...)
+		command = exec.CommandContext(ctx, microsandboxBinary, args...)
+	default:
+		return nil, errors.New("native filesystem operations are unavailable for this sandbox driver")
+	}
+	command.Stdin = input
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = strings.TrimSpace(stdout.String())
+		}
+		if message == "" {
+			message = "sandbox filesystem operation failed"
+		}
+		return nil, errors.New(message)
+	}
+	return stdout.Bytes(), nil
+}
+
+func runtimeFileExists(driver, target, containerPath string) (bool, error) {
+	output, err := runtimeFileRun(driver, target, "exists", containerPath, nil, 15*time.Second)
+	if err != nil {
+		return false, err
+	}
+	var result runtimeFileExistsResult
+	if err := json.Unmarshal(output, &result); err != nil {
+		return false, fmt.Errorf("decode sandbox file metadata: %w", err)
+	}
+	return result.Exists, nil
+}
+
 func rpcList(driver, target, containerPath string) ([]fileEntry, error) {
+	if driver != "docker" {
+		output, err := runtimeFileRun(driver, target, "list", containerPath, nil, 15*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		var entries []fileEntry
+		if err := json.Unmarshal(output, &entries); err != nil {
+			return nil, fmt.Errorf("decode sandbox directory listing: %w", err)
+		}
+		return entries, nil
+	}
 	output, err := runtimeRun(driver, target, `set -eu; test -d "$1" || { echo "directory not found: $1" >&2; exit 1; }; find "$1" -mindepth 1 -maxdepth 1 -printf "%y\t%s\t%T@\t%p\n" | sed -n "1,1000p"`, containerPath, nil, 15*time.Second)
 	if err != nil {
 		return nil, err
@@ -473,9 +548,18 @@ func rpcList(driver, target, containerPath string) ([]fileEntry, error) {
 }
 
 func rpcRead(driver, target, containerPath string) (string, error) {
-	output, err := runtimeRun(driver, target, `set -eu; test -f "$1" || { echo "file not found: $1" >&2; exit 1; }; size=$(wc -c < "$1"); [ "$size" -le 524288 ] || { echo "file exceeds the 512 KiB editor limit" >&2; exit 1; }; cat "$1"`, containerPath, nil, 15*time.Second)
+	var output []byte
+	var err error
+	if driver == "docker" {
+		output, err = runtimeRun(driver, target, `set -eu; test -f "$1" || { echo "file not found: $1" >&2; exit 1; }; size=$(wc -c < "$1"); [ "$size" -le 524288 ] || { echo "file exceeds the 512 KiB editor limit" >&2; exit 1; }; cat "$1"`, containerPath, nil, 15*time.Second)
+	} else {
+		output, err = runtimeFileRun(driver, target, "read", containerPath, nil, 15*time.Second)
+	}
 	if err != nil {
 		return "", err
+	}
+	if len(output) > maxFileSize {
+		return "", errors.New("file exceeds the 512 KiB editor limit")
 	}
 	if bytes.IndexByte(output, 0) >= 0 {
 		return "", errors.New("binary files cannot be opened in the text editor")
@@ -491,14 +575,42 @@ func rpcWrite(driver, target, containerPath, content string) (string, error) {
 	if len(encoded) > maxFileSize {
 		return "", errors.New("file exceeds the 512 KiB editor limit")
 	}
-	_, err := runtimeRun(driver, target, `set -eu; target=$1; parent=${target%/*}; [ -n "$parent" ] || parent=/; mkdir -p "$parent"; temp="$target.agentbox.$$"; trap "rm -f \$temp" EXIT; cat > "$temp"; mv "$temp" "$target"; trap - EXIT`, containerPath, encoded, 15*time.Second)
+	var err error
+	if driver == "docker" {
+		_, err = runtimeRun(driver, target, `set -eu; target=$1; parent=${target%/*}; [ -n "$parent" ] || parent=/; mkdir -p "$parent"; temp="$target.agentbox.$$"; trap "rm -f \$temp" EXIT; cat > "$temp"; mv "$temp" "$target"; trap - EXIT`, containerPath, encoded, 15*time.Second)
+	} else {
+		_, err = runtimeFileRun(driver, target, "write", containerPath, bytes.NewReader(encoded), 15*time.Second)
+	}
 	return "saved", err
+}
+
+func stagedUploadPath(target, containerPath, uploadID string) string {
+	digest := sha256.Sum256([]byte(target + "\x00" + containerPath + "\x00" + uploadID))
+	return filepath.Join(uploadStagingDir, fmt.Sprintf("%x.part", digest))
 }
 
 func rpcUploadStart(driver, target, containerPath, uploadID string) (string, error) {
 	tempPath, err := uploadTempPath(containerPath, uploadID)
 	if err != nil {
 		return "", err
+	}
+	if driver != "docker" {
+		exists, err := runtimeFileExists(driver, target, containerPath)
+		if err != nil {
+			return "", err
+		}
+		if exists {
+			return "", fmt.Errorf("file already exists: %s", containerPath)
+		}
+		if err := os.MkdirAll(uploadStagingDir, 0o700); err != nil {
+			return "", err
+		}
+		stagedPath := stagedUploadPath(target, containerPath, uploadID)
+		file, err := os.OpenFile(stagedPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return "", err
+		}
+		return "started", file.Close()
 	}
 	_, err = runtimeRun(driver, target, `set -eu; final=$1; temp=$2; [ ! -e "$final" ] || { echo "file already exists: $final" >&2; exit 1; }; parent=${final%/*}; [ -n "$parent" ] || parent=/; mkdir -p "$parent"; rm -f "$temp"; : > "$temp"`, containerPath, nil, 15*time.Second, tempPath)
 	return "started", err
@@ -516,6 +628,27 @@ func rpcUploadChunk(driver, target, containerPath, uploadID, content string) (st
 	if len(chunk) > maxUploadChunkSize {
 		return "", errors.New("upload chunk exceeds 192 KiB")
 	}
+	if driver != "docker" {
+		stagedPath := stagedUploadPath(target, containerPath, uploadID)
+		file, err := os.OpenFile(stagedPath, os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", errors.New("upload is not initialized")
+			}
+			return "", err
+		}
+		_, writeErr := file.Write(chunk)
+		info, statErr := file.Stat()
+		closeErr := file.Close()
+		if err := errors.Join(writeErr, statErr, closeErr); err != nil {
+			return "", err
+		}
+		if info.Size() > maxUploadSize {
+			_ = os.Remove(stagedPath)
+			return "", errors.New("upload exceeds 50 MiB")
+		}
+		return "received", nil
+	}
 	script := fmt.Sprintf(`set -eu; target=$1; test -f "$target" || { echo "upload is not initialized" >&2; exit 1; }; cat >> "$target"; size=$(wc -c < "$target"); [ "$size" -le %d ] || { rm -f "$target"; echo "upload exceeds 50 MiB" >&2; exit 1; }`, maxUploadSize)
 	_, err = runtimeRun(driver, target, script, tempPath, chunk, 30*time.Second)
 	return "received", err
@@ -526,6 +659,32 @@ func rpcUploadFinish(driver, target, containerPath, uploadID string) (string, er
 	if err != nil {
 		return "", err
 	}
+	if driver != "docker" {
+		stagedPath := stagedUploadPath(target, containerPath, uploadID)
+		file, err := os.Open(stagedPath)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return "", errors.New("upload is not initialized")
+			}
+			return "", err
+		}
+		defer file.Close()
+		exists, err := runtimeFileExists(driver, target, containerPath)
+		if err != nil {
+			return "", err
+		}
+		if exists {
+			_ = os.Remove(stagedPath)
+			return "", fmt.Errorf("file already exists: %s", containerPath)
+		}
+		if _, err := runtimeFileRun(driver, target, "write", containerPath, file, 2*time.Minute); err != nil {
+			return "", err
+		}
+		if err := os.Remove(stagedPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		return "uploaded", nil
+	}
 	_, err = runtimeRun(driver, target, `set -eu; final=$1; temp=$2; test -f "$temp" || { echo "upload is not initialized" >&2; exit 1; }; [ ! -e "$final" ] || { rm -f "$temp"; echo "file already exists: $final" >&2; exit 1; }; mv "$temp" "$final"`, containerPath, nil, 15*time.Second, tempPath)
 	return "uploaded", err
 }
@@ -534,6 +693,13 @@ func rpcUploadCancel(driver, target, containerPath, uploadID string) (string, er
 	tempPath, err := uploadTempPath(containerPath, uploadID)
 	if err != nil {
 		return "", err
+	}
+	if driver != "docker" {
+		stagedPath := stagedUploadPath(target, containerPath, uploadID)
+		if err := os.Remove(stagedPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		return "cancelled", nil
 	}
 	_, err = runtimeRun(driver, target, `rm -f "$1"`, tempPath, nil, 15*time.Second)
 	return "cancelled", err

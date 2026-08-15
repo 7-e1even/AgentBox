@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -110,8 +111,24 @@ func newSessionHub(origins []string) *sessionHub {
 	}
 }
 
-func (h *sessionHub) acceptOptions() *websocket.AcceptOptions {
-	return &websocket.AcceptOptions{OriginPatterns: h.originPatterns}
+func (h *sessionHub) acceptOptions(request *http.Request) *websocket.AcceptOptions {
+	patterns := append([]string(nil), h.originPatterns...)
+	if forwardedHost := forwardedHostPattern(request.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+		patterns = append(patterns, forwardedHost)
+	}
+	return &websocket.AcceptOptions{OriginPatterns: patterns}
+}
+
+func forwardedHostPattern(value string) string {
+	value = strings.TrimSpace(strings.Split(value, ",")[0])
+	if value == "" || strings.ContainsAny(value, `*/\?#@`) {
+		return ""
+	}
+	parsed, err := url.Parse("http://" + value)
+	if err != nil || parsed.Host != value || parsed.Hostname() == "" || parsed.Path != "" {
+		return ""
+	}
+	return value
 }
 
 func (h *sessionHub) hasWorker(serverID string) bool {
@@ -275,7 +292,7 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 		s.handleError(w, err)
 		return
 	}
-	conn, err := websocket.Accept(w, request, s.sessions.acceptOptions())
+	conn, err := websocket.Accept(w, request, s.sessions.acceptOptions(request))
 	if err != nil {
 		s.logger.Warn("accept worker session websocket", "server_id", serverID, "error", err)
 		return
@@ -320,7 +337,7 @@ func (s *Server) connectSandboxSession(w http.ResponseWriter, request *http.Requ
 		s.writeError(w, http.StatusUnauthorized, "沙箱会话票据无效或已过期")
 		return
 	}
-	conn, err := websocket.Accept(w, request, s.sessions.acceptOptions())
+	conn, err := websocket.Accept(w, request, s.sessions.acceptOptions(request))
 	if err != nil {
 		s.logger.Warn("accept browser session websocket", "sandbox_id", ticket.Target.SandboxID, "error", err)
 		return

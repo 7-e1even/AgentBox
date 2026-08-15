@@ -24,10 +24,10 @@ import {
 import {
   normalizeRuntimeImageReference,
   runtimeImageChoices,
-  usesRuntimeImageInventory,
 } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
+import { RuntimeImageCombobox } from "@/components/runtime-image-combobox"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
 import {
@@ -130,7 +130,6 @@ export function SandboxEditorDialog({
     driver,
     input.spec.imageReference
   )
-  const usesImageInventory = usesRuntimeImageInventory(driver)
   const lockedTools = useMemo(
     () => (resource ? supportedAgentToolList(resource.spec.agentTools) : []),
     [resource]
@@ -309,7 +308,18 @@ export function SandboxEditorDialog({
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[min(860px,calc(100vh-2rem))] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl">
+      <DialogContent
+        className="flex max-h-[min(860px,calc(100vh-2rem))] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl"
+        onEscapeKeyDown={(event) => {
+          if (
+            document.querySelector(
+              '[data-slot="combobox-content"][data-open]'
+            )
+          ) {
+            event.preventDefault()
+          }
+        }}
+      >
         <DialogHeader className="border-b px-6 py-5">
           <DialogTitle>{resource ? "编辑沙箱" : "创建沙箱"}</DialogTitle>
           <DialogDescription>
@@ -474,72 +484,16 @@ export function SandboxEditorDialog({
 
                   <Field className="sm:col-span-2">
                     <FieldLabel htmlFor="sandbox-image">系统镜像</FieldLabel>
-                    {usesImageInventory ? (
-                      <Select
-                        value={stringValue(input.spec.imageReference)}
-                        disabled={Boolean(resource) || !server}
-                        onValueChange={(value) =>
-                          updateSpec("imageReference", value)
-                        }
-                      >
-                        <SelectTrigger id="sandbox-image" className="w-full">
-                          <SelectValue placeholder="选择本地镜像" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          {imageChoices.local.length > 0 && (
-                            <SelectGroup>
-                              <SelectLabel>
-                                {driver === "vm"
-                                  ? "Worker 本地 VM 镜像"
-                                  : "Docker 本地镜像"}
-                              </SelectLabel>
-                              {imageChoices.local.map((option) => (
-                                <SelectItem
-                                  key={option.value}
-                                  value={option.value}
-                                >
-                                  {option.label}
-                                </SelectItem>
-                              ))}
-                            </SelectGroup>
-                          )}
-                          {imageChoices.registry.length > 0 && (
-                            <SelectGroup>
-                              <SelectLabel>未缓存的 Registry 引用</SelectLabel>
-                              {imageChoices.registry.map((option) => (
-                                <SelectItem
-                                  key={option.value}
-                                  value={option.value}
-                                >
-                                  {option.label}
-                                </SelectItem>
-                              ))}
-                            </SelectGroup>
-                          )}
-                          {imageChoices.local.length === 0 &&
-                            imageChoices.registry.length === 0 && (
-                              <SelectGroup>
-                                <SelectLabel>
-                                  当前服务器没有可用镜像
-                                </SelectLabel>
-                                <SelectItem value="__unavailable" disabled>
-                                  请先准备对应驱动的镜像
-                                </SelectItem>
-                              </SelectGroup>
-                            )}
-                        </SelectContent>
-                      </Select>
-                    ) : (
-                      <Input
-                        id="sandbox-image"
-                        value={stringValue(input.spec.imageReference)}
-                        disabled={Boolean(resource) || !server}
-                        placeholder="ubuntu:24.04 或 registry.example.com/agent:latest"
-                        onChange={(event) =>
-                          updateSpec("imageReference", event.target.value)
-                        }
-                      />
-                    )}
+                    <RuntimeImageCombobox
+                      id="sandbox-image"
+                      value={stringValue(input.spec.imageReference)}
+                      choices={imageChoices}
+                      driver={driver}
+                      disabled={Boolean(resource) || !server}
+                      onChange={(value) =>
+                        updateSpec("imageReference", value)
+                      }
+                    />
                     <FieldDescription aria-live="polite">
                       {runtimeImageDescription(driver)}
                     </FieldDescription>
@@ -1012,15 +966,15 @@ function runtimeDriverDescription(server: ManagedServer, driver: string) {
 
 function runtimeImageDescription(driver: string) {
   if (driver === "boxlite") {
-    return "BoxLite 使用独立 OCI 缓存；该 Registry 引用不会复用 Docker 本地镜像。"
+    return "可搜索当前服务器的容器镜像；未缓存的 Registry 引用由 BoxLite 在创建时拉取。"
   }
   if (driver === "microsandbox") {
-    return "Microsandbox 使用独立镜像缓存；Worker 可导入匹配的 Docker 本地镜像进行预热。"
+    return "可搜索当前服务器的容器镜像；Microsandbox 会导入可复用内容或从 Registry 拉取。"
   }
   if (driver === "vm") {
     return "只显示 Worker 已盘点到的本地 qcow2/raw VM 镜像。"
   }
-  return "优先选择 Docker 本地镜像；未缓存的 Registry 引用会在创建时拉取。"
+  return "可搜索当前服务器的容器镜像；未缓存的 Registry 引用会在创建时拉取。"
 }
 
 function projectResources(

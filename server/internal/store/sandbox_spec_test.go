@@ -2,6 +2,7 @@ package store
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -95,6 +96,19 @@ func TestIncompatibleAgentToolsAllowsSingleConvertibleLLMProtocol(t *testing.T) 
 		)
 		if len(got) != 0 {
 			t.Fatalf("protocol %s incompatibleAgentTools() = %#v, want none", protocol, got)
+		}
+	}
+}
+
+func TestSandboxUpdatesPreserveWorkerManagedLifecycleFields(t *testing.T) {
+	for _, expected := range []string{
+		`($5::jsonb - 'status' - 'message' - 'externalId')`,
+		`'status', spec->'status'`,
+		`'message', spec->'message'`,
+		`'externalId', spec->'externalId'`,
+	} {
+		if !strings.Contains(resourceUpdateSpecSQL, expected) {
+			t.Fatalf("sandbox update does not preserve Worker-managed field %q", expected)
 		}
 	}
 }
