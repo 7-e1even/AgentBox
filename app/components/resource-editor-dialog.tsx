@@ -12,6 +12,11 @@ import {
   type ResourceInput,
   type ResourceKind,
 } from "@/lib/platform-schema"
+import {
+  normalizeRuntimeImageReference,
+  runtimeImageChoices,
+  usesRuntimeImageInventory,
+} from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -63,6 +68,7 @@ type SpecField = {
   description?: string
   textarea?: boolean
   options?: Option[]
+  optionGroupLabel?: string
   multiOptions?: Option[]
   environmentVariables?: boolean
   advanced?: boolean
@@ -112,6 +118,19 @@ function runtimeDriverDescription(server: ManagedServer, driver: string) {
   return "由 Worker 通过 Docker 创建容器，适合兼容性优先的环境。"
 }
 
+function runtimeImageDescription(driver: string) {
+  if (driver === "boxlite") {
+    return "填写 BoxLite 独立拉取的 OCI Registry 引用；不会复用 Docker 本地镜像。"
+  }
+  if (driver === "microsandbox") {
+    return "填写 Microsandbox 使用的 OCI Registry 引用；Worker 可将匹配的 Docker 本地镜像导入其独立缓存。"
+  }
+  if (driver === "vm") {
+    return "只允许选择 Worker 已盘点到的本地 qcow2/raw VM 镜像。"
+  }
+  return "优先选择 Docker 本地镜像；未缓存的 Registry 引用会在首次创建时拉取。"
+}
+
 function fields(
   kind: ResourceKind,
   resources: Resource[],
@@ -129,36 +148,10 @@ function fields(
   const server = servers.find((item) => item.id === spec.serverId)
   const driverOptions = runtimeDriverOptions(server)
   const driver = typeof spec.driver === "string" ? spec.driver : "docker"
-  const serverImages = server?.inventory.dockerImages ?? []
-  const inventoryImageOptions = serverImages.map((item) => ({
-    value: item.reference,
-    label: `${item.reference}${item.size ? ` · ${item.size}` : ""}`,
-  }))
-  const currentImageReference = String(spec.imageReference ?? "").trim()
-  const imageOptions = [
-    ...inventoryImageOptions,
-    ...(!currentImageReference ||
-    inventoryImageOptions.some(
-      (option) => option.value === currentImageReference
-    )
-      ? []
-      : [
-          {
-            value: currentImageReference,
-            label: `${currentImageReference} · 创建时自动拉取`,
-          },
-        ]),
-    ...(inventoryImageOptions.some(
-      (option) => option.value === "ubuntu:24.04"
-    ) || currentImageReference === "ubuntu:24.04"
-      ? []
-      : [
-          {
-            value: "ubuntu:24.04",
-            label: "ubuntu:24.04 · 创建时自动拉取",
-          },
-        ]),
-  ]
+  const imageChoices = runtimeImageChoices(server, driver, spec.imageReference)
+  const imageOptions = usesRuntimeImageInventory(driver)
+    ? [...imageChoices.local, ...imageChoices.registry]
+    : undefined
   switch (kind) {
     case "project":
       return [
@@ -218,8 +211,15 @@ function fields(
           key: "imageReference",
           label: "系统镜像",
           options: imageOptions,
-          description:
-            "使用 OCI 镜像引用；服务器没有该镜像时会在首次创建沙箱时自动拉取。",
+          optionGroupLabel:
+            driver === "vm"
+              ? "Worker 本地 VM 镜像"
+              : "Docker 本地镜像与 Registry 引用",
+          placeholder:
+            driver === "boxlite" || driver === "microsandbox"
+              ? "ubuntu:24.04 或 registry.example.com/agent:latest"
+              : undefined,
+          description: runtimeImageDescription(driver),
         },
         {
           key: "agentTools",
@@ -509,7 +509,7 @@ function SpecFieldEditor({
           </SelectTrigger>
           <SelectContent>
             <SelectGroup>
-              <SelectLabel>{field.label}</SelectLabel>
+              <SelectLabel>{field.optionGroupLabel ?? field.label}</SelectLabel>
               {field.options.map((option) => (
                 <SelectItem
                   key={option.value}
@@ -583,17 +583,11 @@ function nextSpec(
     next.driver = availableDrivers[0] ?? ""
   }
 
-  const images = server?.inventory.dockerImages ?? []
-  const currentReference = String(next.imageReference ?? "")
-  const currentExists =
-    (key !== "driver" && Boolean(currentReference.trim())) ||
-    images.some((image) =>
-      [image.reference, image.path, image.id].includes(currentReference)
-    )
-  if (!currentExists) {
-    const first = images[0]
-    next.imageReference = first?.reference ?? "ubuntu:24.04"
-  }
+  next.imageReference = normalizeRuntimeImageReference(
+    server,
+    String(next.driver ?? ""),
+    next.imageReference
+  )
   return next
 }
 
@@ -651,20 +645,11 @@ function initialEditorSpec(
   if (!spec.imageReference && legacyImage) {
     spec.imageReference = legacyImage.spec.reference
   }
-  const images = server?.inventory.dockerImages ?? []
-  const currentReference = String(spec.imageReference ?? "")
-  if (
-    spec.driver !== "" &&
-    !images.some((image) =>
-      [image.reference, image.path, image.id].includes(currentReference)
-    )
-  ) {
-    const image = images[0]
-    spec.imageReference = image?.reference ?? "ubuntu:24.04"
-  }
-  if (spec.driver && !currentReference.trim()) {
-    spec.imageReference = images[0]?.reference ?? "ubuntu:24.04"
-  }
+  spec.imageReference = normalizeRuntimeImageReference(
+    server,
+    String(spec.driver ?? ""),
+    spec.imageReference
+  )
   return spec
 }
 
@@ -804,7 +789,12 @@ export function ResourceEditorDialog({
       return
     }
     if (kind === "runtime" && !String(input.spec.imageReference ?? "").trim()) {
-      setErrors({ spec: "请选择服务器上实际存在的系统镜像" })
+      setErrors({
+        spec:
+          input.spec.driver === "vm"
+            ? "请选择 Worker 本地存在的 VM 镜像"
+            : "请填写可用的 OCI 镜像引用",
+      })
       return
     }
     if (kind === "sandbox" && !String(input.spec.runtimeId ?? "").trim()) {

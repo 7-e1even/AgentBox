@@ -20,7 +20,6 @@ import {
 import { CollectionHeader } from "@/components/control-plane-view"
 import { DataTable, DataTableColumnHeader } from "@/components/data-table"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
-import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
   Empty,
@@ -44,8 +43,7 @@ import {
   type ServerImage,
 } from "@/lib/server-schema"
 
-type RuntimeDriver = "docker" | "boxlite" | "microsandbox"
-type ImageRow = { image: ServerImage; driver: RuntimeDriver }
+type ImageRow = { image: ServerImage }
 
 export function ImageManagement({
   servers,
@@ -57,7 +55,7 @@ export function ImageManagement({
   onCreateRuntime: (
     serverId: string,
     imageReference: string,
-    driver: RuntimeDriver
+    driver: "docker"
   ) => void
 }) {
   const [requestedServerId, setRequestedServerId] = useState(
@@ -91,17 +89,9 @@ export function ImageManagement({
       servers[0]?.id ??
       "")
   const server = servers.find((item) => item.id === selectedServerId)
-  const preferredDriver = server
-    ? preferredRuntimeDriver(server.capabilities)
-    : undefined
   const imageCount = server?.inventory.dockerImages.length ?? 0
   const images =
-    server && preferredDriver
-      ? server.inventory.dockerImages.map((image) => ({
-          image,
-          driver: preferredDriver,
-        }))
-      : []
+    server?.inventory.dockerImages.map((image) => ({ image })) ?? []
   const columns = useMemo(
     () =>
       server
@@ -125,7 +115,7 @@ export function ImageManagement({
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <CollectionHeader
-        title="服务器镜像"
+        title="Docker 镜像"
         count={imageCount}
         action={
           <Button
@@ -157,7 +147,7 @@ export function ImageManagement({
           <>
             <CollectionToolbar>
               <p className="text-sm text-muted-foreground">
-                选择服务器查看 Worker 实际盘点到的镜像。
+                这里只展示 Worker 实际盘点到的 Docker 本地镜像。
               </p>
               <Select
                 value={selectedServerId}
@@ -193,29 +183,30 @@ export function ImageManagement({
               </Alert>
             )}
 
+            {server &&
+              (server.capabilities.includes("boxlite") ||
+                server.capabilities.includes("microsandbox")) && (
+                <Alert>
+                  <BoxIcon />
+                  <AlertTitle>MicroVM 镜像独立处理</AlertTitle>
+                  <AlertDescription>
+                    BoxLite 与 Microsandbox 使用各自的运行时缓存，因此不会把下面的
+                    Docker 本地库存直接显示为 MicroVM 镜像；Worker
+                    可以在后台为对应运行时拉取或预热镜像。
+                  </AlertDescription>
+                </Alert>
+              )}
+
             {server && images.length > 0 ? (
               <DataTable
                 data={images}
                 columns={columns}
-                getRowId={({ image, driver }) =>
-                  `${driver}-${image.id}-${image.reference}`
-                }
+                getRowId={({ image }) => `${image.id}-${image.reference}`}
                 initialPageSize={8}
                 searchPlaceholder="搜索镜像…"
                 searchValue={({ image }) =>
                   `${image.reference} ${image.id} ${image.architecture} ${image.format}`
                 }
-                filters={[
-                  {
-                    columnId: "driver",
-                    title: "类型",
-                    options: [
-                      { label: "Docker", value: "docker" },
-                      { label: "BoxLite", value: "boxlite" },
-                      { label: "Microsandbox", value: "microsandbox" },
-                    ],
-                  },
-                ]}
               />
             ) : server ? (
               <Empty className="min-h-64 border">
@@ -223,9 +214,9 @@ export function ImageManagement({
                   <EmptyMedia variant="icon">
                     <HardDriveIcon />
                   </EmptyMedia>
-                  <EmptyTitle>没有镜像</EmptyTitle>
+                  <EmptyTitle>没有 Docker 镜像</EmptyTitle>
                   <EmptyDescription>
-                    当前服务器没有符合此类型的镜像。
+                    当前服务器没有 Worker 可盘点到的 Docker 本地镜像。
                   </EmptyDescription>
                 </EmptyHeader>
               </Empty>
@@ -242,7 +233,7 @@ function imageColumns(
   onCreateRuntime: (
     serverId: string,
     imageReference: string,
-    driver: RuntimeDriver
+    driver: "docker"
   ) => void
 ): ColumnDef<ImageRow>[] {
   return [
@@ -254,7 +245,7 @@ function imageColumns(
       ),
       cell: ({ row }) => (
         <CollectionTablePrimaryContent
-          icon={row.original.driver === "docker" ? ContainerIcon : BoxIcon}
+          icon={ContainerIcon}
           title={row.original.image.reference}
           description={
             row.original.image.id
@@ -265,21 +256,6 @@ function imageColumns(
       ),
       meta: { label: "镜像" },
       enableHiding: false,
-    },
-    {
-      id: "driver",
-      accessorFn: ({ driver }) => driver,
-      header: ({ column }) => (
-        <DataTableColumnHeader column={column} title="类型" />
-      ),
-      cell: ({ row }) => (
-        <Badge variant="outline">
-          {runtimeDriverLabel(row.original.driver)}
-        </Badge>
-      ),
-      filterFn: (row, columnId, filterValue) =>
-        (filterValue as string[]).includes(row.getValue(columnId)),
-      meta: { label: "类型" },
     },
     {
       id: "architecture",
@@ -328,36 +304,25 @@ function imageColumns(
     {
       id: "actions",
       cell: ({ row }) => {
-        const { image, driver } = row.original
+        const { image } = row.original
         return (
           <Button
             size="sm"
             variant="outline"
-            onClick={() => onCreateRuntime(server.id, image.reference, driver)}
+            onClick={() =>
+              onCreateRuntime(server.id, image.reference, "docker")
+            }
           >
             <PlusIcon data-icon="inline-start" />
-            创建环境
+            创建 Docker 环境
           </Button>
         )
       },
       enableSorting: false,
       enableHiding: false,
-      meta: { className: "w-28" },
+      meta: { className: "w-36" },
     },
   ]
-}
-
-function preferredRuntimeDriver(capabilities: string[]) {
-  if (capabilities.includes("boxlite")) return "boxlite" as const
-  if (capabilities.includes("docker")) return "docker" as const
-  if (capabilities.includes("microsandbox")) return "microsandbox" as const
-  return undefined
-}
-
-function runtimeDriverLabel(driver: RuntimeDriver) {
-  if (driver === "boxlite") return "BoxLite"
-  if (driver === "microsandbox") return "Microsandbox"
-  return "Docker"
 }
 
 function shortID(value: string) {
