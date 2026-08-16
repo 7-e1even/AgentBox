@@ -1,6 +1,7 @@
 package platform
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -163,6 +164,28 @@ func TestSandboxValidatesEnvironmentVariables(t *testing.T) {
 	}
 	if err := Validate(input); !IsValidationError(err) {
 		t.Fatalf("Validate() error = %v, want reserved environment name rejection", err)
+	}
+}
+
+func TestNormalizeAddsTrustedSandboxEnvironmentVariable(t *testing.T) {
+	input := Input{
+		Kind: KindSandbox,
+		Spec: map[string]any{
+			"environmentVariables": []any{
+				map[string]any{"name": "NODE_ENV", "value": "development"},
+				map[string]any{"name": "IS_SANDBOX", "value": "0"},
+			},
+		},
+	}
+
+	Normalize(&input)
+
+	want := []any{
+		map[string]any{"name": "NODE_ENV", "value": "development"},
+		map[string]any{"name": "IS_SANDBOX", "value": "1"},
+	}
+	if got := input.Spec["environmentVariables"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("environmentVariables = %#v, want %#v", got, want)
 	}
 }
 

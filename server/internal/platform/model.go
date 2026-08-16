@@ -224,6 +224,27 @@ func Normalize(input *Input) {
 	if input.Spec == nil {
 		input.Spec = map[string]any{}
 	}
+	if input.Kind == KindRuntime || input.Kind == KindSandbox {
+		input.Spec["environmentVariables"] = SandboxEnvironmentVariables(
+			input.Spec["environmentVariables"],
+		)
+	}
+}
+
+func SandboxEnvironmentVariables(value any) []any {
+	variables, _ := value.([]any)
+	result := make([]any, 0, len(variables)+1)
+	for _, variable := range variables {
+		entry, ok := variable.(map[string]any)
+		if ok {
+			name, _ := entry["name"].(string)
+			if name == "IS_SANDBOX" {
+				continue
+			}
+		}
+		result = append(result, variable)
+	}
+	return append(result, map[string]any{"name": "IS_SANDBOX", "value": "1"})
 }
 
 func NormalizeServerRegistration(input *ServerRegistration) {

@@ -22,6 +22,17 @@ export function environmentVariableEntries(
   })
 }
 
+export function sandboxEnvironmentVariables(
+  value: unknown
+): EnvironmentVariableEntry[] {
+  return [
+    ...environmentVariableEntries(value).filter(
+      (entry) => entry.name !== "IS_SANDBOX"
+    ),
+    { name: "IS_SANDBOX", value: "1" },
+  ]
+}
+
 export function environmentVariablesError(value: unknown) {
   const entries = environmentVariableEntries(value)
   if (entries.length > 100) return "环境变量不能超过 100 个"

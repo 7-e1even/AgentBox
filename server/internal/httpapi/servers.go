@@ -1981,7 +1981,7 @@ configure_skills() {
     printf '%s\n' '---' "name: $NAME" "description: $DESCRIPTION" '---' '' "$INSTRUCTIONS" > "$SKILL_FILE"
     docker exec "$CONTAINER" mkdir -p "/opt/agentbox/skills/$ID"
     docker exec -i "$CONTAINER" sh -c "cat > /opt/agentbox/skills/$ID/SKILL.md" < "$SKILL_FILE"
-    for TARGET in \
+    for SKILL_TARGET in \
       "/root/.agents/skills/$ID" \
       "/root/.gemini/antigravity-cli/skills/$ID" \
       "/root/.codex/skills/$ID" \
@@ -2003,8 +2003,8 @@ configure_skills() {
       "/root/.grok/skills/$ID" \
       "/root/.qwen/skills/$ID" \
       "/root/.qwenpaw/skill_pool/$ID"; do
-      docker exec "$CONTAINER" mkdir -p "$TARGET"
-      docker exec -i "$CONTAINER" sh -c "cat > $TARGET/SKILL.md" < "$SKILL_FILE"
+      docker exec "$CONTAINER" mkdir -p "$SKILL_TARGET"
+      docker exec -i "$CONTAINER" sh -c "cat > $SKILL_TARGET/SKILL.md" < "$SKILL_FILE"
     done
     rm -f "$SKILL_FILE"
   done

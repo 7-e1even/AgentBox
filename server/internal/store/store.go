@@ -1803,7 +1803,7 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		"skillIds":             effectiveSpec["skillIds"],
 		"mcpServerIds":         effectiveSpec["mcpServerIds"],
 		"variableIds":          effectiveSpec["variableIds"],
-		"environmentVariables": effectiveSpec["environmentVariables"],
+		"environmentVariables": platform.SandboxEnvironmentVariables(effectiveSpec["environmentVariables"]),
 		"credentialIds":        effectiveSpec["credentialIds"],
 		"modelBindings":        effectiveSpec["modelBindings"],
 		"workspace":            effectiveSpec["workspace"],

@@ -16,7 +16,10 @@ import {
 } from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
 import type { ManagedNetworkProxy } from "@/lib/network-proxy-schema"
-import { environmentVariablesError } from "@/lib/environment-variables"
+import {
+  environmentVariablesError,
+  sandboxEnvironmentVariables,
+} from "@/lib/environment-variables"
 import {
   resourceInputSchema,
   type Resource,
@@ -947,6 +950,9 @@ function sandboxInputFromResource(resource: Resource, template?: Resource) {
       ...templateDefaults(template),
       ...input.spec,
       agentTools: supportedAgentToolList(input.spec.agentTools),
+      environmentVariables: sandboxEnvironmentVariables(
+        input.spec.environmentVariables
+      ),
     },
   }
 }
@@ -967,9 +973,9 @@ function templateDefaults(template?: Resource) {
     skillIds: stringList(template?.spec.skillIds),
     mcpServerIds: stringList(template?.spec.mcpServerIds),
     variableIds: stringList(template?.spec.variableIds),
-    environmentVariables: Array.isArray(template?.spec.environmentVariables)
-      ? template.spec.environmentVariables
-      : [],
+    environmentVariables: sandboxEnvironmentVariables(
+      template?.spec.environmentVariables
+    ),
     credentialIds: stringList(template?.spec.credentialIds),
   }
 }

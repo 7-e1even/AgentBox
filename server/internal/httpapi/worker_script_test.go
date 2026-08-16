@@ -397,6 +397,22 @@ func TestWorkerInjectsSandboxEnvironmentVariables(t *testing.T) {
 	}
 }
 
+func TestWorkerSkillInstallDoesNotReuseRuntimeTargetVariable(t *testing.T) {
+	for _, expected := range []string{
+		`for SKILL_TARGET in`,
+		`mkdir -p "$SKILL_TARGET"`,
+		`cat > $SKILL_TARGET/SKILL.md`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("sandbox skill installation is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerDaemon, `for TARGET in \
+      "/root/.agents/skills/$ID"`) {
+		t.Fatal("sandbox skill installation reuses the runtime TARGET variable")
+	}
+}
+
 func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 	for _, expected := range []string{
 		`/api/worker/agentbox-worker?arch=$ARCH`,

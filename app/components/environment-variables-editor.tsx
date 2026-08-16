@@ -40,6 +40,7 @@ export function EnvironmentVariablesEditor({
                 <Input
                   aria-label={`第 ${index + 1} 个环境变量名`}
                   className="font-mono"
+                  disabled={entry.name === "IS_SANDBOX"}
                   value={entry.name}
                   placeholder="NODE_ENV"
                   onChange={(event) =>
@@ -49,6 +50,7 @@ export function EnvironmentVariablesEditor({
                 <Input
                   aria-label={`${entry.name || `第 ${index + 1} 个环境变量`}的值`}
                   className="font-mono"
+                  disabled={entry.name === "IS_SANDBOX"}
                   value={entry.value}
                   placeholder="production"
                   onChange={(event) =>
@@ -61,6 +63,7 @@ export function EnvironmentVariablesEditor({
                 variant="ghost"
                 size="icon-sm"
                 aria-label={`删除 ${entry.name || `第 ${index + 1} 个环境变量`}`}
+                disabled={entry.name === "IS_SANDBOX"}
                 onClick={() => remove(index)}
               >
                 <Trash2Icon />

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   environmentVariableEntries,
   environmentVariablesError,
+  sandboxEnvironmentVariables,
 } from "./environment-variables"
 
 describe("environment variables", () => {
@@ -28,5 +29,17 @@ describe("environment variables", () => {
     expect(
       environmentVariablesError([{ name: "bad-name", value: "value" }])
     ).toContain("格式")
+  })
+
+  it("adds the trusted sandbox marker and replaces an unsafe override", () => {
+    expect(
+      sandboxEnvironmentVariables([
+        { name: "NODE_ENV", value: "development" },
+        { name: "IS_SANDBOX", value: "0" },
+      ])
+    ).toEqual([
+      { name: "NODE_ENV", value: "development" },
+      { name: "IS_SANDBOX", value: "1" },
+    ])
   })
 })

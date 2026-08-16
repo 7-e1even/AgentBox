@@ -6,7 +6,10 @@ import { CheckIcon, SaveIcon } from "lucide-react"
 import { agentToolOptions, supportedAgentToolList } from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
 import type { ManagedNetworkProxy } from "@/lib/network-proxy-schema"
-import { environmentVariablesError } from "@/lib/environment-variables"
+import {
+  environmentVariablesError,
+  sandboxEnvironmentVariables,
+} from "@/lib/environment-variables"
 import {
   resourceInputSchema,
   type Resource,
@@ -443,7 +446,7 @@ function defaults(kind: ResourceKind) {
       skillIds: [],
       mcpServerIds: [],
       variableIds: [],
-      environmentVariables: [],
+      environmentVariables: sandboxEnvironmentVariables(undefined),
       credentialIds: [],
     },
     skill: { version: "1.0.0", source: "inline" },
@@ -452,7 +455,7 @@ function defaults(kind: ResourceKind) {
       policy: "new",
       status: "requested",
       agentTools: [],
-      environmentVariables: [],
+      environmentVariables: sandboxEnvironmentVariables(undefined),
       credentialIds: [],
     },
     variable: { mode: "secret-ref" },
@@ -616,7 +619,9 @@ function nextSpec(
       next.serverId = runtime.spec.serverId
       next.agentTools = supportedAgentToolList(runtime.spec.agentTools)
       next.credentialIds = stringArray(runtime.spec.credentialIds)
-      next.environmentVariables = runtime.spec.environmentVariables
+      next.environmentVariables = sandboxEnvironmentVariables(
+        runtime.spec.environmentVariables
+      )
     }
     return next
   }
@@ -668,11 +673,17 @@ function initialEditorSpec(
       spec.serverId = runtime.spec.serverId
       spec.agentTools = supportedAgentToolList(runtime.spec.agentTools)
       spec.credentialIds = stringArray(runtime.spec.credentialIds)
-      spec.environmentVariables = runtime.spec.environmentVariables
+      spec.environmentVariables = sandboxEnvironmentVariables(
+        runtime.spec.environmentVariables
+      )
     }
     return spec
   }
   if (kind !== "runtime") return spec
+
+  spec.environmentVariables = sandboxEnvironmentVariables(
+    spec.environmentVariables
+  )
 
   const selectedServer = servers.find((item) => item.id === spec.serverId)
   const server =
