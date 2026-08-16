@@ -108,6 +108,25 @@ UPDATE provider_credentials SET model_id = '' WHERE model_id <> '';
 CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider
   ON provider_credentials(provider_id, enabled, updated_at DESC);
 
+CREATE TABLE IF NOT EXISTS network_proxies (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  scheme TEXT NOT NULL CHECK (scheme IN ('http', 'https')),
+  host TEXT NOT NULL,
+  port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+  username TEXT NOT NULL DEFAULT '',
+  password_ciphertext BYTEA NOT NULL,
+  password_nonce BYTEA NOT NULL,
+  password_last_four TEXT NOT NULL DEFAULT '',
+  no_proxy JSONB NOT NULL DEFAULT '[]'::jsonb,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL,
+  updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_network_proxies_enabled
+  ON network_proxies(enabled, updated_at DESC);
+
 CREATE TABLE IF NOT EXISTS worker_jobs (
   id UUID PRIMARY KEY,
   server_id UUID NOT NULL REFERENCES managed_servers(id) ON DELETE CASCADE,

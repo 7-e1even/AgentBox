@@ -176,6 +176,13 @@ func registerWorkerImageReference(path, reference string) error {
 	metadataPath := filepath.Join(path, workerImageMetadataName)
 	data, err := os.ReadFile(metadataPath)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			metadata, metadataErr := workerImageMetadataFromLayout(path, reference)
+			if metadataErr != nil {
+				return metadataErr
+			}
+			return writeWorkerImageMetadata(path, metadata)
+		}
 		return fmt.Errorf("read Worker OCI image metadata: %w", err)
 	}
 	var metadata workerImageMetadata
@@ -190,6 +197,47 @@ func registerWorkerImageReference(path, reference string) error {
 	metadata.References = append(metadata.References, reference)
 	sort.Strings(metadata.References)
 	return writeWorkerImageMetadata(path, metadata)
+}
+
+func workerImageMetadataFromLayout(path, reference string) (workerImageMetadata, error) {
+	index, err := layout.ImageIndexFromPath(path)
+	if err != nil {
+		return workerImageMetadata{}, fmt.Errorf("read Worker OCI image layout: %w", err)
+	}
+	manifest, err := index.IndexManifest()
+	if err != nil || len(manifest.Manifests) == 0 {
+		return workerImageMetadata{}, errors.New("Worker OCI image layout has no manifest")
+	}
+	image, err := index.Image(manifest.Manifests[0].Digest)
+	if err != nil {
+		return workerImageMetadata{}, fmt.Errorf("read Worker OCI image: %w", err)
+	}
+	config, err := image.ConfigFile()
+	if err != nil {
+		return workerImageMetadata{}, fmt.Errorf("read Worker OCI image configuration: %w", err)
+	}
+	configDigest, err := image.ConfigName()
+	if err != nil {
+		return workerImageMetadata{}, fmt.Errorf("read Worker OCI image ID: %w", err)
+	}
+	size, err := ociImageContentSize(image)
+	if err != nil {
+		return workerImageMetadata{}, fmt.Errorf("calculate Worker OCI image content size: %w", err)
+	}
+	created := ""
+	if !config.Created.IsZero() {
+		created = config.Created.UTC().Format(time.RFC3339)
+	}
+	return workerImageMetadata{
+		ID:           configDigest.String(),
+		References:   []string{reference},
+		Architecture: config.Architecture,
+		Size:         formatByteSize(size),
+		Created:      created,
+		Format:       "oci",
+		Path:         path,
+		Source:       "worker-oci",
+	}, nil
 }
 
 func writeWorkerImageMetadata(layoutPath string, metadata workerImageMetadata) error {

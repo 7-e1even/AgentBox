@@ -40,13 +40,38 @@ func TestWorkerCredentialFormatsFollowProtocol(t *testing.T) {
 		`openai-responses|openai-chat)`,
 		`append_env "$ENV_FILE" OPENAI_API_KEY "$SECRET"`,
 		`append_env "$ENV_FILE" ANTHROPIC_API_KEY "$SECRET"`,
-		`append_env "$ENV_FILE" ANTHROPIC_AUTH_TOKEN "$CLAUDE_SECRET"`,
+		`replace_env "$ENV_FILE" ANTHROPIC_AUTH_TOKEN "$CLAUDE_SECRET"`,
 		`append_env "$ENV_FILE" GEMINI_API_KEY "$SECRET"`,
 		`append_env "$ENV_FILE" "AGENTBOX_KEY_$ENV_ID" "$SECRET"`,
 	} {
 		if !strings.Contains(workerDaemon, mapping) {
 			t.Fatalf("worker credential mapping is missing %q", mapping)
 		}
+	}
+}
+
+func TestWorkerUsesOnlyBearerTokenForClaudeCodeGateway(t *testing.T) {
+	start := strings.Index(workerDaemon, `if jq -e '.job.payload.agentTools | index("claude-code")'`)
+	if start < 0 {
+		t.Fatal("Claude Code credential block was not found")
+	}
+	end := strings.Index(workerDaemon[start:], `docker exec "$CONTAINER" mkdir -p /opt/agentbox/secrets`)
+	if end < 0 {
+		t.Fatal("Claude Code credential block end was not found")
+	}
+	body := workerDaemon[start : start+end]
+	for _, expected := range []string{
+		`remove_env "$ENV_FILE" ANTHROPIC_API_KEY`,
+		`replace_env "$ENV_FILE" ANTHROPIC_AUTH_TOKEN "$CLAUDE_SECRET"`,
+		`replace_env "$ENV_FILE" ANTHROPIC_BASE_URL "$CLAUDE_ENDPOINT"`,
+		`replace_env "$ENV_FILE" ANTHROPIC_MODEL "$CLAUDE_MODEL"`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("Claude Code gateway configuration is missing %q", expected)
+		}
+	}
+	if strings.Contains(body, `append_env "$ENV_FILE" ANTHROPIC_API_KEY "$CLAUDE_SECRET"`) {
+		t.Fatal("Claude Code must not set ANTHROPIC_API_KEY together with ANTHROPIC_AUTH_TOKEN")
 	}
 }
 
@@ -86,7 +111,7 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 		`kimi) PACKAGE='@moonshot-ai/kimi-code'`,
 		`omp) PACKAGE='@oh-my-pi/pi-coding-agent'`,
 		`openclaw) PACKAGE='openclaw'`,
-		`docker exec "$CONTAINER" npm install -g --force @earendil-works/pi-coding-agent@latest`,
+		`agent_tool_exec_logged "$CONTAINER" pi npm install -g --force @earendil-works/pi-coding-agent@latest`,
 		`copilot-cli) PACKAGE='@github/copilot'`,
 		`qoder-cli) PACKAGE='@qoder-ai/qodercli'`,
 		`qoder-cn) PACKAGE='@qodercn-ai/qoderclicn'`,
@@ -114,6 +139,81 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 	}
 }
 
+func TestWorkerInstallsOpenCodeWithoutGuestNPMForBoxLite(t *testing.T) {
+	for _, expected := range []string{
+		`INSTALL_OPENCODE=false`,
+		`INSTALL_OPENCODE=true`,
+		`PACKAGE='opencode-ai'`,
+		`install_boxlite_opencode "$CONTAINER"`,
+		`PLATFORM_PACKAGE=opencode-linux-x64`,
+		`PLATFORM_PACKAGE=opencode-linux-arm64`,
+		`"https://registry.npmjs.org/$PLATFORM_PACKAGE/latest"`,
+		`EXPECTED_SHA512=$(printf '%s' "${INTEGRITY#sha512-}" | base64 -d`,
+		`ACTUAL_SHA512=$(sha512sum "$ARCHIVE"`,
+		`tar -xzf "$ARCHIVE" -C "$TMP_DIR" package/bin/opencode`,
+		`boxlite_local_cli cp "$TMP_DIR/package/bin/opencode" "$CONTAINER:/usr/local/bin/opencode"`,
+		`agent_tool_exec "$CONTAINER" test -x /usr/local/bin/opencode`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite OpenCode binary installer is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerRecoversBoxLitePortalDuringAgentToolInstall(t *testing.T) {
+	for _, expected := range []string{
+		`recover_boxlite_agent_tool_install()`,
+		`BoxLite portal disconnected while installing Agent tools; restarting the sandbox and retrying once`,
+		`boxlite_cli restart "$CONTAINER" >/dev/null 2>"$RESTART_LOG"`,
+		`grep -Fq 'Handle invalidated after stop()' "$RESTART_LOG"`,
+		`stop_boxlite_server`,
+		`ensure_boxlite_server || return 1`,
+		`boxlite_cli start "$CONTAINER"`,
+		`agent_tool_exec "$CONTAINER" sh -lc`,
+		`Agent tool prerequisite installation failed`,
+		`Agent tool package installation failed`,
+		`agent_tool_exec_stdin "$CONTAINER" "$VERSION_FILE"`,
+		`could not install or verify the selected Agent tools in the $DRIVER sandbox`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite Agent tool recovery is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerDaemon, `is not compatible with the selected Agent tools`) {
+		t.Fatal("Agent tool failures must not be reported as image incompatibility without evidence")
+	}
+}
+
+func TestWorkerKeepsLargeBoxLiteAgentToolOutputOffAttachStream(t *testing.T) {
+	for _, expected := range []string{
+		`agent_tool_exec_logged()`,
+		`if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" != boxlite ]; then`,
+		`LOG_FILE="/tmp/agentbox-$LABEL-install.log"`,
+		`STATUS_FILE="$LOG_FILE.status"`,
+		`PID_FILE="$LOG_FILE.pid"`,
+		`INSTALL_ATTEMPT=1`,
+		`while [ "$INSTALL_ATTEMPT" -le 2 ]; do`,
+		`(trap "" HUP; "$@"; CODE=$?; printf "%s\n" "$CODE" >"$STATUS_FILE")`,
+		`DEADLINE=$(($(date +%s) + ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800}))`,
+		`STATUS=$(docker exec "$CONTAINER" sh -lc 'test -f "$1" && cat "$1" || true'`,
+		`sleep "${AGENTBOX_AGENT_TOOL_POLL_SECONDS:-15}"`,
+		`Retrying Agent tool installation from the sandbox cache: $LABEL`,
+		`Agent tool installation timed out after ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800} seconds`,
+		`tail -c 3000 "$1"`,
+		`agent_tool_exec_logged "$CONTAINER" prerequisites sh -lc`,
+		`for PACKAGE_SPEC in "$@"; do`,
+		`agent_tool_exec_logged "$CONTAINER" "npm-package-$PACKAGE_INDEX"`,
+		`PACKAGE_COMMAND='set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; npm install -g "$1"'`,
+		`PACKAGE_COMMAND='npm install -g "$1"'`,
+		`sh -lc "$PACKAGE_COMMAND" agentbox "$PACKAGE_SPEC"`,
+		`Agent tool package installation failed: $PACKAGE_SPEC`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite quiet Agent tool install is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 	for _, expected := range []string{
 		`if [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"`,
@@ -122,7 +222,7 @@ func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
 		`major === 22 && minor >= 19`,
 		`apiKey: ("$AGENTBOX_KEY_" + (.id | env_id))`,
-		`INSTALLER_REVISION=2`,
+		`INSTALLER_REVISION=3`,
 		`LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
@@ -164,10 +264,29 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 	}
 }
 
+func TestWorkerPreinstallsBoxLiteAgentToolsWithDockerCache(t *testing.T) {
+	for _, expected := range []string{
+		`AGENT_TOOLS_PREINSTALLED=false`,
+		`if [ "$DRIVER" = boxlite ] && command -v docker >/dev/null`,
+		`AGENTBOX_RUNTIME_DRIVER=docker`,
+		`if ! RUNTIME_IMAGE=$(`,
+		`prepare_agent_image "$IMAGE" "$JOB_FILE"`,
+		`AGENT_TOOLS_PREINSTALLED=true`,
+		`runtime_call "$DRIVER" prepare-image "$RUNTIME_IMAGE"`,
+		`runtime_call "$DRIVER" create "$TARGET" "$RUNTIME_IMAGE"`,
+		`if [ "$AGENT_TOOLS_PREINSTALLED" = true ]; then`,
+		`cached image command is unavailable: $COMMAND`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite Docker Agent image reuse is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerWritesSmallRuntimeFilesThroughStdin(t *testing.T) {
 	for _, expected := range []string{
-		`docker exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json`,
-		`docker exec -i "$CONTAINER" sh -c 'cat > /opt/agentbox/agent-versions.json' < "$VERSION_FILE"`,
+		`agent_tool_exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json`,
+		`agent_tool_exec_stdin "$CONTAINER" "$VERSION_FILE" sh -c 'cat > /opt/agentbox/agent-versions.json'`,
 		`docker exec "$TARGET" rm -rf /opt/agentbox/manifest.json`,
 		`docker exec -i "$TARGET" sh -c 'cat > /opt/agentbox/manifest.json' < "$MANIFEST"`,
 	} {
@@ -196,6 +315,27 @@ func TestWorkerRestartReappliesSandboxConfiguration(t *testing.T) {
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("sandbox restart support is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerStartRetriesSandboxCreationAfterProvisioningFailure(t *testing.T) {
+	start := strings.Index(workerDaemon, "start_sandbox()")
+	if start < 0 {
+		t.Fatal("sandbox start function was not found")
+	}
+	restart := strings.Index(workerDaemon[start:], "restart_sandbox()")
+	if restart < 0 {
+		t.Fatal("sandbox restart function was not found")
+	}
+	body := workerDaemon[start : start+restart]
+	for _, expected := range []string{
+		`EXTERNAL_ID=$(jq -r '.job.payload.externalId // empty' "$JOB_FILE")`,
+		`if [ -z "$EXTERNAL_ID" ]; then`,
+		`create_sandbox "$JOB_FILE"`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("sandbox start retry is missing %q", expected)
 		}
 	}
 }
@@ -340,8 +480,9 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 		`/usr/local/bin/boxlite --url "$BOXLITE_URL"`,
 		`boxlite_cli create --detach`,
 		`WORKER_OCI_IMAGE_DIR=$STATE_DIR/oci-images`,
-		`command docker image save -o "$ARCHIVE_PATH" "$IMAGE"`,
-		`agentbox-worker image-to-oci --archive "$ARCHIVE_PATH"`,
+		`skopeo copy --insecure-policy "docker-daemon:$IMAGE" "oci:$TEMP_ROOTFS:agentbox"`,
+		`agentbox-worker image-to-oci \
+       --output "$ROOTFS_PATH" --reference "$IMAGE"`,
 		`boxlite_create_with_rootfs`,
 		`rootfs_path: $rootfsPath`,
 		`source: "worker-oci"`,
@@ -367,6 +508,10 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("runtime SDK worker integration is missing %q", expected)
 		}
+	}
+	if strings.Contains(workerDaemon, `command docker image save`) ||
+		strings.Contains(workerDaemon, `ARCHIVE_PATH=$(mktemp "$STATE_DIR/docker-image.`) {
+		t.Fatal("BoxLite Docker image conversion must not materialize a full temporary archive")
 	}
 	for _, removed := range []string{"pip install", "python3 -m venv", "/api/worker/agentbox-runtime-driver"} {
 		if strings.Contains(workerInstall, removed) {
@@ -436,12 +581,51 @@ func TestWorkerBoxLiteServerLifecycleIsOwnedByMainLoop(t *testing.T) {
 
 func TestWorkerBoxLiteDeleteIsIdempotent(t *testing.T) {
 	for _, expected := range []string{
-		`HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$BOXLITE_URL/v1/boxes/$1")`,
+		`boxlite_delete()`,
+		`HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$BOXLITE_URL/v1/boxes/$TARGET")`,
 		`404) return 0 ;;`,
-		`boxlite_cli rm --force "$1"`,
+		`boxlite_cli rm --force "$TARGET"`,
+		`BoxLite did not remove $TARGET`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("BoxLite idempotent delete is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerBoxLiteReplacesFailedBoxBeforeCreate(t *testing.T) {
+	createStart := strings.Index(workerDaemon, "    create)\n")
+	createEnd := strings.Index(workerDaemon[createStart:], "    inspect)")
+	if createStart < 0 || createEnd < 0 {
+		t.Fatal("BoxLite create action was not found")
+	}
+	createBody := workerDaemon[createStart : createStart+createEnd]
+	for _, expected := range []string{
+		`BOX_STATUS=$(printf '%s' "$BOX_JSON" | boxlite_inspect_status)`,
+		`failed|error)`,
+		`boxlite_delete "$TARGET"`,
+		`if [ "$BOX_EXISTS" = false ]; then`,
+	} {
+		if !strings.Contains(createBody, expected) {
+			t.Fatalf("BoxLite failed-box replacement is missing %q", expected)
+		}
+	}
+	deleteIndex := strings.Index(createBody, `boxlite_delete "$TARGET"`)
+	createIndex := strings.Index(createBody, `boxlite_create_with_rootfs "$TARGET"`)
+	if deleteIndex < 0 || createIndex < 0 || deleteIndex >= createIndex {
+		t.Fatal("BoxLite must delete a failed box before creating its replacement")
+	}
+
+	for _, expected := range []string{
+		`boxlite_inspect_status()`,
+		`(.[0].Status // .[0].status // .[0].State.Status // .[0].state.status // "")`,
+		`(.Status // .status // .State.Status // .state.status // "")`,
+		`boxlite_inspect_usable()`,
+		`failed|error) return 1 ;;`,
+		`inspect) boxlite_inspect_usable "$1" ;;`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite failed-box inspection is missing %q", expected)
 		}
 	}
 }
@@ -458,6 +642,36 @@ func TestWorkerMicrosandboxImportsSharedOCIImageBeforeRegistryFallback(t *testin
 	registryIndex := strings.LastIndex(prepareBody, `runtime_call microsandbox prepare-image "$IMAGE"`)
 	if localIndex < 0 || archiveIndex < localIndex || registryIndex < archiveIndex {
 		t.Fatalf("Microsandbox must import the shared Worker OCI image before Registry fallback")
+	}
+}
+
+func TestWorkerInjectsProxyBeforeAgentInstallationWithoutPersistingSecret(t *testing.T) {
+	for _, expected := range []string{
+		`configure_proxy()`,
+		`/opt/agentbox/secrets/proxy.env`,
+		`[ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env`,
+		`append_env "$PROXY_ENV" NODE_USE_ENV_PROXY 1`,
+		`append_env "$PROXY_ENV" CLAUDE_CODE_PROXY_RESOLVES_HOSTS 1`,
+		`del(.credentials, .proxy)`,
+		`.job.payload.proxy.allowNet[]?`,
+		`--allow-net "$ALLOWED_HOST"`,
+		`network: {mode: $network, allow_net: $allowNet}`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker proxy integration is missing %q", expected)
+		}
+	}
+
+	prepareStart := strings.Index(workerDaemon, "prepare_agent_image()")
+	prepareEnd := strings.Index(workerDaemon[prepareStart:], "remove_proxy()")
+	if prepareStart < 0 || prepareEnd < 0 {
+		t.Fatal("Worker cached-image preparation function was not found")
+	}
+	prepareBody := workerDaemon[prepareStart : prepareStart+prepareEnd]
+	configureIndex := strings.Index(prepareBody, `configure_proxy "$BUILD_CONTAINER" "$JOB_FILE"`)
+	installIndex := strings.Index(prepareBody, `install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE"`)
+	if configureIndex < 0 || installIndex < 0 || configureIndex >= installIndex {
+		t.Fatal("Worker must inject proxy settings before installing Agent tools")
 	}
 }
 

@@ -216,3 +216,46 @@ func TestValidateCredential(t *testing.T) {
 		t.Fatalf("ValidateCredential() error = %v, want newline rejection", err)
 	}
 }
+
+func TestValidateNetworkProxyAndNetworkBinding(t *testing.T) {
+	proxy := NetworkProxyInput{
+		ID:       "office-proxy",
+		Name:     "Office Proxy",
+		Scheme:   "http",
+		Host:     "proxy.internal",
+		Port:     7890,
+		Username: "agentbox",
+		Password: "secret",
+		NoProxy:  []string{"registry.internal", "10.0.0.0/8"},
+		Enabled:  true,
+	}
+	if err := ValidateNetworkProxy(proxy); err != nil {
+		t.Fatalf("ValidateNetworkProxy() returned error: %v", err)
+	}
+	proxy.NoProxy = []string{"*"}
+	if err := ValidateNetworkProxy(proxy); !IsValidationError(err) {
+		t.Fatalf("ValidateNetworkProxy() error = %v, want global bypass rejection", err)
+	}
+
+	projectID := "default"
+	runtime := Input{
+		ID:        "runtime-proxy",
+		Kind:      KindRuntime,
+		ProjectID: &projectID,
+		Name:      "Runtime Proxy",
+		Spec: map[string]any{
+			"serverId":       "7b20f83b-6418-4a9f-8477-3dc7c35d6310",
+			"driver":         "boxlite",
+			"imageReference": "ubuntu:24.04",
+			"network":        "none",
+			"proxyId":        "office-proxy",
+		},
+	}
+	if err := Validate(runtime); !IsValidationError(err) {
+		t.Fatalf("Validate() error = %v, want isolated network proxy rejection", err)
+	}
+	runtime.Spec["network"] = "restricted"
+	if err := Validate(runtime); err != nil {
+		t.Fatalf("Validate() rejected restricted proxy runtime: %v", err)
+	}
+}

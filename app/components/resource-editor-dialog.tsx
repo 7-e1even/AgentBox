@@ -5,6 +5,7 @@ import { CheckIcon, SaveIcon } from "lucide-react"
 
 import { agentToolOptions, supportedAgentToolList } from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
+import type { ManagedNetworkProxy } from "@/lib/network-proxy-schema"
 import { environmentVariablesError } from "@/lib/environment-variables"
 import {
   resourceInputSchema,
@@ -75,6 +76,8 @@ type SpecField = {
   multiOptions?: Option[]
   environmentVariables?: boolean
   advanced?: boolean
+  emptyValue?: string
+  disabled?: boolean
 }
 
 function runtimeDriverOptions(server?: ManagedServer): Option[] {
@@ -139,6 +142,7 @@ function fields(
   resources: Resource[],
   servers: ManagedServer[],
   credentials: ManagedCredential[],
+  proxies: ManagedNetworkProxy[],
   spec: Record<string, unknown>
 ): SpecField[] {
   const runtimeOptions = resources
@@ -255,6 +259,37 @@ function fields(
           key: "network",
           label: "网络策略",
           options: values("none", "restricted", "egress"),
+          description:
+            spec.network === "none"
+              ? "完全隔离，不创建环境网络接口。"
+              : spec.network === "egress"
+                ? "允许环境直接访问出站网络；代理只负责路由兼容。"
+                : driver === "boxlite"
+                  ? "受限网络配合代理时，只放行代理、直连地址和控制面。"
+                  : "Docker 的受限网络依赖环境内程序遵守代理配置。",
+          advanced: true,
+        },
+        {
+          key: "proxyId",
+          label: "网络代理",
+          options: [
+            { value: "__none__", label: "不使用代理" },
+            ...proxies
+              .filter(
+                (item) => item.enabled || item.id === String(spec.proxyId ?? "")
+              )
+              .map((item) => ({
+                value: item.id,
+                label: `${item.name}${item.enabled ? "" : " · 已停用"}`,
+                disabled: !item.enabled,
+              })),
+          ],
+          emptyValue: "__none__",
+          disabled: spec.network === "none",
+          description:
+            spec.network === "none"
+              ? "完全隔离时不能使用代理。"
+              : "覆盖环境内安装和运行流量；宿主机拉取镜像不受影响。",
           advanced: true,
         },
         {
@@ -404,6 +439,7 @@ function defaults(kind: ResourceKind) {
       cpu: "2",
       memory: "4 GiB",
       network: "restricted",
+      proxyId: "",
       skillIds: [],
       mcpServerIds: [],
       variableIds: [],
@@ -502,9 +538,17 @@ function SpecFieldEditor({
           value={
             kind === "runtime" && field.key === "serverId" && !spec.serverId
               ? "__launch__"
-              : String(spec[field.key] ?? "")
+              : field.emptyValue && !spec[field.key]
+                ? field.emptyValue
+                : String(spec[field.key] ?? "")
           }
-          onValueChange={(value) => onChange(field.key, value)}
+          disabled={field.disabled}
+          onValueChange={(value) =>
+            onChange(
+              field.key,
+              field.emptyValue && value === field.emptyValue ? "" : value
+            )
+          }
         >
           <SelectTrigger id={`spec-${field.key}`} className="w-full">
             <SelectValue placeholder="请选择" />
@@ -561,6 +605,9 @@ function nextSpec(
   servers: ManagedServer[]
 ) {
   const next = { ...spec, [key]: value }
+  if (kind === "runtime" && key === "network" && value === "none") {
+    next.proxyId = ""
+  }
   if (kind === "sandbox" && key === "runtimeId") {
     const runtime = resources.find(
       (item) => item.kind === "runtime" && item.id === value
@@ -691,6 +738,7 @@ export function ResourceEditorDialog({
   resources,
   servers,
   credentials,
+  proxies,
   initialSpec,
   onOpenChange,
   onSave,
@@ -701,6 +749,7 @@ export function ResourceEditorDialog({
   resources: Resource[]
   servers: ManagedServer[]
   credentials: ManagedCredential[]
+  proxies: ManagedNetworkProxy[]
   initialSpec?: Record<string, unknown>
   onOpenChange: (open: boolean) => void
   onSave: (input: ResourceInput) => Promise<void>
@@ -739,6 +788,7 @@ export function ResourceEditorDialog({
     projectResources,
     servers,
     credentials,
+    proxies,
     input.spec
   )
   const primarySpecFields = specFields.filter((field) => !field.advanced)
@@ -799,6 +849,14 @@ export function ResourceEditorDialog({
       })
       return
     }
+    if (
+      kind === "runtime" &&
+      input.spec.network === "none" &&
+      String(input.spec.proxyId ?? "").trim()
+    ) {
+      setErrors({ spec: "完全隔离网络不能同时使用代理" })
+      return
+    }
     if (kind === "sandbox" && !String(input.spec.runtimeId ?? "").trim()) {
       setErrors({ spec: "请先创建并选择一个沙箱模板" })
       return
@@ -832,9 +890,7 @@ export function ResourceEditorDialog({
         }`}
         onEscapeKeyDown={(event) => {
           if (
-            document.querySelector(
-              '[data-slot="combobox-content"][data-open]'
-            )
+            document.querySelector('[data-slot="combobox-content"][data-open]')
           ) {
             event.preventDefault()
           }

@@ -19,6 +19,7 @@ import {
   SandboxesView,
 } from "@/components/environment-views"
 import { ImageManagement } from "@/components/image-management"
+import { NetworkProxyManagement } from "@/components/network-proxy-management"
 import { ResourceView } from "@/components/control-plane-view"
 import { ResourceEditorDialog } from "@/components/resource-editor-dialog"
 import { SandboxEditorDialog } from "@/components/sandbox-editor-dialog"
@@ -43,6 +44,11 @@ import {
 } from "@/lib/platform-schema"
 import { PROJECT_COOKIE_NAME, resourcesForProject } from "@/lib/project-scope"
 import type { ManagedServer } from "@/lib/server-schema"
+import {
+  networkProxyResponseSchema,
+  type ManagedNetworkProxy,
+  type NetworkProxyInput,
+} from "@/lib/network-proxy-schema"
 import { appToast as toast } from "@/lib/app-toast"
 import {
   userResponseSchema,
@@ -95,6 +101,7 @@ export function ControlPlaneShell({
   initialResources,
   initialServers,
   initialCredentials,
+  initialProxies,
   currentUser,
   initialUsers,
   initialProjectId,
@@ -104,6 +111,7 @@ export function ControlPlaneShell({
   initialResources: Resource[]
   initialServers: ManagedServer[]
   initialCredentials: ManagedCredential[]
+  initialProxies: ManagedNetworkProxy[]
   currentUser: ManagedUser
   initialUsers: ManagedUser[]
   initialProjectId: string
@@ -114,6 +122,7 @@ export function ControlPlaneShell({
   const [resources, setResources] = useState(initialResources)
   const [servers, setServers] = useState(initialServers)
   const [credentials, setCredentials] = useState(initialCredentials)
+  const [proxies, setProxies] = useState(initialProxies)
   const [users, setUsers] = useState(initialUsers)
   const [sessionUser, setSessionUser] = useState(currentUser)
   const [projectId, setProjectId] = useState(initialProjectId)
@@ -228,6 +237,45 @@ export function ControlPlaneShell({
       toast.success("API Key 已永久删除", { description: credential.name })
     } catch (error) {
       toast.error("无法删除 API Key", { description: errorMessage(error) })
+      throw error
+    }
+  }
+
+  async function saveNetworkProxy(
+    input: NetworkProxyInput,
+    editing: ManagedNetworkProxy | null
+  ): Promise<ManagedNetworkProxy> {
+    const result = networkProxyResponseSchema.parse(
+      await requestJson<unknown>(
+        editing ? `/api/network-proxies/${editing.id}` : "/api/network-proxies",
+        {
+          method: editing ? "PATCH" : "POST",
+          body: JSON.stringify(input),
+        }
+      )
+    )
+    setProxies((current) =>
+      editing
+        ? current.map((item) =>
+            item.id === result.proxy.id ? result.proxy : item
+          )
+        : [result.proxy, ...current]
+    )
+    toast.success(editing ? "代理已更新" : "代理凭据已加密保存", {
+      description: result.proxy.name,
+    })
+    return result.proxy
+  }
+
+  async function deleteNetworkProxy(proxy: ManagedNetworkProxy) {
+    try {
+      await requestJson<void>(`/api/network-proxies/${proxy.id}`, {
+        method: "DELETE",
+      })
+      setProxies((current) => current.filter((item) => item.id !== proxy.id))
+      toast.success("代理已删除", { description: proxy.name })
+    } catch (error) {
+      toast.error("无法删除代理", { description: errorMessage(error) })
       throw error
     }
   }
@@ -558,6 +606,12 @@ export function ControlPlaneShell({
         onDeleteModel={deleteCredentialModel}
         onDelete={deleteCredential}
       />
+    ) : section === "proxies" ? (
+      <NetworkProxyManagement
+        proxies={proxies}
+        onSave={saveNetworkProxy}
+        onDelete={deleteNetworkProxy}
+      />
     ) : section === "settings" ? (
       <SettingsView
         user={sessionUser}
@@ -644,6 +698,7 @@ export function ControlPlaneShell({
               resources={resources}
               servers={servers}
               credentials={credentials}
+              proxies={proxies}
               initialSpec={resourceEditor.initialSpec}
               onOpenChange={(open) => !open && setResourceEditor(null)}
               onSave={saveResource}
@@ -662,6 +717,7 @@ export function ControlPlaneShell({
               resources={resources}
               servers={servers}
               credentials={credentials}
+              proxies={proxies}
               initialRuntimeId={sandboxEditor.initialRuntimeId}
               onOpenChange={(open) => !open && setSandboxEditor(null)}
               onSave={saveSandbox}

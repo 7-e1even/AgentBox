@@ -110,6 +110,42 @@ func TestOCIImageContentSizeIncludesLayerContent(t *testing.T) {
 	}
 }
 
+func TestRunImageToOCIRegistersLayoutCreatedWithoutWorkerMetadata(t *testing.T) {
+	outputPath := filepath.Join(t.TempDir(), "skopeo-layout")
+	reference := "example.test/agentbox:skopeo"
+	config, err := empty.Image.ConfigFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config = config.DeepCopy()
+	config.Architecture = "amd64"
+	config.OS = "linux"
+	image, err := mutate.ConfigFile(empty.Image, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	index := mutate.AppendManifests(empty.Index, mutate.IndexAddendum{Add: image})
+	index = mutate.IndexMediaType(index, types.OCIImageIndex)
+	if _, err := layout.Write(outputPath, index); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout bytes.Buffer
+	if err := runImageToOCI([]string{
+		"--output", outputPath,
+		"--reference", reference,
+	}, &stdout); err != nil {
+		t.Fatalf("register OCI layout without Worker metadata: %v", err)
+	}
+	metadata := readWorkerImageMetadata(t, outputPath)
+	if len(metadata.References) != 1 || metadata.References[0] != reference {
+		t.Fatalf("registered references = %#v", metadata.References)
+	}
+	if metadata.Architecture != "amd64" || metadata.Path != outputPath || metadata.Source != "worker-oci" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
 func TestRunImageToOCIRequiresArchiveForMissingLayout(t *testing.T) {
 	err := runImageToOCI([]string{
 		"--output", filepath.Join(t.TempDir(), "missing"),

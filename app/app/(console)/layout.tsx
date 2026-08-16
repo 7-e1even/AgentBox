@@ -5,6 +5,7 @@ import { ControlPlaneShell } from "@/components/control-plane-shell"
 import { BackendUnavailable } from "@/components/backend-unavailable"
 import { catalogSchema } from "@/lib/catalog"
 import { credentialsResponseSchema } from "@/lib/credential-schema"
+import { networkProxiesResponseSchema } from "@/lib/network-proxy-schema"
 import { resourcesResponseSchema } from "@/lib/platform-schema"
 import { PROJECT_COOKIE_NAME, resolveProjectId } from "@/lib/project-scope"
 import { serversResponseSchema } from "@/lib/server-schema"
@@ -17,17 +18,20 @@ async function loadPlatform(cookieHeader: string, isAdmin: boolean) {
     resourcesResponse,
     serversResponse,
     credentialsResponse,
+    proxiesResponse,
   ] = await Promise.all([
     fetch(`${apiOrigin}/api/catalog`, requestOptions(cookieHeader)),
     fetch(`${apiOrigin}/api/resources`, requestOptions(cookieHeader)),
     fetch(`${apiOrigin}/api/servers`, requestOptions(cookieHeader)),
     fetch(`${apiOrigin}/api/credentials`, requestOptions(cookieHeader)),
+    fetch(`${apiOrigin}/api/network-proxies`, requestOptions(cookieHeader)),
   ])
   if (
     !catalogResponse.ok ||
     !resourcesResponse.ok ||
     !serversResponse.ok ||
-    !credentialsResponse.ok
+    !credentialsResponse.ok ||
+    !proxiesResponse.ok
   ) {
     throw new Error("Go API returned an error")
   }
@@ -38,6 +42,9 @@ async function loadPlatform(cookieHeader: string, isAdmin: boolean) {
   const servers = serversResponseSchema.parse(await serversResponse.json())
   const credentials = credentialsResponseSchema.parse(
     await credentialsResponse.json()
+  )
+  const proxies = networkProxiesResponseSchema.parse(
+    await proxiesResponse.json()
   )
   const users = isAdmin
     ? usersResponseSchema.parse(
@@ -55,6 +62,7 @@ async function loadPlatform(cookieHeader: string, isAdmin: boolean) {
     resources: resources.resources,
     servers: servers.servers,
     credentials: credentials.credentials,
+    proxies: proxies.proxies,
     users,
   }
 }
@@ -106,6 +114,7 @@ export default async function ConsoleLayout({
       initialResources={platform.resources}
       initialServers={platform.servers}
       initialCredentials={platform.credentials}
+      initialProxies={platform.proxies}
       currentUser={currentUser}
       initialUsers={platform.users}
       initialProjectId={initialProjectId}

@@ -9,6 +9,7 @@ export const APP_SECTION_PATHS = {
   skills: "/skills",
   mcp: "/mcp-servers",
   access: "/model-services",
+  proxies: "/network-proxies",
   settings: "/settings",
   variables: "/variables",
   users: "/users",

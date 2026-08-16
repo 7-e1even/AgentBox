@@ -155,7 +155,8 @@ curl -fsSL "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"
 curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$microsandbox_source_tmp"
 
 install_host_dependencies() {
-  if command -v jq >/dev/null; then
+  if command -v jq >/dev/null &&
+     { ! command -v docker >/dev/null || command -v skopeo >/dev/null; }; then
     return 0
   fi
   if ! command -v apt-get >/dev/null; then
@@ -164,7 +165,9 @@ install_host_dependencies() {
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  apt-get install -y ca-certificates jq
+  PACKAGES="ca-certificates jq"
+  command -v docker >/dev/null && PACKAGES="$PACKAGES skopeo"
+  apt-get install -y $PACKAGES
 }
 
 install_host_dependencies
@@ -530,17 +533,26 @@ worker_local_oci_image() {
     printf '%s' "$ROOTFS_PATH"
     return 0
   fi
-  ARCHIVE_PATH=$(mktemp "$STATE_DIR/docker-image.XXXXXX.tar") || return 1
-  if command docker image save -o "$ARCHIVE_PATH" "$IMAGE" &&
-     /usr/local/bin/agentbox-worker image-to-oci --archive "$ARCHIVE_PATH" \
+  if ! command -v skopeo >/dev/null; then
+    if ! command -v apt-get >/dev/null; then
+      echo "skopeo is required to convert a local Docker image without a full temporary archive" >&2
+      return 1
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update >/dev/null && apt-get install -y skopeo >/dev/null || return 1
+  fi
+  TEMP_ROOTFS=$(mktemp -d "$WORKER_OCI_IMAGE_DIR/.skopeo-XXXXXX") || return 1
+  if skopeo copy --insecure-policy "docker-daemon:$IMAGE" "oci:$TEMP_ROOTFS:agentbox" >/dev/null &&
+     rm -rf "$ROOTFS_PATH" &&
+     mv "$TEMP_ROOTFS" "$ROOTFS_PATH" &&
+     /usr/local/bin/agentbox-worker image-to-oci \
        --output "$ROOTFS_PATH" --reference "$IMAGE" >/dev/null; then
-    rm -f "$ARCHIVE_PATH"
     printf '%s' "$ROOTFS_PATH"
     return 0
   else
     STATUS=$?
   fi
-  rm -f "$ARCHIVE_PATH"
+  rm -rf "$TEMP_ROOTFS" "$ROOTFS_PATH"
   return "$STATUS"
 }
 
@@ -612,10 +624,10 @@ microsandbox_prepare_image() {
 }
 
 boxlite_create_with_rootfs() {
-  TARGET=$1; IMAGE=$2; ROOTFS_PATH=$3; CPUS=$4; MEMORY=$5; DISK_SIZE=$6; NETWORK=$7
+  TARGET=$1; IMAGE=$2; ROOTFS_PATH=$3; CPUS=$4; MEMORY=$5; DISK_SIZE=$6; NETWORK=$7; ALLOW_NET=$8
   BODY=$(jq -n --arg name "$TARGET" --arg image "$IMAGE" --arg rootfsPath "$ROOTFS_PATH" \
     --argjson cpus "$CPUS" --argjson memory "$MEMORY" --argjson diskSize "$DISK_SIZE" \
-    --arg network "$NETWORK" '
+    --arg network "$NETWORK" --argjson allowNet "$ALLOW_NET" '
       {
         name: $name,
         image: $image,
@@ -624,11 +636,52 @@ boxlite_create_with_rootfs() {
         memory_mib: $memory,
         disk_size_gb: $diskSize,
         working_dir: "/",
-        network: {mode: $network, allow_net: []},
+        network: {mode: $network, allow_net: $allowNet},
         detach: true
       }
     ')
   curl -fsS -X POST "$BOXLITE_URL/v1/boxes" -H 'Content-Type: application/json' --data "$BODY"
+}
+
+boxlite_inspect_status() {
+  jq -r '
+    if type == "array" then
+      (.[0].Status // .[0].status // .[0].State.Status // .[0].state.status // "")
+    else
+      (.Status // .status // .State.Status // .state.status // "")
+    end
+  '
+}
+
+boxlite_inspect_usable() {
+  BOX_JSON=$(boxlite_cli inspect "$1") || return 1
+  BOX_STATUS=$(printf '%s' "$BOX_JSON" | boxlite_inspect_status)
+  printf '%s\n' "$BOX_JSON"
+  case "$BOX_STATUS" in
+    failed|error) return 1 ;;
+  esac
+}
+
+boxlite_delete() {
+  TARGET=$1
+  if ! HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$BOXLITE_URL/v1/boxes/$TARGET"); then
+    echo "BoxLite service is unavailable" >&2
+    return 1
+  fi
+  case "$HTTP_STATUS" in
+    404) return 0 ;;
+    200) ;;
+    *) echo "BoxLite inspect returned HTTP $HTTP_STATUS" >&2; return 1 ;;
+  esac
+  boxlite_cli rm --force "$TARGET" >/dev/null || return 1
+  if ! HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$BOXLITE_URL/v1/boxes/$TARGET"); then
+    echo "BoxLite service is unavailable after deleting $TARGET" >&2
+    return 1
+  fi
+  [ "$HTTP_STATUS" = 404 ] || {
+    echo "BoxLite did not remove $TARGET (inspect returned HTTP $HTTP_STATUS)" >&2
+    return 1
+  }
 }
 
 install_boxlite_guest() {
@@ -671,7 +724,7 @@ boxlite_call() {
       ;;
     create)
       TARGET=${1:-}; IMAGE=${2:-}; shift 2
-      CPUS=2; MEMORY=4096; DISK_SIZE=${AGENTBOX_BOXLITE_DISK_SIZE_GB:-20}; WORKDIR=/workspace; NETWORK=enabled
+      CPUS=2; MEMORY=4096; DISK_SIZE=${AGENTBOX_BOXLITE_DISK_SIZE_GB:-20}; WORKDIR=/workspace; NETWORK=enabled; ALLOW_NET='[]'
       while [ "$#" -gt 0 ]; do
         case "$1" in
           --cpus) CPUS=${2:-2}; shift 2 ;;
@@ -679,41 +732,50 @@ boxlite_call() {
           --disk-size) DISK_SIZE=${2:-20}; shift 2 ;;
           --workdir) WORKDIR=${2:-/workspace}; shift 2 ;;
           --network) [ "${2:-}" = none ] && NETWORK=disabled || NETWORK=enabled; shift 2 ;;
+          --allow-net) ALLOW_NET=$(printf '%s' "$ALLOW_NET" | jq --arg host "${2:-}" '. + [$host] | unique'); shift 2 ;;
           *) echo "unsupported BoxLite create option: $1" >&2; return 2 ;;
         esac
       done
       case "$DISK_SIZE" in ''|*[!0-9]*|0) echo "invalid BoxLite disk size: $DISK_SIZE" >&2; return 2 ;; esac
-      if ! boxlite_cli inspect "$TARGET" >/dev/null 2>&1; then
+      BOX_EXISTS=false
+      if BOX_JSON=$(boxlite_cli inspect "$TARGET" 2>/dev/null); then
+        BOX_STATUS=$(printf '%s' "$BOX_JSON" | boxlite_inspect_status)
+        case "$BOX_STATUS" in
+          failed|error)
+            boxlite_delete "$TARGET" || {
+              echo "BoxLite could not remove failed sandbox $TARGET" >&2
+              return 1
+            }
+            ;;
+          *) BOX_EXISTS=true ;;
+        esac
+      fi
+      if [ "$BOX_EXISTS" = false ]; then
         if ROOTFS_PATH=$(worker_local_oci_image "$IMAGE"); then
           boxlite_create_with_rootfs "$TARGET" "$IMAGE" "$ROOTFS_PATH" \
-            "$CPUS" "$MEMORY" "$DISK_SIZE" "$NETWORK" >/dev/null
+            "$CPUS" "$MEMORY" "$DISK_SIZE" "$NETWORK" "$ALLOW_NET" >/dev/null
         else
           STATUS=$?
           if [ "$STATUS" -ne 2 ]; then
             return "$STATUS"
           fi
-          boxlite_cli create --detach --name "$TARGET" --cpus "$CPUS" --memory "$MEMORY" \
-            --disk-size "$DISK_SIZE" --workdir / --network "$NETWORK" "$IMAGE" >/dev/null
+          set -- boxlite_cli create --detach --name "$TARGET" --cpus "$CPUS" --memory "$MEMORY" \
+            --disk-size "$DISK_SIZE" --workdir / --network "$NETWORK"
+          for ALLOWED_HOST in $(printf '%s' "$ALLOW_NET" | jq -r '.[]'); do
+            set -- "$@" --allow-net "$ALLOWED_HOST"
+          done
+          set -- "$@" "$IMAGE"
+          "$@" >/dev/null
         fi
       fi
       boxlite_start "$TARGET" || return 1
       install_boxlite_guest "$TARGET" "$WORKDIR"
       ;;
-    inspect) boxlite_cli inspect "$1" ;;
+    inspect) boxlite_inspect_usable "$1" ;;
     prepare-image) boxlite_prepare_image "$1" ;;
     start) boxlite_start "$1" ;;
     stop) boxlite_cli stop "$1" ;;
-    delete)
-      if ! HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' "$BOXLITE_URL/v1/boxes/$1"); then
-        echo "BoxLite service is unavailable" >&2
-        return 1
-      fi
-      case "$HTTP_STATUS" in
-        200) boxlite_cli rm --force "$1" ;;
-        404) return 0 ;;
-        *) echo "BoxLite inspect returned HTTP $HTTP_STATUS" >&2; return 1 ;;
-      esac
-      ;;
+    delete) boxlite_delete "$1" ;;
     exec)
       USE_STDIN=false; WORKDIR=
       while [ "$#" -gt 0 ]; do
@@ -1118,14 +1180,169 @@ agent_tool_command() {
   esac
 }
 
+recover_boxlite_agent_tool_install() {
+  CONTAINER=$1
+  [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ] || return 1
+  echo "BoxLite portal disconnected while installing Agent tools; restarting the sandbox and retrying once" >&2
+  RESTART_LOG=$(mktemp "$STATE_DIR/boxlite-agent-tool-restart.XXXXXX") || return 1
+  if boxlite_cli restart "$CONTAINER" >/dev/null 2>"$RESTART_LOG"; then
+    rm -f "$RESTART_LOG"
+    return 0
+  fi
+  if grep -Fq 'Handle invalidated after stop()' "$RESTART_LOG"; then
+    rm -f "$RESTART_LOG"
+    stop_boxlite_server
+    ensure_boxlite_server || return 1
+    boxlite_cli start "$CONTAINER" >/dev/null
+    return
+  fi
+  cat "$RESTART_LOG" >&2
+  rm -f "$RESTART_LOG"
+  return 1
+}
+
+agent_tool_exec() {
+  CONTAINER=$1
+  shift
+  if docker exec "$CONTAINER" "$@"; then
+    return 0
+  fi
+  recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+  docker exec "$CONTAINER" "$@"
+}
+
+agent_tool_exec_stdin() {
+  CONTAINER=$1
+  INPUT_FILE=$2
+  shift 2
+  if docker exec -i "$CONTAINER" "$@" < "$INPUT_FILE"; then
+    return 0
+  fi
+  recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+  docker exec -i "$CONTAINER" "$@" < "$INPUT_FILE"
+}
+
+agent_tool_exec_logged() {
+  CONTAINER=$1
+  LABEL=$2
+  shift 2
+  if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" != boxlite ]; then
+    agent_tool_exec "$CONTAINER" "$@"
+    return
+  fi
+  LOG_FILE="/tmp/agentbox-$LABEL-install.log"
+  STATUS_FILE="$LOG_FILE.status"
+  PID_FILE="$LOG_FILE.pid"
+  INSTALL_ATTEMPT=1
+  while [ "$INSTALL_ATTEMPT" -le 2 ]; do
+    if ! agent_tool_exec "$CONTAINER" sh -lc \
+        'LOG_FILE=$1; STATUS_FILE=$2; PID_FILE=$3; shift 3; rm -f "$LOG_FILE" "$STATUS_FILE" "$PID_FILE"; (trap "" HUP; "$@"; CODE=$?; printf "%s\n" "$CODE" >"$STATUS_FILE") >"$LOG_FILE" 2>&1 </dev/null & printf "%s\n" "$!" >"$PID_FILE"' \
+        agentbox "$LOG_FILE" "$STATUS_FILE" "$PID_FILE" "$@"; then
+      return 1
+    fi
+    DEADLINE=$(($(date +%s) + ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800}))
+    PORTAL_FAILED=false
+    while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+      if ! STATUS=$(docker exec "$CONTAINER" sh -lc 'test -f "$1" && cat "$1" || true' agentbox "$STATUS_FILE"); then
+        PORTAL_FAILED=true
+        break
+      fi
+      case "$STATUS" in
+        0)
+          docker exec "$CONTAINER" rm -f "$LOG_FILE" "$STATUS_FILE" "$PID_FILE" >/dev/null 2>&1 || true
+          return 0
+          ;;
+        '' ) sleep "${AGENTBOX_AGENT_TOOL_POLL_SECONDS:-15}" ;;
+        * )
+          docker exec "$CONTAINER" sh -lc 'test ! -f "$1" || tail -c 3000 "$1"' agentbox "$LOG_FILE" >&2 || true
+          return 1
+          ;;
+      esac
+    done
+    if [ "$PORTAL_FAILED" = true ]; then
+      recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+      if [ "$INSTALL_ATTEMPT" -lt 2 ]; then
+        INSTALL_ATTEMPT=$((INSTALL_ATTEMPT + 1))
+        echo "Retrying Agent tool installation from the sandbox cache: $LABEL" >&2
+        continue
+      fi
+      return 1
+    fi
+    docker exec "$CONTAINER" sh -lc 'test ! -s "$1" || kill "$(cat "$1")" 2>/dev/null || true; test ! -f "$2" || tail -c 3000 "$2"' \
+      agentbox "$PID_FILE" "$LOG_FILE" >&2 || true
+    echo "Agent tool installation timed out after ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800} seconds: $LABEL" >&2
+    return 1
+  done
+  return 1
+}
+
+install_boxlite_opencode() {
+  CONTAINER=$1
+  case "$(uname -m)" in
+    x86_64|amd64) PLATFORM_PACKAGE=opencode-linux-x64 ;;
+    aarch64|arm64) PLATFORM_PACKAGE=opencode-linux-arm64 ;;
+    *) echo "OpenCode does not provide a BoxLite binary for $(uname -m)" >&2; return 1 ;;
+  esac
+  if docker exec "$CONTAINER" sh -lc 'ldd --version 2>&1 || true' | grep -qi musl; then
+    PLATFORM_PACKAGE="$PLATFORM_PACKAGE-musl"
+  fi
+  TMP_DIR=$(mktemp -d "$STATE_DIR/opencode.XXXXXX") || return 1
+  META_FILE="$TMP_DIR/metadata.json"
+  ARCHIVE="$TMP_DIR/opencode.tgz"
+  if ! curl --connect-timeout 15 --max-time 60 -fsSL \
+      "https://registry.npmjs.org/$PLATFORM_PACKAGE/latest" -o "$META_FILE"; then
+    rm -rf "$TMP_DIR"
+    return 1
+  fi
+  PACKAGE_NAME=$(jq -r '.name // empty' "$META_FILE")
+  TARBALL_URL=$(jq -r '.dist.tarball // empty' "$META_FILE")
+  INTEGRITY=$(jq -r '.dist.integrity // empty' "$META_FILE")
+  if [ "$PACKAGE_NAME" != "$PLATFORM_PACKAGE" ] || [ -z "$TARBALL_URL" ] ||
+     [ "${INTEGRITY#sha512-}" = "$INTEGRITY" ]; then
+    echo "OpenCode npm metadata is incomplete for $PLATFORM_PACKAGE" >&2
+    rm -rf "$TMP_DIR"
+    return 1
+  fi
+  if ! curl --connect-timeout 15 --max-time 300 -fsSL "$TARBALL_URL" -o "$ARCHIVE"; then
+    rm -rf "$TMP_DIR"
+    return 1
+  fi
+  EXPECTED_SHA512=$(printf '%s' "${INTEGRITY#sha512-}" | base64 -d | od -An -tx1 | tr -d ' \n')
+  ACTUAL_SHA512=$(sha512sum "$ARCHIVE" | cut -d ' ' -f 1)
+  if [ -z "$EXPECTED_SHA512" ] || [ "$ACTUAL_SHA512" != "$EXPECTED_SHA512" ]; then
+    echo "OpenCode npm package integrity check failed" >&2
+    rm -rf "$TMP_DIR"
+    return 1
+  fi
+  if ! tar -xzf "$ARCHIVE" -C "$TMP_DIR" package/bin/opencode ||
+     ! chmod 0755 "$TMP_DIR/package/bin/opencode"; then
+    rm -rf "$TMP_DIR"
+    return 1
+  fi
+  stop_boxlite_server
+  if boxlite_local_cli cp "$TMP_DIR/package/bin/opencode" "$CONTAINER:/usr/local/bin/opencode"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  rm -rf "$TMP_DIR"
+  ensure_boxlite_server || { [ "$STATUS" -ne 0 ] || STATUS=$?; }
+  [ "$STATUS" -eq 0 ] || return "$STATUS"
+  agent_tool_exec "$CONTAINER" test -x /usr/local/bin/opencode
+}
+
 install_agent_tools() {
   CONTAINER=$1
   JOB_FILE=$2
   TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u)
   [ -n "$TOOLS" ] || return 0
-  docker exec "$CONTAINER" sh -lc \
-    'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git jq unzip python3' >&2
+  if ! agent_tool_exec_logged "$CONTAINER" prerequisites sh -lc \
+      'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git jq unzip python3' >&2; then
+    echo "Agent tool prerequisite installation failed" >&2
+    return 1
+  fi
   INSTALL_PI=false
+  INSTALL_OPENCODE=false
   set --
   for TOOL in $TOOLS; do
     COMMAND=$(agent_tool_command "$TOOL") || { echo "unsupported Agent tool: $TOOL" >&2; return 1; }
@@ -1142,7 +1359,13 @@ install_agent_tools() {
       kimi) PACKAGE='@moonshot-ai/kimi-code' ;;
       omp) PACKAGE='@oh-my-pi/pi-coding-agent' ;;
       openclaw) PACKAGE='openclaw' ;;
-      opencode) PACKAGE='opencode-ai' ;;
+      opencode)
+        if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ]; then
+          INSTALL_OPENCODE=true
+          continue
+        fi
+        PACKAGE='opencode-ai'
+        ;;
       pi) INSTALL_PI=true; continue ;;
       copilot-cli) PACKAGE='@github/copilot' ;;
       qoder-cli) PACKAGE='@qoder-ai/qodercli' ;;
@@ -1158,21 +1381,51 @@ install_agent_tools() {
 
   if printf '%s\n' "$TOOLS" | grep -qx omp &&
      ! docker exec "$CONTAINER" sh -lc 'command -v bun >/dev/null'; then
-    docker exec "$CONTAINER" sh -lc \
-      'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://bun.sh/install -o "$INSTALLER"; bash "$INSTALLER" >/dev/null; test -x /root/.bun/bin/bun; ln -sf /root/.bun/bin/bun /usr/bin/bun' >&2
+    if ! agent_tool_exec_logged "$CONTAINER" bun sh -lc \
+        'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://bun.sh/install -o "$INSTALLER"; bash "$INSTALLER" >/dev/null; test -x /root/.bun/bin/bun; ln -sf /root/.bun/bin/bun /usr/bin/bun' >&2; then
+      echo "Agent tool runtime installation failed: bun" >&2
+      return 1
+    fi
   fi
   if [ "$#" -gt 0 ] || [ "$INSTALL_PI" = true ]; then
-    docker exec "$CONTAINER" sh -lc \
-      'if ! node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\'' 2>/dev/null; then curl -fsSL https://deb.nodesource.com/setup_22.x | sh; export DEBIAN_FRONTEND=noninteractive; apt-get install -y nodejs; fi; node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\''' >&2
+    if ! agent_tool_exec_logged "$CONTAINER" node sh -lc \
+        'if ! node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\'' 2>/dev/null; then curl -fsSL https://deb.nodesource.com/setup_22.x | sh; export DEBIAN_FRONTEND=noninteractive; apt-get install -y nodejs; fi; node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\''' >&2; then
+      echo "Agent tool runtime installation failed: Node.js 22.19 or newer is required" >&2
+      return 1
+    fi
   fi
   if [ "$#" -gt 0 ]; then
-    docker exec "$CONTAINER" npm install -g "$@" >&2
+    PACKAGE_INDEX=0
+    for PACKAGE_SPEC in "$@"; do
+      PACKAGE_INDEX=$((PACKAGE_INDEX + 1))
+      if [ "$PACKAGE_SPEC" = opencode-ai@latest ]; then
+        PACKAGE_COMMAND='set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; npm install -g "$1"'
+      else
+        PACKAGE_COMMAND='npm install -g "$1"'
+      fi
+      if ! agent_tool_exec_logged "$CONTAINER" "npm-package-$PACKAGE_INDEX" \
+          sh -lc "$PACKAGE_COMMAND" agentbox "$PACKAGE_SPEC" >&2; then
+        echo "Agent tool package installation failed: $PACKAGE_SPEC" >&2
+        return 1
+      fi
+    done
   fi
   if [ "$INSTALL_PI" = true ]; then
-    docker exec "$CONTAINER" npm uninstall -g @mariozechner/pi-coding-agent >&2 || true
-    docker exec "$CONTAINER" npm install -g --force @earendil-works/pi-coding-agent@latest >&2
+    if ! agent_tool_exec_logged "$CONTAINER" pi-cleanup npm uninstall -g @mariozechner/pi-coding-agent >&2; then
+      echo "Agent tool package cleanup failed: pi" >&2
+      return 1
+    fi
+    if ! agent_tool_exec_logged "$CONTAINER" pi npm install -g --force @earendil-works/pi-coding-agent@latest >&2; then
+      echo "Agent tool package installation failed: pi" >&2
+      return 1
+    fi
   fi
-
+  if [ "$INSTALL_OPENCODE" = true ]; then
+    if ! install_boxlite_opencode "$CONTAINER" >&2; then
+      echo "Agent tool package installation failed: opencode" >&2
+      return 1
+    fi
+  fi
   for TOOL in $TOOLS; do
     COMMAND=$(agent_tool_command "$TOOL") || return 1
     if docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
@@ -1180,16 +1433,16 @@ install_agent_tools() {
     fi
     case "$TOOL" in
       antigravity)
-        docker exec "$CONTAINER" sh -lc \
-          'set -eu; case "$(uname -m)" in x86_64|amd64) PLATFORM=linux_amd64 ;; aarch64|arm64) PLATFORM=linux_arm64 ;; *) exit 1 ;; esac; TMP_DIR=$(mktemp -d); trap '\''rm -rf "$TMP_DIR"'\'' EXIT; MANIFEST=$(curl --connect-timeout 15 --max-time 60 -fsSL "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/$PLATFORM.json"); URL=$(printf "%s" "$MANIFEST" | jq -r .url); SHA512=$(printf "%s" "$MANIFEST" | jq -r .sha512); curl --connect-timeout 15 --max-time 300 -fsSL "$URL" -o "$TMP_DIR/agy.tar.gz"; printf "%s  %s\n" "$SHA512" "$TMP_DIR/agy.tar.gz" | sha512sum -c -; tar -xzf "$TMP_DIR/agy.tar.gz" -C "$TMP_DIR" antigravity; install -m 0755 "$TMP_DIR/antigravity" /usr/bin/agy' >&2
+        agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
+          'set -eu; case "$(uname -m)" in x86_64|amd64) PLATFORM=linux_amd64 ;; aarch64|arm64) PLATFORM=linux_arm64 ;; *) exit 1 ;; esac; TMP_DIR=$(mktemp -d); trap '\''rm -rf "$TMP_DIR"'\'' EXIT; MANIFEST=$(curl --connect-timeout 15 --max-time 60 -fsSL "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/$PLATFORM.json"); URL=$(printf "%s" "$MANIFEST" | jq -r .url); SHA512=$(printf "%s" "$MANIFEST" | jq -r .sha512); curl --connect-timeout 15 --max-time 300 -fsSL "$URL" -o "$TMP_DIR/agy.tar.gz"; printf "%s  %s\n" "$SHA512" "$TMP_DIR/agy.tar.gz" | sha512sum -c -; tar -xzf "$TMP_DIR/agy.tar.gz" -C "$TMP_DIR" antigravity; install -m 0755 "$TMP_DIR/antigravity" /usr/bin/agy' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
       cursor)
-        docker exec "$CONTAINER" sh -lc \
-          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://cursor.com/install -o "$INSTALLER"; bash "$INSTALLER"; if [ -x /root/.local/bin/cursor-agent ]; then ln -sf /root/.local/bin/cursor-agent /usr/bin/cursor-agent; elif [ -x /root/.cursor/bin/cursor-agent ]; then ln -sf /root/.cursor/bin/cursor-agent /usr/bin/cursor-agent; else exit 1; fi' >&2
+        agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://cursor.com/install -o "$INSTALLER"; bash "$INSTALLER"; if [ -x /root/.local/bin/cursor-agent ]; then ln -sf /root/.local/bin/cursor-agent /usr/bin/cursor-agent; elif [ -x /root/.cursor/bin/cursor-agent ]; then ln -sf /root/.cursor/bin/cursor-agent /usr/bin/cursor-agent; else exit 1; fi' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
       qwenpaw)
-        docker exec "$CONTAINER" sh -lc \
-          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -LsSf https://astral.sh/uv/install.sh -o "$INSTALLER"; sh "$INSTALLER" >/dev/null; timeout 3600 /root/.local/bin/uv tool install --python 3.12 qwenpaw; test -x /root/.local/bin/qwenpaw; ln -sf /root/.local/bin/qwenpaw /usr/bin/qwenpaw' >&2
+        agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -LsSf https://astral.sh/uv/install.sh -o "$INSTALLER"; sh "$INSTALLER" >/dev/null; timeout 3600 /root/.local/bin/uv tool install --python 3.12 qwenpaw; test -x /root/.local/bin/qwenpaw; ln -sf /root/.local/bin/qwenpaw /usr/bin/qwenpaw' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
     esac
   done
@@ -1210,9 +1463,13 @@ install_agent_tools() {
       "$VERSION_FILE" > "$NEXT_VERSION_FILE"
     mv "$NEXT_VERSION_FILE" "$VERSION_FILE"
   done
-  docker exec "$CONTAINER" mkdir -p /opt/agentbox
-  docker exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json
-  docker exec -i "$CONTAINER" sh -c 'cat > /opt/agentbox/agent-versions.json' < "$VERSION_FILE"
+  if ! agent_tool_exec "$CONTAINER" mkdir -p /opt/agentbox ||
+     ! agent_tool_exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json ||
+     ! agent_tool_exec_stdin "$CONTAINER" "$VERSION_FILE" sh -c 'cat > /opt/agentbox/agent-versions.json'; then
+    echo "Agent tool version metadata could not be written" >&2
+    rm -f "$VERSION_FILE"
+    return 1
+  fi
   rm -f "$VERSION_FILE"
 }
 
@@ -1261,7 +1518,7 @@ prepare_agent_image() {
   command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
 
   TOOL_SET=$(printf '%s\n' "$TOOLS" | paste -sd, -)
-  INSTALLER_REVISION=2
+  INSTALLER_REVISION=3
   CACHE_KEY=$(printf '%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
   CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
@@ -1292,7 +1549,13 @@ prepare_agent_image() {
       --label "agentbox.runtime.build=$CACHE_KEY" \
       "$BUILD_BASE_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait' >/dev/null
   fi
+  if ! configure_proxy "$BUILD_CONTAINER" "$JOB_FILE"; then
+    echo "Agent runtime build could not apply the selected network proxy" >&2
+    docker stop --time 10 "$BUILD_CONTAINER" >/dev/null 2>&1 || true
+    return 1
+  fi
   if install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE" &&
+     remove_proxy "$BUILD_CONTAINER" &&
      docker commit \
        --change "LABEL agentbox.runtime.cache=true" \
        --change "LABEL agentbox.runtime.refreshed=$NOW" \
@@ -1307,6 +1570,7 @@ prepare_agent_image() {
     return 0
   fi
 
+  remove_proxy "$BUILD_CONTAINER"
   docker stop --time 10 "$BUILD_CONTAINER" >/dev/null 2>&1 || true
   docker image rm "$REFRESH_IMAGE" >/dev/null 2>&1 || true
   if docker image inspect "$CACHE_IMAGE" >/dev/null 2>&1; then
@@ -1324,6 +1588,64 @@ append_env() {
   VALUE=$3
   ESCAPED=$(printf '%s' "$VALUE" | sed "s/'/'\"'\"'/g")
   printf "%s='%s'\n" "$KEY" "$ESCAPED" >> "$ENV_FILE"
+}
+
+remove_env() {
+  ENV_FILE=$1
+  KEY=$2
+  FILTERED=$(mktemp)
+  awk -v key="$KEY" 'index($0, key "=") != 1' "$ENV_FILE" > "$FILTERED"
+  cat "$FILTERED" > "$ENV_FILE"
+  rm -f "$FILTERED"
+}
+
+replace_env() {
+  ENV_FILE=$1
+  KEY=$2
+  VALUE=$3
+  remove_env "$ENV_FILE" "$KEY"
+  append_env "$ENV_FILE" "$KEY" "$VALUE"
+}
+
+remove_proxy() {
+  CONTAINER=$1
+  docker exec "$CONTAINER" rm -f \
+    /opt/agentbox/secrets/proxy.env \
+    /etc/profile.d/agentbox-proxy.sh >/dev/null 2>&1 || true
+}
+
+configure_proxy() {
+  CONTAINER=$1
+  JOB_FILE=$2
+  if ! jq -e '.job.payload.proxy? and (.job.payload.proxy.url // "") != ""' "$JOB_FILE" >/dev/null; then
+    remove_proxy "$CONTAINER"
+    return 0
+  fi
+
+  PROXY_URL_B64=$(jq -r '.job.payload.proxy.url | @base64' "$JOB_FILE")
+  PROXY_URL=$(printf '%s' "$PROXY_URL_B64" | base64 -d)
+  NO_PROXY=$(jq -r '.job.payload.proxy.noProxy // [] | join(",")' "$JOB_FILE")
+  PROXY_ENV=$(mktemp)
+  PROXY_LOADER=$(mktemp)
+  chmod 600 "$PROXY_ENV"
+  for NAME in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+    append_env "$PROXY_ENV" "$NAME" "$PROXY_URL"
+  done
+  append_env "$PROXY_ENV" NO_PROXY "$NO_PROXY"
+  append_env "$PROXY_ENV" no_proxy "$NO_PROXY"
+  append_env "$PROXY_ENV" NODE_USE_ENV_PROXY 1
+  append_env "$PROXY_ENV" CLAUDE_CODE_PROXY_RESOLVES_HOSTS 1
+  printf '%s\n' '[ -r /opt/agentbox/secrets/proxy.env ] && . /opt/agentbox/secrets/proxy.env' > "$PROXY_LOADER"
+
+  if docker exec "$CONTAINER" mkdir -p /opt/agentbox/secrets /etc/profile.d &&
+     docker exec "$CONTAINER" rm -rf /opt/agentbox/secrets/proxy.env /etc/profile.d/agentbox-proxy.sh &&
+     docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /opt/agentbox/secrets/proxy.env' < "$PROXY_ENV" &&
+     docker exec -i "$CONTAINER" sh -c 'cat > /etc/profile.d/agentbox-proxy.sh; chmod 644 /etc/profile.d/agentbox-proxy.sh' < "$PROXY_LOADER"; then
+    rm -f "$PROXY_ENV" "$PROXY_LOADER"
+    return 0
+  fi
+  rm -f "$PROXY_ENV" "$PROXY_LOADER"
+  return 1
 }
 
 configure_credentials() {
@@ -1453,10 +1775,10 @@ configure_credentials() {
       CLAUDE_SECRET=$(printf '%s' "$CLAUDE_CREDENTIAL" | jq -r '.secret')
       CLAUDE_ENDPOINT=$(printf '%s' "$CLAUDE_CREDENTIAL" | jq -r '.anthropicEndpoint')
       CLAUDE_MODEL=$(printf '%s' "$CLAUDE_CREDENTIAL" | jq -r '.modelId')
-      append_env "$ENV_FILE" ANTHROPIC_API_KEY "$CLAUDE_SECRET"
-      append_env "$ENV_FILE" ANTHROPIC_AUTH_TOKEN "$CLAUDE_SECRET"
-      append_env "$ENV_FILE" ANTHROPIC_BASE_URL "$CLAUDE_ENDPOINT"
-      append_env "$ENV_FILE" ANTHROPIC_MODEL "$CLAUDE_MODEL"
+      remove_env "$ENV_FILE" ANTHROPIC_API_KEY
+      replace_env "$ENV_FILE" ANTHROPIC_AUTH_TOKEN "$CLAUDE_SECRET"
+      replace_env "$ENV_FILE" ANTHROPIC_BASE_URL "$CLAUDE_ENDPOINT"
+      replace_env "$ENV_FILE" ANTHROPIC_MODEL "$CLAUDE_MODEL"
     fi
   fi
 
@@ -1784,7 +2106,7 @@ install_agent_wrappers() {
     COMMAND=$(agent_tool_command "$TOOL") || continue
     docker exec "$CONTAINER" test -x "/usr/bin/$COMMAND" || continue
     WRAPPER=$(mktemp)
-    printf '#!/bin/sh\nset -a\n. /opt/agentbox/secrets/agentbox.env\nset +a\nexec /usr/bin/%s "$@"\n' "$COMMAND" > "$WRAPPER"
+    printf '#!/bin/sh\nset -a\n. /opt/agentbox/secrets/agentbox.env\n[ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env\nset +a\nexec /usr/bin/%s "$@"\n' "$COMMAND" > "$WRAPPER"
     docker exec -i "$CONTAINER" sh -c "cat > /usr/local/bin/$COMMAND && chmod 0755 /usr/local/bin/$COMMAND" < "$WRAPPER"
     rm -f "$WRAPPER"
   done
@@ -1850,6 +2172,11 @@ create_sandbox() {
       set -- "$@" "$RUNTIME_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait'
       "$@" >/dev/null
     fi
+    if ! configure_proxy "$TARGET" "$JOB_FILE"; then
+      cleanup_failed_create
+      echo "stage proxy-config failed: image $IMAGE could not accept the selected network proxy" >&2
+      return 1
+    fi
   else
     runtime_probe "$DRIVER" || { echo "stage runtime-probe failed: $DRIVER self-test failed" >&2; return 1; }
     if runtime_call "$DRIVER" inspect "$TARGET" >/dev/null 2>&1; then
@@ -1858,17 +2185,38 @@ create_sandbox() {
     CPU_COUNT=$(printf '%s' "${CPU:-2}" | sed 's/\..*$//')
     case "$CPU_COUNT" in ''|*[!0-9]*) CPU_COUNT=2 ;; esac
     MEMORY_MIB=$(memory_mib "$MEMORY_VALUE")
+    RUNTIME_IMAGE=$IMAGE
+    AGENT_TOOLS_PREINSTALLED=false
+    if [ "$DRIVER" = boxlite ] && command -v docker >/dev/null &&
+       command docker info >/dev/null 2>&1 &&
+       jq -e '.job.payload.agentTools? | length > 0' "$JOB_FILE" >/dev/null; then
+      if ! RUNTIME_IMAGE=$(
+        AGENTBOX_RUNTIME_DRIVER=docker
+        export AGENTBOX_RUNTIME_DRIVER
+        prepare_agent_image "$IMAGE" "$JOB_FILE"
+      ); then
+        echo "stage agent-image failed: Docker could not preinstall the selected Agent tools for BoxLite" >&2
+        return 1
+      fi
+      AGENT_TOOLS_PREINSTALLED=true
+    fi
     if [ "$DRIVER" = microsandbox ]; then
       if ! microsandbox_prepare_image "$IMAGE" >/dev/null; then
         echo "stage image-prepare failed: $DRIVER could not prepare $IMAGE" >&2
         return 1
       fi
-    elif ! runtime_call "$DRIVER" prepare-image "$IMAGE" >/dev/null; then
-      echo "stage image-prepare failed: $DRIVER could not prepare $IMAGE" >&2
+    elif ! runtime_call "$DRIVER" prepare-image "$RUNTIME_IMAGE" >/dev/null; then
+      echo "stage image-prepare failed: $DRIVER could not prepare $RUNTIME_IMAGE" >&2
       return 1
     fi
-    if ! runtime_call "$DRIVER" create "$TARGET" "$IMAGE" --cpus "$CPU_COUNT" \
-      --memory "$MEMORY_MIB" --workdir "$WORKDIR" --network "$NETWORK" >/dev/null; then
+    set -- runtime_call "$DRIVER" create "$TARGET" "$RUNTIME_IMAGE" --cpus "$CPU_COUNT" \
+      --memory "$MEMORY_MIB" --workdir "$WORKDIR" --network "$NETWORK"
+    if [ "$DRIVER" = boxlite ] && [ "$NETWORK" = restricted ]; then
+      for ALLOWED_HOST in $(jq -r '.job.payload.proxy.allowNet[]?' "$JOB_FILE"); do
+        set -- "$@" --allow-net "$ALLOWED_HOST"
+      done
+    fi
+    if ! "$@" >/dev/null; then
       cleanup_failed_create
       echo "stage runtime-create failed: $DRIVER could not create the sandbox" >&2
       return 1
@@ -1878,10 +2226,24 @@ create_sandbox() {
       echo "stage workspace-init failed: $DRIVER could not prepare $WORKDIR" >&2
       return 1
     fi
-    if ! install_agent_tools "$TARGET" "$JOB_FILE"; then
+    if ! configure_proxy "$TARGET" "$JOB_FILE"; then
       cleanup_failed_create
-      echo "stage agent-tools failed: image $IMAGE is not compatible with the selected Agent tools" >&2
+      echo "stage proxy-config failed: image $IMAGE could not accept the selected network proxy" >&2
       return 1
+    fi
+    if [ "$AGENT_TOOLS_PREINSTALLED" = true ]; then
+      for TOOL in $(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u); do
+        COMMAND=$(agent_tool_command "$TOOL") || { cleanup_failed_create; return 1; }
+        if ! docker exec "$TARGET" sh -lc "command -v $COMMAND >/dev/null"; then
+          cleanup_failed_create
+          echo "stage agent-tools failed: cached image command is unavailable: $COMMAND" >&2
+          return 1
+        fi
+      done
+    elif ! install_agent_tools "$TARGET" "$JOB_FILE"; then
+        cleanup_failed_create
+        echo "stage agent-tools failed: could not install or verify the selected Agent tools in the $DRIVER sandbox for image $IMAGE" >&2
+        return 1
     fi
   fi
 
@@ -1892,7 +2254,7 @@ create_sandbox() {
   fi
   MANIFEST=$(mktemp)
   if ! docker exec "$TARGET" rm -rf /opt/agentbox/manifest.json ||
-     ! jq '.job.payload | del(.credentials)' "$JOB_FILE" > "$MANIFEST" ||
+     ! jq '.job.payload | del(.credentials, .proxy)' "$JOB_FILE" > "$MANIFEST" ||
      ! docker exec -i "$TARGET" sh -c 'cat > /opt/agentbox/manifest.json' < "$MANIFEST"; then
     rm -f "$MANIFEST"
     cleanup_failed_create
@@ -1942,6 +2304,11 @@ sandbox_container_name() {
 start_sandbox() {
   JOB_FILE=$1
   DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  EXTERNAL_ID=$(jq -r '.job.payload.externalId // empty' "$JOB_FILE")
+  if [ -z "$EXTERNAL_ID" ]; then
+    create_sandbox "$JOB_FILE"
+    return
+  fi
   TARGET=$(sandbox_container_name "$JOB_FILE")
   AGENTBOX_RUNTIME_DRIVER=$DRIVER
   export AGENTBOX_RUNTIME_DRIVER
@@ -1956,6 +2323,11 @@ start_sandbox() {
     else
       runtime_call "$DRIVER" fs-mkdir "$TARGET" "$WORKDIR" >/dev/null
     fi
+  fi
+
+  if ! configure_proxy "$TARGET" "$JOB_FILE"; then
+    echo "stage proxy-config failed: sandbox could not apply the selected network proxy" >&2
+    return 1
   fi
 
   if jq -e '.job.payload.credentials? and .job.payload.agentTools?' "$JOB_FILE" >/dev/null; then

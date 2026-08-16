@@ -7,6 +7,7 @@ import {
   KeyRoundIcon,
   LayoutDashboardIcon,
   LayoutTemplateIcon,
+  NetworkIcon,
   PlugZapIcon,
   ServerIcon,
   SparklesIcon,
@@ -54,6 +55,7 @@ export function AppSidebar({
         ...(currentUser.preferences.showCapabilities
           ? ([
               { title: "模型服务", section: "access", icon: KeyRoundIcon },
+              { title: "网络代理", section: "proxies", icon: NetworkIcon },
               { title: "Skills", section: "skills", icon: SparklesIcon },
               { title: "MCP Servers", section: "mcp", icon: PlugZapIcon },
             ] satisfies NavigationGroup["items"])

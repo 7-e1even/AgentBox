@@ -24,6 +24,7 @@ func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	attachWorkerRuntimeEndpoints(job.Payload, workerRequestBaseURL(request))
+	attachWorkerProxyEndpoint(job.Payload, workerRequestBaseURL(request))
 	s.writeJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
@@ -78,6 +79,65 @@ func attachWorkerRuntimeEndpoints(payload map[string]any, baseURL string) {
 			credential["endpoint"] = credential["openaiEndpoint"]
 		}
 	}
+}
+
+func attachWorkerProxyEndpoint(payload map[string]any, baseURL string) {
+	proxy, ok := payload["proxy"].(map[string]any)
+	if !ok || baseURL == "" {
+		return
+	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Hostname() == "" {
+		return
+	}
+	proxyHost, _ := proxy["host"].(string)
+	noProxy := uniqueStrings([]string{"localhost", "127.0.0.1", "::1"}, proxy["noProxy"], parsed.Hostname())
+	allowNet := uniqueStrings([]string{proxyHost}, proxy["noProxy"], parsed.Hostname())
+	proxy["noProxy"] = noProxy
+	proxy["allowNet"] = removeLocalProxyHosts(allowNet)
+}
+
+func uniqueStrings(initial []string, extra any, final string) []string {
+	result := make([]string, 0, len(initial)+4)
+	seen := make(map[string]bool)
+	appendValue := func(value string) {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value == "" || seen[key] {
+			return
+		}
+		seen[key] = true
+		result = append(result, value)
+	}
+	for _, value := range initial {
+		appendValue(value)
+	}
+	switch values := extra.(type) {
+	case []string:
+		for _, value := range values {
+			appendValue(value)
+		}
+	case []any:
+		for _, value := range values {
+			if text, ok := value.(string); ok {
+				appendValue(text)
+			}
+		}
+	}
+	appendValue(final)
+	return result
+}
+
+func removeLocalProxyHosts(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "", "localhost", "127.0.0.1", "::1":
+			continue
+		}
+		result = append(result, value)
+	}
+	return result
 }
 
 func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request) {

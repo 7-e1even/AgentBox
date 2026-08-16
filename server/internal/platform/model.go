@@ -2,8 +2,10 @@ package platform
 
 import (
 	"errors"
+	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -137,6 +139,33 @@ type ManagedCredential struct {
 	LastCheckError string            `json:"lastCheckError"`
 	CreatedAt      time.Time         `json:"createdAt"`
 	UpdatedAt      time.Time         `json:"updatedAt"`
+}
+
+type NetworkProxyInput struct {
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Scheme   string   `json:"scheme"`
+	Host     string   `json:"host"`
+	Port     int      `json:"port"`
+	Username string   `json:"username"`
+	Password string   `json:"password"`
+	NoProxy  []string `json:"noProxy"`
+	Enabled  bool     `json:"enabled"`
+}
+
+type ManagedNetworkProxy struct {
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Scheme         string    `json:"scheme"`
+	Host           string    `json:"host"`
+	Port           int       `json:"port"`
+	Username       string    `json:"username"`
+	MaskedPassword string    `json:"maskedPassword"`
+	HasPassword    bool      `json:"hasPassword"`
+	NoProxy        []string  `json:"noProxy"`
+	Enabled        bool      `json:"enabled"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 type CredentialModel struct {
@@ -328,6 +357,71 @@ func ValidateCredential(input CredentialInput, requireSecret bool) error {
 	return nil
 }
 
+func NormalizeNetworkProxy(input *NetworkProxyInput) {
+	input.ID = strings.ToLower(strings.TrimSpace(input.ID))
+	input.Name = strings.TrimSpace(input.Name)
+	input.Scheme = strings.ToLower(strings.TrimSpace(input.Scheme))
+	input.Host = strings.Trim(strings.TrimSpace(input.Host), "[]")
+	input.Username = strings.TrimSpace(input.Username)
+	seen := make(map[string]struct{}, len(input.NoProxy))
+	noProxy := make([]string, 0, len(input.NoProxy))
+	for _, entry := range input.NoProxy {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		key := strings.ToLower(entry)
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		noProxy = append(noProxy, entry)
+	}
+	input.NoProxy = noProxy
+}
+
+func ValidateNetworkProxy(input NetworkProxyInput) error {
+	if n := utf8.RuneCountInString(input.ID); n < 2 || n > 64 || !idPattern.MatchString(input.ID) {
+		return &ValidationError{Message: "代理标识只能包含小写字母、数字和连字符，长度为 2 到 64"}
+	}
+	if n := utf8.RuneCountInString(input.Name); n < 2 || n > 80 {
+		return &ValidationError{Message: "代理名称需要 2 到 80 个字符"}
+	}
+	if input.Scheme != "http" && input.Scheme != "https" {
+		return &ValidationError{Message: "第一版代理协议只支持 HTTP 或 HTTPS"}
+	}
+	if input.Port < 1 || input.Port > 65535 {
+		return &ValidationError{Message: "代理端口需要在 1 到 65535 之间"}
+	}
+	if input.Host == "" || utf8.RuneCountInString(input.Host) > 253 || strings.ContainsAny(input.Host, "\x00\r\n\t /\\@") {
+		return &ValidationError{Message: "代理主机名或 IP 无效"}
+	}
+	if net.ParseIP(input.Host) == nil {
+		parsed, err := url.Parse(input.Scheme + "://" + net.JoinHostPort(input.Host, strconv.Itoa(input.Port)))
+		if err != nil || parsed.Hostname() != input.Host {
+			return &ValidationError{Message: "代理主机名或 IP 无效"}
+		}
+	}
+	if utf8.RuneCountInString(input.Username) > 512 || strings.ContainsAny(input.Username, "\x00\r\n") {
+		return &ValidationError{Message: "代理用户名无效"}
+	}
+	if len(input.Password) > 16*1024 || strings.ContainsAny(input.Password, "\x00\r\n") {
+		return &ValidationError{Message: "代理密码无效"}
+	}
+	if input.Password != "" && input.Username == "" {
+		return &ValidationError{Message: "填写代理密码时也需要填写用户名"}
+	}
+	if len(input.NoProxy) > 100 {
+		return &ValidationError{Message: "直连地址不能超过 100 个"}
+	}
+	for _, entry := range input.NoProxy {
+		if entry == "*" || utf8.RuneCountInString(entry) > 255 || strings.ContainsAny(entry, "\x00\r\n\t ,") {
+			return &ValidationError{Message: "直连地址格式无效，请每行填写一个主机、IP 或 CIDR"}
+		}
+	}
+	return nil
+}
+
 func NormalizeCredentialModel(input *CredentialModelInput) {
 	input.ID = strings.TrimSpace(strings.TrimPrefix(input.ID, "models/"))
 	input.Name = strings.TrimSpace(input.Name)
@@ -414,6 +508,9 @@ func Validate(input Input) error {
 		if err := validateEnvironmentVariables(input.Spec); err != nil {
 			return err
 		}
+		if err := validateNetworkSpec(input.Spec); err != nil {
+			return err
+		}
 	}
 	if input.Kind == KindSandbox {
 		if err := require(input.Spec, "runtimeId", "请选择沙箱模板"); err != nil {
@@ -429,12 +526,31 @@ func Validate(input Input) error {
 		if err := validateEnvironmentVariables(input.Spec); err != nil {
 			return err
 		}
+		if err := validateNetworkSpec(input.Spec); err != nil {
+			return err
+		}
 	}
 	if input.Kind == KindVariable {
 		if err := require(input.Spec, "key", "请填写环境变量名"); err != nil {
 			return err
 		}
 		return require(input.Spec, "reference", "请填写变量或密钥引用")
+	}
+	return nil
+}
+
+func validateNetworkSpec(spec map[string]any) error {
+	network, _ := spec["network"].(string)
+	if network != "" && network != "none" && network != "restricted" && network != "egress" {
+		return &ValidationError{Message: "网络策略无效"}
+	}
+	proxyID, _ := spec["proxyId"].(string)
+	proxyID = strings.TrimSpace(proxyID)
+	if proxyID != "" && !idPattern.MatchString(proxyID) {
+		return &ValidationError{Message: "网络代理引用无效"}
+	}
+	if proxyID != "" && network == "none" {
+		return &ValidationError{Message: "完全隔离的环境不能同时使用网络代理"}
 	}
 	return nil
 }

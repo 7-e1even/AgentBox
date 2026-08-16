@@ -17,6 +17,7 @@ describe("app section routes", () => {
     expect(appSectionPath("automations")).toBe("/automations")
     expect(appSectionPath("mcp")).toBe("/mcp-servers")
     expect(appSectionPath("access")).toBe("/model-services")
+    expect(appSectionPath("proxies")).toBe("/network-proxies")
   })
 
   it("does not expose the removed Agent configuration route", () => {

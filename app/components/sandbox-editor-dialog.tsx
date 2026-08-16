@@ -15,6 +15,7 @@ import {
   supportedAgentToolList,
 } from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
+import type { ManagedNetworkProxy } from "@/lib/network-proxy-schema"
 import { environmentVariablesError } from "@/lib/environment-variables"
 import {
   resourceInputSchema,
@@ -67,6 +68,7 @@ type SandboxEditorDialogProps = {
   resources: Resource[]
   servers: ManagedServer[]
   credentials: ManagedCredential[]
+  proxies: ManagedNetworkProxy[]
   initialRuntimeId?: string
   onOpenChange: (open: boolean) => void
   onSave: (input: ResourceInput) => Promise<void>
@@ -78,6 +80,7 @@ export function SandboxEditorDialog({
   resources,
   servers,
   credentials,
+  proxies,
   initialRuntimeId,
   onOpenChange,
   onSave,
@@ -146,7 +149,11 @@ export function SandboxEditorDialog({
   function updateSpec(key: string, value: unknown) {
     setInput((current) => ({
       ...current,
-      spec: { ...current.spec, [key]: value },
+      spec: {
+        ...current.spec,
+        [key]: value,
+        ...(key === "network" && value === "none" ? { proxyId: "" } : {}),
+      },
     }))
     setError("")
   }
@@ -243,6 +250,10 @@ export function SandboxEditorDialog({
       setError("运行服务器当前不可用，或所选隔离驱动尚未通过 Worker 自检")
       return
     }
+    if (input.spec.network === "none" && stringValue(input.spec.proxyId)) {
+      setError("完全隔离网络不能同时使用代理")
+      return
+    }
     const environmentError = environmentVariablesError(
       input.spec.environmentVariables
     )
@@ -312,9 +323,7 @@ export function SandboxEditorDialog({
         className="flex max-h-[min(860px,calc(100vh-2rem))] flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl"
         onEscapeKeyDown={(event) => {
           if (
-            document.querySelector(
-              '[data-slot="combobox-content"][data-open]'
-            )
+            document.querySelector('[data-slot="combobox-content"][data-open]')
           ) {
             event.preventDefault()
           }
@@ -490,9 +499,7 @@ export function SandboxEditorDialog({
                       choices={imageChoices}
                       driver={driver}
                       disabled={Boolean(resource) || !server}
-                      onChange={(value) =>
-                        updateSpec("imageReference", value)
-                      }
+                      onChange={(value) => updateSpec("imageReference", value)}
                     />
                     <FieldDescription aria-live="polite">
                       {runtimeImageDescription(driver)}
@@ -542,6 +549,52 @@ export function SandboxEditorDialog({
                         </SelectGroup>
                       </SelectContent>
                     </Select>
+                  </Field>
+                  <Field>
+                    <FieldLabel htmlFor="sandbox-proxy">网络代理</FieldLabel>
+                    <Select
+                      value={stringValue(input.spec.proxyId) || "__none__"}
+                      disabled={
+                        Boolean(resource) || input.spec.network === "none"
+                      }
+                      onValueChange={(value) =>
+                        updateSpec("proxyId", value === "__none__" ? "" : value)
+                      }
+                    >
+                      <SelectTrigger id="sandbox-proxy" className="w-full">
+                        <SelectValue placeholder="选择网络代理" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectGroup>
+                          <SelectLabel>环境网络代理</SelectLabel>
+                          <SelectItem value="__none__">不使用代理</SelectItem>
+                          {proxies
+                            .filter(
+                              (item) =>
+                                item.enabled ||
+                                item.id === stringValue(input.spec.proxyId)
+                            )
+                            .map((item) => (
+                              <SelectItem
+                                key={item.id}
+                                value={item.id}
+                                disabled={!item.enabled}
+                              >
+                                {item.name}
+                                {item.enabled ? "" : " · 已停用"}
+                              </SelectItem>
+                            ))}
+                        </SelectGroup>
+                      </SelectContent>
+                    </Select>
+                    <FieldDescription>
+                      {input.spec.network === "none"
+                        ? "完全隔离时不能使用代理。"
+                        : driver === "boxlite" &&
+                            input.spec.network === "restricted"
+                          ? "只放行代理、直连地址和控制面。"
+                          : "向环境内程序注入标准 HTTP(S) 代理变量。"}
+                    </FieldDescription>
                   </Field>
                   <Field>
                     <FieldLabel htmlFor="sandbox-workdir">工作目录</FieldLabel>
@@ -909,6 +962,7 @@ function templateDefaults(template?: Resource) {
     cpu: stringValue(template?.spec.cpu) || "2",
     memory: stringValue(template?.spec.memory) || "4 GiB",
     network: stringValue(template?.spec.network) || "restricted",
+    proxyId: stringValue(template?.spec.proxyId),
     agentTools: supportedAgentToolList(template?.spec.agentTools),
     skillIds: stringList(template?.spec.skillIds),
     mcpServerIds: stringList(template?.spec.mcpServerIds),

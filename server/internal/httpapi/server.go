@@ -42,6 +42,10 @@ type PlatformStore interface {
 	AddCredentialModel(context.Context, string, platform.CredentialModelInput) ([]platform.CredentialModel, error)
 	DeleteCredentialModel(context.Context, string, string) ([]platform.CredentialModel, error)
 	DeleteCredential(context.Context, string) error
+	ListNetworkProxies(context.Context) ([]platform.ManagedNetworkProxy, error)
+	CreateNetworkProxy(context.Context, platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error)
+	UpdateNetworkProxy(context.Context, string, platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error)
+	DeleteNetworkProxy(context.Context, string) error
 	ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error)
 	ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error)
 	CompleteWorkerJob(context.Context, string, string, string, platform.WorkerJobResult) error
@@ -154,6 +158,10 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	authenticated("POST /api/credentials/{id}/models", server.addCredentialModel)
 	authenticated("DELETE /api/credentials/{id}/models", server.deleteCredentialModel)
 	authenticated("DELETE /api/credentials/{id}", server.deleteCredential)
+	authenticated("GET /api/network-proxies", server.listNetworkProxies)
+	authenticated("POST /api/network-proxies", server.createNetworkProxy)
+	authenticated("PATCH /api/network-proxies/{id}", server.updateNetworkProxy)
+	authenticated("DELETE /api/network-proxies/{id}", server.deleteNetworkProxy)
 	authenticated("GET /api/servers", server.listServers)
 	authenticated("DELETE /api/servers/{id}", server.deleteServer)
 	authenticated("POST /api/servers/{id}/actions/update-worker", server.updateWorker)

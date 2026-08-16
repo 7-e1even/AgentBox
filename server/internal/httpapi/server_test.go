@@ -108,6 +108,16 @@ func (fakeStore) DeleteCredentialModel(context.Context, string, string) ([]platf
 	return []platform.CredentialModel{}, nil
 }
 func (fakeStore) DeleteCredential(context.Context, string) error { return nil }
+func (fakeStore) ListNetworkProxies(context.Context) ([]platform.ManagedNetworkProxy, error) {
+	return []platform.ManagedNetworkProxy{}, nil
+}
+func (fakeStore) CreateNetworkProxy(_ context.Context, input platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error) {
+	return platform.ManagedNetworkProxy{ID: input.ID, Name: input.Name}, nil
+}
+func (fakeStore) UpdateNetworkProxy(_ context.Context, _ string, input platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error) {
+	return platform.ManagedNetworkProxy{ID: input.ID, Name: input.Name}, nil
+}
+func (fakeStore) DeleteNetworkProxy(context.Context, string) error { return nil }
 func (fakeStore) ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error) {
 	return platform.RuntimeLLMTarget{}, store.ErrRuntimeUnauthorized
 }

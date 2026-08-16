@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -591,6 +592,144 @@ func (s *Store) DeleteCredential(ctx context.Context, id string) error {
 	result, err := s.pool.Exec(ctx, "DELETE FROM provider_credentials WHERE id = $1", id)
 	if err != nil {
 		return fmt.Errorf("delete provider credential: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return ErrResourceNotFound
+	}
+	return nil
+}
+
+const networkProxyColumns = `id, name, scheme, host, port, username,
+  password_last_four, no_proxy, enabled, created_at, updated_at`
+
+func scanNetworkProxy(row pgx.Row) (platform.ManagedNetworkProxy, error) {
+	var result platform.ManagedNetworkProxy
+	var lastFour string
+	var noProxyJSON []byte
+	if err := row.Scan(
+		&result.ID, &result.Name, &result.Scheme, &result.Host, &result.Port,
+		&result.Username, &lastFour, &noProxyJSON, &result.Enabled,
+		&result.CreatedAt, &result.UpdatedAt,
+	); err != nil {
+		return platform.ManagedNetworkProxy{}, err
+	}
+	if err := json.Unmarshal(noProxyJSON, &result.NoProxy); err != nil {
+		return platform.ManagedNetworkProxy{}, fmt.Errorf("decode network proxy bypass list: %w", err)
+	}
+	if result.NoProxy == nil {
+		result.NoProxy = []string{}
+	}
+	result.HasPassword = lastFour != ""
+	if result.HasPassword {
+		result.MaskedPassword = "••••" + lastFour
+	}
+	return result, nil
+}
+
+func (s *Store) ListNetworkProxies(ctx context.Context) ([]platform.ManagedNetworkProxy, error) {
+	rows, err := s.pool.Query(ctx, `SELECT `+networkProxyColumns+` FROM network_proxies
+    ORDER BY enabled DESC, updated_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list network proxies: %w", err)
+	}
+	defer rows.Close()
+	proxies := make([]platform.ManagedNetworkProxy, 0)
+	for rows.Next() {
+		proxy, err := scanNetworkProxy(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan network proxy: %w", err)
+		}
+		proxies = append(proxies, proxy)
+	}
+	return proxies, rows.Err()
+}
+
+func (s *Store) CreateNetworkProxy(ctx context.Context, input platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error) {
+	platform.NormalizeNetworkProxy(&input)
+	if err := platform.ValidateNetworkProxy(input); err != nil {
+		return platform.ManagedNetworkProxy{}, err
+	}
+	ciphertext, nonce, err := encryptSecret(s.secretKey, input.Password)
+	if err != nil {
+		return platform.ManagedNetworkProxy{}, err
+	}
+	noProxyJSON, err := json.Marshal(input.NoProxy)
+	if err != nil {
+		return platform.ManagedNetworkProxy{}, fmt.Errorf("encode network proxy bypass list: %w", err)
+	}
+	now := time.Now().UTC()
+	result, err := scanNetworkProxy(s.pool.QueryRow(ctx, `INSERT INTO network_proxies
+    (id, name, scheme, host, port, username, password_ciphertext,
+     password_nonce, password_last_four, no_proxy, enabled, created_at, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
+    RETURNING `+networkProxyColumns,
+		input.ID, input.Name, input.Scheme, input.Host, input.Port, input.Username,
+		ciphertext, nonce, lastFour(input.Password), noProxyJSON, input.Enabled, now,
+	))
+	if err != nil {
+		return platform.ManagedNetworkProxy{}, mapResourceError(err)
+	}
+	return result, nil
+}
+
+func (s *Store) UpdateNetworkProxy(ctx context.Context, id string, input platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error) {
+	platform.NormalizeNetworkProxy(&input)
+	if input.ID != id {
+		return platform.ManagedNetworkProxy{}, &platform.ValidationError{Message: "代理标识不能修改"}
+	}
+	if err := platform.ValidateNetworkProxy(input); err != nil {
+		return platform.ManagedNetworkProxy{}, err
+	}
+	noProxyJSON, err := json.Marshal(input.NoProxy)
+	if err != nil {
+		return platform.ManagedNetworkProxy{}, fmt.Errorf("encode network proxy bypass list: %w", err)
+	}
+	now := time.Now().UTC()
+	if input.Password == "" && input.Username != "" {
+		result, err := scanNetworkProxy(s.pool.QueryRow(ctx, `UPDATE network_proxies SET
+      name = $1, scheme = $2, host = $3, port = $4, username = $5,
+      no_proxy = $6, enabled = $7, updated_at = $8
+      WHERE id = $9 RETURNING `+networkProxyColumns,
+			input.Name, input.Scheme, input.Host, input.Port, input.Username,
+			noProxyJSON, input.Enabled, now, id,
+		))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return platform.ManagedNetworkProxy{}, ErrResourceNotFound
+		}
+		return result, err
+	}
+	ciphertext, nonce, err := encryptSecret(s.secretKey, input.Password)
+	if err != nil {
+		return platform.ManagedNetworkProxy{}, err
+	}
+	result, err := scanNetworkProxy(s.pool.QueryRow(ctx, `UPDATE network_proxies SET
+    name = $1, scheme = $2, host = $3, port = $4, username = $5,
+    password_ciphertext = $6, password_nonce = $7, password_last_four = $8,
+    no_proxy = $9, enabled = $10, updated_at = $11
+    WHERE id = $12 RETURNING `+networkProxyColumns,
+		input.Name, input.Scheme, input.Host, input.Port, input.Username,
+		ciphertext, nonce, lastFour(input.Password), noProxyJSON, input.Enabled, now, id,
+	))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.ManagedNetworkProxy{}, ErrResourceNotFound
+	}
+	return result, err
+}
+
+func (s *Store) DeleteNetworkProxy(ctx context.Context, id string) error {
+	var referenced bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+    SELECT 1 FROM control_resources
+    WHERE kind IN ('runtime', 'sandbox') AND spec->>'proxyId' = $1
+  )`, id).Scan(&referenced); err != nil {
+		return fmt.Errorf("check network proxy bindings: %w", err)
+	}
+	if referenced {
+		return fmt.Errorf("%w: network proxy is still referenced", ErrConflict)
+	}
+	result, err := s.pool.Exec(ctx, "DELETE FROM network_proxies WHERE id = $1", id)
+	if err != nil {
+		return fmt.Errorf("delete network proxy: %w", err)
 	}
 	if result.RowsAffected() != 1 {
 		return ErrResourceNotFound
@@ -1174,6 +1313,9 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 		if err := s.attachWorkerCredentials(ctx, tx, job.ResourceID, job.Payload); err != nil {
 			return platform.WorkerJob{}, err
 		}
+		if err := s.attachWorkerNetworkProxy(ctx, tx, job.Payload); err != nil {
+			return platform.WorkerJob{}, err
+		}
 	}
 	now := time.Now().UTC()
 	leaseDuration := workerJobLeaseDuration
@@ -1242,6 +1384,46 @@ func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, sandboxI
 		})
 	}
 	payload["credentials"] = credentials
+	return nil
+}
+
+func (s *Store) attachWorkerNetworkProxy(ctx context.Context, tx pgx.Tx, payload map[string]any) error {
+	proxyID, _ := payload["proxyId"].(string)
+	proxyID = strings.TrimSpace(proxyID)
+	if proxyID == "" {
+		return nil
+	}
+	var scheme, host, username string
+	var port int
+	var ciphertext, nonce, noProxyJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT scheme, host, port, username,
+      password_ciphertext, password_nonce, no_proxy
+    FROM network_proxies WHERE id = $1 AND enabled = TRUE`, proxyID).Scan(
+		&scheme, &host, &port, &username, &ciphertext, &nonce, &noProxyJSON,
+	); errors.Is(err, pgx.ErrNoRows) {
+		return &platform.ValidationError{Message: "环境引用了不存在或已停用的网络代理"}
+	} else if err != nil {
+		return fmt.Errorf("load worker network proxy: %w", err)
+	}
+	password, err := decryptSecret(s.secretKey, ciphertext, nonce)
+	if err != nil {
+		return err
+	}
+	var noProxy []string
+	if err := json.Unmarshal(noProxyJSON, &noProxy); err != nil {
+		return fmt.Errorf("decode worker network proxy bypass list: %w", err)
+	}
+	proxyURL := &url.URL{Scheme: scheme, Host: net.JoinHostPort(host, strconv.Itoa(port))}
+	if username != "" {
+		if password == "" {
+			proxyURL.User = url.User(username)
+		} else {
+			proxyURL.User = url.UserPassword(username, password)
+		}
+	}
+	payload["proxy"] = map[string]any{
+		"id": proxyID, "url": proxyURL.String(), "host": host, "noProxy": noProxy,
+	}
 	return nil
 }
 
@@ -1616,6 +1798,7 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		"cpu":                  effectiveSpec["cpu"],
 		"memory":               effectiveSpec["memory"],
 		"network":              effectiveSpec["network"],
+		"proxyId":              effectiveSpec["proxyId"],
 		"agentTools":           effectiveSpec["agentTools"],
 		"skillIds":             effectiveSpec["skillIds"],
 		"mcpServerIds":         effectiveSpec["mcpServerIds"],
@@ -1658,6 +1841,7 @@ func effectiveSandboxSpec(runtimeSpec, sandboxSpec map[string]any) map[string]an
 		"cpu",
 		"memory",
 		"network",
+		"proxyId",
 		"agentTools",
 		"skillIds",
 		"mcpServerIds",
@@ -1979,6 +2163,9 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 				return &platform.ValidationError{Message: "环境模板包含不存在或已停用的 API Key"}
 			}
 		}
+		if err := s.validateNetworkProxyBinding(ctx, input.Spec, "环境模板"); err != nil {
+			return err
+		}
 		return nil
 	}
 	if input.Kind != platform.KindSandbox {
@@ -1997,6 +2184,14 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 		return fmt.Errorf("decode sandbox environment: %w", err)
 	}
 	effectiveSpec := effectiveSandboxSpec(runtimeSpec, input.Spec)
+	if proxyID, _ := effectiveSpec["proxyId"].(string); strings.TrimSpace(proxyID) != "" {
+		if network, _ := effectiveSpec["network"].(string); network == "none" {
+			return &platform.ValidationError{Message: "完全隔离的环境不能同时使用网络代理"}
+		}
+	}
+	if err := s.validateNetworkProxyBinding(ctx, effectiveSpec, "沙箱"); err != nil {
+		return err
+	}
 	serverID, _ := effectiveSpec["serverId"].(string)
 	driver, _ := effectiveSpec["driver"].(string)
 	requiredCapability := driver
@@ -2082,6 +2277,24 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 		return &platform.ValidationError{Message: strings.Join(incompatible, "、") + " 与当前所选模型服务的接口协议不兼容"}
 	}
 	input.Spec["credentialIds"] = allowedCredentialIDs
+	return nil
+}
+
+func (s *Store) validateNetworkProxyBinding(ctx context.Context, spec map[string]any, subject string) error {
+	proxyID, _ := spec["proxyId"].(string)
+	proxyID = strings.TrimSpace(proxyID)
+	if proxyID == "" {
+		return nil
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+    SELECT 1 FROM network_proxies WHERE id = $1 AND enabled = TRUE
+  )`, proxyID).Scan(&exists); err != nil {
+		return fmt.Errorf("check network proxy binding: %w", err)
+	}
+	if !exists {
+		return &platform.ValidationError{Message: subject + "包含不存在或已停用的网络代理"}
+	}
 	return nil
 }
 
