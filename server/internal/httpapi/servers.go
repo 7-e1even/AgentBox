@@ -1840,6 +1840,17 @@ configure_credentials() {
       replace_env "$ENV_FILE" ANTHROPIC_AUTH_TOKEN "$CLAUDE_SECRET"
       replace_env "$ENV_FILE" ANTHROPIC_BASE_URL "$CLAUDE_ENDPOINT"
       replace_env "$ENV_FILE" ANTHROPIC_MODEL "$CLAUDE_MODEL"
+      if [ "$CLAUDE_MODEL" = k3-256k ]; then
+        # Claude Code caps unknown model IDs at 200K unless K3's real window is explicit.
+        for KEY in ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL \
+          ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL \
+          CLAUDE_CODE_SUBAGENT_MODEL; do
+          replace_env "$ENV_FILE" "$KEY" "$CLAUDE_MODEL"
+        done
+        for KEY in CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_AUTO_COMPACT_WINDOW; do
+          grep -q "^$KEY=" "$ENV_FILE" || append_env "$ENV_FILE" "$KEY" 262144
+        done
+      fi
     fi
   fi
 

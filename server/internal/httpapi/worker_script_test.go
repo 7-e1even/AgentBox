@@ -75,6 +75,34 @@ func TestWorkerUsesOnlyBearerTokenForClaudeCodeGateway(t *testing.T) {
 	}
 }
 
+func TestWorkerConfiguresClaudeCodeForK3_256K(t *testing.T) {
+	start := strings.Index(workerDaemon, `if jq -e '.job.payload.agentTools | index("claude-code")'`)
+	if start < 0 {
+		t.Fatal("Claude Code credential block was not found")
+	}
+	end := strings.Index(workerDaemon[start:], `docker exec "$CONTAINER" mkdir -p /opt/agentbox/secrets`)
+	if end < 0 {
+		t.Fatal("Claude Code credential block end was not found")
+	}
+	body := workerDaemon[start : start+end]
+	for _, expected := range []string{
+		`if [ "$CLAUDE_MODEL" = k3-256k ]`,
+		`ANTHROPIC_DEFAULT_FABLE_MODEL ANTHROPIC_DEFAULT_OPUS_MODEL`,
+		`ANTHROPIC_DEFAULT_SONNET_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL`,
+		`CLAUDE_CODE_SUBAGENT_MODEL`,
+		`replace_env "$ENV_FILE" "$KEY" "$CLAUDE_MODEL"`,
+		`CLAUDE_CODE_MAX_CONTEXT_TOKENS CLAUDE_CODE_AUTO_COMPACT_WINDOW`,
+		`grep -q "^$KEY=" "$ENV_FILE" || append_env "$ENV_FILE" "$KEY" 262144`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("Claude Code K3-256K configuration is missing %q", expected)
+		}
+	}
+	if strings.Contains(body, `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT`) {
+		t.Fatal("Claude Code K3-256K must keep proactive window enforcement enabled")
+	}
+}
+
 func TestWorkerAgentConfigsMatchSupportedProtocols(t *testing.T) {
 	for _, config := range []string{
 		`CODEX_ENDPOINT=https://api.openai.com/v1`,
