@@ -43,9 +43,21 @@ func (s *Server) setupAdmin(w http.ResponseWriter, request *http.Request) {
 	expiresAt := time.Now().UTC().Add(sessionLifetime)
 	user, err := s.store.SetupAdmin(request.Context(), input, tokenHash, expiresAt)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAuth, Action: "setup-admin",
+			Message: "初始化管理员失败", Status: platform.LogStatusFailed,
+			Detail: map[string]any{"error": err.Error(), "username": input.Username},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "setup-admin",
+		Message:      "初始化管理员账号 " + user.Username,
+		ActorID:      user.ID,
+		ActorName:    user.Name,
+		ResourceKind: "user", ResourceID: user.ID, ResourceName: user.Name,
+	})
 	s.setSessionCookie(w, request, token, expiresAt)
 	s.writeJSON(w, http.StatusCreated, map[string]any{"user": user})
 }
@@ -63,6 +75,11 @@ func (s *Server) login(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if !s.loginLimiter.allow(s.clientIP(request), time.Now().UTC()) {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAuth, Action: "login",
+			Message: "登录尝试过于频繁", Status: platform.LogStatusFailed,
+			Detail: map[string]any{"username": input.Username, "reason": "rate-limited"},
+		})
 		s.writeError(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 		return
 	}
@@ -75,12 +92,23 @@ func (s *Server) login(w http.ResponseWriter, request *http.Request) {
 	user, err := s.store.AuthenticateUser(request.Context(), input.Username, input.Password, tokenHash, expiresAt)
 	if err != nil {
 		if errors.Is(err, store.ErrUnauthorized) {
+			s.recordLog(request, platform.LogEntry{
+				Level: platform.LogLevelWarn, Category: platform.LogCategoryAuth, Action: "login",
+				Message: "登录失败：" + input.Username, Status: platform.LogStatusFailed,
+				Detail: map[string]any{"username": input.Username, "reason": "用户名或密码错误，或账号已停用"},
+			})
 			s.writeError(w, http.StatusUnauthorized, "用户名或密码错误，或账号已停用")
 			return
 		}
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "login",
+		Message:   "用户登录成功：" + user.Username,
+		ActorID:   user.ID,
+		ActorName: user.Name,
+	})
 	s.setSessionCookie(w, request, token, expiresAt)
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
@@ -97,24 +125,40 @@ func (s *Server) updateCurrentUser(w http.ResponseWriter, request *http.Request)
 	current := userFromContext(request.Context())
 	input.Role = current.Role
 	input.Status = current.Status
+	entry := platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "update-profile",
+		Message:      "更新个人资料：" + current.Username,
+		ResourceKind: "user", ResourceID: current.ID, ResourceName: current.Name,
+		Detail: map[string]any{"passwordChanged": input.Password != ""},
+	}
 	// 修改自己的密码时保留当前会话（不踢掉本次登录），其余会话仍失效。
 	if input.Password != "" {
 		if preserver, ok := s.store.(sessionPreservingUserStore); ok {
 			keepHash, _ := sessionHash(request)
 			user, err := preserver.UpdateUserPreservingSession(request.Context(), current.ID, input, keepHash)
 			if err != nil {
+				entry.Level = platform.LogLevelWarn
+				entry.Status = platform.LogStatusFailed
+				entry.Detail["error"] = err.Error()
+				s.recordLog(request, entry)
 				s.handleError(w, err)
 				return
 			}
+			s.recordLog(request, entry)
 			s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 			return
 		}
 	}
 	user, err := s.store.UpdateUser(request.Context(), current.ID, input)
 	if err != nil {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Detail["error"] = err.Error()
+		s.recordLog(request, entry)
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -126,9 +170,20 @@ func (s *Server) updateCurrentUserPreferences(w http.ResponseWriter, request *ht
 	current := userFromContext(request.Context())
 	user, err := s.store.UpdateUserPreferences(request.Context(), current.ID, input)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAuth, Action: "update-preferences",
+			Message: "更新偏好设置失败", Status: platform.LogStatusFailed,
+			ResourceKind: "user", ResourceID: current.ID, ResourceName: current.Name,
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "update-preferences",
+		Message:      "更新偏好设置",
+		ResourceKind: "user", ResourceID: current.ID, ResourceName: current.Name,
+	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -139,6 +194,10 @@ func (s *Server) logout(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "logout",
+		Message: "用户登出：" + userFromContext(request.Context()).Username,
+	})
 	s.clearSessionCookie(w, request)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -159,9 +218,20 @@ func (s *Server) createUser(w http.ResponseWriter, request *http.Request) {
 	}
 	user, err := s.store.CreateUser(request.Context(), input)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryUser, Action: "create",
+			Message: "创建用户 " + input.Username + " 失败", Status: platform.LogStatusFailed,
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryUser, Action: "create",
+		Message:      "创建用户 " + user.Username,
+		ResourceKind: "user", ResourceID: user.ID, ResourceName: user.Name,
+		Detail: map[string]any{"role": string(user.Role)},
+	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{"user": user})
 }
 
@@ -177,9 +247,21 @@ func (s *Server) updateUser(w http.ResponseWriter, request *http.Request) {
 	}
 	user, err := s.store.UpdateUser(request.Context(), request.PathValue("id"), input)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryUser, Action: "update",
+			Message: "更新用户 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "user", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryUser, Action: "update",
+		Message:      "更新用户 " + user.Username,
+		ResourceKind: "user", ResourceID: user.ID, ResourceName: user.Name,
+		Detail: map[string]any{"role": string(user.Role), "status": string(user.Status)},
+	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -190,9 +272,20 @@ func (s *Server) deleteUser(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	if err := s.store.DeleteUser(request.Context(), request.PathValue("id")); err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryUser, Action: "delete",
+			Message: "删除用户 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "user", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryUser, Action: "delete",
+		Message:      "删除用户 " + request.PathValue("id"),
+		ResourceKind: "user", ResourceID: request.PathValue("id"),
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 

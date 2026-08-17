@@ -476,3 +476,27 @@ CREATE INDEX IF NOT EXISTS idx_automation_runs_project_received
 
 CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_received
   ON automation_runs(automation_id, received_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS system_logs (
+  id BIGSERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  level TEXT NOT NULL,
+  category TEXT NOT NULL,
+  action TEXT NOT NULL,
+  message TEXT NOT NULL,
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  resource_kind TEXT NOT NULL DEFAULT '',
+  resource_id TEXT NOT NULL DEFAULT '',
+  resource_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'success',
+  duration_ms BIGINT NOT NULL DEFAULT 0,
+  remote_addr TEXT NOT NULL DEFAULT '',
+  detail JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_system_logs_created
+  ON system_logs(created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_system_logs_category_created
+  ON system_logs(category, created_at DESC);

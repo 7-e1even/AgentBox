@@ -44,9 +44,19 @@ func (s *Server) createAutomation(w http.ResponseWriter, request *http.Request) 
 		request.Context(), input, userFromContext(request.Context()).ID,
 	)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "create",
+			Message: "创建自动化 " + input.Name + " 失败", Status: platform.LogStatusFailed,
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "create",
+		Message:      "创建自动化 " + automation.Name,
+		ResourceKind: "automation", ResourceID: automation.ID, ResourceName: automation.Name,
+	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"automation":  automation,
 		"secret":      secret,
@@ -63,17 +73,40 @@ func (s *Server) updateAutomation(w http.ResponseWriter, request *http.Request) 
 		request.Context(), request.PathValue("id"), input, userFromContext(request.Context()).ID,
 	)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "update",
+			Message: "更新自动化 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "automation", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "update",
+		Message:      "更新自动化 " + automation.Name,
+		ResourceKind: "automation", ResourceID: automation.ID, ResourceName: automation.Name,
+		Detail: map[string]any{"enabled": automation.Enabled},
+	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"automation": automation})
 }
 
 func (s *Server) deleteAutomation(w http.ResponseWriter, request *http.Request) {
 	if err := s.store.DeleteAutomation(request.Context(), request.PathValue("id")); err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "delete",
+			Message: "删除自动化 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "automation", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "delete",
+		Message:      "删除自动化 " + request.PathValue("id"),
+		ResourceKind: "automation", ResourceID: request.PathValue("id"),
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -82,9 +115,20 @@ func (s *Server) rotateAutomationSecret(w http.ResponseWriter, request *http.Req
 		request.Context(), request.PathValue("id"), userFromContext(request.Context()).ID,
 	)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "rotate-secret",
+			Message: "轮换自动化密钥 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "automation", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "rotate-secret",
+		Message:      "轮换自动化密钥 " + automation.Name,
+		ResourceKind: "automation", ResourceID: automation.ID, ResourceName: automation.Name,
+	})
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"automation":  automation,
 		"secret":      secret,
@@ -119,9 +163,21 @@ func (s *Server) testAutomation(w http.ResponseWriter, request *http.Request) {
 	}
 	result, err := s.store.TestAutomation(request.Context(), request.PathValue("id"), body)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "test",
+			Message: "测试自动化 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "automation", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleAutomationTriggerError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "test",
+		Message:      "测试自动化 " + result.Run.AutomationName,
+		ResourceKind: "automation", ResourceID: request.PathValue("id"), ResourceName: result.Run.AutomationName,
+		Detail: map[string]any{"runId": result.Run.ID, "status": string(result.Run.Status)},
+	})
 	s.writeJSON(w, http.StatusAccepted, result)
 }
 
@@ -186,9 +242,32 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 		Query:          query,
 	})
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "webhook",
+			Message: "Webhook 触发失败：" + request.PathValue("endpointId"), Status: platform.LogStatusFailed,
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleAutomationTriggerError(w, err)
 		return
 	}
+	entry := platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "webhook",
+		Message:      "Webhook 触发自动化 " + result.Run.AutomationName,
+		ResourceKind: "automation", ResourceName: result.Run.AutomationName,
+		Detail: map[string]any{
+			"runId": result.Run.ID, "status": string(result.Run.Status),
+			"duplicate": result.Duplicate, "endpointId": request.PathValue("endpointId"),
+		},
+	}
+	if result.Run.AutomationID != nil {
+		entry.ResourceID = *result.Run.AutomationID
+	}
+	if result.Run.ErrorMessage != "" {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Detail["error"] = result.Run.ErrorMessage
+	}
+	s.recordLog(request, entry)
 	status := http.StatusAccepted
 	if result.Duplicate {
 		status = http.StatusOK

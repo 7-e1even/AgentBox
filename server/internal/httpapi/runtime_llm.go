@@ -91,14 +91,38 @@ func (s *Server) runtimeLLMGemini(w http.ResponseWriter, request *http.Request) 
 func (s *Server) forwardNativeRuntimeLLMGemini(
 	w http.ResponseWriter, request *http.Request, target platform.RuntimeLLMTarget,
 ) {
+	started := time.Now()
+	var upstreamStatus int
+	failure := ""
+	defer func() {
+		entry := platform.LogEntry{
+			Category: platform.LogCategoryLLM, Action: "proxy",
+			Message:      "LLM 代理请求 " + target.ModelID,
+			ResourceKind: "credential", ResourceID: target.CredentialID,
+			DurationMS: time.Since(started).Milliseconds(),
+			Detail: map[string]any{
+				"sandboxId": target.SandboxID, "provider": target.ProviderID,
+				"protocol": "gemini", "model": target.ModelID,
+				"upstreamStatus": upstreamStatus,
+			},
+		}
+		if failure != "" {
+			entry.Level = platform.LogLevelWarn
+			entry.Status = platform.LogStatusFailed
+			entry.Detail["error"] = failure
+		}
+		s.recordLog(request, entry)
+	}()
 	upstreamURL, err := runtimeLLMGeminiURL(target, request.PathValue("path"), request.URL.Query())
 	if err != nil {
+		failure = "凭据 API 地址无效"
 		s.writeRuntimeLLMError(w, runtimeLLMProtocolGemini, http.StatusBadGateway, err.Error())
 		return
 	}
 	request.Body = http.MaxBytesReader(w, request.Body, runtimeLLMMaxBodyBytes)
 	upstreamRequest, err := http.NewRequestWithContext(request.Context(), request.Method, upstreamURL, request.Body)
 	if err != nil {
+		failure = "无法创建上游请求"
 		s.writeRuntimeLLMError(w, runtimeLLMProtocolGemini, http.StatusBadGateway, "无法创建上游请求")
 		return
 	}
@@ -106,10 +130,15 @@ func (s *Server) forwardNativeRuntimeLLMGemini(
 	upstreamRequest.Header.Set("x-goog-api-key", target.Secret)
 	response, err := s.runtimeLLMClient.Do(upstreamRequest)
 	if err != nil {
+		failure = "无法连接模型服务"
 		s.writeRuntimeLLMError(w, runtimeLLMProtocolGemini, http.StatusBadGateway, "无法连接模型服务")
 		return
 	}
 	defer response.Body.Close()
+	upstreamStatus = response.StatusCode
+	if response.StatusCode >= http.StatusBadRequest {
+		failure = fmt.Sprintf("模型服务返回 HTTP %d", response.StatusCode)
+	}
 	copyRuntimeLLMHeaders(response.Header, w.Header())
 	w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
@@ -391,6 +420,33 @@ func (s *Server) forwardRuntimeLLM(
 ) {
 	translatedRequest := body
 	ctx := request.Context()
+	started := time.Now()
+	var upstreamStatus int
+	failure := ""
+	// 记录 LLM 代理调用：只写元信息（凭据/协议/模型/状态码/耗时），
+	// 绝不记录请求与响应 body；上游错误可能携带含密钥的 URL，只写通用原因。
+	defer func() {
+		entry := platform.LogEntry{
+			Category: platform.LogCategoryLLM, Action: "proxy",
+			Message:      "LLM 代理请求 " + target.ModelID,
+			ResourceKind: "credential", ResourceID: target.CredentialID,
+			DurationMS: time.Since(started).Milliseconds(),
+			Detail: map[string]any{
+				"sandboxId":      target.SandboxID,
+				"provider":       target.ProviderID,
+				"protocol":       string(clientProtocol) + "->" + string(upstreamProtocol),
+				"model":          target.ModelID,
+				"streaming":      streaming,
+				"upstreamStatus": upstreamStatus,
+			},
+		}
+		if failure != "" {
+			entry.Level = platform.LogLevelWarn
+			entry.Status = platform.LogStatusFailed
+			entry.Detail["error"] = failure
+		}
+		s.recordLog(request, entry)
+	}()
 	if !streaming {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, runtimeLLMNonStreamingTimeout)
@@ -400,6 +456,7 @@ func (s *Server) forwardRuntimeLLM(
 		ctx, http.MethodPost, upstreamURL, bytes.NewReader(body),
 	)
 	if err != nil {
+		failure = "无法创建上游请求"
 		s.writeRuntimeLLMError(w, clientProtocol, http.StatusBadGateway, "无法创建上游请求")
 		return
 	}
@@ -429,12 +486,15 @@ func (s *Server) forwardRuntimeLLM(
 		s.logger.Warn("runtime LLM upstream request failed",
 			"sandbox", target.SandboxID, "credential", target.CredentialID,
 			"protocol", target.Protocol, "error", err)
+		failure = "无法连接模型服务"
 		s.writeRuntimeLLMError(w, clientProtocol, http.StatusBadGateway, "无法连接模型服务")
 		return
 	}
 	defer response.Body.Close()
 	copyRuntimeLLMHeaders(response.Header, w.Header())
+	upstreamStatus = response.StatusCode
 	if response.StatusCode >= http.StatusBadRequest {
+		failure = fmt.Sprintf("模型服务返回 HTTP %d", response.StatusCode)
 		s.forwardRuntimeLLMError(w, clientProtocol, upstreamProtocol, response)
 		return
 	}
@@ -456,6 +516,7 @@ func (s *Server) forwardRuntimeLLM(
 	}
 	responseBody, err := io.ReadAll(io.LimitReader(response.Body, runtimeLLMMaxBodyBytes+1))
 	if err != nil || len(responseBody) > runtimeLLMMaxBodyBytes {
+		failure = "模型服务响应无效"
 		s.writeRuntimeLLMError(w, clientProtocol, http.StatusBadGateway, "模型服务响应无效")
 		return
 	}
@@ -465,6 +526,7 @@ func (s *Server) forwardRuntimeLLM(
 			originalBody, translatedRequest, responseBody,
 		)
 		if err != nil {
+			failure = "模型响应无法转换为 Agent 所需协议"
 			s.writeRuntimeLLMError(w, clientProtocol, http.StatusBadGateway, "模型响应无法转换为 Agent 所需协议")
 			return
 		}

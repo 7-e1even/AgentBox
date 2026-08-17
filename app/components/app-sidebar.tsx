@@ -9,6 +9,7 @@ import {
   LayoutTemplateIcon,
   NetworkIcon,
   PlugZapIcon,
+  ScrollTextIcon,
   ServerIcon,
   SparklesIcon,
   UsersIcon,
@@ -77,7 +78,10 @@ export function AppSidebar({
       ? [
           {
             title: "管理",
-            items: [{ title: "用户管理", section: "users", icon: UsersIcon }],
+            items: [
+              { title: "用户管理", section: "users", icon: UsersIcon },
+              { title: "日志", section: "logs", icon: ScrollTextIcon },
+            ],
           } satisfies NavigationGroup,
         ]
       : []),

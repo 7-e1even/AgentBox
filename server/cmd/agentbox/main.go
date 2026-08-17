@@ -81,15 +81,16 @@ func main() {
 	}
 	defer repository.Close()
 
+	handler := httpapi.New(repository, catalog.BuiltinCatalog, logger, origins, httpapi.Config{
+		DisableAuth:      disableAuth,
+		WorkerBinaryDir:  workerBinaryDir,
+		WorkerVersion:    workerVersion,
+		WorkerReleaseURL: workerReleaseURL,
+		WorkerCacheDir:   workerCacheDir,
+	})
 	server := &http.Server{
-		Addr: net.JoinHostPort(bindHost, port),
-		Handler: httpapi.New(repository, catalog.BuiltinCatalog, logger, origins, httpapi.Config{
-			DisableAuth:      disableAuth,
-			WorkerBinaryDir:  workerBinaryDir,
-			WorkerVersion:    workerVersion,
-			WorkerReleaseURL: workerReleaseURL,
-			WorkerCacheDir:   workerCacheDir,
-		}),
+		Addr:              net.JoinHostPort(bindHost, port),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      3 * time.Minute,
@@ -106,11 +107,19 @@ func main() {
 			cancel()
 		}
 	}()
+	handler.RecordSystem("info", "startup", "AgentBox API 已启动", map[string]any{
+		"address": server.Addr, "version": version,
+	})
 
 	<-ctx.Done()
+	handler.RecordSystem("info", "shutdown", "AgentBox API 正在关闭", nil)
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("shutdown api", "error", err)
+	}
+	// 停 HTTP 后再 flush 剩余系统日志，避免 Close 时仍有新日志写入。
+	if err := handler.Close(shutdownCtx); err != nil {
+		logger.Warn("flush system logs", "error", err)
 	}
 }

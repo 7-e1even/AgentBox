@@ -26,6 +26,12 @@ func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
 	baseURL := workerRequestBaseURL(request, s.trustedProxy)
 	attachWorkerRuntimeEndpoints(job.Payload, baseURL)
 	attachWorkerProxyEndpoint(job.Payload, baseURL)
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryJob, Action: "claim",
+		Message:      "Worker 认领任务：" + job.Action,
+		ResourceKind: "server", ResourceID: request.PathValue("id"),
+		Detail: map[string]any{"jobId": job.ID, "jobAction": job.Action, "resourceId": job.ResourceID},
+	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
@@ -161,5 +167,24 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 		s.handleError(w, err)
 		return
 	}
+	message := result.Message
+	if len(message) > 500 {
+		message = message[:500]
+	}
+	entry := platform.LogEntry{
+		Category: platform.LogCategoryJob, Action: "complete",
+		Message:      "Worker 任务完成",
+		ResourceKind: "server", ResourceID: request.PathValue("id"),
+		Detail: map[string]any{"jobId": request.PathValue("jobId"), "externalId": result.ExternalID},
+	}
+	if message != "" {
+		entry.Detail["message"] = message
+	}
+	if !result.Success {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Message = "Worker 任务失败"
+	}
+	s.recordLog(request, entry)
 	w.WriteHeader(http.StatusNoContent)
 }

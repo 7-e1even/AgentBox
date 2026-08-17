@@ -268,6 +268,12 @@ func (s *Server) createSandboxSessionTicket(w http.ResponseWriter, request *http
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategorySandbox, Action: "session-ticket",
+		Message:      "签发沙箱会话票据",
+		ResourceKind: string(platform.KindSandbox), ResourceID: target.SandboxID,
+		Detail: map[string]any{"serverId": target.ServerID, "driver": target.Driver},
+	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"ticket": token, "expiresAt": expiresAt,
 	})
@@ -338,6 +344,12 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 		_ = previous.socket.conn.Close(websocket.StatusServiceRestart, "worker session replaced")
 	}
 	s.logger.Info("worker session connected", "server_id", serverID)
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategorySession, Action: "worker-connect",
+		Message:      "Worker 会话已建立",
+		ResourceKind: "server", ResourceID: serverID,
+	})
+	connectedAt := time.Now()
 	defer func() {
 		for _, session := range s.sessions.unregisterWorker(worker) {
 			_ = session.socket.writeJSON(sessionMessage{Type: "error", Error: "Worker 会话已断开，正在等待重连"})
@@ -345,6 +357,12 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 		}
 		worker.socket.conn.CloseNow()
 		s.logger.Info("worker session disconnected", "server_id", serverID)
+		s.recordLog(request, platform.LogEntry{
+			Category: platform.LogCategorySession, Action: "worker-close",
+			Message:      "Worker 会话已断开",
+			ResourceKind: "server", ResourceID: serverID,
+			DurationMS: time.Since(connectedAt).Milliseconds(),
+		})
 	}()
 
 	for {
@@ -389,11 +407,25 @@ func (s *Server) connectSandboxSession(w http.ResponseWriter, request *http.Requ
 		_ = conn.Close(websocket.StatusTryAgainLater, "worker session unavailable")
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategorySession, Action: "connect",
+		Message:      "沙箱会话已建立",
+		ResourceKind: string(platform.KindSandbox), ResourceID: ticket.Target.SandboxID,
+		Detail: map[string]any{"serverId": ticket.Target.ServerID, "driver": ticket.Target.Driver},
+	})
+	connectedAt := time.Now()
 	defer func() {
 		if currentWorker := s.sessions.unregisterBrowser(browser); currentWorker != nil {
 			_ = currentWorker.socket.writeJSON(sessionMessage{Type: "close", SessionID: browser.id})
 		}
 		conn.CloseNow()
+		s.recordLog(request, platform.LogEntry{
+			Category: platform.LogCategorySession, Action: "close",
+			Message:      "沙箱会话已关闭",
+			ResourceKind: string(platform.KindSandbox), ResourceID: ticket.Target.SandboxID,
+			DurationMS: time.Since(connectedAt).Milliseconds(),
+			Detail:     map[string]any{"serverId": ticket.Target.ServerID, "driver": ticket.Target.Driver},
+		})
 	}()
 	if err := worker.socket.writeJSON(sessionMessage{
 		Type: "open", SessionID: browser.id, SandboxID: ticket.Target.SandboxID,

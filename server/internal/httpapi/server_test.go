@@ -170,8 +170,12 @@ func (fakeStore) UpdateUserPreferences(_ context.Context, id string, input platf
 	user.Preferences = input
 	return user, nil
 }
-func (fakeStore) DeleteUser(context.Context, string) error { return nil }
-func (fakeStore) Ping(context.Context) error               { return nil }
+func (fakeStore) DeleteUser(context.Context, string) error              { return nil }
+func (fakeStore) InsertLogs(context.Context, []platform.LogEntry) error { return nil }
+func (fakeStore) ListLogs(context.Context, platform.LogFilter) ([]platform.LogEntry, int, error) {
+	return []platform.LogEntry{}, 0, nil
+}
+func (fakeStore) Ping(context.Context) error { return nil }
 
 func rawTestHandler() http.Handler {
 	return New(fakeStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{})

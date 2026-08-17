@@ -22,9 +22,20 @@ func (s *Server) createNetworkProxy(w http.ResponseWriter, request *http.Request
 	}
 	proxy, err := s.store.CreateNetworkProxy(request.Context(), input)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryProxy, Action: "create",
+			Message: "创建网络代理 " + input.Name + " 失败", Status: platform.LogStatusFailed,
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "create",
+		Message:      "创建网络代理 " + proxy.Name,
+		ResourceKind: "proxy", ResourceID: proxy.ID, ResourceName: proxy.Name,
+		Detail: map[string]any{"scheme": proxy.Scheme, "host": proxy.Host},
+	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{"proxy": proxy})
 }
 
@@ -35,16 +46,39 @@ func (s *Server) updateNetworkProxy(w http.ResponseWriter, request *http.Request
 	}
 	proxy, err := s.store.UpdateNetworkProxy(request.Context(), request.PathValue("id"), input)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryProxy, Action: "update",
+			Message: "更新网络代理 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "proxy", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "update",
+		Message:      "更新网络代理 " + proxy.Name,
+		ResourceKind: "proxy", ResourceID: proxy.ID, ResourceName: proxy.Name,
+		Detail: map[string]any{"scheme": proxy.Scheme, "host": proxy.Host, "enabled": proxy.Enabled},
+	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"proxy": proxy})
 }
 
 func (s *Server) deleteNetworkProxy(w http.ResponseWriter, request *http.Request) {
 	if err := s.store.DeleteNetworkProxy(request.Context(), request.PathValue("id")); err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryProxy, Action: "delete",
+			Message: "删除网络代理 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "proxy", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "delete",
+		Message:      "删除网络代理 " + request.PathValue("id"),
+		ResourceKind: "proxy", ResourceID: request.PathValue("id"),
+	})
 	w.WriteHeader(http.StatusNoContent)
 }

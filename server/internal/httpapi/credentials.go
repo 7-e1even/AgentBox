@@ -23,9 +23,20 @@ func (s *Server) createCredential(w http.ResponseWriter, request *http.Request) 
 	}
 	credential, err := s.store.CreateCredential(request.Context(), input)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryCredential, Action: "create",
+			Message: "创建模型凭据 " + input.Name + " 失败", Status: platform.LogStatusFailed,
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "create",
+		Message:      "创建模型凭据 " + credential.Name,
+		ResourceKind: "credential", ResourceID: credential.ID, ResourceName: credential.Name,
+		Detail: map[string]any{"provider": credential.ProviderID},
+	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{"credential": credential})
 }
 
@@ -38,26 +49,68 @@ func (s *Server) updateCredential(w http.ResponseWriter, request *http.Request) 
 		request.Context(), request.PathValue("id"), input,
 	)
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryCredential, Action: "update",
+			Message: "更新模型凭据 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "credential", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "update",
+		Message:      "更新模型凭据 " + credential.Name,
+		ResourceKind: "credential", ResourceID: credential.ID, ResourceName: credential.Name,
+		Detail: map[string]any{"provider": credential.ProviderID, "enabled": credential.Enabled},
+	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"credential": credential})
 }
 
 func (s *Server) deleteCredential(w http.ResponseWriter, request *http.Request) {
 	if err := s.store.DeleteCredential(request.Context(), request.PathValue("id")); err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryCredential, Action: "delete",
+			Message: "删除模型凭据 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "credential", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "delete",
+		Message:      "删除模型凭据 " + request.PathValue("id"),
+		ResourceKind: "credential", ResourceID: request.PathValue("id"),
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) checkCredential(w http.ResponseWriter, request *http.Request) {
 	credential, err := s.store.CheckCredential(request.Context(), request.PathValue("id"))
 	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryCredential, Action: "check",
+			Message: "检查模型凭据 " + request.PathValue("id") + " 失败", Status: platform.LogStatusFailed,
+			ResourceKind: "credential", ResourceID: request.PathValue("id"),
+			Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	entry := platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "check",
+		Message:      "检查模型凭据 " + credential.Name,
+		ResourceKind: "credential", ResourceID: credential.ID, ResourceName: credential.Name,
+		Detail: map[string]any{"provider": credential.ProviderID},
+	}
+	if credential.LastCheckOK != nil && !*credential.LastCheckOK {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Message = "检查模型凭据未通过：" + credential.Name
+		entry.Detail["error"] = credential.LastCheckError
+	}
+	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusOK, map[string]any{"credential": credential})
 }
 

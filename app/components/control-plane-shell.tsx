@@ -79,6 +79,9 @@ const AutomationManagement = dynamic(() =>
 const ImageManagement = dynamic(() =>
   import("@/components/image-management").then((mod) => mod.ImageManagement)
 )
+const LogsView = dynamic(() =>
+  import("@/components/logs-view").then((mod) => mod.LogsView)
+)
 const NetworkProxyManagement = dynamic(() =>
   import("@/components/network-proxy-management").then(
     (mod) => mod.NetworkProxyManagement
@@ -702,6 +705,26 @@ export function ControlPlaneShell({
         }
         onDelete={setDeletingResource}
       />
+    ) : section === "logs" ? (
+      isAdmin ? (
+        <LogsView />
+      ) : (
+        <section className="flex min-h-0 flex-1 flex-col">
+          <Empty className="min-h-0 flex-1 rounded-none border-0">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <ShieldXIcon />
+              </EmptyMedia>
+              <EmptyTitle>没有权限访问日志</EmptyTitle>
+              <EmptyDescription>
+                当前角色为
+                {sessionUser.role === "operator" ? "运维人员" : "只读成员"}
+                ，日志仅对管理员开放。
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </section>
+      )
     ) : section === "users" ? (
       isAdmin ? (
         <UserManagement

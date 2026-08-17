@@ -13,6 +13,7 @@ export const APP_SECTION_PATHS = {
   settings: "/settings",
   variables: "/variables",
   users: "/users",
+  logs: "/logs",
 } as const
 
 export type AppSection = keyof typeof APP_SECTION_PATHS

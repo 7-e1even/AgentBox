@@ -68,6 +68,8 @@ type PlatformStore interface {
 	UpdateUser(context.Context, string, platform.UserInput) (platform.User, error)
 	UpdateUserPreferences(context.Context, string, platform.UserPreferences) (platform.User, error)
 	DeleteUser(context.Context, string) error
+	InsertLogs(context.Context, []platform.LogEntry) error
+	ListLogs(context.Context, platform.LogFilter) ([]platform.LogEntry, int, error)
 	Ping(context.Context) error
 }
 
@@ -75,11 +77,15 @@ type Server struct {
 	store            PlatformStore
 	catalog          catalog.Catalog
 	logger           *slog.Logger
+	handler          http.Handler
 	allowedOrigins   map[string]struct{}
 	disableAuth      bool
 	trustedProxy     bool
 	loginLimiter     *loginRateLimiter
 	sessions         *sessionHub
+	logRecorder      *logRecorder
+	serverStatesMu   sync.Mutex
+	serverStates     map[string]string
 	runtimeLLMClient *http.Client
 	workerBinaryDir  string
 	workerVersion    string
@@ -97,7 +103,7 @@ type Config struct {
 	WorkerCacheDir   string
 }
 
-func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger, origins []string, config Config) http.Handler {
+func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger, origins []string, config Config) *Server {
 	trustedProxy := trustedProxyFromEnv()
 	server := &Server{
 		store:            repository,
@@ -108,6 +114,8 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 		trustedProxy:     trustedProxy,
 		loginLimiter:     newLoginRateLimiter(),
 		sessions:         newSessionHub(origins, trustedProxy),
+		logRecorder:      newLogRecorder(repository, logger),
+		serverStates:     make(map[string]string),
 		runtimeLLMClient: newRuntimeLLMHTTPClient(),
 		workerBinaryDir:  config.WorkerBinaryDir,
 		workerVersion:    config.WorkerVersion,
@@ -145,6 +153,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	admin("POST /api/users", server.createUser)
 	admin("PATCH /api/users/{id}", server.updateUser)
 	admin("DELETE /api/users/{id}", server.deleteUser)
+	admin("GET /api/logs", server.listLogs)
 	authenticated("GET /api/catalog", server.getCatalog)
 	authenticated("GET /api/resources", server.listResources)
 	operator("POST /api/resources", server.createResource)
@@ -197,7 +206,14 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	mux.HandleFunc("GET /api/runtime/sandboxes/{id}/llm/{credentialId}/gemini/{path...}", server.runtimeLLMGemini)
 	mux.HandleFunc("POST /api/runtime/sandboxes/{id}/llm/{credentialId}/gemini/{path...}", server.runtimeLLMGemini)
 
-	return server.recoverPanic(server.cors(server.logRequests(mux)))
+	server.handler = server.recoverPanic(server.cors(server.logRequests(mux)))
+	return server
+}
+
+// ServeHTTP 使 *Server 直接作为 http.Handler 使用，
+// 同时保留 Close/RecordSystem 供优雅关停与系统事件打点。
+func (s *Server) ServeHTTP(w http.ResponseWriter, request *http.Request) {
+	s.handler.ServeHTTP(w, request)
 }
 
 func (s *Server) health(w http.ResponseWriter, request *http.Request) {
@@ -228,11 +244,24 @@ func (s *Server) createResource(w http.ResponseWriter, request *http.Request) {
 	if !s.decodeJSON(w, request, &input) {
 		return
 	}
+	started := time.Now()
 	resource, err := s.store.CreateResource(request.Context(), input)
+	entry := platform.LogEntry{
+		Category: platform.LogCategoryResource, Action: "create",
+		ResourceKind: string(input.Kind), ResourceID: input.ID, ResourceName: input.Name,
+		DurationMS: time.Since(started).Milliseconds(),
+	}
 	if err != nil {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Message = fmt.Sprintf("创建资源 %s 失败", input.Name)
+		entry.Detail = map[string]any{"error": err.Error()}
+		s.recordLog(request, entry)
 		s.handleError(w, err)
 		return
 	}
+	entry.Message = fmt.Sprintf("创建资源 %s（%s）", resource.Name, resource.Kind)
+	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusCreated, map[string]any{"resource": resource})
 }
 
@@ -241,19 +270,44 @@ func (s *Server) updateResource(w http.ResponseWriter, request *http.Request) {
 	if !s.decodeJSON(w, request, &input) {
 		return
 	}
-	resource, err := s.store.UpdateResource(request.Context(), request.PathValue("id"), input)
+	id := request.PathValue("id")
+	started := time.Now()
+	resource, err := s.store.UpdateResource(request.Context(), id, input)
+	entry := platform.LogEntry{
+		Category: platform.LogCategoryResource, Action: "update",
+		ResourceKind: string(input.Kind), ResourceID: id, ResourceName: input.Name,
+		DurationMS: time.Since(started).Milliseconds(),
+	}
 	if err != nil {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Message = fmt.Sprintf("更新资源 %s 失败", id)
+		entry.Detail = map[string]any{"error": err.Error()}
+		s.recordLog(request, entry)
 		s.handleError(w, err)
 		return
 	}
+	entry.ResourceName = resource.Name
+	entry.Message = fmt.Sprintf("更新资源 %s（%s）", resource.Name, resource.Kind)
+	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusOK, map[string]any{"resource": resource})
 }
 
 func (s *Server) deleteResource(w http.ResponseWriter, request *http.Request) {
-	if err := s.store.DeleteResource(request.Context(), request.PathValue("id")); err != nil {
+	id := request.PathValue("id")
+	if err := s.store.DeleteResource(request.Context(), id); err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryResource, Action: "delete",
+			Message: fmt.Sprintf("删除资源 %s 失败", id), Status: platform.LogStatusFailed,
+			ResourceID: id, Detail: map[string]any{"error": err.Error()},
+		})
 		s.handleError(w, err)
 		return
 	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryResource, Action: "delete",
+		Message: fmt.Sprintf("删除资源 %s", id), ResourceID: id,
+	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -339,10 +393,40 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 		started := time.Now()
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(recorder, request)
+		duration := time.Since(started)
 		s.logger.Info("request",
 			"method", request.Method, "path", request.URL.Path,
 			"status", recorder.status, "remote", request.RemoteAddr,
-			"duration", time.Since(started).String())
+			"duration", duration.String())
+		s.recordAPIRequest(request, recorder.status, duration)
+	})
+}
+
+// recordAPIRequest 把 HTTP 请求写入系统日志（api 分类）。
+// 跳过高频轮询路径，以及已由 sessions.go 打点覆盖的 WebSocket 连接路径。
+func (s *Server) recordAPIRequest(request *http.Request, status int, duration time.Duration) {
+	path := request.URL.Path
+	if path == "/api/logs" || strings.HasSuffix(path, "/heartbeat") ||
+		(strings.HasPrefix(path, "/api/servers/") && strings.HasSuffix(path, "/sessions/connect")) ||
+		(strings.HasPrefix(path, "/api/sandboxes/") && strings.HasSuffix(path, "/session")) {
+		return
+	}
+	level := platform.LogLevelInfo
+	entryStatus := platform.LogStatusSuccess
+	switch {
+	case status >= http.StatusInternalServerError:
+		level = platform.LogLevelError
+		entryStatus = platform.LogStatusFailed
+	case status >= http.StatusBadRequest:
+		level = platform.LogLevelWarn
+		entryStatus = platform.LogStatusFailed
+	}
+	s.recordLog(request, platform.LogEntry{
+		Level: level, Category: platform.LogCategoryAPI,
+		Action:  request.Method + " " + path,
+		Message: fmt.Sprintf("%s %s → %d", request.Method, path, status),
+		Status:  entryStatus, DurationMS: duration.Milliseconds(),
+		Detail: map[string]any{"method": request.Method, "path": path, "status": status},
 	})
 }
 
