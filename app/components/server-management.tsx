@@ -668,6 +668,7 @@ function ServerDetail({
       <div className="min-h-0 flex-1 overflow-auto p-4 sm:p-6">
         <div className="mx-auto grid max-w-5xl gap-6">
           <WorkerUpdateAlert server={server} />
+          <WorkerOfflineAlert server={server} />
           {!supportsWorkerUpdate ? (
             <Alert>
               <TriangleAlertIcon />
@@ -882,6 +883,39 @@ function WorkerUpdateAlert({ server }: { server: ManagedServer }) {
       </AlertTitle>
       <AlertDescription>
         目标版本 {server.workerUpdateTarget}，期间终端会话可能短暂断开。
+      </AlertDescription>
+    </Alert>
+  )
+}
+
+function WorkerOfflineAlert({ server }: { server: ManagedServer }) {
+  const workerIsRestarting =
+    server.workerUpdateStatus === "pending" ||
+    server.workerUpdateStatus === "updating"
+  if (server.status !== "offline" || workerIsRestarting) return null
+
+  return (
+    <Alert>
+      <TriangleAlertIcon />
+      <AlertTitle>Worker 已离线</AlertTitle>
+      <AlertDescription className="grid gap-3 text-pretty">
+        <p>
+          平台最近 45 秒没有收到心跳。请 SSH 登录 {server.hostname}
+          ，启用并重启 Worker：
+        </p>
+        <CommandStep
+          number={1}
+          title="启用并重启 Worker"
+          command="sudo systemctl enable agentbox-worker.service && sudo systemctl restart agentbox-worker.service"
+        />
+        <p>
+          等待 15–60 秒后页面会自动刷新。若仍未上线，请执行
+          <code className="mx-1 break-all font-mono text-xs">
+            sudo systemctl status agentbox-worker.service --no-pager
+          </code>
+          查看错误；若提示找不到服务，请重新运行“添加服务器”中的 Worker
+          安装命令。
+        </p>
       </AlertDescription>
     </Alert>
   )
