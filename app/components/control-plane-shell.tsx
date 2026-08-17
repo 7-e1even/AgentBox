@@ -13,6 +13,7 @@ import { ShieldXIcon, Trash2Icon } from "lucide-react"
 import { useRouter } from "next/navigation"
 
 import { AppSidebar } from "@/components/app-sidebar"
+import { ResourceEditorDialog } from "@/components/resource-editor-dialog"
 import { SettingsView } from "@/components/settings-view"
 import { SiteHeaderProvider } from "@/components/site-header"
 import type { Provider } from "@/lib/catalog"
@@ -102,11 +103,6 @@ const EnvironmentTemplatesView = dynamic(() =>
 )
 const SandboxesView = dynamic(() =>
   import("@/components/environment-views").then((mod) => mod.SandboxesView)
-)
-const ResourceEditorDialog = dynamic(() =>
-  import("@/components/resource-editor-dialog").then(
-    (mod) => mod.ResourceEditorDialog
-  )
 )
 const SandboxEditorDialog = dynamic(() =>
   import("@/components/sandbox-editor-dialog").then(

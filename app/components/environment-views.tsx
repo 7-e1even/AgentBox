@@ -687,7 +687,12 @@ function environmentColumns({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuGroup>
-                <DropdownMenuItem onClick={() => onEdit(row.original)}>
+                <DropdownMenuItem
+                  onSelect={() => {
+                    // Let Radix restore focus from the menu before mounting a modal.
+                    requestAnimationFrame(() => onEdit(row.original))
+                  }}
+                >
                   <PencilIcon />
                   编辑
                 </DropdownMenuItem>

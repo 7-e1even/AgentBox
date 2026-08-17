@@ -784,6 +784,7 @@ export function ResourceEditorDialog({
   const [slugEdited, setSlugEdited] = useState(Boolean(resource))
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
   const projects = resources.filter((item) => item.kind === "project")
   const projectResources = resources.filter(
     (item) =>
@@ -1002,25 +1003,33 @@ export function ResourceEditorDialog({
             ))}
           </div>
           {advancedSpecFields.length > 0 && (
-            <details className="group rounded-xl border">
+            <details
+              className="group rounded-xl border"
+              open={advancedOpen}
+              onToggle={(event) =>
+                setAdvancedOpen(event.currentTarget.open)
+              }
+            >
               <summary className="cursor-pointer list-none px-4 py-3 text-sm font-medium">
                 高级配置
                 <span className="ml-2 font-normal text-muted-foreground">
                   工作目录、资源、网络与扩展能力
                 </span>
               </summary>
-              <div className="grid gap-4 border-t p-4 sm:grid-cols-2">
-                {advancedSpecFields.map((field) => (
-                  <SpecFieldEditor
-                    key={field.key}
-                    field={field}
-                    kind={kind}
-                    spec={input.spec}
-                    invalid={Boolean(errors.spec)}
-                    onChange={updateSpec}
-                  />
-                ))}
-              </div>
+              {advancedOpen ? (
+                <div className="grid gap-4 border-t p-4 sm:grid-cols-2">
+                  {advancedSpecFields.map((field) => (
+                    <SpecFieldEditor
+                      key={field.key}
+                      field={field}
+                      kind={kind}
+                      spec={input.spec}
+                      invalid={Boolean(errors.spec)}
+                      onChange={updateSpec}
+                    />
+                  ))}
+                </div>
+              ) : null}
             </details>
           )}
           {kind !== "project" && kind !== "sandbox" && (
