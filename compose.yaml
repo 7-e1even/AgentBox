@@ -16,6 +16,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   server:
     image: ghcr.io/7-e1even/agentbox-server:${AGENTBOX_VERSION:-latest}
@@ -32,6 +37,7 @@ services:
       ALLOWED_ORIGINS: "${AGENTBOX_ALLOWED_ORIGINS:-}"
       AGENTBOX_SECRET_KEY_FILE: /var/lib/agentbox/secret-key
       AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS: ${AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS:-false}
+      AGENTBOX_TRUSTED_PROXY: ${AGENTBOX_TRUSTED_PROXY:-false}
       AGENTBOX_ENV: production
       AGENTBOX_DISABLE_AUTH: "false"
     volumes:
@@ -52,6 +58,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   app:
     image: ghcr.io/7-e1even/agentbox-app:${AGENTBOX_VERSION:-latest}
@@ -81,6 +92,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 12
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   agentbox-postgres:

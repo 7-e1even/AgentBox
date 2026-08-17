@@ -1,9 +1,17 @@
 "use client"
 
-import { forwardRef, useEffect, useImperativeHandle, useRef } from "react"
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react"
 import { FitAddon } from "@xterm/addon-fit"
 import { Terminal } from "@xterm/xterm"
+import { RefreshCwIcon } from "lucide-react"
 
+import { Button } from "@/components/ui/button"
 import {
   SandboxSessionClient,
   type SandboxSessionState,
@@ -21,6 +29,7 @@ export const SandboxTerminal = forwardRef<
 >(function SandboxTerminal({ session }, ref) {
   const containerRef = useRef<HTMLDivElement>(null)
   const terminalRef = useRef<Terminal | null>(null)
+  const [closedDetail, setClosedDetail] = useState<string | null>(null)
 
   useImperativeHandle(ref, () => ({
     async pasteFromClipboard() {
@@ -57,15 +66,22 @@ export const SandboxTerminal = forwardRef<
     terminal.writeln("\x1b[90m正在建立 root PTY 会话…\x1b[0m")
 
     let lastState: SandboxSessionState | null = null
+    let hasBeenReady = false
     const unsubscribeOutput = session.onOutput((data) => terminal.write(data))
     const unsubscribeState = session.onState((state, detail) => {
       if (state === lastState && !detail) return
       lastState = state
       if (state === "ready") {
+        if (hasBeenReady) terminal.clear()
+        hasBeenReady = true
+        setClosedDetail(null)
         terminal.focus()
         session.resize(terminal.cols, terminal.rows)
-      } else if (detail) {
-        terminal.writeln(`\r\n\x1b[90m${detail}\x1b[0m`)
+      } else {
+        if (state === "disconnected" && detail) setClosedDetail(detail)
+        if (detail) {
+          terminal.writeln(`\r\n\x1b[90m${detail}\x1b[0m`)
+        }
       }
     })
     const dataDisposable = terminal.onData((data) => session.sendInput(data))
@@ -94,9 +110,25 @@ export const SandboxTerminal = forwardRef<
   return (
     <div
       aria-label="沙箱 root 终端"
-      className="h-full min-h-0 w-full bg-[#0c0c0c] p-2"
+      className="relative h-full min-h-0 w-full bg-[#0c0c0c] p-2"
     >
       <div ref={containerRef} className="h-full min-h-0 w-full" />
+      {closedDetail ? (
+        <div className="absolute inset-2 flex flex-col items-center justify-center gap-3 rounded-sm bg-[#0c0c0c]/85 text-center">
+          <p className="text-xs text-[#9ca3af]">{closedDetail}</p>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => {
+              setClosedDetail(null)
+              session.restart()
+            }}
+          >
+            <RefreshCwIcon data-icon="inline-start" />
+            重新连接
+          </Button>
+        </div>
+      ) : null}
     </div>
   )
 })

@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  server:
+    name: Go build, vet and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: Build
+        working-directory: server
+        run: go build ./...
+      - name: Vet
+        working-directory: server
+        run: go vet ./...
+      - name: Test
+        working-directory: server
+        run: go test ./...
+
+  web:
+    name: Web lint, typecheck, test and build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.33.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: app/pnpm-lock.yaml
+      - name: Install dependencies
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        working-directory: app
+        run: pnpm lint
+      - name: Typecheck
+        working-directory: app
+        run: pnpm typecheck
+      - name: Test
+        working-directory: app
+        run: pnpm test
+      - name: Build
+        working-directory: app
+        run: pnpm build

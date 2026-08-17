@@ -41,11 +41,12 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
     const payload = needsSetup
       ? {
           name: String(form.get("name") ?? ""),
+          username: String(form.get("username") ?? ""),
           email: String(form.get("email") ?? ""),
           password,
         }
       : {
-          email: String(form.get("email") ?? ""),
+          username: String(form.get("username") ?? ""),
           password,
         }
     try {
@@ -124,16 +125,39 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
                   </Field>
                 )}
                 <Field>
-                  <FieldLabel htmlFor="email">邮箱</FieldLabel>
+                  <FieldLabel htmlFor="username">用户名</FieldLabel>
                   <Input
-                    id="email"
-                    name="email"
-                    type="email"
-                    autoComplete="email"
-                    placeholder="name@example.com"
+                    id="username"
+                    name="username"
+                    autoComplete="username"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                    minLength={3}
+                    maxLength={64}
+                    pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}"
+                    placeholder="admin"
                     required
                   />
+                  <FieldDescription>
+                    使用字母、数字、点、下划线或短横线。
+                  </FieldDescription>
                 </Field>
+                {needsSetup && (
+                  <Field>
+                    <FieldLabel htmlFor="email">联系邮箱</FieldLabel>
+                    <Input
+                      id="email"
+                      name="email"
+                      type="email"
+                      autoComplete="email"
+                      placeholder="name@example.com"
+                      required
+                    />
+                    <FieldDescription>
+                      仅用于账号资料，不作为登录凭据。
+                    </FieldDescription>
+                  </Field>
+                )}
                 <Field>
                   <FieldLabel htmlFor="password">密码</FieldLabel>
                   <Input

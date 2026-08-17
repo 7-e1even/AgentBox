@@ -15,13 +15,15 @@ export default async function LoginPage() {
     headers: cookieHeader ? { Cookie: cookieHeader } : undefined,
   }).catch(() => null)
   if (sessionResponse?.ok) {
-    userResponseSchema.parse(await sessionResponse.json())
+    const sessionBody = userResponseSchema.safeParse(await sessionResponse.json())
+    if (!sessionBody.success) return <BackendUnavailable variant="error" />
     redirect("/")
   }
   const statusResponse = await fetch(`${apiOrigin}/api/auth/status`, {
     cache: "no-store",
   }).catch(() => null)
-  if (!statusResponse?.ok) return <BackendUnavailable />
+  if (!statusResponse) return <BackendUnavailable variant="unreachable" />
+  if (!statusResponse.ok) return <BackendUnavailable variant="error" />
 
   const needsSetup = authStatusSchema.parse(
     await statusResponse.json()

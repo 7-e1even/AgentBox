@@ -210,6 +210,7 @@ function ProfileSettings({
   onSave: (input: UserInput) => Promise<void>
 }) {
   const [name, setName] = useState(user.name)
+  const [username, setUsername] = useState(user.username)
   const [email, setEmail] = useState(user.email)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
@@ -218,6 +219,7 @@ function ProfileSettings({
     event.preventDefault()
     const parsed = userInputSchema.safeParse({
       name,
+      username,
       email,
       password: "",
       role: user.role,
@@ -266,8 +268,24 @@ function ProfileSettings({
             <FieldDescription>团队成员看到的名称。</FieldDescription>
             <FieldError>{errors.name}</FieldError>
           </Field>
+          <Field data-invalid={Boolean(errors.username)}>
+            <FieldLabel htmlFor="settings-username">登录用户名</FieldLabel>
+            <Input
+              id="settings-username"
+              value={username}
+              autoComplete="username"
+              autoCapitalize="none"
+              spellCheck={false}
+              aria-invalid={Boolean(errors.username)}
+              onChange={(event) => setUsername(event.target.value)}
+            />
+            <FieldDescription>
+              登录 AgentBox 时使用，保存后统一转为小写。
+            </FieldDescription>
+            <FieldError>{errors.username}</FieldError>
+          </Field>
           <Field data-invalid={Boolean(errors.email)}>
-            <FieldLabel htmlFor="settings-email">登录邮箱</FieldLabel>
+            <FieldLabel htmlFor="settings-email">联系邮箱</FieldLabel>
             <Input
               id="settings-email"
               type="email"
@@ -277,7 +295,7 @@ function ProfileSettings({
               onChange={(event) => setEmail(event.target.value)}
             />
             <FieldDescription>
-              修改后，下次登录需要使用新的邮箱地址。
+              仅用于账号资料，不作为登录凭据。
             </FieldDescription>
             <FieldError>{errors.email}</FieldError>
           </Field>
@@ -324,6 +342,7 @@ function AccountSettings({
     try {
       await onSave({
         name: user.name,
+        username: user.username,
         email: user.email,
         password,
         role: user.role,
@@ -612,6 +631,9 @@ function DisplaySettings({
         </Field>
         <FieldSet>
           <FieldLegend variant="label">侧栏分组</FieldLegend>
+          <FieldDescription>
+            关闭后对应入口将从侧栏隐藏，已打开的页面不受影响，可随时重新开启。
+          </FieldDescription>
           <FieldGroup>
             <SidebarGroupSwitch
               label="能力配置"
@@ -722,7 +744,7 @@ function EnvironmentSettings({
           <AlertTitle>平台保存引用，不保存宿主机明文</AlertTitle>
           <AlertDescription>
             例如 CUSTOM_API_TOKEN 可以指向 env://CUSTOM_API_TOKEN 或
-            secret://CUSTOM_API_TOKEN。环境模板或 Agent
+            secret://CUSTOM_API_TOKEN。沙箱模板或 Agent
             选中它后，创建沙箱时才解析并注入。
           </AlertDescription>
         </Alert>

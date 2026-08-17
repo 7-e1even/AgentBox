@@ -54,7 +54,7 @@ func (s *Server) registerServer(w http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) heartbeatServer(w http.ResponseWriter, request *http.Request) {
-	credential := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+	credential := authBearer(request)
 	var capabilities []string
 	var inventory *platform.ServerInventory
 	workerVersion := ""
@@ -140,18 +140,50 @@ case "$SERVER_URL" in
   http://*|https://*) ;;
   *) echo "usage: install.sh <agentbox-url>" >&2; exit 2 ;;
 esac
+case "$SERVER_URL" in
+  https://*|http://localhost*|http://127.0.0.1*|http://\[::1\]*) ;;
+  http://*)
+    echo "============================================================================" >&2
+    echo "WARNING: $SERVER_URL uses plain HTTP." >&2
+    echo "The Worker binary, server credentials, and sandbox secrets will cross the" >&2
+    echo "network unencrypted. Use HTTPS (or an SSH tunnel) for any real deployment." >&2
+    echo "============================================================================" >&2
+    ;;
+esac
+
+verify_worker_checksum() {
+  BINARY=$1
+  HEADERS=$2
+  EXPECTED_SHA256=$(tr -d '\r' < "$HEADERS" |
+    sed -n 's/^[Xx]-[Cc]hecksum-[Ss]ha256:[[:space:]]*\([0-9A-Fa-f]\{1,\}\).*/\1/p' | head -n 1)
+  if [ -z "$EXPECTED_SHA256" ]; then
+    echo "warning: the server did not provide a Worker checksum; skipping integrity verification" >&2
+    return 0
+  fi
+  if ! command -v sha256sum >/dev/null; then
+    echo "sha256sum is required to verify the downloaded Worker binary" >&2
+    exit 1
+  fi
+  ACTUAL_SHA256=$(sha256sum "$BINARY" | cut -d ' ' -f 1)
+  if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+    echo "Worker binary checksum mismatch (expected $EXPECTED_SHA256, got $ACTUAL_SHA256); refusing to install" >&2
+    exit 1
+  fi
+}
 
 worker_tmp=$(mktemp)
+worker_headers_tmp=$(mktemp)
 microsandbox_source_tmp=$(mktemp)
 microsandbox_build_tmp=$(mktemp -d)
 boxlite_tmp=$(mktemp -d)
-trap 'rm -f "$worker_tmp" "$microsandbox_source_tmp"; rm -rf "$microsandbox_build_tmp" "$boxlite_tmp"' EXIT
+trap 'rm -f "$worker_tmp" "$worker_headers_tmp" "$microsandbox_source_tmp"; rm -rf "$microsandbox_build_tmp" "$boxlite_tmp"' EXIT
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64; BOXLITE_ARCH=x86_64 ;;
   aarch64|arm64) ARCH=arm64; BOXLITE_ARCH=aarch64 ;;
   *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
-curl -fsSL "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"
+curl -fsSL -D "$worker_headers_tmp" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"
+verify_worker_checksum "$worker_tmp" "$worker_headers_tmp"
 curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$microsandbox_source_tmp"
 
 install_host_dependencies() {
@@ -251,7 +283,7 @@ EOF
   (
     cd "$microsandbox_build_tmp"
     if ! go mod tidy; then
-      GOPROXY=https://goproxy.cn,direct go mod tidy
+      GOPROXY="${AGENTBOX_GOPROXY:-https://goproxy.cn,direct}" go mod tidy
     fi
     CGO_ENABLED=1 go build -tags agentbox_driver -trimpath -ldflags '-s -w' -o agentbox-microsandbox-driver .
   )
@@ -325,9 +357,15 @@ setup_worker() {
     *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
   esac
   CAPS=$(worker_capabilities)
+  PREVIOUS_CREDENTIAL=
+  if [ -s "$CONFIG" ]; then
+    PREVIOUS_CREDENTIAL=$(sed -n '3p' "$CONFIG" | tr -d '\r\n')
+  fi
   BODY=$(jq -n --arg pairingToken "$TOKEN" --arg serverId "$SERVER_ID" \
     --arg name "$HOST" --arg hostname "$HOST" --arg arch "$ARCH" --argjson capabilities "$CAPS" \
-    '{pairingToken:$pairingToken,serverId:$serverId,name:$name,hostname:$hostname,os:"linux",arch:$arch,capabilities:$capabilities}')
+    --arg previousCredential "$PREVIOUS_CREDENTIAL" \
+    '{pairingToken:$pairingToken,serverId:$serverId,name:$name,hostname:$hostname,os:"linux",arch:$arch,capabilities:$capabilities}
+     + (if $previousCredential == "" then {} else {previousCredential:$previousCredential} end)')
   RESPONSE=$(curl -fsS -X POST "$SERVER_URL/api/servers/register" -H 'Content-Type: application/json' --data "$BODY")
   CREDENTIAL=$(printf '%s' "$RESPONSE" | sed -n 's/.*"credential":"\([^"]*\)".*/\1/p')
   [ -n "$CREDENTIAL" ] || { echo "registration response was invalid" >&2; exit 1; }
@@ -993,8 +1031,11 @@ finalize_worker_update() {
   CURRENT_VERSION=$(/usr/local/bin/agentbox-worker version 2>/dev/null || printf unknown)
   CONFIRMED="$STATE_DIR/worker-update-confirmed"
   if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
-    printf '%s\n' "$JOB_ID" > "$CONFIRMED"
+    # Confirm only after the Server has accepted the completion report: if this
+    # process is alive but cannot talk to the Server (protocol mismatch), the
+    # pending rollback must still fire.
     if complete_job "$JOB_ID" true "" "Worker 已更新到 $TARGET_VERSION"; then
+      printf '%s\n' "$JOB_ID" > "$CONFIRMED"
       rm -f "$MARKER" "$CONFIRMED"
       [ -z "$ROLLBACK_SCRIPT" ] || rm -f "$ROLLBACK_SCRIPT"
     fi
@@ -1034,7 +1075,7 @@ EOF
     export GOMODCACHE="$STATE_DIR/go-mod-cache"
     export GOCACHE="$STATE_DIR/go-build-cache"
     if ! go mod tidy; then
-      GOPROXY=https://goproxy.cn,direct go mod tidy
+      GOPROXY="${AGENTBOX_GOPROXY:-https://goproxy.cn,direct}" go mod tidy
     fi
     CGO_ENABLED=1 go build -tags agentbox_driver -trimpath -ldflags '-s -w' -o agentbox-microsandbox-driver .
     ./agentbox-microsandbox-driver probe >/dev/null
@@ -1069,9 +1110,29 @@ update_worker() {
   esac
 
   WORKER_TMP=$(mktemp "$STATE_DIR/agentbox-worker.XXXXXX") || return 1
-  if ! curl -fsSL "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH&version=$TARGET_VERSION" -o "$WORKER_TMP"; then
-    rm -f "$WORKER_TMP"
+  WORKER_HEADERS=$(mktemp "$STATE_DIR/agentbox-worker-headers.XXXXXX") || { rm -f "$WORKER_TMP"; return 1; }
+  if ! curl -fsSL -D "$WORKER_HEADERS" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH&version=$TARGET_VERSION" -o "$WORKER_TMP"; then
+    rm -f "$WORKER_TMP" "$WORKER_HEADERS"
     return 1
+  fi
+  # Verify integrity before executing anything from the downloaded binary.
+  EXPECTED_SHA256=$(tr -d '\r' < "$WORKER_HEADERS" |
+    sed -n 's/^[Xx]-[Cc]hecksum-[Ss]ha256:[[:space:]]*\([0-9A-Fa-f]\{1,\}\).*/\1/p' | head -n 1)
+  rm -f "$WORKER_HEADERS"
+  if [ -n "$EXPECTED_SHA256" ]; then
+    command -v sha256sum >/dev/null || {
+      echo "sha256sum is required to verify the downloaded Worker" >&2
+      rm -f "$WORKER_TMP"
+      return 1
+    }
+    ACTUAL_SHA256=$(sha256sum "$WORKER_TMP" | cut -d ' ' -f 1)
+    if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+      echo "downloaded Worker checksum mismatch (expected $EXPECTED_SHA256, got $ACTUAL_SHA256)" >&2
+      rm -f "$WORKER_TMP"
+      return 1
+    fi
+  else
+    echo "warning: the server did not provide a Worker checksum; skipping integrity verification" >&2
   fi
   chmod 0755 "$WORKER_TMP" || { rm -f "$WORKER_TMP"; return 1; }
   DOWNLOADED_VERSION=$("$WORKER_TMP" version 2>/dev/null || true)
@@ -1980,7 +2041,7 @@ configure_skills() {
     SKILL_FILE=$(mktemp)
     printf '%s\n' '---' "name: $NAME" "description: $DESCRIPTION" '---' '' "$INSTRUCTIONS" > "$SKILL_FILE"
     docker exec "$CONTAINER" mkdir -p "/opt/agentbox/skills/$ID"
-    docker exec -i "$CONTAINER" sh -c "cat > /opt/agentbox/skills/$ID/SKILL.md" < "$SKILL_FILE"
+    docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/SKILL.md" < "$SKILL_FILE"
     for SKILL_TARGET in \
       "/root/.agents/skills/$ID" \
       "/root/.gemini/antigravity-cli/skills/$ID" \
@@ -2004,7 +2065,7 @@ configure_skills() {
       "/root/.qwen/skills/$ID" \
       "/root/.qwenpaw/skill_pool/$ID"; do
       docker exec "$CONTAINER" mkdir -p "$SKILL_TARGET"
-      docker exec -i "$CONTAINER" sh -c "cat > $SKILL_TARGET/SKILL.md" < "$SKILL_FILE"
+      docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "$SKILL_TARGET/SKILL.md" < "$SKILL_FILE"
     done
     rm -f "$SKILL_FILE"
   done

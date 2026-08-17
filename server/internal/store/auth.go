@@ -14,7 +14,22 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
-const userColumns = `id, name, email, role, status, preferences, last_login_at, created_at, updated_at`
+const userColumns = `id, name, username, email, role, status, preferences, last_login_at, created_at, updated_at`
+
+// 用户会话有效期（7 天滚动）：剩余不足一半时在认证时滑动顺延。
+const (
+	userSessionLifetime         = 7 * 24 * time.Hour
+	userSessionRenewalThreshold = userSessionLifetime / 2
+)
+
+// dummyLoginPasswordHash 用于用户名不存在时的占位 bcrypt 比较，消除时序侧信道。
+var dummyLoginPasswordHash = func() []byte {
+	hash, err := bcrypt.GenerateFromPassword([]byte("agentbox-dummy-password"), bcrypt.DefaultCost)
+	if err != nil {
+		panic(err)
+	}
+	return hash
+}()
 
 func (s *Store) NeedsUserSetup(ctx context.Context) (bool, error) {
 	var count int
@@ -52,9 +67,9 @@ func (s *Store) SetupAdmin(ctx context.Context, input platform.UserInput, sessio
 	}
 	now := time.Now().UTC()
 	user, err := scanUser(tx.QueryRow(ctx, `INSERT INTO users
-    (id, name, email, password_hash, role, status, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-    RETURNING `+userColumns, uuid.NewString(), input.Name, input.Email, passwordHash, input.Role, input.Status, now))
+    (id, name, username, email, password_hash, role, status, created_at, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+    RETURNING `+userColumns, uuid.NewString(), input.Name, input.Username, input.Email, passwordHash, input.Role, input.Status, now))
 	if err != nil {
 		return platform.User{}, mapUserError(err)
 	}
@@ -68,12 +83,17 @@ func (s *Store) SetupAdmin(ctx context.Context, input platform.UserInput, sessio
 	return user, nil
 }
 
-func (s *Store) AuthenticateUser(ctx context.Context, email, password string, sessionHash []byte, expiresAt time.Time) (platform.User, error) {
-	email = normalizeEmail(email)
+func (s *Store) AuthenticateUser(ctx context.Context, username, password string, sessionHash []byte, expiresAt time.Time) (platform.User, error) {
+	username = normalizeUsername(username)
 	var passwordHash []byte
 	user, err := scanUserWithPassword(s.pool.QueryRow(ctx, `SELECT `+userColumns+`, password_hash
-    FROM users WHERE email = $1`, email), &passwordHash)
-	if err != nil || user.Status != platform.UserStatusActive || bcrypt.CompareHashAndPassword(passwordHash, []byte(password)) != nil {
+    FROM users WHERE LOWER(username) = $1`, username), &passwordHash)
+	// 用户名不存在时也执行一次 dummy bcrypt 比较，避免通过响应时间探测账号是否注册。
+	compareHash := passwordHash
+	if err != nil {
+		compareHash = dummyLoginPasswordHash
+	}
+	if bcrypt.CompareHashAndPassword(compareHash, []byte(password)) != nil || err != nil || user.Status != platform.UserStatusActive {
 		return platform.User{}, ErrUnauthorized
 	}
 	tx, err := s.pool.Begin(ctx)
@@ -100,16 +120,22 @@ func (s *Store) AuthenticateUser(ctx context.Context, email, password string, se
 }
 
 func (s *Store) UserBySession(ctx context.Context, sessionHash []byte) (platform.User, error) {
+	now := time.Now().UTC()
 	user, err := scanUser(s.pool.QueryRow(ctx, `SELECT `+prefixedUserColumns("u")+`
     FROM user_sessions s
     JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.status = 'active'`, sessionHash, time.Now().UTC()))
+    WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.status = 'active'`, sessionHash, now))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.User{}, ErrUnauthorized
 	}
 	if err != nil {
 		return platform.User{}, fmt.Errorf("find session user: %w", err)
 	}
+	// 滑动续期：剩余有效期不足一半时顺延至 7 天（滚动上限不变）。
+	// 续期失败不影响本次认证结果。
+	_, _ = s.pool.Exec(ctx, `UPDATE user_sessions SET expires_at = $2
+    WHERE token_hash = $1 AND expires_at > $3 AND expires_at < $4`,
+		sessionHash, now.Add(userSessionLifetime), now, now.Add(userSessionRenewalThreshold))
 	return user, nil
 }
 
@@ -122,7 +148,7 @@ func (s *Store) DeleteSession(ctx context.Context, sessionHash []byte) error {
 
 func (s *Store) ListUsers(ctx context.Context) ([]platform.User, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+userColumns+` FROM users
-    ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, name, email`)
+    ORDER BY CASE status WHEN 'active' THEN 0 ELSE 1 END, name, username`)
 	if err != nil {
 		return nil, fmt.Errorf("list users: %w", err)
 	}
@@ -149,9 +175,9 @@ func (s *Store) CreateUser(ctx context.Context, input platform.UserInput) (platf
 	}
 	now := time.Now().UTC()
 	user, err := scanUser(s.pool.QueryRow(ctx, `INSERT INTO users
-    (id, name, email, password_hash, role, status, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
-    RETURNING `+userColumns, uuid.NewString(), input.Name, input.Email, passwordHash, input.Role, input.Status, now))
+    (id, name, username, email, password_hash, role, status, created_at, updated_at)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+    RETURNING `+userColumns, uuid.NewString(), input.Name, input.Username, input.Email, passwordHash, input.Role, input.Status, now))
 	if err != nil {
 		return platform.User{}, mapUserError(err)
 	}
@@ -159,6 +185,16 @@ func (s *Store) CreateUser(ctx context.Context, input platform.UserInput) (platf
 }
 
 func (s *Store) UpdateUser(ctx context.Context, id string, input platform.UserInput) (platform.User, error) {
+	return s.updateUser(ctx, id, input, nil)
+}
+
+// UpdateUserPreservingSession 与 UpdateUser 相同，但密码变更/停用导致会话失效时
+// 保留 keepSessionHash 对应的会话（用户自己改密时不踢掉当前登录）。
+func (s *Store) UpdateUserPreservingSession(ctx context.Context, id string, input platform.UserInput, keepSessionHash []byte) (platform.User, error) {
+	return s.updateUser(ctx, id, input, keepSessionHash)
+}
+
+func (s *Store) updateUser(ctx context.Context, id string, input platform.UserInput, keepSessionHash []byte) (platform.User, error) {
 	platform.NormalizeUserInput(&input)
 	if err := platform.ValidateUserInput(input, false); err != nil {
 		return platform.User{}, err
@@ -166,23 +202,29 @@ func (s *Store) UpdateUser(ctx context.Context, id string, input platform.UserIn
 	now := time.Now().UTC()
 	var row pgx.Row
 	if input.Password == "" {
-		row = s.pool.QueryRow(ctx, `UPDATE users SET name = $2, email = $3, role = $4, status = $5, updated_at = $6
-      WHERE id = $1 RETURNING `+userColumns, id, input.Name, input.Email, input.Role, input.Status, now)
+		row = s.pool.QueryRow(ctx, `UPDATE users SET name = $2, username = $3, email = $4, role = $5, status = $6, updated_at = $7
+      WHERE id = $1 RETURNING `+userColumns, id, input.Name, input.Username, input.Email, input.Role, input.Status, now)
 	} else {
 		passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 		if err != nil {
 			return platform.User{}, fmt.Errorf("hash password: %w", err)
 		}
-		row = s.pool.QueryRow(ctx, `UPDATE users SET name = $2, email = $3, password_hash = $4, role = $5, status = $6, updated_at = $7
-      WHERE id = $1 RETURNING `+userColumns, id, input.Name, input.Email, passwordHash, input.Role, input.Status, now)
+		row = s.pool.QueryRow(ctx, `UPDATE users SET name = $2, username = $3, email = $4, password_hash = $5, role = $6, status = $7, updated_at = $8
+      WHERE id = $1 RETURNING `+userColumns, id, input.Name, input.Username, input.Email, passwordHash, input.Role, input.Status, now)
 	}
 	user, err := scanUser(row)
 	if err != nil {
 		return platform.User{}, mapUserError(err)
 	}
 	if input.Password != "" || input.Status == platform.UserStatusDisabled {
-		if _, err := s.pool.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", id); err != nil {
-			return platform.User{}, fmt.Errorf("invalidate user sessions: %w", err)
+		if len(keepSessionHash) == 0 {
+			if _, err := s.pool.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", id); err != nil {
+				return platform.User{}, fmt.Errorf("invalidate user sessions: %w", err)
+			}
+		} else {
+			if _, err := s.pool.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1 AND token_hash <> $2", id, keepSessionHash); err != nil {
+				return platform.User{}, fmt.Errorf("invalidate user sessions: %w", err)
+			}
 		}
 	}
 	return user, nil
@@ -213,21 +255,21 @@ func (s *Store) DeleteUser(ctx context.Context, id string) error {
 
 func scanUser(row pgx.Row) (platform.User, error) {
 	var user platform.User
-	err := row.Scan(&user.ID, &user.Name, &user.Email, &user.Role, &user.Status, &user.Preferences, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt)
+	err := row.Scan(&user.ID, &user.Name, &user.Username, &user.Email, &user.Role, &user.Status, &user.Preferences, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt)
 	return user, err
 }
 
 func scanUserWithPassword(row pgx.Row, passwordHash *[]byte) (platform.User, error) {
 	var user platform.User
-	err := row.Scan(&user.ID, &user.Name, &user.Email, &user.Role, &user.Status, &user.Preferences, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt, passwordHash)
+	err := row.Scan(&user.ID, &user.Name, &user.Username, &user.Email, &user.Role, &user.Status, &user.Preferences, &user.LastLoginAt, &user.CreatedAt, &user.UpdatedAt, passwordHash)
 	return user, err
 }
 
 func prefixedUserColumns(alias string) string {
-	return alias + `.id, ` + alias + `.name, ` + alias + `.email, ` + alias + `.role, ` + alias + `.status, ` + alias + `.preferences, ` + alias + `.last_login_at, ` + alias + `.created_at, ` + alias + `.updated_at`
+	return alias + `.id, ` + alias + `.name, ` + alias + `.username, ` + alias + `.email, ` + alias + `.role, ` + alias + `.status, ` + alias + `.preferences, ` + alias + `.last_login_at, ` + alias + `.created_at, ` + alias + `.updated_at`
 }
 
-func normalizeEmail(value string) string {
+func normalizeUsername(value string) string {
 	return strings.ToLower(strings.TrimSpace(value))
 }
 

@@ -101,7 +101,7 @@ function DataTable<TData, TValue>({
   filters = [],
   getRowId,
   initialPageSize = 10,
-  searchPlaceholder = "搜索...",
+  searchPlaceholder = "搜索…",
   searchValue,
   emptyMessage = "没有符合条件的数据。",
 }: DataTableProps<TData, TValue>) {

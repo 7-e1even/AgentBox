@@ -11,7 +11,7 @@ import (
 )
 
 func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
-	credential := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+	credential := authBearer(request)
 	job, err := s.store.ClaimWorkerJob(
 		request.Context(), request.PathValue("id"), credential,
 	)
@@ -23,22 +23,26 @@ func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	attachWorkerRuntimeEndpoints(job.Payload, workerRequestBaseURL(request))
-	attachWorkerProxyEndpoint(job.Payload, workerRequestBaseURL(request))
+	baseURL := workerRequestBaseURL(request, s.trustedProxy)
+	attachWorkerRuntimeEndpoints(job.Payload, baseURL)
+	attachWorkerProxyEndpoint(job.Payload, baseURL)
 	s.writeJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
-func workerRequestBaseURL(request *http.Request) string {
+func workerRequestBaseURL(request *http.Request, trustedProxy bool) string {
 	scheme := "http"
 	if request.TLS != nil {
 		scheme = "https"
 	}
-	if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Proto")); forwarded == "http" || forwarded == "https" {
-		scheme = forwarded
-	}
 	host := request.Host
-	if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Host")); forwarded != "" {
-		host = forwarded
+	if trustedProxy {
+		// 仅在信任代理时才采纳 X-Forwarded-Proto/Host，防止伪造头污染 Worker 回连地址。
+		if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Proto")); forwarded == "http" || forwarded == "https" {
+			scheme = forwarded
+		}
+		if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Host")); forwarded != "" {
+			host = forwarded
+		}
 	}
 	parsed, err := url.Parse(scheme + "://" + host)
 	if err != nil || parsed.Host == "" || parsed.User != nil {
@@ -149,7 +153,7 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 		s.writeError(w, http.StatusBadRequest, "Worker 结果过长")
 		return
 	}
-	credential := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+	credential := authBearer(request)
 	if err := s.store.CompleteWorkerJob(
 		request.Context(), request.PathValue("id"), credential,
 		request.PathValue("jobId"), result,

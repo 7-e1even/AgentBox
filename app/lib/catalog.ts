@@ -15,31 +15,10 @@ export const providerSchema = z.object({
   models: z.array(providerModelSchema),
 })
 
-export const skillDefinitionSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  description: z.string(),
-  version: z.string(),
-  category: z.string(),
-})
-
-export const mcpServerDefinitionSchema = z.object({
-  id: z.string(),
-  name: z.string(),
-  description: z.string(),
-  transport: z.enum(["stdio", "http"]),
-  toolCount: z.number().int().nonnegative(),
-  status: z.enum(["ready", "attention"]),
-})
-
 export const catalogSchema = z.object({
   providers: z.array(providerSchema),
-  skills: z.array(skillDefinitionSchema),
-  mcpServers: z.array(mcpServerDefinitionSchema),
 })
 
 export type ProviderModel = z.infer<typeof providerModelSchema>
 export type Provider = z.infer<typeof providerSchema>
-export type SkillDefinition = z.infer<typeof skillDefinitionSchema>
-export type McpServerDefinition = z.infer<typeof mcpServerDefinitionSchema>
 export type AgentCatalog = z.infer<typeof catalogSchema>

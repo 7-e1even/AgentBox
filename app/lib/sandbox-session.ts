@@ -31,6 +31,7 @@ type FileOperation =
 const uploadChunkSize = 192 * 1024
 
 export const sandboxUploadMaxSize = 50 * 1024 * 1024
+export const sandboxFileReadMaxSize = 5 * 1024 * 1024
 
 export class SandboxSessionClient {
   private socket: WebSocket | null = null
@@ -65,6 +66,22 @@ export class SandboxSessionClient {
     this.socket = null
     this.failPending(new Error("沙箱会话已关闭"))
     this.setState("disconnected")
+  }
+
+  restart() {
+    if (this.stopped) {
+      this.start()
+      return
+    }
+    this.connectionGeneration += 1
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    const socket = this.socket
+    this.socket = null
+    socket?.close(1000, "reconnect")
+    this.failPending(new Error("沙箱会话正在重新连接"))
+    this.reconnectDelay = 1000
+    void this.connect()
   }
 
   getState() {
@@ -180,9 +197,13 @@ export class SandboxSessionClient {
         error?: string
       } | null
       if (!response.ok || !payload?.ticket) {
-        throw new Error(
+        const detail =
           payload?.error || `无法创建沙箱会话（HTTP ${response.status}）`
-        )
+        if (response.status === 401 || response.status === 403) {
+          this.setState("error", detail)
+          return
+        }
+        throw new Error(detail)
       }
       if (this.stopped || generation !== this.connectionGeneration) return
 

@@ -103,10 +103,12 @@ const runtimeDefinitions: Record<
 
 export function ImageManagement({
   servers,
+  canMutate,
   onServersChange,
   onCreateRuntime,
 }: {
   servers: ManagedServer[]
+  canMutate: boolean
   onServersChange: (servers: ManagedServer[]) => void
   onCreateRuntime: (
     serverId: string,
@@ -151,9 +153,9 @@ export function ImageManagement({
   const columns = useMemo(
     () =>
       server
-        ? imageColumns(server, scope, onCreateRuntime)
+        ? imageColumns(server, scope, canMutate, onCreateRuntime)
         : ([] as ColumnDef<ImageRow>[]),
-    [onCreateRuntime, scope, server]
+    [canMutate, onCreateRuntime, scope, server]
   )
 
   async function refreshNow() {
@@ -324,6 +326,7 @@ function hasCreatableRuntime(server: ManagedServer) {
 function imageColumns(
   server: ManagedServer,
   scope: ImageScope,
+  canMutate: boolean,
   onCreateRuntime: (
     serverId: string,
     imageReference: string,
@@ -405,7 +408,7 @@ function imageColumns(
     },
   ]
 
-  if (scope !== "vm") {
+  if (scope !== "vm" && canMutate) {
     columns.push({
       id: "actions",
       cell: ({ row }) => (

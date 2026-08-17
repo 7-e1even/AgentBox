@@ -33,7 +33,9 @@ type MCPServer struct {
 }
 
 type Catalog struct {
-	Providers  []Provider  `json:"providers"`
-	Skills     []Skill     `json:"skills"`
-	MCPServers []MCPServer `json:"mcpServers"`
+	Providers []Provider `json:"providers"`
+	// Skills and MCPServers only seed builtin control_resources at startup;
+	// they are no longer part of the /api/catalog response consumed by clients.
+	Skills     []Skill     `json:"-"`
+	MCPServers []MCPServer `json:"-"`
 }

@@ -25,7 +25,12 @@ import (
 	"github.com/skys-mission/lmm-adapter-go/token"
 )
 
-const runtimeLLMMaxBodyBytes = 32 << 20
+const (
+	runtimeLLMMaxBodyBytes = 32 << 20
+	// runtimeLLMNonStreamingTimeout 限制非流式请求的整体耗时（连接+读完整响应体），
+	// 流式请求不受此限制，由连接保活与客户端断开控制。
+	runtimeLLMNonStreamingTimeout = 2 * time.Minute
+)
 
 var runtimeLLMConverter = adapter.NewConverter(
 	adapter.WithAdapter(claude.New()),
@@ -385,8 +390,14 @@ func (s *Server) forwardRuntimeLLM(
 	streaming bool,
 ) {
 	translatedRequest := body
+	ctx := request.Context()
+	if !streaming {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, runtimeLLMNonStreamingTimeout)
+		defer cancel()
+	}
 	upstreamRequest, err := http.NewRequestWithContext(
-		request.Context(), http.MethodPost, upstreamURL, bytes.NewReader(body),
+		ctx, http.MethodPost, upstreamURL, bytes.NewReader(body),
 	)
 	if err != nil {
 		s.writeRuntimeLLMError(w, clientProtocol, http.StatusBadGateway, "无法创建上游请求")
@@ -450,7 +461,7 @@ func (s *Server) forwardRuntimeLLM(
 	}
 	if clientProtocol != upstreamProtocol {
 		converted, err := convertRuntimeLLMResponse(
-			request.Context(), upstreamProtocol, clientProtocol, target.ModelID,
+			ctx, upstreamProtocol, clientProtocol, target.ModelID,
 			originalBody, translatedRequest, responseBody,
 		)
 		if err != nil {

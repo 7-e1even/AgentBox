@@ -3,6 +3,9 @@ export type EnvironmentVariableEntry = {
   value: string
 }
 
+// 服务端在 API 响应中用该固定掩码代替真实值；编辑时原样回传表示不修改。
+export const environmentVariableMask = "••••••"
+
 const environmentVariableNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 export function environmentVariableEntries(

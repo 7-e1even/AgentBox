@@ -21,8 +21,24 @@ import (
 var version = "dev"
 
 func main() {
-	_ = godotenv.Load(".env", "server/.env")
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	envFiles := []string{".env", "server/.env"}
+	existing := make([]string, 0, len(envFiles))
+	for _, file := range envFiles {
+		if info, err := os.Stat(file); err == nil && info.Mode().IsRegular() {
+			existing = append(existing, file)
+		}
+	}
+	// godotenv.Load loads files in order and never overrides a variable that is
+	// already set, so the first existing file wins on conflicts.
+	_ = godotenv.Load(envFiles...)
+	if len(existing) > 1 {
+		logger.Warn("multiple .env files found; values from the first file win and are NOT overridden",
+			"effective", existing[0], "ignored", existing[1:])
+	}
+	if os.Getenv("POSTGRES_PASSWORD") == "change-me-before-deploy" {
+		logger.Warn("POSTGRES_PASSWORD is still the placeholder \"change-me-before-deploy\"; set a strong password before deploying")
+	}
 	databaseURL := os.Getenv("DATABASE_URL")
 	if databaseURL == "" {
 		logger.Error("DATABASE_URL is required")

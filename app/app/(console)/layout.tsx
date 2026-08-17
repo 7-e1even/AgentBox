@@ -92,17 +92,17 @@ export default async function ConsoleLayout({
     `${apiOrigin}/api/auth/me`,
     requestOptions(cookieHeader)
   ).catch(() => null)
-  if (!sessionResponse) return <BackendUnavailable />
+  if (!sessionResponse) return <BackendUnavailable variant="unreachable" />
   if (sessionResponse.status === 401) redirect("/login")
-  if (!sessionResponse.ok) return <BackendUnavailable />
-  const currentUser = userResponseSchema.parse(
-    await sessionResponse.json()
-  ).user
+  if (!sessionResponse.ok) return <BackendUnavailable variant="error" />
+  const sessionBody = userResponseSchema.safeParse(await sessionResponse.json())
+  if (!sessionBody.success) redirect("/login")
+  const currentUser = sessionBody.data.user
   const platform = await resolvePlatform(
     cookieHeader,
     currentUser.role === "admin"
   )
-  if (!platform) return <BackendUnavailable />
+  if (!platform) return <BackendUnavailable variant="error" />
   const initialProjectId = resolveProjectId(
     platform.resources,
     cookieStore.get(PROJECT_COOKIE_NAME)?.value

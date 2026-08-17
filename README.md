@@ -22,9 +22,11 @@ docker compose ps
 
 长期或生产部署请先将 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`；需要固定版本、端口或公开地址时也在该文件中覆盖。
 
+生产环境建议由反向代理（如 Nginx、Caddy）终结 TLS，以 HTTPS 对外提供访问。位于反向代理之后时，在 `.env` 中设置 `AGENTBOX_TRUSTED_PROXY=true`，Server 才会信任代理传入的 `X-Forwarded-*` 头；直接暴露端口或可信内网保持默认即可。
+
 打开 `http://<服务器地址>:3000` 创建首个管理员，再到“服务器”页面复制命令安装并配对 Linux Worker。安装脚本会经由 AgentBox Server 下载当前 Release 中对应 `amd64` / `arm64` 的单个 Go Worker 二进制并校验 SHA-256；目标机不需要 Python，也不需要直接访问 GitHub。
 
-Worker 上线后，服务器详情页会显示当前版本。发布新版本并升级 AgentBox Server 后，可在同一页面点击“更新 Worker”：Server 会缓存 Release 资产，Worker 原子替换二进制并重启；新版不能正常启动时会自动恢复上一版。
+Worker 上线后，服务器详情页会显示当前版本。发布新版本并升级 AgentBox Server 后，可在同一页面点击“更新 Worker”：Server 会缓存 Release 资产，Worker 校验 SHA-256 后原子替换二进制并重启；新版不能正常启动时会自动恢复上一版。
 
 从旧版迁移时，需要在物理服务器上重新运行一次安装命令，让旧 Worker 获得自更新能力；安装器会保留已有配对配置。完成这一次迁移后，后续升级均可在 Web 中执行。
 
@@ -46,12 +48,61 @@ docker compose up -d --build
 
 源码构建的 Server 版本默认为 `dev`，不会提供 Web 在线更新。
 
+需要限制容器资源占用时，可添加 `compose.override.yaml`（Compose 会自动合并），按需调整：
+
+```yaml
+services:
+  server:
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+  app:
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+```
+
+### Windows 本地源码启动
+
+已安装 Go 1.24+、Node.js 20.9+ 和 pnpm 后，双击根目录的 `start-agentbox.bat` 即可同时启动 API 与 Web。脚本优先使用 `server/.env` 中已有的 `DATABASE_URL`；未配置数据库时，会使用 Docker 在本机启动开发用 PostgreSQL。服务就绪后会自动打开 `http://127.0.0.1:3000`。
+
+启动脚本不会关闭鉴权。首次打开时按页面提示创建管理员账号，之后使用用户名和密码登录；邮箱仅作为个人资料，不作为登录凭据。关闭脚本打开的两个 AgentBox 终端窗口即可停止 API 与 Web。
+
+## 备份与恢复
+
+升级 AgentBox 前请先备份。需要备份两部分：PostgreSQL 数据，以及 `agentbox-secrets` 卷中的凭据加密主密钥。
+
+```sh
+# 备份数据库（默认库名与用户均为 agentbox）
+docker compose exec postgres pg_dump -U agentbox -d agentbox > agentbox-backup.sql
+
+# 备份凭据加密主密钥（卷名带 Compose 项目名前缀，可用 docker volume ls 确认）
+docker run --rm -v agentbox_agentbox-secrets:/data:ro -v "$PWD":/backup alpine \
+  tar czf /backup/agentbox-secrets.tar.gz -C /data .
+```
+
+恢复时反向执行：
+
+```sh
+docker compose exec -T postgres psql -U agentbox -d agentbox < agentbox-backup.sql
+docker run --rm -v agentbox_agentbox-secrets:/data -v "$PWD":/backup alpine \
+  tar xzf /backup/agentbox-secrets.tar.gz -C /data
+```
+
+主密钥一旦丢失，数据库中已加密保存的模型凭据将无法解密，只能逐个重新录入，请与数据库备份分开妥善保管。
+
 ## 核心能力
 
 - 接入 Linux 物理机或 VM，并通过 Worker 管理沙箱生命周期
-- 使用环境模板复用镜像、Agent 工具、变量、Skills、MCP 和初始化命令
-- 支持 Docker、BoxLite 和 Microsandbox；实际可用类型以服务器能力检测为准
-- 预装和配置 Codex、Claude Code、Gemini CLI、OpenCode 等 Agent 工具
+- 使用沙箱模板复用镜像、Agent 工具、变量、Skills、MCP 和初始化命令，支持多项目分组管理
+- 支持 Docker、BoxLite 和 Microsandbox；实际可用类型以服务器能力检测为准（VM 运行时暂不支持，仅保留存量数据只读盘点）
+- 预装和配置 Codex、Claude Code、Gemini CLI、OpenCode、Kimi、Pi、Reasonix 等 Agent 工具
+- 通过自动化 Webhook 联动外部系统，通过网络代理控制沙箱出入流量
+- 内置运行时 LLM 网关：模型凭据只保存在 Server，由 Server 代理协议转换，不下发到沙箱
 - 在浏览器中使用 root 终端、文件管理器和代码编辑器运维沙箱
 - 使用 PostgreSQL 持久化配置，并加密保存模型凭据
 
@@ -69,7 +120,7 @@ Linux Worker 的调度、交互会话和文件操作收敛在同一个 Go 二进
 
 ## 发布
 
-推送 `v*` 标签会触发发布流水线：先运行 Go 测试，再生成两个架构的 Worker、`SHA256SUMS` 和 GitHub Release，最后将 Server/Web 多架构镜像发布到 GHCR。同一 Release 中的 Server 与 Worker 会保持版本一致。
+推送 `v*` 标签会触发发布流水线：先运行 Go 测试与 Web 的 lint、typecheck、test 和 build，全部通过后再生成两个架构的 Worker、`SHA256SUMS` 和 GitHub Release，最后将 Server/Web 多架构镜像发布到 GHCR。同一 Release 中的 Server 与 Worker 会保持版本一致。
 
 ## 验证
 
@@ -83,6 +134,8 @@ pnpm typecheck
 pnpm test
 pnpm build
 ```
+
+推送到 `main` 分支或发起 Pull Request 时，日常 CI 会自动执行上述检查，Go 侧还包括 `go build ./...` 与 `go vet ./...`。
 
 ## 开源协议
 

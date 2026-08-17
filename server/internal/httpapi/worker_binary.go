@@ -57,9 +57,47 @@ func (s *Server) workerBinary(w http.ResponseWriter, request *http.Request) {
 		http.Error(w, "Worker binary is unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	// Expose the SHA-256 of the exact bytes served so installers can verify the
+	// last hop. The checksum is captured from the upstream-verified download and
+	// persisted next to the cached asset; for older caches it is computed once
+	// from the stored file and then reused.
+	if checksum, err := s.workerServedChecksum(request.Context(), path); err == nil && checksum != "" {
+		w.Header().Set("X-Checksum-Sha256", checksum)
+	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", `attachment; filename="agentbox-worker"`)
 	http.ServeContent(w, request, info.Name(), info.ModTime(), file)
+}
+
+// workerServedChecksum returns the lowercase hex SHA-256 of the served asset,
+// reading the sidecar written when the asset was cached and computing (then
+// persisting) it for assets cached before the sidecar existed.
+func (s *Server) workerServedChecksum(ctx context.Context, path string) (string, error) {
+	sidecar := path + ".sha256"
+	if data, err := os.ReadFile(sidecar); err == nil {
+		sum := strings.ToLower(strings.TrimSpace(string(data)))
+		if len(sum) == sha256.Size*2 {
+			if _, err := hex.DecodeString(sum); err == nil {
+				return sum, nil
+			}
+		}
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return "", err
+	}
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	if err := os.WriteFile(sidecar, []byte(sum+"\n"), 0o644); err != nil {
+		if s.logger != nil {
+			s.logger.WarnContext(ctx, "persist Worker checksum sidecar", "path", sidecar, "error", err)
+		}
+	}
+	return sum, nil
 }
 
 func (s *Server) resolveWorkerBinary(ctx context.Context, version, arch string) (string, error) {
@@ -128,6 +166,9 @@ func (s *Server) resolveWorkerBinary(ctx context.Context, version, arch string) 
 	}
 	if err := os.Rename(temporaryPath, cachedPath); err != nil {
 		return "", fmt.Errorf("publish Worker cache file: %w", err)
+	}
+	if err := os.WriteFile(cachedPath+".sha256", []byte(actual+"\n"), 0o644); err != nil && s.logger != nil {
+		s.logger.WarnContext(ctx, "persist Worker checksum sidecar", "path", cachedPath+".sha256", "error", err)
 	}
 	return cachedPath, nil
 }

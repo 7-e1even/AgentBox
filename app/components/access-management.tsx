@@ -117,6 +117,7 @@ import { cn } from "@/lib/utils"
 type AccessManagementProps = {
   credentials: ManagedCredential[]
   providers: Provider[]
+  canMutate: boolean
   onSave: (
     input: CredentialInput,
     editing: ManagedCredential | null
@@ -139,6 +140,7 @@ const MODEL_PAGE_SIZE = 24
 export function AccessManagement({
   credentials,
   providers,
+  canMutate,
   onSave,
   onCheck,
   onPullModels,
@@ -190,10 +192,12 @@ export function AccessManagement({
         title="模型服务"
         count={credentials.length}
         action={
-          <Button size="sm" onClick={() => setCreating(true)}>
-            <PlusIcon data-icon="inline-start" />
-            添加服务
-          </Button>
+          canMutate ? (
+            <Button size="sm" onClick={() => setCreating(true)}>
+              <PlusIcon data-icon="inline-start" />
+              添加服务
+            </Button>
+          ) : undefined
         }
       />
 
@@ -230,7 +234,9 @@ export function AccessManagement({
                     detail={provider?.name ?? credential.providerId}
                     status={status}
                     onClick={() => setSelection(credential.id)}
-                    onDelete={() => setDeleting(credential)}
+                    onDelete={
+                      canMutate ? () => setDeleting(credential) : undefined
+                    }
                   />
                 )
               })}
@@ -242,16 +248,18 @@ export function AccessManagement({
             </ItemGroup>
           </ScrollArea>
 
-          <div className="shrink-0 border-t p-3">
-            <Button
-              variant="outline"
-              className="w-full"
-              onClick={() => setCreating(true)}
-            >
-              <PlusIcon data-icon="inline-start" />
-              添加服务
-            </Button>
-          </div>
+          {canMutate ? (
+            <div className="shrink-0 border-t p-3">
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => setCreating(true)}
+              >
+                <PlusIcon data-icon="inline-start" />
+                添加服务
+              </Button>
+            </div>
+          ) : null}
         </aside>
 
         <div className="flex min-h-0 overflow-hidden">
@@ -261,6 +269,7 @@ export function AccessManagement({
               credential={selectedCredential}
               credentials={credentials}
               providers={providers}
+              canMutate={canMutate}
               onSave={onSave}
               onCheck={onCheck}
               onPullModels={onPullModels}
@@ -274,17 +283,23 @@ export function AccessManagement({
                 <EmptyMedia variant="icon">
                   <LockKeyholeIcon />
                 </EmptyMedia>
-                <EmptyTitle>添加第一个模型服务</EmptyTitle>
+                <EmptyTitle>
+                  {canMutate ? "添加第一个模型服务" : "还没有模型服务"}
+                </EmptyTitle>
                 <EmptyDescription>
-                  保存 API 连接后，再获取或手动添加这个服务可用的模型。
+                  {canMutate
+                    ? "保存 API 连接后，再获取或手动添加这个服务可用的模型。"
+                    : "当前角色只能查看已配置的模型服务。"}
                 </EmptyDescription>
               </EmptyHeader>
-              <EmptyContent>
-                <Button size="sm" onClick={() => setCreating(true)}>
-                  <PlusIcon data-icon="inline-start" />
-                  添加服务
-                </Button>
-              </EmptyContent>
+              {canMutate ? (
+                <EmptyContent>
+                  <Button size="sm" onClick={() => setCreating(true)}>
+                    <PlusIcon data-icon="inline-start" />
+                    添加服务
+                  </Button>
+                </EmptyContent>
+              ) : null}
             </Empty>
           )}
         </div>
@@ -346,7 +361,7 @@ function ServiceListItem({
   detail: string
   status?: { label: string; dotClassName: string }
   onClick?: () => void
-  onDelete: () => void
+  onDelete?: () => void
 }) {
   return (
     <CollectionListItem
@@ -376,32 +391,34 @@ function ServiceListItem({
           <ItemDescription>{detail}</ItemDescription>
         </ItemContent>
       </button>
-      <ItemActions>
-        <DropdownMenu>
-          <DropdownMenuTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-sm"
-              className={cn(
-                "opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100",
-                selected && "opacity-100"
-              )}
-              aria-label={`管理 ${name}`}
-            >
-              <EllipsisVerticalIcon />
-            </Button>
-          </DropdownMenuTrigger>
-          <DropdownMenuContent align="end" className="w-36">
-            <DropdownMenuGroup>
-              <DropdownMenuItem variant="destructive" onSelect={onDelete}>
-                <Trash2Icon />
-                删除服务
-              </DropdownMenuItem>
-            </DropdownMenuGroup>
-          </DropdownMenuContent>
-        </DropdownMenu>
-      </ItemActions>
+      {onDelete ? (
+        <ItemActions>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                className={cn(
+                  "opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 data-[state=open]:opacity-100",
+                  selected && "opacity-100"
+                )}
+                aria-label={`管理 ${name}`}
+              >
+                <EllipsisVerticalIcon />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-36">
+              <DropdownMenuGroup>
+                <DropdownMenuItem variant="destructive" onSelect={onDelete}>
+                  <Trash2Icon />
+                  删除服务
+                </DropdownMenuItem>
+              </DropdownMenuGroup>
+            </DropdownMenuContent>
+          </DropdownMenu>
+        </ItemActions>
+      ) : null}
     </CollectionListItem>
   )
 }
@@ -598,6 +615,7 @@ function CredentialEditor({
   credential,
   credentials,
   providers,
+  canMutate,
   onSave,
   onCheck,
   onPullModels,
@@ -724,27 +742,31 @@ function CredentialEditor({
           </div>
         </div>
         <div className="flex items-center gap-3">
-          <Field orientation="horizontal" className="w-auto gap-2">
-            <FieldLabel htmlFor="credential-enabled">启用</FieldLabel>
-            <Switch
-              id="credential-enabled"
-              checked={input.enabled}
-              onCheckedChange={(checked) => update("enabled", checked)}
-            />
-          </Field>
-          <Button
-            size="sm"
-            disabled={
-              saving ||
-              checking ||
-              pullingModels ||
-              (Boolean(credential) && !dirty)
-            }
-            onClick={() => void persist()}
-          >
-            <SaveIcon data-icon="inline-start" />
-            {saving ? "正在保存…" : "保存"}
-          </Button>
+          {canMutate ? (
+            <>
+              <Field orientation="horizontal" className="w-auto gap-2">
+                <FieldLabel htmlFor="credential-enabled">启用</FieldLabel>
+                <Switch
+                  id="credential-enabled"
+                  checked={input.enabled}
+                  onCheckedChange={(checked) => update("enabled", checked)}
+                />
+              </Field>
+              <Button
+                size="sm"
+                disabled={
+                  saving ||
+                  checking ||
+                  pullingModels ||
+                  (Boolean(credential) && !dirty)
+                }
+                onClick={() => void persist()}
+              >
+                <SaveIcon data-icon="inline-start" />
+                {saving ? "正在保存…" : "保存"}
+              </Button>
+            </>
+          ) : null}
         </div>
       </div>
 
@@ -758,15 +780,17 @@ function CredentialEditor({
                 {actualRequestPath(input.protocol)}
               </CardDescription>
               <CardAction>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setApiSettingsOpen(true)}
-                >
-                  <Settings2Icon data-icon="inline-start" />
-                  API 设置
-                </Button>
+                {canMutate ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setApiSettingsOpen(true)}
+                  >
+                    <Settings2Icon data-icon="inline-start" />
+                    API 设置
+                  </Button>
+                ) : null}
               </CardAction>
             </CardHeader>
             <CardContent>
@@ -780,6 +804,7 @@ function CredentialEditor({
                         type={showSecret ? "text" : "password"}
                         autoComplete="new-password"
                         value={input.secret}
+                        disabled={!canMutate}
                         placeholder={
                           credential
                             ? `当前 ${credential.maskedSecret}；输入新值可替换`
@@ -803,15 +828,17 @@ function CredentialEditor({
                         {showSecret ? <EyeOffIcon /> : <EyeIcon />}
                       </Button>
                     </div>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      disabled={saving || checking || pullingModels}
-                      onClick={() => void checkConnection()}
-                    >
-                      <ActivityIcon data-icon="inline-start" />
-                      {checking ? "正在检测…" : "检测连接"}
-                    </Button>
+                    {canMutate ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        disabled={saving || checking || pullingModels}
+                        onClick={() => void checkConnection()}
+                      >
+                        <ActivityIcon data-icon="inline-start" />
+                        {checking ? "正在检测…" : "检测连接"}
+                      </Button>
+                    ) : null}
                   </div>
                 </Field>
 
@@ -822,6 +849,7 @@ function CredentialEditor({
                   <Input
                     id="credential-endpoint"
                     value={input.endpoint}
+                    disabled={!canMutate}
                     placeholder={defaultEndpointHint(input.providerId)}
                     onChange={(event) => updateEndpoint(event.target.value)}
                     onBlur={() =>
@@ -849,6 +877,7 @@ function CredentialEditor({
             models={credential?.models ?? []}
             busy={saving || pullingModels}
             pulling={pullingModels}
+            canMutate={canMutate}
             onPull={() => void pullModels()}
             onAdd={onAddModel}
             onDelete={onDeleteModel}
@@ -946,6 +975,7 @@ function CredentialModels({
   models,
   busy,
   pulling,
+  canMutate,
   onPull,
   onAdd,
   onDelete,
@@ -955,6 +985,7 @@ function CredentialModels({
   models: CredentialModel[]
   busy: boolean
   pulling: boolean
+  canMutate: boolean
   onPull: () => void
   onAdd: AccessManagementProps["onAddModel"]
   onDelete: AccessManagementProps["onDeleteModel"]
@@ -1078,35 +1109,37 @@ function CredentialModels({
             这里只维护可用模型；具体模型在创建或编辑沙箱时选择。
           </CardDescription>
           <CardAction>
-            <ButtonGroup aria-label="模型操作">
-              <Button
-                type="button"
-                variant="outline"
-                disabled={!credential || busy}
-                onClick={onPull}
-              >
-                <RefreshCwIcon
-                  data-icon="inline-start"
-                  className={pulling ? "animate-spin" : undefined}
-                />
-                {pulling ? "正在获取…" : "获取模型列表"}
-              </Button>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="icon"
-                    aria-label="添加模型"
-                    disabled={!credential || busy}
-                    onClick={() => setAdding(true)}
-                  >
-                    <PlusIcon />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>手动添加模型</TooltipContent>
-              </Tooltip>
-            </ButtonGroup>
+            {canMutate ? (
+              <ButtonGroup aria-label="模型操作">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={!credential || busy}
+                  onClick={onPull}
+                >
+                  <RefreshCwIcon
+                    data-icon="inline-start"
+                    className={pulling ? "animate-spin" : undefined}
+                  />
+                  {pulling ? "正在获取…" : "获取模型列表"}
+                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      aria-label="添加模型"
+                      disabled={!credential || busy}
+                      onClick={() => setAdding(true)}
+                    >
+                      <PlusIcon />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>手动添加模型</TooltipContent>
+                </Tooltip>
+              </ButtonGroup>
+            ) : null}
           </CardAction>
         </CardHeader>
 
@@ -1136,10 +1169,12 @@ function CredentialModels({
                   </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent>
-                  <Button variant="outline" disabled={busy} onClick={onPull}>
-                    <RefreshCwIcon data-icon="inline-start" />
-                    获取模型列表
-                  </Button>
+                  {canMutate ? (
+                    <Button variant="outline" disabled={busy} onClick={onPull}>
+                      <RefreshCwIcon data-icon="inline-start" />
+                      获取模型列表
+                    </Button>
+                  ) : null}
                 </EmptyContent>
               </Empty>
             ) : groups.length === 0 ? (
@@ -1197,23 +1232,25 @@ function CredentialModels({
                                 )}
                               </ItemContent>
                             </div>
-                            <ItemActions>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <Button
-                                    type="button"
-                                    variant="ghost"
-                                    size="icon-sm"
-                                    aria-label={`删除 ${model.name}`}
-                                    disabled={deletingId === model.id}
-                                    onClick={() => void deleteModel(model)}
-                                  >
-                                    <Trash2Icon />
-                                  </Button>
-                                </TooltipTrigger>
-                                <TooltipContent>删除模型</TooltipContent>
-                              </Tooltip>
-                            </ItemActions>
+                            {canMutate ? (
+                              <ItemActions>
+                                <Tooltip>
+                                  <TooltipTrigger asChild>
+                                    <Button
+                                      type="button"
+                                      variant="ghost"
+                                      size="icon-sm"
+                                      aria-label={`删除 ${model.name}`}
+                                      disabled={deletingId === model.id}
+                                      onClick={() => void deleteModel(model)}
+                                    >
+                                      <Trash2Icon />
+                                    </Button>
+                                  </TooltipTrigger>
+                                  <TooltipContent>删除模型</TooltipContent>
+                                </Tooltip>
+                              </ItemActions>
+                            ) : null}
                           </CollectionListItem>
                         ))}
                       </CollectionList>

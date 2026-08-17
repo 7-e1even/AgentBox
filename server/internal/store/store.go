@@ -13,13 +13,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"agentbox/internal/catalog"
@@ -62,6 +65,9 @@ type Store struct {
 	pool      *pgxpool.Pool
 	catalog   catalog.Catalog
 	secretKey []byte
+
+	janitorCancel context.CancelFunc
+	janitorDone   chan struct{}
 }
 
 func New(ctx context.Context, databaseURL string, catalog catalog.Catalog) (*Store, error) {
@@ -97,16 +103,36 @@ func New(ctx context.Context, databaseURL string, catalog catalog.Catalog) (*Sto
 		pool.Close()
 		return nil, err
 	}
+	store.startJanitor()
 	return store, nil
 }
 
-func (s *Store) Close() { s.pool.Close() }
+func (s *Store) Close() {
+	if s.janitorCancel != nil {
+		s.janitorCancel()
+		<-s.janitorDone
+	}
+	s.pool.Close()
+}
 
 func (s *Store) Ping(ctx context.Context) error { return s.pool.Ping(ctx) }
 
 func (s *Store) migrate(ctx context.Context) error {
-	if _, err := s.pool.Exec(ctx, schema); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin migrate: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	// Serialize with concurrent instances exactly like seed(): schema statements
+	// are idempotent but not safe to run concurrently (e.g. constraint re-adds).
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(0x4147424f58)); err != nil {
+		return fmt.Errorf("lock migrate: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schema); err != nil {
 		return fmt.Errorf("migrate database: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit migrate: %w", err)
 	}
 	return nil
 }
@@ -127,6 +153,71 @@ func (s *Store) seed(ctx context.Context) error {
 		return fmt.Errorf("commit seed: %w", err)
 	}
 	return nil
+}
+
+const janitorInterval = 5 * time.Minute
+
+// janitorStatements runs on every janitor pass. Every statement is idempotent:
+// repeated execution converges to the same state.
+var janitorStatements = []string{
+	// Finished worker jobs older than 7 days.
+	`DELETE FROM worker_jobs
+	  WHERE status IN ('succeeded', 'failed') AND updated_at < NOW() - INTERVAL '7 days'`,
+	// Automation runs received more than 30 days ago.
+	`DELETE FROM automation_runs WHERE received_at < NOW() - INTERVAL '30 days'`,
+	// Expired login sessions (login only cleans up opportunistically).
+	`DELETE FROM user_sessions WHERE expires_at < NOW()`,
+	// Sandboxes stuck in a transitional state because their creation/operation
+	// job was never claimed or its lease expired (worker offline or dead).
+	`UPDATE control_resources sandbox
+	  SET spec = sandbox.spec || jsonb_build_object(
+	    'status', 'error'::text,
+	    'message', 'Worker 离线或任务超时未被认领'::text
+	  ), updated_at = NOW()
+	  WHERE sandbox.kind = 'sandbox'
+	    AND sandbox.spec->>'status' IN ('requested', 'pending', 'starting')
+	    AND sandbox.updated_at < NOW() - INTERVAL '15 minutes'
+	    AND EXISTS (
+	      SELECT 1 FROM (
+	        SELECT job.lease_until
+	        FROM worker_jobs job
+	        WHERE job.resource_id = sandbox.id
+	        ORDER BY job.created_at DESC
+	        LIMIT 1
+	      ) latest
+	      WHERE latest.lease_until IS NULL OR latest.lease_until < NOW()
+	    )`,
+}
+
+// startJanitor launches the background cleanup loop; Close stops it.
+func (s *Store) startJanitor() {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.janitorCancel = cancel
+	s.janitorDone = make(chan struct{})
+	go func() {
+		defer close(s.janitorDone)
+		ticker := time.NewTicker(janitorInterval)
+		defer ticker.Stop()
+		for {
+			s.runJanitorPass(ctx)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+}
+
+func (s *Store) runJanitorPass(ctx context.Context) {
+	for _, statement := range janitorStatements {
+		if _, err := s.pool.Exec(ctx, statement); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Warn("store janitor statement failed", "error", err)
+		}
+	}
 }
 
 func seedResources(ctx context.Context, tx pgx.Tx, catalog catalog.Catalog) error {
@@ -297,6 +388,22 @@ func (s *Store) RegisterServer(ctx context.Context, input platform.ServerRegistr
 		return platform.ManagedServer{}, "", err
 	}
 	serverID := input.ServerID
+	// Re-registering a known serverID rotates its credential, so the caller must
+	// prove possession of the server by presenting its current credential.
+	var existingHash []byte
+	err = tx.QueryRow(ctx, `SELECT credential_hash FROM managed_servers
+    WHERE id = $1 FOR UPDATE`, serverID).Scan(&existingHash)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		// Fresh registration.
+	case err != nil:
+		return platform.ManagedServer{}, "", fmt.Errorf("load existing server registration: %w", err)
+	default:
+		previous := strings.TrimSpace(input.PreviousCredential)
+		if previous == "" || !hmac.Equal(hashToken(previous), existingHash) {
+			return platform.ManagedServer{}, "", ErrWorkerUnauthorized
+		}
+	}
 	now := time.Now().UTC()
 	server, err := scanManagedServer(tx.QueryRow(ctx, `INSERT INTO managed_servers
     (id, name, hostname, os, arch, capabilities, credential_hash, last_seen_at, created_at, updated_at)
@@ -1146,7 +1253,19 @@ func parseCredentialModels(reader io.Reader) ([]platform.CredentialModel, error)
 	return models, nil
 }
 
+var (
+	providerHTTPClientOnce sync.Once
+	providerHTTPClient     *http.Client
+)
+
 func safeProviderHTTPClient() *http.Client {
+	providerHTTPClientOnce.Do(func() {
+		providerHTTPClient = newSafeProviderHTTPClient()
+	})
+	return providerHTTPClient
+}
+
+func newSafeProviderHTTPClient() *http.Client {
 	allowPrivate := strings.EqualFold(os.Getenv("AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS"), "true")
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	transport := &http.Transport{
@@ -1234,15 +1353,205 @@ func decryptSecret(key, ciphertext, nonce []byte) (string, error) {
 	return string(plaintext), nil
 }
 
+// environmentValueMask is the fixed replacement sent to clients instead of a
+// stored environment variable value. It leaks neither length nor suffix.
+const environmentValueMask = "••••••"
+
+// encryptedEnvironmentPrefix marks environment variable values encrypted with
+// the credential key (AES-GCM). Values without the prefix are legacy plaintext
+// and are passed through unchanged for backward compatibility.
+const encryptedEnvironmentPrefix = "enc:"
+
+func encryptEnvironmentValue(key []byte, value string) (string, error) {
+	ciphertext, nonce, err := encryptSecret(key, value)
+	if err != nil {
+		return "", err
+	}
+	return encryptedEnvironmentPrefix + base64.RawStdEncoding.EncodeToString(append(nonce, ciphertext...)), nil
+}
+
+func decryptEnvironmentValue(key []byte, value string) (string, error) {
+	if !strings.HasPrefix(value, encryptedEnvironmentPrefix) {
+		return value, nil
+	}
+	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(value, encryptedEnvironmentPrefix))
+	if err != nil {
+		return "", fmt.Errorf("decode encrypted environment variable: %w", err)
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return "", fmt.Errorf("initialize environment variable decryption: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", fmt.Errorf("initialize environment variable cipher: %w", err)
+	}
+	if len(raw) < gcm.NonceSize() {
+		return "", errors.New("encrypted environment variable is truncated")
+	}
+	plaintext, err := gcm.Open(nil, raw[:gcm.NonceSize()], raw[gcm.NonceSize():], nil)
+	if err != nil {
+		return "", errors.New("decrypt environment variable")
+	}
+	return string(plaintext), nil
+}
+
+// encryptSpecEnvironmentVariables encrypts every environment variable value in
+// place. It is idempotent: values already carrying the enc: prefix (for example
+// values preserved from the stored spec) are left untouched. The fixed mask
+// value is rejected: it is only meaningful for updates and is resolved against
+// the stored spec before this function runs.
+func (s *Store) encryptSpecEnvironmentVariables(spec map[string]any) error {
+	variables, ok := spec["environmentVariables"].([]any)
+	if !ok {
+		return nil
+	}
+	for _, variable := range variables {
+		entry, ok := variable.(map[string]any)
+		if !ok {
+			continue
+		}
+		value, ok := entry["value"].(string)
+		if !ok || strings.HasPrefix(value, encryptedEnvironmentPrefix) {
+			continue
+		}
+		if value == environmentValueMask {
+			name, _ := entry["name"].(string)
+			return &platform.ValidationError{Message: "环境变量 " + name + " 没有可保留的已存值，请重新输入"}
+		}
+		encrypted, err := encryptEnvironmentValue(s.secretKey, value)
+		if err != nil {
+			return err
+		}
+		entry["value"] = encrypted
+	}
+	return nil
+}
+
+// preserveMaskedEnvironmentVariables resolves masked values in an update
+// payload against the stored spec: a value equal to the fixed mask keeps the
+// stored (already encrypted) value for the same variable name.
+func (s *Store) preserveMaskedEnvironmentVariables(ctx context.Context, id string, spec map[string]any) error {
+	variables, ok := spec["environmentVariables"].([]any)
+	if !ok {
+		return nil
+	}
+	needsPreserve := false
+	for _, variable := range variables {
+		if entry, ok := variable.(map[string]any); ok && entry["value"] == environmentValueMask {
+			needsPreserve = true
+			break
+		}
+	}
+	if !needsPreserve {
+		return nil
+	}
+	var existingJSON []byte
+	err := s.pool.QueryRow(ctx, `SELECT spec->'environmentVariables'
+    FROM control_resources WHERE id = $1`, id).Scan(&existingJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrResourceNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("load stored environment variables: %w", err)
+	}
+	stored := map[string]string{}
+	var existing []any
+	if err := json.Unmarshal(existingJSON, &existing); err == nil {
+		for _, variable := range existing {
+			entry, ok := variable.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, nameOK := entry["name"].(string)
+			value, valueOK := entry["value"].(string)
+			if nameOK && valueOK {
+				stored[name] = value
+			}
+		}
+	}
+	return resolveMaskedEnvironmentVariables(variables, stored)
+}
+
+// resolveMaskedEnvironmentVariables substitutes values equal to the fixed mask
+// with the stored value for the same variable name.
+func resolveMaskedEnvironmentVariables(variables []any, stored map[string]string) error {
+	for _, variable := range variables {
+		entry, ok := variable.(map[string]any)
+		if !ok || entry["value"] != environmentValueMask {
+			continue
+		}
+		name, _ := entry["name"].(string)
+		kept, exists := stored[name]
+		if !exists {
+			return &platform.ValidationError{Message: "环境变量 " + name + " 没有可保留的已存值，请重新输入"}
+		}
+		entry["value"] = kept
+	}
+	return nil
+}
+
+// maskSpecEnvironmentVariables replaces every environment variable value with
+// the fixed mask before a resource is returned to API clients.
+func maskSpecEnvironmentVariables(spec map[string]any) {
+	variables, ok := spec["environmentVariables"].([]any)
+	if !ok {
+		return
+	}
+	for _, variable := range variables {
+		if entry, ok := variable.(map[string]any); ok {
+			if _, isString := entry["value"].(string); isString {
+				entry["value"] = environmentValueMask
+			}
+		}
+	}
+}
+
+func maskResourceEnvironmentVariables(resource *platform.Resource) {
+	if resource.Kind != platform.KindRuntime && resource.Kind != platform.KindSandbox {
+		return
+	}
+	maskSpecEnvironmentVariables(resource.Spec)
+}
+
+// decryptPayloadEnvironmentVariables hands plaintext values to the worker when
+// a job is claimed. Legacy values without the enc: prefix pass through as-is.
+func (s *Store) decryptPayloadEnvironmentVariables(payload map[string]any) error {
+	variables, ok := payload["environmentVariables"].([]any)
+	if !ok {
+		return nil
+	}
+	for _, variable := range variables {
+		entry, ok := variable.(map[string]any)
+		if !ok {
+			continue
+		}
+		value, ok := entry["value"].(string)
+		if !ok {
+			continue
+		}
+		plaintext, err := decryptEnvironmentValue(s.secretKey, value)
+		if err != nil {
+			return fmt.Errorf("decrypt worker environment variable: %w", err)
+		}
+		entry["value"] = plaintext
+	}
+	return nil
+}
+
 func loadSecretKey() ([]byte, error) {
 	if encoded := strings.TrimSpace(os.Getenv("AGENTBOX_SECRET_KEY")); encoded != "" {
 		return decodeSecretKey(encoded)
 	}
-	path := strings.TrimSpace(os.Getenv("AGENTBOX_SECRET_KEY_FILE"))
-	if path == "" {
-		path = ".agentbox-secret-key"
+	path, legacy, err := secretKeyFilePath()
+	if err != nil {
+		return nil, err
 	}
 	if data, err := os.ReadFile(path); err == nil {
+		if legacy {
+			slog.Warn("using the legacy working-directory credential key file; "+
+				"move it to the user-level path or set AGENTBOX_SECRET_KEY_FILE", "path", path)
+		}
 		return decodeSecretKey(strings.TrimSpace(string(data)))
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read credential encryption key: %w", err)
@@ -1251,11 +1560,34 @@ func loadSecretKey() ([]byte, error) {
 	if _, err := rand.Read(key); err != nil {
 		return nil, fmt.Errorf("generate credential encryption key: %w", err)
 	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, fmt.Errorf("create credential encryption key directory: %w", err)
+	}
 	encoded := base64.RawStdEncoding.EncodeToString(key)
 	if err := os.WriteFile(path, []byte(encoded+"\n"), 0o600); err != nil {
 		return nil, fmt.Errorf("persist credential encryption key: %w", err)
 	}
 	return key, nil
+}
+
+// secretKeyFilePath deterministically picks the credential key location:
+// an explicit AGENTBOX_SECRET_KEY_FILE wins, then a legacy file in the working
+// directory (for backward compatibility), otherwise the user-level default.
+func secretKeyFilePath() (path string, legacy bool, err error) {
+	if path := strings.TrimSpace(os.Getenv("AGENTBOX_SECRET_KEY_FILE")); path != "" {
+		return path, false, nil
+	}
+	const legacyPath = ".agentbox-secret-key"
+	if _, err := os.Stat(legacyPath); err == nil {
+		return legacyPath, true, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", false, fmt.Errorf("check legacy credential key file: %w", err)
+	}
+	configDir, err := os.UserConfigDir()
+	if err != nil {
+		return "", false, fmt.Errorf("locate user config directory for the credential key: %w", err)
+	}
+	return filepath.Join(configDir, "agentbox", "secret-key"), false, nil
 }
 
 func decodeSecretKey(encoded string) ([]byte, error) {
@@ -1307,6 +1639,9 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	}
 	if err := json.Unmarshal(payloadJSON, &job.Payload); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("decode worker job payload: %w", err)
+	}
+	if err := s.decryptPayloadEnvironmentVariables(job.Payload); err != nil {
+		return platform.WorkerJob{}, err
 	}
 	if resourceID.Valid {
 		job.ResourceID = resourceID.String
@@ -1701,6 +2036,7 @@ func (s *Store) ListResources(ctx context.Context) ([]platform.Resource, error) 
 		if err != nil {
 			return nil, fmt.Errorf("scan resource: %w", err)
 		}
+		maskResourceEnvironmentVariables(&resource)
 		resources = append(resources, resource)
 	}
 	return resources, rows.Err()
@@ -1714,8 +2050,13 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 	if err := s.ensureProject(ctx, input); err != nil {
 		return platform.Resource{}, err
 	}
-	if err := s.ensureResourceReferences(ctx, input); err != nil {
+	if err := s.ensureResourceReferences(ctx, input, true); err != nil {
 		return platform.Resource{}, err
+	}
+	if input.Kind == platform.KindRuntime || input.Kind == platform.KindSandbox {
+		if err := s.encryptSpecEnvironmentVariables(input.Spec); err != nil {
+			return platform.Resource{}, err
+		}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -1739,6 +2080,7 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 	if err := tx.Commit(ctx); err != nil {
 		return platform.Resource{}, mapResourceError(err)
 	}
+	maskResourceEnvironmentVariables(&result)
 	return result, nil
 }
 
@@ -1900,8 +2242,16 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	if err := s.ensureProject(ctx, input); err != nil {
 		return platform.Resource{}, err
 	}
-	if err := s.ensureResourceReferences(ctx, input); err != nil {
+	if err := s.ensureResourceReferences(ctx, input, false); err != nil {
 		return platform.Resource{}, err
+	}
+	if input.Kind == platform.KindRuntime || input.Kind == platform.KindSandbox {
+		if err := s.preserveMaskedEnvironmentVariables(ctx, id, input.Spec); err != nil {
+			return platform.Resource{}, err
+		}
+		if err := s.encryptSpecEnvironmentVariables(input.Spec); err != nil {
+			return platform.Resource{}, err
+		}
 	}
 	result, err := scanResource(s.pool.QueryRow(ctx, `UPDATE control_resources SET
 		project_id = $1, name = $2, description = $3, enabled = $4,
@@ -1915,6 +2265,7 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	if err != nil {
 		return platform.Resource{}, mapResourceError(err)
 	}
+	maskResourceEnvironmentVariables(&result)
 	return result, nil
 }
 
@@ -2014,6 +2365,7 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	if err := tx.Commit(ctx); err != nil {
 		return platform.Resource{}, fmt.Errorf("commit sandbox operation: %w", err)
 	}
+	maskResourceEnvironmentVariables(&resource)
 	return resource, nil
 }
 
@@ -2072,7 +2424,7 @@ func (s *Store) ensureProject(ctx context.Context, input platform.Input) error {
 	return nil
 }
 
-func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Input) error {
+func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Input, requireOnlineServer bool) error {
 	if input.Kind == platform.KindImage {
 		rows, err := s.pool.Query(ctx, `SELECT spec->>'driver' FROM control_resources
       WHERE kind = 'runtime' AND spec->>'imageId' = $1`, input.ID)
@@ -2201,11 +2553,16 @@ func (s *Store) ensureResourceReferences(ctx context.Context, input platform.Inp
 	var supports bool
 	var serverArch string
 	var inventoryJSON []byte
-	if err := s.pool.QueryRow(ctx, `SELECT capabilities ? $2, arch, inventory
-      FROM managed_servers WHERE id = $1`, serverID, requiredCapability).Scan(&supports, &serverArch, &inventoryJSON); errors.Is(err, pgx.ErrNoRows) {
+	var serverOnline bool
+	if err := s.pool.QueryRow(ctx, `SELECT capabilities ? $2, arch, inventory,
+      last_seen_at > NOW() - INTERVAL '45 seconds'
+      FROM managed_servers WHERE id = $1`, serverID, requiredCapability).Scan(&supports, &serverArch, &inventoryJSON, &serverOnline); errors.Is(err, pgx.ErrNoRows) {
 		return &platform.ValidationError{Message: "目标服务器不存在"}
 	} else if err != nil {
 		return fmt.Errorf("check sandbox server: %w", err)
+	}
+	if requireOnlineServer && !serverOnline {
+		return &platform.ValidationError{Message: "目标服务器离线，无法创建沙箱"}
 	}
 	if !supports {
 		return &platform.ValidationError{Message: "目标服务器尚未通过所选隔离驱动的自检"}

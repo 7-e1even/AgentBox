@@ -177,7 +177,7 @@ function fields(
           label: "OCI 镜像引用",
           placeholder: "ubuntu:24.04 或 registry.example.com/agent:latest",
           description:
-            "保存镜像引用；实际拉取和 VM rootfs 转换发生在沙箱创建阶段。",
+            "保存镜像引用；实际拉取发生在沙箱创建阶段。",
         },
         {
           key: "architecture",
@@ -191,11 +191,8 @@ function fields(
         {
           key: "modes",
           label: "兼容类型",
-          multiOptions: [
-            { value: "docker", label: "Docker 容器" },
-            { value: "vm", label: "VM 沙箱" },
-          ],
-          description: "VM 会将 OCI 镜像转换为可启动的根文件系统。",
+          multiOptions: [{ value: "docker", label: "Docker 容器" }],
+          description: "镜像通过 OCI 运行时（Docker、BoxLite、Microsandbox）使用。",
         },
       ]
     case "runtime":
@@ -204,7 +201,7 @@ function fields(
           key: "serverId",
           label: "运行服务器",
           options: serverOptions,
-          description: "基座会使用这台服务器的镜像与隔离能力。",
+          description: "沙箱模板会使用这台服务器的镜像与隔离能力。",
         },
         {
           key: "driver",
@@ -366,7 +363,7 @@ function fields(
           key: "runtimeId",
           label: "沙箱模板",
           options: runtimeOptions,
-          description: "先继承基座配置，再按这个沙箱的需要调整。",
+          description: "先继承沙箱模板配置，再按这个沙箱的需要调整。",
         },
         {
           key: "workspace",
@@ -432,7 +429,7 @@ function defaults(kind: ResourceKind) {
     image: {
       reference: "",
       architecture: "all",
-      modes: ["docker", "vm"],
+      modes: ["docker"],
     },
     runtime: {
       driver: "docker",
@@ -916,11 +913,11 @@ export function ResourceEditorDialog({
             {kind === "project"
               ? "项目只用于组织智能体和相关配置。"
               : kind === "image"
-                ? "镜像是平台级 OCI 引用，可供 Docker 与 VM 沙箱模板复用。"
+                ? "镜像是平台级 OCI 引用，可供沙箱模板复用。"
                 : kind === "runtime"
-                  ? "把服务器、镜像、Agent 工具与模型凭据保存成可复用基座。"
+                  ? "把服务器、镜像、Agent 工具与模型凭据保存成可复用沙箱模板。"
                   : kind === "sandbox"
-                    ? "从基座继承默认配置，并为这个沙箱选择一个或多个 Agent。"
+                    ? "从沙箱模板继承默认配置，并为这个沙箱选择一个或多个 Agent。"
                     : "配置会保存在平台控制面，并由沙箱创建流程消费。"}
           </DialogDescription>
         </DialogHeader>
@@ -1039,7 +1036,7 @@ export function ResourceEditorDialog({
                 <FieldLabel htmlFor="resource-enabled">启用配置</FieldLabel>
                 <FieldDescription>
                   {kind === "image"
-                    ? "停用后不能用于创建或更新环境模板。"
+                    ? "停用后不能用于创建或更新沙箱模板。"
                     : "禁用后保留声明，但不会用于新建沙箱。"}
                 </FieldDescription>
               </div>

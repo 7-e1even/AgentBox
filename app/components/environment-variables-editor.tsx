@@ -4,6 +4,7 @@ import { PlusIcon, Trash2Icon } from "lucide-react"
 
 import {
   environmentVariableEntries,
+  environmentVariableMask,
   type EnvironmentVariableEntry,
 } from "@/lib/environment-variables"
 import { Button } from "@/components/ui/button"
@@ -17,6 +18,9 @@ export function EnvironmentVariablesEditor({
   onChange: (value: EnvironmentVariableEntry[]) => void
 }) {
   const entries = environmentVariableEntries(value)
+  const hasMaskedEntries = entries.some(
+    (entry) => entry.value === environmentVariableMask
+  )
 
   function update(index: number, patch: Partial<EnvironmentVariableEntry>) {
     onChange(
@@ -51,8 +55,14 @@ export function EnvironmentVariablesEditor({
                   aria-label={`${entry.name || `第 ${index + 1} 个环境变量`}的值`}
                   className="font-mono"
                   disabled={entry.name === "IS_SANDBOX"}
-                  value={entry.value}
-                  placeholder="production"
+                  value={
+                    entry.value === environmentVariableMask ? "" : entry.value
+                  }
+                  placeholder={
+                    entry.value === environmentVariableMask
+                      ? `${environmentVariableMask} 保持不变，输入以修改`
+                      : "production"
+                  }
                   onChange={(event) =>
                     update(index, { value: event.target.value })
                   }
@@ -74,7 +84,9 @@ export function EnvironmentVariablesEditor({
       )}
       <div className="flex items-center justify-between gap-3">
         <p className="text-xs text-muted-foreground">
-          普通配置会明文保存；API Key 请使用模型服务。
+          {hasMaskedEntries
+            ? `显示为 ${environmentVariableMask} 的值保持不变，输入新值才会覆盖。`
+            : "普通配置会明文保存；API Key 请使用模型服务。"}
         </p>
         <Button
           type="button"

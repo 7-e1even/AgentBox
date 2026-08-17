@@ -38,9 +38,12 @@ const (
 	boxliteGuestHelper  = "/opt/agentbox/agentbox-guest"
 	microsandboxBinary  = "/usr/local/bin/agentbox-microsandbox-driver"
 	uploadStagingDir    = "/var/lib/agentbox-worker/uploads"
+	stagedUploadMaxAge  = 24 * time.Hour
+	maxConcurrentRPCs   = 32
 )
 
 func Run(ctx context.Context, configPath string, stderr io.Writer) error {
+	cleanupStaleUploads(stderr)
 	delay := time.Second
 	for ctx.Err() == nil {
 		connected, err := runConnection(ctx, configPath)
@@ -100,15 +103,49 @@ func runConnection(ctx context.Context, configPath string) (bool, error) {
 	}
 }
 
+// cleanupStaleUploads removes staged upload files left behind by interrupted
+// sessions so the staging directory cannot grow without bound.
+func cleanupStaleUploads(stderr io.Writer) {
+	entries, err := os.ReadDir(uploadStagingDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			_, _ = fmt.Fprintf(stderr, "staging cleanup: read %s: %v\n", uploadStagingDir, err)
+		}
+		return
+	}
+	cutoff := time.Now().Add(-stagedUploadMaxAge)
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".part") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(uploadStagingDir, entry.Name())); err == nil {
+			removed++
+		}
+	}
+	if removed > 0 {
+		_, _ = fmt.Fprintf(stderr, "staging cleanup: removed %d stale upload(s) from %s\n", removed, uploadStagingDir)
+	}
+}
+
 type sessionManager struct {
 	conn     *websocket.Conn
 	writeMu  sync.Mutex
 	sessions map[string]*terminalSession
 	mu       sync.RWMutex
+	rpcSlots chan struct{}
 }
 
 func newSessionManager(conn *websocket.Conn) *sessionManager {
-	return &sessionManager{conn: conn, sessions: make(map[string]*terminalSession)}
+	return &sessionManager{
+		conn:     conn,
+		sessions: make(map[string]*terminalSession),
+		rpcSlots: make(chan struct{}, maxConcurrentRPCs),
+	}
 }
 
 func (m *sessionManager) send(outgoing message) error {
@@ -129,7 +166,20 @@ func (m *sessionManager) handle(incoming message) {
 	m.mu.RUnlock()
 	switch incoming.Type {
 	case "rpc":
-		go m.handleRPC(incoming)
+		select {
+		case m.rpcSlots <- struct{}{}:
+			go func() {
+				defer func() { <-m.rpcSlots }()
+				m.handleRPC(incoming)
+			}()
+		default:
+			_ = m.send(message{
+				Type:      "rpc-result",
+				SessionID: incoming.SessionID,
+				RequestID: incoming.RequestID,
+				Error:     "session worker is busy; retry the file operation",
+			})
+		}
 	case "input":
 		if session != nil {
 			_ = session.input(incoming.Data)
@@ -519,7 +569,7 @@ func rpcList(driver, target, containerPath string) ([]fileEntry, error) {
 		}
 		return entries, nil
 	}
-	output, err := runtimeRun(driver, target, `set -eu; test -d "$1" || { echo "directory not found: $1" >&2; exit 1; }; find "$1" -mindepth 1 -maxdepth 1 -printf "%y\t%s\t%T@\t%p\n" | sed -n "1,1000p"`, containerPath, nil, 15*time.Second)
+	output, err := runtimeRun(driver, target, `set -eu; test -d "$1" || { echo "directory not found: $1" >&2; exit 1; }; tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT; if find "$1" -mindepth 1 -maxdepth 1 -printf "%y\t%s\t%T@\t%p\n" > "$tmp" 2>/dev/null; then sed -n "1,1000p" "$tmp"; exit 0; fi; find "$1" -mindepth 1 -maxdepth 1 -print | while IFS= read -r entry; do if [ -d "$entry" ]; then entry_type=d; else entry_type=f; fi; entry_size=$(stat -c %s "$entry" 2>/dev/null || printf '0'); entry_mtime=$(stat -c %Y "$entry" 2>/dev/null || printf '0'); printf '%s\t%s\t%s\t%s\n' "$entry_type" "$entry_size" "$entry_mtime" "$entry"; done > "$tmp"; sed -n "1,1000p" "$tmp"`, containerPath, nil, 30*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -589,6 +639,17 @@ func stagedUploadPath(target, containerPath, uploadID string) string {
 	return filepath.Join(uploadStagingDir, fmt.Sprintf("%x.part", digest))
 }
 
+var stagedUploadLocks sync.Map
+
+// lockStagedUpload serializes chunk writes for one staged upload so concurrent
+// RPC handlers cannot append out-of-order chunks to the same file.
+func lockStagedUpload(key string) func() {
+	lock, _ := stagedUploadLocks.LoadOrStore(key, &sync.Mutex{})
+	mutex := lock.(*sync.Mutex)
+	mutex.Lock()
+	return mutex.Unlock
+}
+
 func rpcUploadStart(driver, target, containerPath, uploadID string) (string, error) {
 	tempPath, err := uploadTempPath(containerPath, uploadID)
 	if err != nil {
@@ -628,6 +689,8 @@ func rpcUploadChunk(driver, target, containerPath, uploadID, content string) (st
 	if len(chunk) > maxUploadChunkSize {
 		return "", errors.New("upload chunk exceeds 192 KiB")
 	}
+	unlock := lockStagedUpload(stagedUploadPath(target, containerPath, uploadID))
+	defer unlock()
 	if driver != "docker" {
 		stagedPath := stagedUploadPath(target, containerPath, uploadID)
 		file, err := os.OpenFile(stagedPath, os.O_WRONLY|os.O_APPEND, 0o600)
@@ -661,6 +724,11 @@ func rpcUploadFinish(driver, target, containerPath, uploadID string) (string, er
 	}
 	if driver != "docker" {
 		stagedPath := stagedUploadPath(target, containerPath, uploadID)
+		unlock := lockStagedUpload(stagedPath)
+		defer func() {
+			unlock()
+			stagedUploadLocks.Delete(stagedPath)
+		}()
 		file, err := os.Open(stagedPath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -696,6 +764,11 @@ func rpcUploadCancel(driver, target, containerPath, uploadID string) (string, er
 	}
 	if driver != "docker" {
 		stagedPath := stagedUploadPath(target, containerPath, uploadID)
+		unlock := lockStagedUpload(stagedPath)
+		defer func() {
+			unlock()
+			stagedUploadLocks.Delete(stagedPath)
+		}()
 		if err := os.Remove(stagedPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return "", err
 		}

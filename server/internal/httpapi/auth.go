@@ -46,20 +46,24 @@ func (s *Server) setupAdmin(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	setSessionCookie(w, request, token, expiresAt)
+	s.setSessionCookie(w, request, token, expiresAt)
 	s.writeJSON(w, http.StatusCreated, map[string]any{"user": user})
 }
 
 func (s *Server) login(w http.ResponseWriter, request *http.Request) {
 	var input struct {
-		Email    string `json:"email"`
+		Username string `json:"username"`
 		Password string `json:"password"`
 	}
 	if !s.decodeJSON(w, request, &input) {
 		return
 	}
-	if strings.TrimSpace(input.Email) == "" || input.Password == "" {
-		s.writeError(w, http.StatusBadRequest, "请输入邮箱和密码")
+	if strings.TrimSpace(input.Username) == "" || input.Password == "" {
+		s.writeError(w, http.StatusBadRequest, "请输入用户名和密码")
+		return
+	}
+	if !s.loginLimiter.allow(s.clientIP(request), time.Now().UTC()) {
+		s.writeError(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 		return
 	}
 	token, tokenHash, err := newSessionToken()
@@ -68,16 +72,16 @@ func (s *Server) login(w http.ResponseWriter, request *http.Request) {
 		return
 	}
 	expiresAt := time.Now().UTC().Add(sessionLifetime)
-	user, err := s.store.AuthenticateUser(request.Context(), input.Email, input.Password, tokenHash, expiresAt)
+	user, err := s.store.AuthenticateUser(request.Context(), input.Username, input.Password, tokenHash, expiresAt)
 	if err != nil {
 		if errors.Is(err, store.ErrUnauthorized) {
-			s.writeError(w, http.StatusUnauthorized, "邮箱或密码错误，或账号已停用")
+			s.writeError(w, http.StatusUnauthorized, "用户名或密码错误，或账号已停用")
 			return
 		}
 		s.handleError(w, err)
 		return
 	}
-	setSessionCookie(w, request, token, expiresAt)
+	s.setSessionCookie(w, request, token, expiresAt)
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -93,6 +97,19 @@ func (s *Server) updateCurrentUser(w http.ResponseWriter, request *http.Request)
 	current := userFromContext(request.Context())
 	input.Role = current.Role
 	input.Status = current.Status
+	// 修改自己的密码时保留当前会话（不踢掉本次登录），其余会话仍失效。
+	if input.Password != "" {
+		if preserver, ok := s.store.(sessionPreservingUserStore); ok {
+			keepHash, _ := sessionHash(request)
+			user, err := preserver.UpdateUserPreservingSession(request.Context(), current.ID, input, keepHash)
+			if err != nil {
+				s.handleError(w, err)
+				return
+			}
+			s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
+			return
+		}
+	}
 	user, err := s.store.UpdateUser(request.Context(), current.ID, input)
 	if err != nil {
 		s.handleError(w, err)
@@ -122,7 +139,7 @@ func (s *Server) logout(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
-	clearSessionCookie(w, request)
+	s.clearSessionCookie(w, request)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -198,7 +215,7 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 		user, err := s.store.UserBySession(request.Context(), tokenHash)
 		if err != nil {
 			if errors.Is(err, store.ErrUnauthorized) {
-				clearSessionCookie(w, request)
+				s.clearSessionCookie(w, request)
 				s.writeError(w, http.StatusUnauthorized, "登录状态无效或已过期")
 				return
 			}
@@ -223,6 +240,7 @@ func (s *Server) debugUser(ctx context.Context) (platform.User, error) {
 	return platform.User{
 		ID:          "00000000-0000-0000-0000-000000000001",
 		Name:        "Debug Admin",
+		Username:    "debug",
 		Email:       "debug@agentbox.local",
 		Role:        platform.UserRoleAdmin,
 		Status:      platform.UserStatusActive,
@@ -232,14 +250,10 @@ func (s *Server) debugUser(ctx context.Context) (platform.User, error) {
 	}, nil
 }
 
-func (s *Server) requireAdmin(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if userFromContext(request.Context()).Role != platform.UserRoleAdmin {
-			s.writeError(w, http.StatusForbidden, "仅管理员可以管理用户")
-			return
-		}
-		next.ServeHTTP(w, request)
-	})
+// sessionPreservingUserStore 由 *store.Store 实现；PlatformStore 接口保持不变，
+// 以免破坏依赖该接口的既有测试 fake。
+type sessionPreservingUserStore interface {
+	UpdateUserPreservingSession(context.Context, string, platform.UserInput, []byte) (platform.User, error)
 }
 
 func userFromContext(ctx context.Context) platform.User {
@@ -266,7 +280,7 @@ func sessionHash(request *http.Request) ([]byte, bool) {
 	return hash[:], true
 }
 
-func setSessionCookie(w http.ResponseWriter, request *http.Request, token string, expiresAt time.Time) {
+func (s *Server) setSessionCookie(w http.ResponseWriter, request *http.Request, token string, expiresAt time.Time) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    token,
@@ -274,19 +288,19 @@ func setSessionCookie(w http.ResponseWriter, request *http.Request, token string
 		Expires:  expiresAt,
 		MaxAge:   int(sessionLifetime.Seconds()),
 		HttpOnly: true,
-		Secure:   request.TLS != nil || request.Header.Get("X-Forwarded-Proto") == "https",
+		Secure:   s.cookieSecure(request),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
 
-func clearSessionCookie(w http.ResponseWriter, request *http.Request) {
+func (s *Server) clearSessionCookie(w http.ResponseWriter, request *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   request.TLS != nil || request.Header.Get("X-Forwarded-Proto") == "https",
+		Secure:   s.cookieSecure(request),
 		SameSite: http.SameSiteLaxMode,
 	})
 }

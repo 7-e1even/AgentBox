@@ -30,6 +30,7 @@ var idPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 var allowedAgentTools = map[string]bool{
 	"claude-code": true,
 	"codex":       true,
+	"gemini-cli":  true,
 	"kimi":        true,
 	"opencode":    true,
 	"pi":          true,
@@ -104,13 +105,16 @@ type ServerPairing struct {
 }
 
 type ServerRegistration struct {
-	PairingToken string   `json:"pairingToken"`
-	ServerID     string   `json:"serverId"`
-	Name         string   `json:"name"`
-	Hostname     string   `json:"hostname"`
-	OS           string   `json:"os"`
-	Arch         string   `json:"arch"`
-	Capabilities []string `json:"capabilities"`
+	PairingToken       string   `json:"pairingToken"`
+	ServerID           string   `json:"serverId"`
+	Name               string   `json:"name"`
+	Hostname           string   `json:"hostname"`
+	OS                 string   `json:"os"`
+	Arch               string   `json:"arch"`
+	Capabilities       []string `json:"capabilities"`
+	// PreviousCredential is required when re-registering a known serverId:
+	// it must match the server's current credential to authorize rotation.
+	PreviousCredential string `json:"previousCredential"`
 }
 
 type CredentialInput struct {

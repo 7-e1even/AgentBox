@@ -157,6 +157,7 @@ WHERE kind = 'sandbox'
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY,
   name TEXT NOT NULL,
+  username TEXT NOT NULL,
   email TEXT NOT NULL UNIQUE,
   password_hash BYTEA NOT NULL,
   role TEXT NOT NULL CHECK (role IN ('admin', 'operator', 'viewer')),
@@ -172,6 +173,43 @@ CREATE INDEX IF NOT EXISTS idx_users_status_updated
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS preferences JSONB NOT NULL
   DEFAULT '{"successNotifications":true,"density":"comfortable","showCapabilities":true,"showInfrastructure":true,"showGovernance":true}'::jsonb;
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+
+WITH username_bases AS (
+  SELECT id, created_at,
+    CASE
+      WHEN LENGTH(BTRIM(REGEXP_REPLACE(LOWER(SPLIT_PART(email, '@', 1)), '[^a-z0-9._-]+', '-', 'g'), '._-')) >= 3
+        THEN LEFT(BTRIM(REGEXP_REPLACE(LOWER(SPLIT_PART(email, '@', 1)), '[^a-z0-9._-]+', '-', 'g'), '._-'), 64)
+      ELSE 'user-' || LEFT(REPLACE(id::text, '-', ''), 8)
+    END AS base
+  FROM users
+  WHERE username IS NULL OR BTRIM(username) = ''
+), username_candidates AS (
+  SELECT id, base,
+    ROW_NUMBER() OVER (PARTITION BY base ORDER BY created_at, id) AS position
+  FROM username_bases
+), resolved_usernames AS (
+  SELECT candidate.id,
+    CASE
+      WHEN candidate.position = 1 AND NOT EXISTS (
+        SELECT 1 FROM users existing
+        WHERE existing.username IS NOT NULL
+          AND LOWER(existing.username) = candidate.base
+      ) THEN candidate.base
+      ELSE LEFT(candidate.base, 31) || '-' || REPLACE(candidate.id::text, '-', '')
+    END AS username
+  FROM username_candidates candidate
+)
+UPDATE users
+SET username = resolved.username
+FROM resolved_usernames resolved
+WHERE users.id = resolved.id;
+
+ALTER TABLE users ALTER COLUMN username SET NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower
+  ON users(LOWER(username));
 
 CREATE TABLE IF NOT EXISTS user_sessions (
   token_hash BYTEA PRIMARY KEY,

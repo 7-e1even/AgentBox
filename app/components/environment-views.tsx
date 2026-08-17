@@ -83,11 +83,13 @@ export function DashboardView({
   resources,
   servers,
   configuredCredentials,
+  canMutate,
   onNavigate,
   onCreateEnvironment,
   onCreateSandbox,
 }: EnvironmentProps & {
   configuredCredentials: number
+  canMutate: boolean
   onNavigate: (section: AppSection) => void
   onCreateEnvironment: () => void
   onCreateSandbox: () => void
@@ -149,14 +151,18 @@ export function DashboardView({
               </p>
             </div>
             <div className="flex shrink-0 flex-wrap gap-2">
-              <Button variant="outline" onClick={onCreateEnvironment}>
-                <PlusIcon data-icon="inline-start" />
-                新建沙箱模板
-              </Button>
-              <Button onClick={onCreateSandbox}>
-                <BoxIcon data-icon="inline-start" />
-                创建沙箱
-              </Button>
+              {canMutate ? (
+                <>
+                  <Button variant="outline" onClick={onCreateEnvironment}>
+                    <PlusIcon data-icon="inline-start" />
+                    新建沙箱模板
+                  </Button>
+                  <Button onClick={onCreateSandbox}>
+                    <BoxIcon data-icon="inline-start" />
+                    创建沙箱
+                  </Button>
+                </>
+              ) : null}
             </div>
           </div>
 
@@ -179,7 +185,7 @@ export function DashboardView({
               icon={KeyRoundIcon}
               label="模型凭据"
               value={configuredCredentials}
-              detail="注入基座后自动生效"
+              detail="注入沙箱模板后自动生效"
               onClick={() => onNavigate("access")}
             />
             <StatCard
@@ -245,13 +251,15 @@ export function DashboardView({
                     <p className="mt-1 text-sm text-muted-foreground">
                       选择服务器和镜像，再加入需要的 Agent 工具与凭据。
                     </p>
-                    <Button
-                      size="sm"
-                      className="mt-4"
-                      onClick={onCreateEnvironment}
-                    >
-                      创建第一个基座
-                    </Button>
+                    {canMutate ? (
+                      <Button
+                        size="sm"
+                        className="mt-4"
+                        onClick={onCreateEnvironment}
+                      >
+                        创建第一个沙箱模板
+                      </Button>
+                    ) : null}
                   </div>
                 )}
               </CardContent>
@@ -342,11 +350,13 @@ function StatCard({
 export function EnvironmentTemplatesView({
   resources,
   servers,
+  canMutate,
   onCreate,
   onEdit,
   onDelete,
   onLaunch,
 }: EnvironmentProps & {
+  canMutate: boolean
   onCreate: () => void
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
@@ -357,11 +367,12 @@ export function EnvironmentTemplatesView({
     () =>
       environmentColumns({
         servers,
+        canMutate,
         onEdit,
         onDelete,
         onLaunch,
       }),
-    [onDelete, onEdit, onLaunch, servers]
+    [canMutate, onDelete, onEdit, onLaunch, servers]
   )
 
   return (
@@ -370,10 +381,12 @@ export function EnvironmentTemplatesView({
         title="沙箱模板"
         count={environments.length}
         action={
-          <Button size="sm" onClick={onCreate}>
-            <PlusIcon data-icon="inline-start" />
-            新建沙箱模板
-          </Button>
+          canMutate ? (
+            <Button size="sm" onClick={onCreate}>
+              <PlusIcon data-icon="inline-start" />
+              新建沙箱模板
+            </Button>
+          ) : undefined
         }
       />
       <CollectionContent>
@@ -389,9 +402,11 @@ export function EnvironmentTemplatesView({
                 与模型凭据。
               </EmptyDescription>
             </EmptyHeader>
-            <EmptyContent>
-              <Button onClick={onCreate}>创建第一个沙箱模板</Button>
-            </EmptyContent>
+            {canMutate ? (
+              <EmptyContent>
+                <Button onClick={onCreate}>创建第一个沙箱模板</Button>
+              </EmptyContent>
+            ) : null}
           </Empty>
         ) : (
           <DataTable
@@ -432,12 +447,16 @@ export function EnvironmentTemplatesView({
 export function SandboxesView({
   resources,
   servers,
+  canMutate,
+  canOpenWorkspace,
   onCreate,
   onEdit,
   busyId,
   onAction,
   onDelete,
 }: EnvironmentProps & {
+  canMutate: boolean
+  canOpenWorkspace: boolean
   onCreate: () => void
   onEdit: (resource: Resource) => void
   busyId: string | null
@@ -455,12 +474,24 @@ export function SandboxesView({
         resources,
         servers,
         busyId,
+        canMutate,
+        canOpenWorkspace,
         onOpen: (sandbox) => setSelectedId(sandbox.id),
         onAction,
         onEdit,
         onDelete,
       }),
-    [busyId, onAction, onDelete, onEdit, resources, servers, setSelectedId]
+    [
+      busyId,
+      canMutate,
+      canOpenWorkspace,
+      onAction,
+      onDelete,
+      onEdit,
+      resources,
+      servers,
+      setSelectedId,
+    ]
   )
   const selected = sandboxes.find((item) => item.id === selectedId) ?? null
   return (
@@ -469,10 +500,12 @@ export function SandboxesView({
         title="沙箱"
         count={sandboxes.length}
         action={
-          <Button size="sm" onClick={onCreate}>
-            <PlusIcon data-icon="inline-start" />
-            创建沙箱
-          </Button>
+          canMutate ? (
+            <Button size="sm" onClick={onCreate}>
+              <PlusIcon data-icon="inline-start" />
+              创建沙箱
+            </Button>
+          ) : undefined
         }
       />
       <CollectionContent>
@@ -487,9 +520,11 @@ export function SandboxesView({
                 选择一个沙箱模板即可创建；服务器、工具和凭据会自动继承。
               </EmptyDescription>
             </EmptyHeader>
-            <EmptyContent>
-              <Button onClick={onCreate}>创建第一个沙箱</Button>
-            </EmptyContent>
+            {canMutate ? (
+              <EmptyContent>
+                <Button onClick={onCreate}>创建第一个沙箱</Button>
+              </EmptyContent>
+            ) : null}
           </Empty>
         ) : (
           <DataTable
@@ -524,6 +559,7 @@ export function SandboxesView({
           )}
           server={servers.find((item) => item.id === selected.spec.serverId)}
           resources={resources}
+          canOpenWorkspace={canOpenWorkspace}
           onOpenChange={(open) => !open && setSelectedId(null)}
         />
       )}
@@ -533,16 +569,18 @@ export function SandboxesView({
 
 function environmentColumns({
   servers,
+  canMutate,
   onEdit,
   onDelete,
   onLaunch,
 }: {
   servers: ManagedServer[]
+  canMutate: boolean
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
   onLaunch: (resource: Resource) => void
 }): ColumnDef<Resource>[] {
-  return [
+  const columns: ColumnDef<Resource>[] = [
     {
       id: "name",
       accessorFn: (environment) => environment.name,
@@ -562,7 +600,9 @@ function environmentColumns({
             }
             title={row.original.name}
             description={row.original.description || "可复用的 Agent 工作环境"}
-            onClick={() => onEdit(row.original)}
+            onClick={
+              canMutate ? () => onEdit(row.original) : undefined
+            }
           />
         )
       },
@@ -629,7 +669,9 @@ function environmentColumns({
       ),
       meta: { label: "已装 Agent", className: "hidden xl:table-cell" },
     },
-    {
+  ]
+  if (canMutate) {
+    columns.push({
       id: "actions",
       cell: ({ row }) => (
         <div className="flex items-center justify-end gap-1">
@@ -674,14 +716,18 @@ function environmentColumns({
       enableSorting: false,
       enableHiding: false,
       meta: { className: "w-36" },
-    },
-  ]
+    })
+  }
+
+  return columns
 }
 
 function sandboxColumns({
   resources,
   servers,
   busyId,
+  canMutate,
+  canOpenWorkspace,
   onOpen,
   onAction,
   onEdit,
@@ -690,6 +736,8 @@ function sandboxColumns({
   resources: Resource[]
   servers: ManagedServer[]
   busyId: string | null
+  canMutate: boolean
+  canOpenWorkspace: boolean
   onOpen: (sandbox: Resource) => void
   onAction: (
     resource: Resource,
@@ -798,41 +846,47 @@ function sandboxColumns({
           <div className="flex items-center justify-end gap-1">
             {sandbox.spec.status === "running" ? (
               <>
-                <Button size="sm" variant="outline" asChild>
-                  <Link href={`/sandboxes/${sandbox.id}`}>
-                    <MonitorIcon data-icon="inline-start" />
-                    工作台
-                  </Link>
-                </Button>
+                {canOpenWorkspace ? (
+                  <Button size="sm" variant="outline" asChild>
+                    <Link href={`/sandboxes/${sandbox.id}`}>
+                      <MonitorIcon data-icon="inline-start" />
+                      工作台
+                    </Link>
+                  </Button>
+                ) : null}
+                {canMutate ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={busy}
+                    onClick={() => void onAction(sandbox, "stop")}
+                  >
+                    {busy ? (
+                      <LoaderCircleIcon className="animate-spin" />
+                    ) : (
+                      <SquareIcon />
+                    )}
+                    停止
+                  </Button>
+                ) : null}
+              </>
+            ) : sandbox.spec.status === "stopped" ||
+              sandbox.spec.status === "error" ? (
+              canMutate ? (
                 <Button
                   size="sm"
                   variant="outline"
                   disabled={busy}
-                  onClick={() => void onAction(sandbox, "stop")}
+                  onClick={() => void onAction(sandbox, "start")}
                 >
                   {busy ? (
                     <LoaderCircleIcon className="animate-spin" />
                   ) : (
-                    <SquareIcon />
+                    <PlayIcon />
                   )}
-                  停止
+                  启动
                 </Button>
-              </>
-            ) : sandbox.spec.status === "stopped" ||
-              sandbox.spec.status === "error" ? (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={busy}
-                onClick={() => void onAction(sandbox, "start")}
-              >
-                {busy ? (
-                  <LoaderCircleIcon className="animate-spin" />
-                ) : (
-                  <PlayIcon />
-                )}
-                启动
-              </Button>
+              ) : null
             ) : null}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -850,11 +904,13 @@ function sandboxColumns({
                     <Settings2Icon />
                     管理
                   </DropdownMenuItem>
-                  <DropdownMenuItem onClick={() => onEdit(sandbox)}>
-                    <PencilIcon />
-                    编辑配置
-                  </DropdownMenuItem>
-                  {sandbox.spec.status === "running" && (
+                  {canMutate ? (
+                    <DropdownMenuItem onClick={() => onEdit(sandbox)}>
+                      <PencilIcon />
+                      编辑配置
+                    </DropdownMenuItem>
+                  ) : null}
+                  {canMutate && sandbox.spec.status === "running" && (
                     <DropdownMenuItem
                       disabled={busy}
                       onClick={() => void onAction(sandbox, "restart")}
@@ -864,24 +920,28 @@ function sandboxColumns({
                     </DropdownMenuItem>
                   )}
                 </DropdownMenuGroup>
-                <DropdownMenuSeparator />
-                <DropdownMenuItem
-                  variant="destructive"
-                  disabled={
-                    busy ||
-                    [
-                      "requested",
-                      "starting",
-                      "stopping",
-                      "restarting",
-                      "deleting",
-                    ].includes(String(sandbox.spec.status ?? ""))
-                  }
-                  onClick={() => onDelete(sandbox)}
-                >
-                  <Trash2Icon />
-                  删除
-                </DropdownMenuItem>
+                {canMutate ? (
+                  <>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      variant="destructive"
+                      disabled={
+                        busy ||
+                        [
+                          "requested",
+                          "starting",
+                          "stopping",
+                          "restarting",
+                          "deleting",
+                        ].includes(String(sandbox.spec.status ?? ""))
+                      }
+                      onClick={() => onDelete(sandbox)}
+                    >
+                      <Trash2Icon />
+                      删除
+                    </DropdownMenuItem>
+                  </>
+                ) : null}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
@@ -912,12 +972,14 @@ function SandboxDetailsDialog({
   environment,
   server,
   resources,
+  canOpenWorkspace,
   onOpenChange,
 }: {
   sandbox: Resource
   environment?: Resource
   server?: ManagedServer
   resources: Resource[]
+  canOpenWorkspace: boolean
   onOpenChange: (open: boolean) => void
 }) {
   const tools = stringList(
@@ -951,7 +1013,7 @@ function SandboxDetailsDialog({
         <DialogHeader>
           <DialogTitle>{sandbox.name}</DialogTitle>
           <DialogDescription>
-            查看这个沙箱的基座、运行位置和已配置能力。
+            查看这个沙箱的沙箱模板、运行位置和已配置能力。
           </DialogDescription>
         </DialogHeader>
 
@@ -995,7 +1057,7 @@ function SandboxDetailsDialog({
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             关闭
           </Button>
-          {sandbox.spec.status === "running" && (
+          {sandbox.spec.status === "running" && canOpenWorkspace && (
             <Button asChild>
               <Link href={`/sandboxes/${sandbox.id}`}>
                 <MonitorIcon data-icon="inline-start" />

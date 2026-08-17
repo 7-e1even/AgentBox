@@ -205,7 +205,7 @@ func (s *Store) PreviewAutomation(ctx context.Context, input platform.Automation
 	if err := platform.Validate(sandboxInput); err != nil {
 		return platform.ResourceInputPreview{}, err
 	}
-	if err := s.ensureResourceReferences(ctx, sandboxInput); err != nil {
+	if err := s.ensureResourceReferences(ctx, sandboxInput, true); err != nil {
 		return platform.ResourceInputPreview{}, err
 	}
 	return platform.ResourceInputPreview{
@@ -322,6 +322,9 @@ func (s *Store) triggerAutomation(
 	}
 	if buildErr == nil {
 		buildErr = ensureAutomatedSandboxReferences(ctx, tx, sandboxInput)
+	}
+	if buildErr == nil {
+		buildErr = s.encryptSpecEnvironmentVariables(sandboxInput.Spec)
 	}
 	if buildErr != nil {
 		return finishFailedAutomationRun(ctx, tx, stored.Automation.ID, run, "input_invalid", buildErr.Error(), receivedAt)
@@ -537,11 +540,16 @@ func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input plat
 	var supports bool
 	var serverArch string
 	var inventoryJSON []byte
-	if err := tx.QueryRow(ctx, `SELECT capabilities ? $2, arch, inventory
-      FROM managed_servers WHERE id = $1`, serverID, requiredCapability).Scan(&supports, &serverArch, &inventoryJSON); errors.Is(err, pgx.ErrNoRows) {
+	var serverOnline bool
+	if err := tx.QueryRow(ctx, `SELECT capabilities ? $2, arch, inventory,
+      last_seen_at > NOW() - INTERVAL '45 seconds'
+      FROM managed_servers WHERE id = $1`, serverID, requiredCapability).Scan(&supports, &serverArch, &inventoryJSON, &serverOnline); errors.Is(err, pgx.ErrNoRows) {
 		return &platform.ValidationError{Message: "目标服务器不存在"}
 	} else if err != nil {
 		return fmt.Errorf("check automated sandbox server: %w", err)
+	}
+	if !serverOnline {
+		return &platform.ValidationError{Message: "目标服务器离线，无法创建沙箱"}
 	}
 	if !supports {
 		return &platform.ValidationError{Message: "目标服务器尚未通过所选隔离驱动的自检"}

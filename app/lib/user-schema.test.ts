@@ -8,6 +8,7 @@ describe("user schemas", () => {
       userSchema.parse({
         id: "7250fd43-8301-44d2-a03f-df4dcc65e499",
         name: "AgentBox Admin",
+        username: "admin",
         email: "admin@agentbox.local",
         role: "admin",
         status: "active",
@@ -32,8 +33,33 @@ describe("user schemas", () => {
     expect(() =>
       userInputSchema.parse({
         name: "Viewer",
+        username: "viewer",
         email: "viewer@example.com",
         password: "short",
+        role: "viewer",
+        status: "active",
+      })
+    ).toThrow()
+  })
+
+  it("normalizes a username and rejects an email address", () => {
+    expect(
+      userInputSchema.parse({
+        name: "Viewer",
+        username: "  Viewer.One  ",
+        email: "viewer@example.com",
+        password: "password123",
+        role: "viewer",
+        status: "active",
+      }).username
+    ).toBe("viewer.one")
+
+    expect(() =>
+      userInputSchema.parse({
+        name: "Viewer",
+        username: "viewer@example.com",
+        email: "viewer@example.com",
+        password: "password123",
         role: "viewer",
         status: "active",
       })

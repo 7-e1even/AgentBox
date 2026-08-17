@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"net/http"
+	"net/url"
 
 	"agentbox/internal/platform"
 )
@@ -82,9 +83,19 @@ func (s *Server) addCredentialModel(w http.ResponseWriter, request *http.Request
 	s.writeJSON(w, http.StatusCreated, map[string]any{"models": models})
 }
 
+// deleteCredentialModel 支持两种路由：
+//   - DELETE /api/credentials/{id}/models/{modelId}（推荐，路径参数）
+//   - DELETE /api/credentials/{id}/models?modelId=...（deprecated，兼容旧前端，后续移除）
 func (s *Server) deleteCredentialModel(w http.ResponseWriter, request *http.Request) {
+	modelID := request.PathValue("modelId")
+	if decoded, err := url.PathUnescape(modelID); err == nil && decoded != "" {
+		modelID = decoded
+	}
+	if modelID == "" {
+		modelID = request.URL.Query().Get("modelId")
+	}
 	models, err := s.store.DeleteCredentialModel(
-		request.Context(), request.PathValue("id"), request.URL.Query().Get("modelId"),
+		request.Context(), request.PathValue("id"), modelID,
 	)
 	if err != nil {
 		s.handleError(w, err)

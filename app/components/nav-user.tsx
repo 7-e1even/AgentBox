@@ -85,7 +85,7 @@ export function TopbarAccountActions({
                 {user.name}
               </span>
               <span className="truncate text-xs text-muted-foreground">
-                {user.email}
+                @{user.username}
               </span>
             </div>
           </DropdownMenuLabel>

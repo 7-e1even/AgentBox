@@ -98,7 +98,10 @@ func listGuestDirectory(target string, stdout io.Writer) error {
 		}
 		info, err := entry.Info()
 		if err != nil {
-			return err
+			// A single unreadable entry (e.g. a dangling symlink or a mount
+			// permission problem) must not fail the whole directory listing.
+			_, _ = fmt.Fprintf(os.Stderr, "guest-fs list: skipping %s: %v\n", entry.Name(), err)
+			continue
 		}
 		entryType := "file"
 		if entry.IsDir() {

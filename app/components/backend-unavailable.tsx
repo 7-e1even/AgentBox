@@ -12,7 +12,12 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 
-export function BackendUnavailable() {
+export function BackendUnavailable({
+  variant = "unreachable",
+}: {
+  variant?: "unreachable" | "error"
+}) {
+  const unreachable = variant === "unreachable"
   return (
     <main className="flex min-h-svh items-center justify-center p-4">
       <Card className="w-full max-w-lg">
@@ -20,21 +25,33 @@ export function BackendUnavailable() {
           <div className="mb-2 flex size-10 items-center justify-center rounded-xl bg-muted">
             <DatabaseZapIcon />
           </div>
-          <CardTitle>Go API 尚未连接</CardTitle>
+          <CardTitle>
+            {unreachable ? "无法连接控制面服务" : "控制面服务暂时不可用"}
+          </CardTitle>
           <CardDescription>
-            前端已经就绪，但 Agent 数据只从独立的 Go 服务读取。
+            {unreachable
+              ? "前端已经就绪，但连不上 AgentBox 控制面服务（server 容器）。"
+              : "控制面服务已启动，但返回了错误响应，请检查其运行状态。"}
           </CardDescription>
         </CardHeader>
         <CardContent>
           <Alert>
             <TerminalIcon />
-            <AlertTitle>启动控制面后端</AlertTitle>
+            <AlertTitle>排查部署状态</AlertTitle>
             <AlertDescription>
-              在 server 目录运行{" "}
+              在部署目录运行{" "}
               <code className="rounded bg-muted px-1 py-0.5">
-                go run ./cmd/agentbox
-              </code>
-              ，然后重新连接。
+                docker compose ps
+              </code>{" "}
+              确认 server 容器在运行；异常时用{" "}
+              <code className="rounded bg-muted px-1 py-0.5">
+                docker compose logs server
+              </code>{" "}
+              查看原因，修复后{" "}
+              <code className="rounded bg-muted px-1 py-0.5">
+                docker compose up -d
+              </code>{" "}
+              重启服务。
             </AlertDescription>
           </Alert>
         </CardContent>

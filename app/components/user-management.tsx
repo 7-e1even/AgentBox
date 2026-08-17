@@ -133,9 +133,9 @@ export function UserManagement({
             data={users}
             columns={columns}
             getRowId={(user) => user.id}
-            searchPlaceholder="搜索名称或邮箱…"
+            searchPlaceholder="搜索名称、用户名或邮箱…"
             searchValue={(user) =>
-              `${user.name} ${user.email} ${roleLabels[user.role]}`
+              `${user.name} ${user.username} ${user.email} ${roleLabels[user.role]}`
             }
             filters={[
               {
@@ -246,7 +246,7 @@ function userColumns({
                 {isCurrent ? <Badge variant="outline">当前</Badge> : null}
               </span>
             }
-            description={user.email}
+            description={`@${user.username} · ${user.email}`}
             media={
               <Avatar className="size-8 rounded-lg">
                 <AvatarFallback className="rounded-lg">
@@ -383,6 +383,7 @@ function UserEditorDialog({
     const form = new FormData(event.currentTarget)
     const result = userInputSchema.safeParse({
       name: form.get("name"),
+      username: form.get("username"),
       email: form.get("email"),
       password: form.get("password") ?? "",
       role,
@@ -429,7 +430,25 @@ function UserEditorDialog({
               />
             </Field>
             <Field>
-              <FieldLabel htmlFor="user-email">邮箱</FieldLabel>
+              <FieldLabel htmlFor="user-username">用户名</FieldLabel>
+              <Input
+                id="user-username"
+                name="username"
+                defaultValue={user?.username}
+                autoComplete="username"
+                autoCapitalize="none"
+                spellCheck={false}
+                minLength={3}
+                maxLength={64}
+                pattern="[A-Za-z0-9][A-Za-z0-9._-]{2,63}"
+                required
+              />
+              <FieldDescription>
+                登录时使用，保存后统一转为小写。
+              </FieldDescription>
+            </Field>
+            <Field>
+              <FieldLabel htmlFor="user-email">联系邮箱</FieldLabel>
               <Input
                 id="user-email"
                 name="email"

@@ -65,13 +65,13 @@ const meta = {
     title: "镜像",
     singular: "镜像",
     empty: "还没有镜像",
-    description: "统一维护 Docker 与 VM 环境模板可选择的 OCI 镜像。",
+    description: "统一维护沙箱模板可选择的 OCI 镜像。",
     icon: Disc3Icon,
   },
   runtime: {
-    title: "环境模板",
-    singular: "环境模板",
-    empty: "还没有环境模板",
+    title: "沙箱模板",
+    singular: "沙箱模板",
+    empty: "还没有沙箱模板",
     description: "预先装好 Agent 工具与能力的可复用隔离环境。",
     icon: ContainerIcon,
   },
@@ -123,6 +123,7 @@ export function ResourceView({
   kind,
   resources,
   servers,
+  canMutate,
   onCreate,
   onEdit,
   onDelete,
@@ -131,6 +132,7 @@ export function ResourceView({
   kind: ResourceTableKind
   resources: Resource[]
   servers: ManagedServer[]
+  canMutate: boolean
   onCreate: () => void
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
@@ -146,6 +148,7 @@ export function ResourceView({
         icon: config.icon,
         resources,
         servers,
+        canMutate,
         onOpen: (resource) =>
           resource.kind === "project" && onProjectOpen
             ? onProjectOpen(resource.id)
@@ -153,7 +156,16 @@ export function ResourceView({
         onEdit,
         onDelete,
       }),
-    [config.icon, kind, onDelete, onEdit, onProjectOpen, resources, servers]
+    [
+      canMutate,
+      config.icon,
+      kind,
+      onDelete,
+      onEdit,
+      onProjectOpen,
+      resources,
+      servers,
+    ]
   )
   const Icon = config.icon
 
@@ -163,10 +175,12 @@ export function ResourceView({
         title={config.title}
         count={total}
         action={
-          <Button size="sm" onClick={onCreate}>
-            <PlusIcon data-icon="inline-start" />
-            新建{config.singular}
-          </Button>
+          canMutate ? (
+            <Button size="sm" onClick={onCreate}>
+              <PlusIcon data-icon="inline-start" />
+              新建{config.singular}
+            </Button>
+          ) : undefined
         }
       />
 
@@ -176,8 +190,10 @@ export function ResourceView({
             icon={Icon}
             title={config.empty}
             description={config.description}
-            actionLabel={`创建第一个${config.singular}`}
-            onAction={onCreate}
+            actionLabel={
+              canMutate ? `创建第一个${config.singular}` : undefined
+            }
+            onAction={canMutate ? onCreate : undefined}
           />
         ) : (
           <DataTable
@@ -246,6 +262,7 @@ function resourceColumns({
   icon,
   resources,
   servers,
+  canMutate,
   onOpen,
   onEdit,
   onDelete,
@@ -254,17 +271,18 @@ function resourceColumns({
   icon: LucideIcon
   resources: Resource[]
   servers: ManagedServer[]
+  canMutate: boolean
   onOpen: (resource: Resource) => void
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
 }): ColumnDef<Resource>[] {
   const labels =
     kind === "project"
-      ? ["项目", "沙箱", "环境模板", "标识"]
+      ? ["项目", "沙箱", "沙箱模板", "标识"]
       : kind === "image"
         ? ["镜像", "OCI 引用", "兼容类型", "使用者"]
         : kind === "runtime"
-          ? ["环境模板", "默认服务器", "隔离类型", "镜像"]
+          ? ["沙箱模板", "默认服务器", "隔离类型", "镜像"]
           : kind === "skill"
             ? ["Skill", "使用者", "来源", "版本"]
             : ["MCP Server", "使用者", "传输方式", "服务地址"]
@@ -291,7 +309,7 @@ function resourceColumns({
           }
           title={row.original.name}
           description={row.original.description || summary(row.original)}
-          onClick={() => onOpen(row.original)}
+          onClick={canMutate ? () => onOpen(row.original) : undefined}
         />
       ),
       meta: { label: labels[0] },
@@ -347,8 +365,11 @@ function resourceColumns({
         </span>
       ),
       meta: { label: "最近更新", className: "hidden xl:table-cell" },
-    },
-    {
+    }
+  )
+
+  if (canMutate) {
+    columns.push({
       id: "actions",
       cell: ({ row }) => (
         <ResourceActions
@@ -360,8 +381,8 @@ function resourceColumns({
       enableSorting: false,
       enableHiding: false,
       meta: { className: "w-10" },
-    }
-  )
+    })
+  }
 
   return columns
 }
@@ -403,10 +424,10 @@ function resourceColumnValues(
       ? [
           text(resource.spec, "reference"),
           stringArray(resource.spec.modes)
-            .map((mode) => (mode === "vm" ? "VM" : "Docker"))
+            .map((mode) => (mode === "vm" ? "VM（旧）" : "Docker"))
             .join(" / ") || "—",
           imageRuntimes.length > 0
-            ? `${imageRuntimes.length} 个环境模板`
+            ? `${imageRuntimes.length} 个沙箱模板`
             : "未使用",
         ]
       : resource.kind === "runtime"
@@ -421,14 +442,14 @@ function resourceColumnValues(
         : resource.kind === "skill"
           ? [
               skillRuntimes.length > 0
-                ? `${skillRuntimes.length} 个环境模板`
+                ? `${skillRuntimes.length} 个沙箱模板`
                 : "未使用",
               text(resource.spec, "source"),
               `v${text(resource.spec, "version")}`,
             ]
           : [
               mcpRuntimes.length > 0
-                ? `${mcpRuntimes.length} 个环境模板`
+                ? `${mcpRuntimes.length} 个沙箱模板`
                 : "未使用",
               text(resource.spec, "transport").toUpperCase(),
               text(resource.spec, "transport") === "http"

@@ -2,31 +2,19 @@
 
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useState,
   type ReactNode,
 } from "react"
-import { Trash2Icon } from "lucide-react"
+import dynamic from "next/dynamic"
+import { ShieldXIcon, Trash2Icon } from "lucide-react"
 import { useRouter } from "next/navigation"
 
-import { AccessManagement } from "@/components/access-management"
 import { AppSidebar } from "@/components/app-sidebar"
-import { AutomationManagement } from "@/components/automation-management"
-import {
-  DashboardView,
-  EnvironmentTemplatesView,
-  SandboxesView,
-} from "@/components/environment-views"
-import { ImageManagement } from "@/components/image-management"
-import { NetworkProxyManagement } from "@/components/network-proxy-management"
-import { ResourceView } from "@/components/control-plane-view"
-import { ResourceEditorDialog } from "@/components/resource-editor-dialog"
-import { SandboxEditorDialog } from "@/components/sandbox-editor-dialog"
-import { ServerManagement } from "@/components/server-management"
 import { SettingsView } from "@/components/settings-view"
 import { SiteHeaderProvider } from "@/components/site-header"
-import { UserManagement } from "@/components/user-management"
 import type { Provider } from "@/lib/catalog"
 import {
   credentialModelsResponseSchema,
@@ -67,8 +55,64 @@ import {
   AlertDialogMedia,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
+import {
+  Empty,
+  EmptyDescription,
+  EmptyHeader,
+  EmptyMedia,
+  EmptyTitle,
+} from "@/components/ui/empty"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
+import { errorMessage, requestJson } from "@/lib/api-client"
 import { appSectionPath, type AppSection } from "@/lib/app-section"
+
+// 各管理视图按需加载，避免所有 section 的代码打进首屏 chunk。
+const AccessManagement = dynamic(() =>
+  import("@/components/access-management").then((mod) => mod.AccessManagement)
+)
+const AutomationManagement = dynamic(() =>
+  import("@/components/automation-management").then(
+    (mod) => mod.AutomationManagement
+  )
+)
+const ImageManagement = dynamic(() =>
+  import("@/components/image-management").then((mod) => mod.ImageManagement)
+)
+const NetworkProxyManagement = dynamic(() =>
+  import("@/components/network-proxy-management").then(
+    (mod) => mod.NetworkProxyManagement
+  )
+)
+const ServerManagement = dynamic(() =>
+  import("@/components/server-management").then((mod) => mod.ServerManagement)
+)
+const UserManagement = dynamic(() =>
+  import("@/components/user-management").then((mod) => mod.UserManagement)
+)
+const ResourceView = dynamic(() =>
+  import("@/components/control-plane-view").then((mod) => mod.ResourceView)
+)
+const DashboardView = dynamic(() =>
+  import("@/components/environment-views").then((mod) => mod.DashboardView)
+)
+const EnvironmentTemplatesView = dynamic(() =>
+  import("@/components/environment-views").then(
+    (mod) => mod.EnvironmentTemplatesView
+  )
+)
+const SandboxesView = dynamic(() =>
+  import("@/components/environment-views").then((mod) => mod.SandboxesView)
+)
+const ResourceEditorDialog = dynamic(() =>
+  import("@/components/resource-editor-dialog").then(
+    (mod) => mod.ResourceEditorDialog
+  )
+)
+const SandboxEditorDialog = dynamic(() =>
+  import("@/components/sandbox-editor-dialog").then(
+    (mod) => mod.SandboxEditorDialog
+  )
+)
 
 const sectionKinds: Partial<
   Record<AppSection, "project" | "runtime" | "skill" | "variable">
@@ -144,6 +188,10 @@ export function ControlPlaneShell({
   const projectResources = resources.filter((item) => item.kind === "project")
   const currentProject = projectResources.find((item) => item.id === projectId)
   const scopedResources = resourcesForProject(resources, projectId)
+  const isViewer = sessionUser.role === "viewer"
+  const isAdmin = sessionUser.role === "admin"
+  // viewer 只读；operator 可变更沙箱/模板/自动化/镜像/项目，不能变更服务器/凭据/代理/用户
+  const canMutateResources = !isViewer
 
   useEffect(() => {
     const secure = window.location.protocol === "https:" ? "; Secure" : ""
@@ -348,7 +396,7 @@ export function ControlPlaneShell({
   ): Promise<CredentialModel[]> {
     const result = credentialModelsResponseSchema.parse(
       await requestJson<unknown>(
-        `/api/credentials/${credential.id}/models?modelId=${encodeURIComponent(model.id)}`,
+        `/api/credentials/${credential.id}/models/${encodeURIComponent(model.id)}`,
         { method: "DELETE" }
       )
     )
@@ -357,12 +405,26 @@ export function ControlPlaneShell({
     return result.models
   }
 
-  async function refreshResources() {
+  const refreshResources = useCallback(async () => {
     const result = resourcesResponseSchema.parse(
       await requestJson<unknown>("/api/resources")
     )
     setResources(result.resources)
-  }
+  }, [])
+
+  const hasPendingSandboxes = resources.some(
+    (item) =>
+      item.kind === "sandbox" &&
+      ["requested", "starting", "stopping", "restarting", "deleting"].includes(
+        String(item.spec.status ?? "")
+      )
+  )
+
+  useEffect(() => {
+    if (!hasPendingSandboxes) return
+    const timer = window.setInterval(() => void refreshResources(), 5000)
+    return () => window.clearInterval(timer)
+  }, [hasPendingSandboxes, refreshResources])
 
   async function operateSandbox(
     sandbox: Resource,
@@ -391,8 +453,6 @@ export function ControlPlaneShell({
               : "删除任务已提交",
         { description: sandbox.name }
       )
-      window.setTimeout(() => void refreshResources(), 6000)
-      window.setTimeout(() => void refreshResources(), 15000)
     } catch (error) {
       toast.error("沙箱操作失败", { description: errorMessage(error) })
     } finally {
@@ -452,7 +512,7 @@ export function ControlPlaneShell({
       }
     }
     toast.success(editing ? "用户已更新" : "用户已创建", {
-      description: result.user.email,
+      description: `@${result.user.username}`,
     })
   }
 
@@ -496,7 +556,7 @@ export function ControlPlaneShell({
     try {
       await requestJson<void>(`/api/users/${user.id}`, { method: "DELETE" })
       setUsers((current) => current.filter((item) => item.id !== user.id))
-      toast.success("用户已删除", { description: user.email })
+      toast.success("用户已删除", { description: `@${user.username}` })
     } catch (error) {
       toast.error("删除用户失败", { description: errorMessage(error) })
       throw error
@@ -528,6 +588,7 @@ export function ControlPlaneShell({
         configuredCredentials={
           credentials.filter((credential) => credential.enabled).length
         }
+        canMutate={canMutateResources}
         onNavigate={navigate}
         onCreateEnvironment={() =>
           setResourceEditor({ kind: "runtime", resource: null })
@@ -540,12 +601,14 @@ export function ControlPlaneShell({
         projectId={projectId}
         resources={resources}
         credentials={credentials}
+        canMutate={canMutateResources}
       />
     ) : section === "runtimes" ? (
       <EnvironmentTemplatesView
         key={projectId}
         resources={scopedResources}
         servers={servers}
+        canMutate={canMutateResources}
         onCreate={() => setResourceEditor({ kind: "runtime", resource: null })}
         onEdit={(resource) => setResourceEditor({ kind: "runtime", resource })}
         onDelete={setDeletingResource}
@@ -561,6 +624,8 @@ export function ControlPlaneShell({
         key={projectId}
         resources={scopedResources}
         servers={servers}
+        canMutate={canMutateResources}
+        canOpenWorkspace={!isViewer}
         onCreate={() => setSandboxEditor({ resource: null })}
         onEdit={(resource) => setSandboxEditor({ resource })}
         busyId={sandboxBusyId}
@@ -571,6 +636,8 @@ export function ControlPlaneShell({
       <ServerManagement
         servers={servers}
         runtimes={resources.filter((item) => item.kind === "runtime")}
+        canMutate={isAdmin}
+        canMutateRuntimes={canMutateResources}
         onServersChange={setServers}
         onCreateRuntime={(serverId) =>
           setResourceEditor({
@@ -586,6 +653,7 @@ export function ControlPlaneShell({
     ) : section === "images" ? (
       <ImageManagement
         servers={servers}
+        canMutate={canMutateResources}
         onServersChange={setServers}
         onCreateRuntime={(serverId, imageReference, driver) =>
           setResourceEditor({
@@ -599,6 +667,7 @@ export function ControlPlaneShell({
       <AccessManagement
         credentials={credentials}
         providers={catalog.providers}
+        canMutate={isAdmin}
         onSave={saveCredential}
         onCheck={checkCredential}
         onPullModels={pullCredentialModels}
@@ -609,6 +678,7 @@ export function ControlPlaneShell({
     ) : section === "proxies" ? (
       <NetworkProxyManagement
         proxies={proxies}
+        canMutate={isAdmin}
         onSave={saveNetworkProxy}
         onDelete={deleteNetworkProxy}
       />
@@ -629,26 +699,46 @@ export function ControlPlaneShell({
         resources={scopedResources}
         kind="mcp"
         servers={servers}
+        canMutate={canMutateResources}
         onCreate={() => setResourceEditor({ kind: "mcp", resource: null })}
         onEdit={(resource) =>
           setResourceEditor({ kind: resource.kind, resource })
         }
         onDelete={setDeletingResource}
       />
-    ) : section === "users" && sessionUser.role === "admin" ? (
-      <UserManagement
-        users={users}
-        currentUser={sessionUser}
-        busyId={userBusyId}
-        onSave={saveUser}
-        onDelete={deleteUser}
-      />
+    ) : section === "users" ? (
+      isAdmin ? (
+        <UserManagement
+          users={users}
+          currentUser={sessionUser}
+          busyId={userBusyId}
+          onSave={saveUser}
+          onDelete={deleteUser}
+        />
+      ) : (
+        <section className="flex min-h-0 flex-1 flex-col">
+          <Empty className="min-h-0 flex-1 rounded-none border-0">
+            <EmptyHeader>
+              <EmptyMedia variant="icon">
+                <ShieldXIcon />
+              </EmptyMedia>
+              <EmptyTitle>没有权限访问用户管理</EmptyTitle>
+              <EmptyDescription>
+                当前角色为
+                {sessionUser.role === "operator" ? "运维人员" : "只读成员"}
+                ，用户管理仅对管理员开放。
+              </EmptyDescription>
+            </EmptyHeader>
+          </Empty>
+        </section>
+      )
     ) : kind ? (
       <ResourceView
         key={kind === "project" ? "projects" : `${kind}:${projectId}`}
         kind={kind}
         resources={kind === "project" ? resources : scopedResources}
         servers={servers}
+        canMutate={canMutateResources}
         onCreate={() => setResourceEditor({ kind, resource: null })}
         onEdit={(resource) =>
           setResourceEditor({ kind: resource.kind, resource })
@@ -757,26 +847,4 @@ export function ControlPlaneShell({
       </SidebarProvider>
     </SectionRendererContext.Provider>
   )
-}
-
-async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
-  })
-  if (response.status === 401) {
-    window.location.assign("/login")
-    throw new Error("登录状态已过期")
-  }
-  if (!response.ok) {
-    const body = (await response
-      .json()
-      .catch(() => ({ error: "请求失败" }))) as { error?: string }
-    throw new Error(body.error || "请求失败")
-  }
-  return response.status === 204 ? (undefined as T) : response.json()
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "请稍后重试"
 }

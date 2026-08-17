@@ -146,7 +146,7 @@ func (fakeStore) HeartbeatServer(context.Context, string, string, []string, *pla
 func (fakeStore) DeleteServer(context.Context, string) error   { return nil }
 func (fakeStore) NeedsUserSetup(context.Context) (bool, error) { return false, nil }
 func (fakeStore) SetupAdmin(_ context.Context, input platform.UserInput, _ []byte, _ time.Time) (platform.User, error) {
-	return platform.User{ID: "7250fd43-8301-44d2-a03f-df4dcc65e499", Name: input.Name, Email: input.Email, Role: platform.UserRoleAdmin, Status: platform.UserStatusActive}, nil
+	return platform.User{ID: "7250fd43-8301-44d2-a03f-df4dcc65e499", Name: input.Name, Username: input.Username, Email: input.Email, Role: platform.UserRoleAdmin, Status: platform.UserStatusActive}, nil
 }
 func (fakeStore) AuthenticateUser(context.Context, string, string, []byte, time.Time) (platform.User, error) {
 	return testAdmin(), nil
@@ -159,10 +159,10 @@ func (fakeStore) ListUsers(context.Context) ([]platform.User, error) {
 	return []platform.User{testAdmin()}, nil
 }
 func (fakeStore) CreateUser(_ context.Context, input platform.UserInput) (platform.User, error) {
-	return platform.User{ID: "0954c4cd-8cce-4f3f-9d73-f03407c9afe1", Name: input.Name, Email: input.Email, Role: input.Role, Status: input.Status}, nil
+	return platform.User{ID: "0954c4cd-8cce-4f3f-9d73-f03407c9afe1", Name: input.Name, Username: input.Username, Email: input.Email, Role: input.Role, Status: input.Status}, nil
 }
 func (fakeStore) UpdateUser(_ context.Context, id string, input platform.UserInput) (platform.User, error) {
-	return platform.User{ID: id, Name: input.Name, Email: input.Email, Role: input.Role, Status: input.Status}, nil
+	return platform.User{ID: id, Name: input.Name, Username: input.Username, Email: input.Email, Role: input.Role, Status: input.Status}, nil
 }
 func (fakeStore) UpdateUserPreferences(_ context.Context, id string, input platform.UserPreferences) (platform.User, error) {
 	user := testAdmin()
@@ -195,7 +195,7 @@ func testHandler() http.Handler {
 
 func testAdmin() platform.User {
 	return platform.User{
-		ID: "7250fd43-8301-44d2-a03f-df4dcc65e499", Name: "Admin", Email: "admin@agentbox.local",
+		ID: "7250fd43-8301-44d2-a03f-df4dcc65e499", Name: "Admin", Username: "admin", Email: "admin@agentbox.local",
 		Role: platform.UserRoleAdmin, Status: platform.UserStatusActive, Preferences: platform.DefaultUserPreferences(),
 	}
 }
@@ -280,7 +280,7 @@ func TestDevelopmentAuthBypassWorksBeforeAdminSetup(t *testing.T) {
 }
 
 func TestLoginCreatesHTTPOnlySession(t *testing.T) {
-	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"email":"admin@agentbox.local","password":"password123"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"admin","password":"password123"}`))
 	response := httptest.NewRecorder()
 	rawTestHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {
@@ -292,8 +292,17 @@ func TestLoginCreatesHTTPOnlySession(t *testing.T) {
 	}
 }
 
+func TestLoginDoesNotAcceptEmailAsIdentifier(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"email":"admin@agentbox.local","password":"password123"}`))
+	response := httptest.NewRecorder()
+	rawTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
 func TestCurrentUserUpdatePreservesRoleAndStatus(t *testing.T) {
-	request := httptest.NewRequest(http.MethodPatch, "/api/auth/me", strings.NewReader(`{"name":"Updated Admin","email":"updated@example.com","password":"","role":"viewer","status":"disabled"}`))
+	request := httptest.NewRequest(http.MethodPatch, "/api/auth/me", strings.NewReader(`{"name":"Updated Admin","username":"updated-admin","email":"updated@example.com","password":"","role":"viewer","status":"disabled"}`))
 	response := httptest.NewRecorder()
 	testHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusOK {

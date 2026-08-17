@@ -1,4 +1,4 @@
-import { SandboxWorkspace } from "@/components/sandbox-workspace"
+import { SandboxWorkspaceLazy } from "@/components/sandbox-workspace-loader"
 
 export default async function SandboxWorkspacePage({
   params,
@@ -6,5 +6,5 @@ export default async function SandboxWorkspacePage({
   params: Promise<{ id: string }>
 }) {
   const { id } = await params
-  return <SandboxWorkspace sandboxId={id} />
+  return <SandboxWorkspaceLazy sandboxId={id} />
 }

@@ -112,6 +112,7 @@ import {
   type AutomationRunStatus,
 } from "@/lib/automation-schema"
 import { appToast as toast } from "@/lib/app-toast"
+import { errorMessage, requestJson } from "@/lib/api-client"
 import type { ManagedCredential } from "@/lib/credential-schema"
 import type { Resource, ResourceInput } from "@/lib/platform-schema"
 
@@ -124,10 +125,12 @@ export function AutomationManagement({
   projectId,
   resources,
   credentials,
+  canMutate,
 }: {
   projectId: string
   resources: Resource[]
   credentials: ManagedCredential[]
+  canMutate: boolean
 }) {
   const templates = useMemo(
     () =>
@@ -261,7 +264,7 @@ export function AutomationManagement({
             >
               返回列表
             </Button>
-          ) : (
+          ) : canMutate ? (
             <Button
               disabled={templates.length === 0}
               onClick={() => {
@@ -272,7 +275,7 @@ export function AutomationManagement({
               <PlusIcon data-icon="inline-start" />
               新建自动化
             </Button>
-          )
+          ) : undefined
         }
       />
       <CollectionContent className="gap-6">
@@ -351,7 +354,7 @@ export function AutomationManagement({
                       : "调整搜索词后再试。"}
                   </EmptyDescription>
                 </EmptyHeader>
-                {automations.length === 0 && (
+                {automations.length === 0 && canMutate && (
                   <EmptyContent>
                     <Button
                       disabled={templates.length === 0}
@@ -388,10 +391,14 @@ export function AutomationManagement({
                             <button
                               type="button"
                               className="flex min-w-0 items-center gap-3 text-left"
-                              onClick={() => {
-                                setEditing(automation)
-                                setSecret("")
-                              }}
+                              onClick={
+                                canMutate
+                                  ? () => {
+                                      setEditing(automation)
+                                      setSecret("")
+                                    }
+                                  : undefined
+                              }
                             >
                               <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
                                 <WorkflowIcon className="size-4" />
@@ -441,16 +448,18 @@ export function AutomationManagement({
                             </Badge>
                           </TableCell>
                           <TableCell className="pr-4 text-right">
-                            <Button
-                              variant="ghost"
-                              size="sm"
-                              onClick={() => {
-                                setEditing(automation)
-                                setSecret("")
-                              }}
-                            >
-                              编辑
-                            </Button>
+                            {canMutate ? (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => {
+                                  setEditing(automation)
+                                  setSecret("")
+                                }}
+                              >
+                                编辑
+                              </Button>
+                            ) : null}
                           </TableCell>
                         </TableRow>
                       )
@@ -703,9 +712,9 @@ function AutomationEditor({
       {templates.length === 0 && (
         <Alert>
           <WorkflowIcon />
-          <AlertTitle>需要一个已启用的环境模板</AlertTitle>
+          <AlertTitle>需要一个已启用的沙箱模板</AlertTitle>
           <AlertDescription>
-            先在环境模板中创建并启用模板，再回来配置自动化。
+            先在沙箱模板中创建并启用模板，再回来配置自动化。
           </AlertDescription>
         </Alert>
       )}
@@ -1450,28 +1459,6 @@ async function copyText(value: string, message: string) {
   } catch {
     toast.error("复制失败", { description: "请手动选择并复制。" })
   }
-}
-
-async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
-  })
-  if (response.status === 401) {
-    window.location.assign("/login")
-    throw new Error("登录状态已过期")
-  }
-  if (!response.ok) {
-    const body = (await response
-      .json()
-      .catch(() => ({ error: "请求失败" }))) as { error?: string }
-    throw new Error(body.error || "请求失败")
-  }
-  return response.status === 204 ? (undefined as T) : response.json()
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "请稍后重试"
 }
 
 function formatDateTime(value: string) {

@@ -401,11 +401,16 @@ func TestWorkerSkillInstallDoesNotReuseRuntimeTargetVariable(t *testing.T) {
 	for _, expected := range []string{
 		`for SKILL_TARGET in`,
 		`mkdir -p "$SKILL_TARGET"`,
-		`cat > $SKILL_TARGET/SKILL.md`,
+		`sh -c 'cat > "$1"' agentbox "$SKILL_TARGET/SKILL.md"`,
+		`sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/SKILL.md"`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("sandbox skill installation is missing %q", expected)
 		}
+	}
+	if strings.Contains(workerDaemon, `sh -c "cat > $SKILL_TARGET/SKILL.md"`) ||
+		strings.Contains(workerDaemon, `sh -c "cat > /opt/agentbox/skills/$ID/SKILL.md"`) {
+		t.Fatal("sandbox skill installation interpolates the skill ID into the remote shell command")
 	}
 	if strings.Contains(workerDaemon, `for TARGET in \
       "/root/.agents/skills/$ID"`) {
@@ -420,9 +425,12 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 		`install_host_dependencies`,
 		`migrate_existing_config`,
 		`if ! go mod tidy; then`,
-		`GOPROXY=https://goproxy.cn,direct go mod tidy`,
+		`GOPROXY="${AGENTBOX_GOPROXY:-https://goproxy.cn,direct}" go mod tidy`,
 		`printf '%s\n%s\n%s\n' "$SERVER_URL" "$SERVER_ID" "$CREDENTIAL" > "$CONFIG"`,
 		`systemctl restart agentbox-worker.service`,
+		`curl -fsSL -D "$worker_headers_tmp" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"`,
+		`verify_worker_checksum "$worker_tmp" "$worker_headers_tmp"`,
+		`WARNING: $SERVER_URL uses plain HTTP.`,
 	} {
 		if !strings.Contains(workerInstall, expected) {
 			t.Fatalf("interactive worker installer is missing %q", expected)
@@ -467,6 +475,50 @@ func TestWorkerSupportsVersionedAtomicSelfUpdate(t *testing.T) {
 	}
 }
 
+func TestWorkerSelfUpdateVerifiesChecksumBeforeExecutingDownload(t *testing.T) {
+	start := strings.Index(workerDaemon, "update_worker()")
+	if start < 0 {
+		t.Fatal("Worker self-update function was not found")
+	}
+	end := strings.Index(workerDaemon[start:], "refresh_microsandbox_driver ||")
+	if end < 0 {
+		t.Fatal("Worker self-update download stage was not found")
+	}
+	body := workerDaemon[start : start+end]
+	for _, expected := range []string{
+		`curl -fsSL -D "$WORKER_HEADERS"`,
+		`EXPECTED_SHA256=$(tr -d '\r' < "$WORKER_HEADERS"`,
+		`ACTUAL_SHA256=$(sha256sum "$WORKER_TMP" | cut -d ' ' -f 1)`,
+		`downloaded Worker checksum mismatch`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("Worker self-update checksum verification is missing %q", expected)
+		}
+	}
+	checksumIndex := strings.Index(body, `ACTUAL_SHA256=$(sha256sum "$WORKER_TMP"`)
+	versionIndex := strings.Index(body, `DOWNLOADED_VERSION=$("$WORKER_TMP" version`)
+	if checksumIndex < 0 || versionIndex < 0 || checksumIndex >= versionIndex {
+		t.Fatal("Worker self-update must verify the checksum before executing the downloaded binary")
+	}
+}
+
+func TestWorkerSelfUpdateConfirmsOnlyAfterServerAcceptsReport(t *testing.T) {
+	start := strings.Index(workerDaemon, "finalize_worker_update()")
+	if start < 0 {
+		t.Fatal("Worker update finalization function was not found")
+	}
+	end := strings.Index(workerDaemon[start:], "restore_worker_binary()")
+	if end < 0 {
+		t.Fatal("Worker update finalization function end was not found")
+	}
+	body := workerDaemon[start : start+end]
+	reportIndex := strings.Index(body, `if complete_job "$JOB_ID" true "" "Worker 已更新到 $TARGET_VERSION"; then`)
+	confirmIndex := strings.Index(body, `printf '%s\n' "$JOB_ID" > "$CONFIRMED"`)
+	if reportIndex < 0 || confirmIndex < 0 || reportIndex >= confirmIndex {
+		t.Fatal("the confirmed marker must be written only after the Server accepts the completion report")
+	}
+}
+
 func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 	for _, expected := range []string{
 		`BOXLITE_VERSION=0.9.7`,
@@ -475,7 +527,7 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 		`/usr/local/bin/boxlite`,
 		`/api/worker/agentbox-microsandbox-driver.go`,
 		`github.com/superradcompany/microsandbox/sdk/go v0.6.8`,
-		`GOPROXY=https://goproxy.cn,direct go mod tidy`,
+		`GOPROXY="${AGENTBOX_GOPROXY:-https://goproxy.cn,direct}" go mod tidy`,
 		`CGO_ENABLED=1 go build -tags agentbox_driver`,
 		`/usr/local/bin/agentbox-microsandbox-driver`,
 		`Runtime capabilities will be published after self-test`,

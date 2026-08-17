@@ -77,6 +77,7 @@ import { cn } from "@/lib/utils"
 
 type NetworkProxyManagementProps = {
   proxies: ManagedNetworkProxy[]
+  canMutate: boolean
   onSave: (
     input: NetworkProxyInput,
     editing: ManagedNetworkProxy | null
@@ -86,13 +87,14 @@ type NetworkProxyManagementProps = {
 
 export function NetworkProxyManagement({
   proxies,
+  canMutate,
   onSave,
   onDelete,
 }: NetworkProxyManagementProps) {
   const [selection, setSelection] = useState<string | null>(
     proxies[0]?.id ?? null
   )
-  const [creating, setCreating] = useState(proxies.length === 0)
+  const [creating, setCreating] = useState(canMutate && proxies.length === 0)
   const [deleting, setDeleting] = useState<ManagedNetworkProxy | null>(null)
   const [deletingBusy, setDeletingBusy] = useState(false)
   const selected = selection
@@ -121,10 +123,12 @@ export function NetworkProxyManagement({
         title="网络代理"
         count={proxies.length}
         action={
-          <Button size="sm" onClick={() => setCreating(true)}>
-            <PlusIcon data-icon="inline-start" />
-            添加代理
-          </Button>
+          canMutate ? (
+            <Button size="sm" onClick={() => setCreating(true)}>
+              <PlusIcon data-icon="inline-start" />
+              添加代理
+            </Button>
+          ) : undefined
         }
       />
 
@@ -174,16 +178,18 @@ export function NetworkProxyManagement({
               )}
             </ItemGroup>
           </ScrollArea>
-          <div className="shrink-0 border-t p-3">
-            <Button
-              variant="outline"
-              className="w-full"
-              onClick={() => setCreating(true)}
-            >
-              <PlusIcon data-icon="inline-start" />
-              添加代理
-            </Button>
-          </div>
+          {canMutate ? (
+            <div className="shrink-0 border-t p-3">
+              <Button
+                variant="outline"
+                className="w-full"
+                onClick={() => setCreating(true)}
+              >
+                <PlusIcon data-icon="inline-start" />
+                添加代理
+              </Button>
+            </div>
+          ) : null}
         </aside>
 
         <div className="min-h-0 overflow-y-auto">
@@ -205,7 +211,8 @@ export function NetworkProxyManagement({
             <ProxyEditor
               key={selected.id}
               proxy={selected}
-              onDelete={() => setDeleting(selected)}
+              canMutate={canMutate}
+              onDelete={canMutate ? () => setDeleting(selected) : undefined}
               onSave={async (input) => {
                 const saved = await onSave(input, selected)
                 setSelection(saved.id)
@@ -219,15 +226,19 @@ export function NetworkProxyManagement({
                 </EmptyMedia>
                 <EmptyTitle>配置环境网络代理</EmptyTitle>
                 <EmptyDescription>
-                  保存代理后，可在沙箱模板或单个沙箱中选择。
+                  {canMutate
+                    ? "保存代理后，可在沙箱模板或单个沙箱中选择。"
+                    : "当前角色只能查看已配置的网络代理。"}
                 </EmptyDescription>
               </EmptyHeader>
-              <EmptyContent>
-                <Button onClick={() => setCreating(true)}>
-                  <PlusIcon data-icon="inline-start" />
-                  添加代理
-                </Button>
-              </EmptyContent>
+              {canMutate ? (
+                <EmptyContent>
+                  <Button onClick={() => setCreating(true)}>
+                    <PlusIcon data-icon="inline-start" />
+                    添加代理
+                  </Button>
+                </EmptyContent>
+              ) : null}
             </Empty>
           )}
         </div>
@@ -266,11 +277,13 @@ export function NetworkProxyManagement({
 
 function ProxyEditor({
   proxy,
+  canMutate = true,
   onSave,
   onCancel,
   onDelete,
 }: {
   proxy: ManagedNetworkProxy | null
+  canMutate?: boolean
   onSave: (input: NetworkProxyInput) => Promise<void>
   onCancel?: () => void
   onDelete?: () => void
@@ -541,14 +554,16 @@ function ProxyEditor({
               取消
             </Button>
           )}
-          <Button disabled={saving} onClick={() => void submit()}>
-            {saving ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <SaveIcon data-icon="inline-start" />
-            )}
-            {proxy ? "保存修改" : "保存代理"}
-          </Button>
+          {canMutate ? (
+            <Button disabled={saving} onClick={() => void submit()}>
+              {saving ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <SaveIcon data-icon="inline-start" />
+              )}
+              {proxy ? "保存修改" : "保存代理"}
+            </Button>
+          ) : null}
         </div>
       </div>
     </div>

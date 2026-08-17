@@ -337,7 +337,7 @@ export function SandboxEditorDialog({
           <DialogDescription>
             {resource
               ? "调整沙箱名称、追加 Agent 或切换具体模型。"
-              : "选择一个环境模板，再确定这个沙箱实际使用的 Agent 与模型。"}
+              : "选择一个沙箱模板，再确定这个沙箱实际使用的 Agent 与模型。"}
           </DialogDescription>
         </DialogHeader>
 

@@ -73,6 +73,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { appToast as toast } from "@/lib/app-toast"
+import { errorMessage, requestJson } from "@/lib/api-client"
+import { writeClipboardText } from "@/lib/clipboard"
 import {
   resourceSchema,
   resourcesResponseSchema,
@@ -84,6 +86,7 @@ import {
 } from "@/lib/sandbox-file-schema"
 import {
   SandboxSessionClient,
+  sandboxFileReadMaxSize,
   sandboxUploadMaxSize,
   type SandboxSessionState,
 } from "@/lib/sandbox-session"
@@ -302,6 +305,13 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
       return
     }
     setOpeningFilePath(entry.path)
+    if (entry.size > sandboxFileReadMaxSize) {
+      toast.error("文件过大，无法在线查看", {
+        description: `${entry.path}（${formatBytes(entry.size)}）超过 5 MiB 上限，请在终端中处理。`,
+      })
+      setOpeningFilePath(null)
+      return
+    }
     try {
       const content = await runFileOperation({ kind: "read", path: entry.path })
       if (typeof content !== "string") throw new Error("文件响应格式无效")
@@ -1386,43 +1396,4 @@ function uploadErrorMessage(error: unknown) {
   return message.includes("unsupported file operation")
     ? "当前 Worker 版本不支持二进制或大文件上传，请重新运行 Worker 安装脚本"
     : message
-}
-
-async function writeClipboardText(value: string) {
-  try {
-    await navigator.clipboard.writeText(value)
-    return
-  } catch {
-    const textarea = document.createElement("textarea")
-    textarea.value = value
-    textarea.style.position = "fixed"
-    textarea.style.opacity = "0"
-    document.body.append(textarea)
-    textarea.select()
-    const copied = document.execCommand("copy")
-    textarea.remove()
-    if (!copied) throw new Error("clipboard unavailable")
-  }
-}
-
-async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
-  })
-  if (response.status === 401) {
-    window.location.assign("/login")
-    throw new Error("登录状态已过期")
-  }
-  if (!response.ok) {
-    const body = (await response
-      .json()
-      .catch(() => ({ error: "请求失败" }))) as { error?: string }
-    throw new Error(body.error || "请求失败")
-  }
-  return response.json() as Promise<T>
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "请稍后重试"
 }

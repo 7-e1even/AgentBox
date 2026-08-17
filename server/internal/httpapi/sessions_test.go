@@ -33,6 +33,9 @@ func (sessionTestStore) ListResources(context.Context) ([]platform.Resource, err
 
 func newSessionTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
+	// 该测试模拟反向代理部署（依赖 X-Forwarded-Host 放行浏览器 Origin），
+	// 因此显式开启可信代理模式。
+	t.Setenv("AGENTBOX_TRUSTED_PROXY", "true")
 	handler := New(
 		sessionTestStore{}, catalog.BuiltinCatalog,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
@@ -48,7 +51,7 @@ func websocketTestURL(serverURL, path string) string {
 }
 
 func TestSandboxSessionTicketIsSingleUse(t *testing.T) {
-	hub := newSessionHub(nil)
+	hub := newSessionHub(nil, false)
 	target := sandboxSessionTarget{SandboxID: "sandbox-one", ServerID: sessionTestServerID, ExternalID: "container", Driver: "docker"}
 	token, _, err := hub.issueTicket(target)
 	if err != nil {
@@ -65,7 +68,7 @@ func TestSandboxSessionTicketIsSingleUse(t *testing.T) {
 func TestSessionAcceptOptionsAllowForwardedGatewayHost(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://server:8091/api/sessions/connect", nil)
 	request.Header.Set("X-Forwarded-Host", "agentbox.example:3000")
-	patterns := newSessionHub(nil).acceptOptions(request).OriginPatterns
+	patterns := newSessionHub(nil, true).acceptOptions(request).OriginPatterns
 	if len(patterns) != 1 || patterns[0] != "agentbox.example:3000" {
 		t.Fatalf("origin patterns = %#v", patterns)
 	}
@@ -74,7 +77,7 @@ func TestSessionAcceptOptionsAllowForwardedGatewayHost(t *testing.T) {
 func TestSessionAcceptOptionsRejectInvalidForwardedGatewayHost(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://server:8091/api/sessions/connect", nil)
 	request.Header.Set("X-Forwarded-Host", "*")
-	if patterns := newSessionHub(nil).acceptOptions(request).OriginPatterns; len(patterns) != 0 {
+	if patterns := newSessionHub(nil, true).acceptOptions(request).OriginPatterns; len(patterns) != 0 {
 		t.Fatalf("origin patterns = %#v", patterns)
 	}
 }

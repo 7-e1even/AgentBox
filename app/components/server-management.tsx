@@ -16,6 +16,8 @@ import {
   TriangleAlertIcon,
 } from "lucide-react"
 import { appToast as toast } from "@/lib/app-toast"
+import { errorMessage, requestJson } from "@/lib/api-client"
+import { writeClipboardText } from "@/lib/clipboard"
 
 import {
   CollectionContent,
@@ -83,12 +85,16 @@ type AddressStatus = "idle" | "detecting" | "verified" | "manual" | "failed"
 export function ServerManagement({
   servers,
   runtimes,
+  canMutate,
+  canMutateRuntimes,
   onServersChange,
   onCreateRuntime,
   onEditRuntime,
 }: {
   servers: ManagedServer[]
   runtimes: Resource[]
+  canMutate: boolean
+  canMutateRuntimes: boolean
   onServersChange: (servers: ManagedServer[]) => void
   onCreateRuntime: (serverId: string) => void
   onEditRuntime: (runtime: Resource) => void
@@ -209,6 +215,8 @@ export function ServerManagement({
           (runtime) =>
             specString(runtime.spec, "serverId") === selectedServer.id
         )}
+        canMutate={canMutate}
+        canMutateRuntimes={canMutateRuntimes}
         onBack={() => setSelectedServerId(null)}
         onCreateRuntime={() => onCreateRuntime(selectedServer.id)}
         onEditRuntime={onEditRuntime}
@@ -230,10 +238,12 @@ export function ServerManagement({
         title="服务器"
         count={servers.length}
         action={
-          <Button size="sm" onClick={addServer}>
-            <PlusIcon data-icon="inline-start" />
-            添加服务器
-          </Button>
+          canMutate ? (
+            <Button size="sm" onClick={addServer}>
+              <PlusIcon data-icon="inline-start" />
+              添加服务器
+            </Button>
+          ) : undefined
         }
       />
 
@@ -246,12 +256,16 @@ export function ServerManagement({
               </EmptyMedia>
               <EmptyTitle>还没有服务器</EmptyTitle>
               <EmptyDescription>
-                先接入一台 Linux 物理机，创建沙箱时再选择它作为目标服务器。
+                {canMutate
+                  ? "先接入一台 Linux 物理机，创建沙箱时再选择它作为目标服务器。"
+                  : "当前角色只能查看服务器，接入服务器需要管理员权限。"}
               </EmptyDescription>
             </EmptyHeader>
-            <EmptyContent>
-              <Button onClick={addServer}>添加第一台服务器</Button>
-            </EmptyContent>
+            {canMutate ? (
+              <EmptyContent>
+                <Button onClick={addServer}>添加第一台服务器</Button>
+              </EmptyContent>
+            ) : null}
           </Empty>
         ) : (
           <DataTable
@@ -502,6 +516,8 @@ function serverColumns(
 function ServerDetail({
   server,
   runtimes,
+  canMutate,
+  canMutateRuntimes,
   onBack,
   onCreateRuntime,
   onEditRuntime,
@@ -511,6 +527,8 @@ function ServerDetail({
 }: {
   server: ManagedServer
   runtimes: Resource[]
+  canMutate: boolean
+  canMutateRuntimes: boolean
   onBack: () => void
   onCreateRuntime: () => void
   onEditRuntime: (runtime: Resource) => void
@@ -607,38 +625,42 @@ function ServerDetail({
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={!canUpdate}
-              title={workerUpdateButtonTitle(
-                server,
-                releaseTarget,
-                supportsWorkerUpdate,
-                workerIsCurrent,
-                updateInProgress
-              )}
-              onClick={() => setConfirmUpdate(true)}
-            >
-              {updateInProgress ? (
-                <Spinner data-icon="inline-start" />
-              ) : (
-                <RefreshCwIcon data-icon="inline-start" />
-              )}
-              {updateInProgress
-                ? "正在更新"
-                : workerIsCurrent
-                  ? "已是最新"
-                  : "更新 Worker"}
-            </Button>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setConfirmDelete(true)}
-            >
-              <Trash2Icon data-icon="inline-start" />
-              移除服务器
-            </Button>
+            {canMutate ? (
+              <>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!canUpdate}
+                  title={workerUpdateButtonTitle(
+                    server,
+                    releaseTarget,
+                    supportsWorkerUpdate,
+                    workerIsCurrent,
+                    updateInProgress
+                  )}
+                  onClick={() => setConfirmUpdate(true)}
+                >
+                  {updateInProgress ? (
+                    <Spinner data-icon="inline-start" />
+                  ) : (
+                    <RefreshCwIcon data-icon="inline-start" />
+                  )}
+                  {updateInProgress
+                    ? "正在更新"
+                    : workerIsCurrent
+                      ? "已是最新"
+                      : "更新 Worker"}
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setConfirmDelete(true)}
+                >
+                  <Trash2Icon data-icon="inline-start" />
+                  移除服务器
+                </Button>
+              </>
+            ) : null}
           </div>
         </div>
       </header>
@@ -691,13 +713,15 @@ function ServerDetail({
               <div>
                 <h2 className="font-medium">沙箱模板</h2>
                 <p className="text-sm text-muted-foreground">
-                  使用这台服务器运行的可复用沙箱基座。
+                  使用这台服务器运行的可复用沙箱模板。
                 </p>
               </div>
-              <Button size="sm" onClick={onCreateRuntime}>
-                <PlusIcon data-icon="inline-start" />
-                新建沙箱模板
-              </Button>
+              {canMutateRuntimes ? (
+                <Button size="sm" onClick={onCreateRuntime}>
+                  <PlusIcon data-icon="inline-start" />
+                  新建沙箱模板
+                </Button>
+              ) : null}
             </div>
 
             {runtimes.length === 0 ? (
@@ -712,9 +736,15 @@ function ServerDetail({
                   </EmptyDescription>
                 </EmptyHeader>
                 <EmptyContent>
-                  <Button variant="outline" size="sm" onClick={onCreateRuntime}>
-                    创建第一个沙箱模板
-                  </Button>
+                  {canMutateRuntimes ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={onCreateRuntime}
+                    >
+                      创建第一个沙箱模板
+                    </Button>
+                  ) : null}
                 </EmptyContent>
               </Empty>
             ) : (
@@ -724,7 +754,11 @@ function ServerDetail({
                     <button
                       type="button"
                       className="flex w-full items-center gap-3 px-4 py-3 text-left transition-colors hover:bg-muted/50 focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none focus-visible:ring-inset"
-                      onClick={() => onEditRuntime(runtime)}
+                      onClick={
+                        canMutateRuntimes
+                          ? () => onEditRuntime(runtime)
+                          : undefined
+                      }
                     >
                       <ItemMedia
                         variant="icon"
@@ -901,8 +935,13 @@ function CommandStep({
           size="icon-sm"
           aria-label={`复制${title}命令`}
           onClick={() => {
-            void navigator.clipboard.writeText(command)
-            toast.success("命令已复制")
+            void writeClipboardText(command)
+              .then(() => toast.success("命令已复制"))
+              .catch(() =>
+                toast.error("复制失败", {
+                  description: "浏览器未授权访问剪贴板，请手动选择并复制。",
+                })
+              )
           }}
         >
           <CopyIcon />
@@ -910,18 +949,6 @@ function CommandStep({
       </div>
     </div>
   )
-}
-
-async function requestJson<T>(url: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(url, {
-    ...options,
-    headers: { "Content-Type": "application/json", ...options?.headers },
-  })
-  if (!response.ok) {
-    const body = (await response.json().catch(() => ({}))) as { error?: string }
-    throw new Error(body.error || "请求失败")
-  }
-  return response.status === 204 ? (undefined as T) : response.json()
 }
 
 function specString(spec: Record<string, unknown>, key: string) {
@@ -934,10 +961,6 @@ function runtimeDriverLabel(driver: string) {
   if (driver === "microsandbox") return "Microsandbox"
   if (driver === "vm") return "VM（旧）"
   return driver ? "Docker" : "未选择驱动"
-}
-
-function errorMessage(error: unknown) {
-  return error instanceof Error ? error.message : "请稍后重试"
 }
 
 function formatTime(value: string) {

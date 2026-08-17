@@ -1,12 +1,14 @@
 package httpapi
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -75,6 +77,8 @@ type Server struct {
 	logger           *slog.Logger
 	allowedOrigins   map[string]struct{}
 	disableAuth      bool
+	trustedProxy     bool
+	loginLimiter     *loginRateLimiter
 	sessions         *sessionHub
 	runtimeLLMClient *http.Client
 	workerBinaryDir  string
@@ -94,13 +98,16 @@ type Config struct {
 }
 
 func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger, origins []string, config Config) http.Handler {
+	trustedProxy := trustedProxyFromEnv()
 	server := &Server{
 		store:            repository,
 		catalog:          catalog,
 		logger:           logger,
 		allowedOrigins:   make(map[string]struct{}, len(origins)),
 		disableAuth:      config.DisableAuth,
-		sessions:         newSessionHub(origins),
+		trustedProxy:     trustedProxy,
+		loginLimiter:     newLoginRateLimiter(),
+		sessions:         newSessionHub(origins, trustedProxy),
 		runtimeLLMClient: newRuntimeLLMHTTPClient(),
 		workerBinaryDir:  config.WorkerBinaryDir,
 		workerVersion:    config.WorkerVersion,
@@ -122,8 +129,13 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	authenticated := func(pattern string, handler http.HandlerFunc) {
 		mux.Handle(pattern, server.requireUser(handler))
 	}
+	// operator 及以上（含 admin）：沙箱/模板/自动化/镜像/项目的读写与操作。
+	operator := func(pattern string, handler http.HandlerFunc) {
+		mux.Handle(pattern, server.requireUser(server.requireRole(platform.UserRoleOperator, handler)))
+	}
+	// 仅 admin：用户、模型凭据、网络代理、服务器（增删/配对/操作）。
 	admin := func(pattern string, handler http.HandlerFunc) {
-		mux.Handle(pattern, server.requireUser(server.requireAdmin(handler)))
+		mux.Handle(pattern, server.requireUser(server.requireRole(platform.UserRoleAdmin, handler)))
 	}
 	authenticated("GET /api/auth/me", server.currentUser)
 	authenticated("PATCH /api/auth/me", server.updateCurrentUser)
@@ -135,38 +147,39 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	admin("DELETE /api/users/{id}", server.deleteUser)
 	authenticated("GET /api/catalog", server.getCatalog)
 	authenticated("GET /api/resources", server.listResources)
-	authenticated("POST /api/resources", server.createResource)
-	authenticated("PATCH /api/resources/{id}", server.updateResource)
-	authenticated("DELETE /api/resources/{id}", server.deleteResource)
-	authenticated("POST /api/sandboxes/{id}/actions/{action}", server.operateSandbox)
-	authenticated("POST /api/sandboxes/{id}/session-ticket", server.createSandboxSessionTicket)
+	operator("POST /api/resources", server.createResource)
+	operator("PATCH /api/resources/{id}", server.updateResource)
+	operator("DELETE /api/resources/{id}", server.deleteResource)
+	operator("POST /api/sandboxes/{id}/actions/{action}", server.operateSandbox)
+	operator("POST /api/sandboxes/{id}/session-ticket", server.createSandboxSessionTicket)
 	authenticated("GET /api/automations", server.listAutomations)
-	authenticated("POST /api/automations", server.createAutomation)
-	authenticated("POST /api/automations/preview", server.previewAutomation)
+	operator("POST /api/automations", server.createAutomation)
+	operator("POST /api/automations/preview", server.previewAutomation)
 	authenticated("GET /api/automations/{id}", server.getAutomation)
-	authenticated("PATCH /api/automations/{id}", server.updateAutomation)
-	authenticated("DELETE /api/automations/{id}", server.deleteAutomation)
-	authenticated("POST /api/automations/{id}/rotate-secret", server.rotateAutomationSecret)
-	authenticated("POST /api/automations/{id}/test", server.testAutomation)
+	operator("PATCH /api/automations/{id}", server.updateAutomation)
+	operator("DELETE /api/automations/{id}", server.deleteAutomation)
+	operator("POST /api/automations/{id}/rotate-secret", server.rotateAutomationSecret)
+	operator("POST /api/automations/{id}/test", server.testAutomation)
 	authenticated("GET /api/automation-runs", server.listAutomationRuns)
 	authenticated("GET /api/automation-runs/{id}", server.getAutomationRun)
 	authenticated("GET /api/credentials", server.listCredentials)
-	authenticated("POST /api/credentials", server.createCredential)
-	authenticated("PATCH /api/credentials/{id}", server.updateCredential)
-	authenticated("POST /api/credentials/{id}/check", server.checkCredential)
-	authenticated("POST /api/credentials/{id}/models/pull", server.pullCredentialModels)
-	authenticated("POST /api/credentials/{id}/models", server.addCredentialModel)
-	authenticated("DELETE /api/credentials/{id}/models", server.deleteCredentialModel)
-	authenticated("DELETE /api/credentials/{id}", server.deleteCredential)
+	admin("POST /api/credentials", server.createCredential)
+	admin("PATCH /api/credentials/{id}", server.updateCredential)
+	admin("POST /api/credentials/{id}/check", server.checkCredential)
+	admin("POST /api/credentials/{id}/models/pull", server.pullCredentialModels)
+	admin("POST /api/credentials/{id}/models", server.addCredentialModel)
+	admin("DELETE /api/credentials/{id}/models", server.deleteCredentialModel)
+	admin("DELETE /api/credentials/{id}/models/{modelId}", server.deleteCredentialModel)
+	admin("DELETE /api/credentials/{id}", server.deleteCredential)
 	authenticated("GET /api/network-proxies", server.listNetworkProxies)
-	authenticated("POST /api/network-proxies", server.createNetworkProxy)
-	authenticated("PATCH /api/network-proxies/{id}", server.updateNetworkProxy)
-	authenticated("DELETE /api/network-proxies/{id}", server.deleteNetworkProxy)
+	admin("POST /api/network-proxies", server.createNetworkProxy)
+	admin("PATCH /api/network-proxies/{id}", server.updateNetworkProxy)
+	admin("DELETE /api/network-proxies/{id}", server.deleteNetworkProxy)
 	authenticated("GET /api/servers", server.listServers)
-	authenticated("DELETE /api/servers/{id}", server.deleteServer)
-	authenticated("POST /api/servers/{id}/actions/update-worker", server.updateWorker)
-	authenticated("POST /api/server-pairings", server.createServerPairing)
-	authenticated("GET /api/server-pairings/{id}", server.getServerPairing)
+	admin("DELETE /api/servers/{id}", server.deleteServer)
+	admin("POST /api/servers/{id}/actions/update-worker", server.updateWorker)
+	admin("POST /api/server-pairings", server.createServerPairing)
+	admin("GET /api/server-pairings/{id}", server.getServerPairing)
 	mux.HandleFunc("POST /api/servers/register", server.registerServer)
 	mux.HandleFunc("POST /api/servers/{id}/heartbeat", server.heartbeatServer)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/claim", server.claimWorkerJob)
@@ -319,10 +332,47 @@ func (s *Server) cors(next http.Handler) http.Handler {
 
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == "/healthz" {
+			next.ServeHTTP(w, request)
+			return
+		}
 		started := time.Now()
-		next.ServeHTTP(w, request)
-		s.logger.Info("request", "method", request.Method, "path", request.URL.Path, "duration", time.Since(started).String())
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(recorder, request)
+		s.logger.Info("request",
+			"method", request.Method, "path", request.URL.Path,
+			"status", recorder.status, "remote", request.RemoteAddr,
+			"duration", time.Since(started).String())
 	})
+}
+
+// statusRecorder 记录响应状态码；透传 Hijacker/Flusher 以兼容 WebSocket 升级与 SSE。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("underlying ResponseWriter does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 func (s *Server) recoverPanic(next http.Handler) http.Handler {

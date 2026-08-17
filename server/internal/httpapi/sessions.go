@@ -23,6 +23,8 @@ const (
 	sandboxSessionTicketLifetime = 30 * time.Second
 	sandboxSessionReadLimit      = 1024 * 1024
 	sandboxSessionWriteTimeout   = 10 * time.Second
+	sandboxSessionPingInterval   = 30 * time.Second
+	sandboxSessionPingTimeout    = 10 * time.Second
 )
 
 type sandboxSessionTarget struct {
@@ -77,6 +79,31 @@ func (s *sessionSocket) writeJSON(message sessionMessage) error {
 	return s.write(encoded)
 }
 
+// startSessionPing 每 30s 发送一次 ping 并等待 pong；超时未收到 pong 则关闭连接，
+// 使阻塞中的 Read 返回错误，从而触发 defer 里的 hub 清理。
+// coder/websocket v1.8 会在 Read 中自动回应对端 ping（read.go handleControl），
+// 浏览器亦由协议栈自动回 pong，因此对端无需任何改动。
+func startSessionPing(conn *websocket.Conn, done <-chan struct{}) {
+	go func() {
+		ticker := time.NewTicker(sandboxSessionPingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				ctx, cancel := context.WithTimeout(context.Background(), sandboxSessionPingTimeout)
+				err := conn.Ping(ctx)
+				cancel()
+				if err != nil {
+					_ = conn.Close(websocket.StatusGoingAway, "ping timeout")
+					return
+				}
+			}
+		}
+	}()
+}
+
 type workerSessionConnection struct {
 	serverID string
 	socket   *sessionSocket
@@ -94,9 +121,10 @@ type sessionHub struct {
 	sessions       map[string]*browserSessionConnection
 	tickets        map[string]sandboxSessionTicket
 	originPatterns []string
+	trustedProxy   bool
 }
 
-func newSessionHub(origins []string) *sessionHub {
+func newSessionHub(origins []string, trustedProxy bool) *sessionHub {
 	patterns := make([]string, 0, len(origins))
 	for _, origin := range origins {
 		if trimmed := strings.TrimSpace(origin); trimmed != "" {
@@ -108,13 +136,17 @@ func newSessionHub(origins []string) *sessionHub {
 		sessions:       make(map[string]*browserSessionConnection),
 		tickets:        make(map[string]sandboxSessionTicket),
 		originPatterns: patterns,
+		trustedProxy:   trustedProxy,
 	}
 }
 
 func (h *sessionHub) acceptOptions(request *http.Request) *websocket.AcceptOptions {
 	patterns := append([]string(nil), h.originPatterns...)
-	if forwardedHost := forwardedHostPattern(request.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
-		patterns = append(patterns, forwardedHost)
+	// 仅在信任代理时才把 X-Forwarded-Host 并入 Origin 白名单，防止伪造头绕过校验。
+	if h.trustedProxy {
+		if forwardedHost := forwardedHostPattern(request.Header.Get("X-Forwarded-Host")); forwardedHost != "" {
+			patterns = append(patterns, forwardedHost)
+		}
 	}
 	return &websocket.AcceptOptions{OriginPatterns: patterns}
 }
@@ -283,7 +315,7 @@ func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID stri
 
 func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Request) {
 	serverID := request.PathValue("id")
-	credential := strings.TrimPrefix(request.Header.Get("Authorization"), "Bearer ")
+	credential := authBearer(request)
 	if err := s.store.HeartbeatServer(request.Context(), serverID, credential, nil, nil, ""); err != nil {
 		if errors.Is(err, store.ErrWorkerUnauthorized) {
 			s.writeError(w, http.StatusUnauthorized, "Worker authentication failed")
@@ -298,6 +330,9 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 		return
 	}
 	conn.SetReadLimit(sandboxSessionReadLimit)
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	startSessionPing(conn, pingDone)
 	worker := &workerSessionConnection{serverID: serverID, socket: &sessionSocket{conn: conn}}
 	if previous := s.sessions.registerWorker(worker); previous != nil {
 		_ = previous.socket.conn.Close(websocket.StatusServiceRestart, "worker session replaced")
@@ -343,6 +378,9 @@ func (s *Server) connectSandboxSession(w http.ResponseWriter, request *http.Requ
 		return
 	}
 	conn.SetReadLimit(sandboxSessionReadLimit)
+	pingDone := make(chan struct{})
+	defer close(pingDone)
+	startSessionPing(conn, pingDone)
 	browser := &browserSessionConnection{
 		id: uuid.NewString(), serverID: ticket.Target.ServerID, socket: &sessionSocket{conn: conn},
 	}
