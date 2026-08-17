@@ -250,6 +250,15 @@ func TestAutomationWebhookDoesNotRequireUserSession(t *testing.T) {
 	}
 }
 
+func TestAutomationWebhookRejectsMalformedEndpointID(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/webhooks/not-a-uuid", strings.NewReader(`{"event":"pull_request"}`))
+	response := httptest.NewRecorder()
+	rawTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+}
+
 func TestDevelopmentAuthBypassInjectsAdminWithoutCookie(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil)
 	response := httptest.NewRecorder()

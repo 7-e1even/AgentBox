@@ -10,6 +10,8 @@ import (
 
 	"agentbox/internal/platform"
 	"agentbox/internal/store"
+
+	"github.com/google/uuid"
 )
 
 func (s *Server) listAutomations(w http.ResponseWriter, request *http.Request) {
@@ -208,6 +210,12 @@ func (s *Server) getAutomationRun(w http.ResponseWriter, request *http.Request) 
 }
 
 func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.Request) {
+	// endpoint_id 是 UUID 列：非法格式会让 Postgres 转型报错，
+	// 提前拦截，避免把 "地址不存在" 误报成 500。
+	if _, err := uuid.Parse(request.PathValue("endpointId")); err != nil {
+		s.writeError(w, http.StatusNotFound, "记录不存在")
+		return
+	}
 	request.Body = http.MaxBytesReader(w, request.Body, 1<<20)
 	body, err := io.ReadAll(request.Body)
 	if err != nil {
