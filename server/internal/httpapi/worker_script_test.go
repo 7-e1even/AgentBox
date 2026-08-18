@@ -135,6 +135,7 @@ func TestWorkerPreconfiguresClaudeCodeOnboarding(t *testing.T) {
 func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 	for _, expected := range []string{
 		`codebuddy) PACKAGE='@tencent-ai/codebuddy-code'`,
+		`deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue`,
 		`grok) PACKAGE='@xai-official/grok'`,
 		`kimi) PACKAGE='@moonshot-ai/kimi-code'`,
 		`omp) PACKAGE='@oh-my-pi/pi-coding-agent'`,
@@ -153,6 +154,7 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 		`TRAE CLI has no verified unattended Linux installer`,
 		`antigravity) printf '%s' agy`,
 		`cursor) printf '%s' cursor-agent`,
+		`deepseek-harness) printf '%s' dsh`,
 		`omp) printf '%s' omp`,
 		`/root/.pi/agent/skills/$ID`,
 		`/root/.omp/agent/skills/$ID`,
@@ -382,6 +384,13 @@ func TestWorkerHasNoDedicatedAgentAccountLogin(t *testing.T) {
 
 func TestWorkerConfiguresExtendedAgentCredentials(t *testing.T) {
 	for _, expected := range []string{
+		`index("deepseek-harness")`,
+		`append_env "$ENV_FILE" DSH_PERMISSION_MODE danger-full-access`,
+		`"agent-default-model": {`,
+		`"llm-pi-ai": {`,
+		`api: "openai-completions"`,
+		`(.chatEndpoint | rtrimstr("/"))`,
+		`cat > /root/.dsh/settings.yaml`,
 		`append_env "$ENV_FILE" COPILOT_PROVIDER_API_KEY "$COPILOT_SECRET"`,
 		`append_env "$ENV_FILE" COPILOT_PROVIDER_BASE_URL "$COPILOT_ENDPOINT"`,
 		`append_env "$ENV_FILE" KIMI_MODEL_NAME "$KIMI_MODEL"`,

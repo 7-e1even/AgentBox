@@ -12,6 +12,7 @@ export type AgentProtocol =
 export const supportedAgentToolIds = [
   "claude-code",
   "codex",
+  "deepseek-harness",
   "gemini-cli",
   "kimi",
   "opencode",
@@ -24,6 +25,7 @@ export type AgentToolId = (typeof supportedAgentToolIds)[number]
 export const agentToolOptions: AgentToolOption[] = [
   { value: "claude-code", label: "Claude Code" },
   { value: "codex", label: "Codex" },
+  { value: "deepseek-harness", label: "DeepSeek Harness" },
   { value: "gemini-cli", label: "Gemini CLI" },
   { value: "kimi", label: "Kimi Code" },
   { value: "opencode", label: "OpenCode" },
@@ -36,6 +38,12 @@ const supportedAgentTools = new Set<string>(supportedAgentToolIds)
 const agentToolProtocols: Record<AgentToolId, readonly AgentProtocol[]> = {
   "claude-code": ["anthropic", "openai-responses", "openai-chat"],
   codex: ["openai-responses", "anthropic", "openai-chat"],
+  "deepseek-harness": [
+    "anthropic",
+    "openai-chat",
+    "openai-responses",
+    "gemini",
+  ],
   "gemini-cli": ["gemini", "anthropic", "openai-chat", "openai-responses"],
   kimi: ["anthropic", "openai-chat", "openai-responses"],
   opencode: ["anthropic", "openai-chat", "openai-responses", "gemini"],

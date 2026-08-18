@@ -1298,6 +1298,7 @@ agent_tool_command() {
     claude-code) printf '%s' claude ;;
     codebuddy) printf '%s' codebuddy ;;
     codex) printf '%s' codex ;;
+    deepseek-harness) printf '%s' dsh ;;
     copilot-cli) printf '%s' copilot ;;
     cursor) printf '%s' cursor-agent ;;
     deveco) printf '%s' deveco ;;
@@ -1492,6 +1493,7 @@ install_agent_tools() {
       codex) PACKAGE='@openai/codex' ;;
       claude-code) PACKAGE='@anthropic-ai/claude-code' ;;
       codebuddy) PACKAGE='@tencent-ai/codebuddy-code' ;;
+      deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue ;;
       gemini-cli) PACKAGE='@google/gemini-cli' ;;
       grok) PACKAGE='@xai-official/grok' ;;
       kimi) PACKAGE='@moonshot-ai/kimi-code' ;;
@@ -1931,6 +1933,11 @@ configure_credentials() {
     fi
   fi
 
+  if jq -e '.job.payload.agentTools | index("deepseek-harness")' "$JOB_FILE" >/dev/null; then
+    grep -q '^DSH_PERMISSION_MODE=' "$ENV_FILE" || \
+      append_env "$ENV_FILE" DSH_PERMISSION_MODE danger-full-access
+  fi
+
   docker exec "$CONTAINER" mkdir -p /opt/agentbox/secrets /etc/profile.d
   docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /opt/agentbox/secrets/agentbox.env' < "$ENV_FILE"
   printf '%s\n' 'if [ -r /opt/agentbox/secrets/agentbox.env ]; then' \
@@ -2040,6 +2047,38 @@ configure_credentials() {
         'umask 077; cat > /root/.pi/agent/settings.json'
     fi
     rm -f "$PI_CONFIG"
+  fi
+
+  if jq -e '.job.payload.agentTools | index("deepseek-harness")' "$JOB_FILE" >/dev/null; then
+    DSH_SETTINGS=$(mktemp)
+    jq '
+      def env_id: ascii_upcase | gsub("-"; "_");
+      [.job.payload.credentials[] |
+        select((.chatEndpoint // "") != "" and (.modelId // "") != "") |
+        {provider: ("agentbox-" + .id), model: .modelId,
+         value: {
+           displayName: ("agentbox-" + .id),
+           apiKeyEnv: ("AGENTBOX_KEY_" + (.id | env_id)),
+           api: "openai-completions",
+           baseURL: (.chatEndpoint | rtrimstr("/")),
+           models: [{id: .modelId, name: .modelId}]
+         }}] as $entries |
+      if ($entries | length) == 0 then empty else
+        {"agent-default-model": {
+           provider: $entries[0].provider,
+           model: $entries[0].model
+         },
+         "llm-pi-ai": {
+           providers: ($entries | map({key: .provider, value: .value}) | from_entries)
+         }}
+      end
+    ' "$JOB_FILE" > "$DSH_SETTINGS"
+    if [ -s "$DSH_SETTINGS" ]; then
+      docker exec "$CONTAINER" mkdir -p /root/.dsh
+      docker exec -i "$CONTAINER" sh -c \
+        'umask 077; cat > /root/.dsh/settings.yaml' < "$DSH_SETTINGS"
+    fi
+    rm -f "$DSH_SETTINGS"
   fi
 
   if jq -e '.job.payload.agentTools | index("reasonix")' "$JOB_FILE" >/dev/null; then

@@ -72,7 +72,7 @@ func TestEnvironmentTemplateRequiresServerInventorySelection(t *testing.T) {
 	}
 	input.Spec["serverId"] = "7b20f83b-6418-4a9f-8477-3dc7c35d6310"
 	input.Spec["agentTools"] = []any{
-		"claude-code", "codex", "kimi", "opencode", "pi", "reasonix",
+		"claude-code", "codex", "deepseek-harness", "kimi", "opencode", "pi", "reasonix",
 	}
 	if err := Validate(input); err != nil {
 		t.Fatalf("Validate() returned error: %v", err)

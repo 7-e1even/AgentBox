@@ -2657,20 +2657,22 @@ func (s *Store) validateNetworkProxyBinding(ctx context.Context, spec map[string
 
 func incompatibleAgentTools(agentTools []string, protocols map[string]bool) []string {
 	compatibility := map[string][]string{
-		"claude-code": {"anthropic", "openai-responses", "openai-chat"},
-		"codex":       {"openai-responses", "anthropic", "openai-chat"},
-		"kimi":        {"anthropic", "openai-chat", "openai-responses"},
-		"opencode":    {"anthropic", "openai-chat", "openai-responses", "gemini"},
-		"pi":          {"anthropic", "openai-chat", "openai-responses", "gemini"},
-		"reasonix":    {"anthropic", "openai-chat", "openai-responses"},
+		"claude-code":      {"anthropic", "openai-responses", "openai-chat"},
+		"codex":            {"openai-responses", "anthropic", "openai-chat"},
+		"deepseek-harness": {"anthropic", "openai-chat", "openai-responses", "gemini"},
+		"kimi":             {"anthropic", "openai-chat", "openai-responses"},
+		"opencode":         {"anthropic", "openai-chat", "openai-responses", "gemini"},
+		"pi":               {"anthropic", "openai-chat", "openai-responses", "gemini"},
+		"reasonix":         {"anthropic", "openai-chat", "openai-responses"},
 	}
 	labels := map[string]string{
-		"claude-code": "Claude Code",
-		"codex":       "Codex",
-		"kimi":        "Kimi Code",
-		"opencode":    "OpenCode",
-		"pi":          "Pi",
-		"reasonix":    "Reasonix",
+		"claude-code":      "Claude Code",
+		"codex":            "Codex",
+		"deepseek-harness": "DeepSeek Harness",
+		"kimi":             "Kimi Code",
+		"opencode":         "OpenCode",
+		"pi":               "Pi",
+		"reasonix":         "Reasonix",
 	}
 	var incompatible []string
 	for _, agentTool := range agentTools {

@@ -28,13 +28,14 @@ const (
 var idPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
 
 var allowedAgentTools = map[string]bool{
-	"claude-code": true,
-	"codex":       true,
-	"gemini-cli":  true,
-	"kimi":        true,
-	"opencode":    true,
-	"pi":          true,
-	"reasonix":    true,
+	"claude-code":      true,
+	"codex":            true,
+	"deepseek-harness": true,
+	"gemini-cli":       true,
+	"kimi":             true,
+	"opencode":         true,
+	"pi":               true,
+	"reasonix":         true,
 }
 
 var environmentVariableNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)

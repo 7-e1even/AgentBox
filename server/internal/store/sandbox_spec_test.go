@@ -80,7 +80,7 @@ func TestEffectiveSandboxSpecAllowsClearingInheritedLists(t *testing.T) {
 func TestIncompatibleAgentToolsChecksCredentialProtocols(t *testing.T) {
 	protocols := map[string]bool{"anthropic": true}
 	got := incompatibleAgentTools(
-		[]string{"claude-code", "codex", "kimi", "opencode", "pi", "reasonix"},
+		[]string{"claude-code", "codex", "deepseek-harness", "kimi", "opencode", "pi", "reasonix"},
 		protocols,
 	)
 	if len(got) != 0 {
@@ -91,12 +91,22 @@ func TestIncompatibleAgentToolsChecksCredentialProtocols(t *testing.T) {
 func TestIncompatibleAgentToolsAllowsSingleConvertibleLLMProtocol(t *testing.T) {
 	for _, protocol := range []string{"anthropic", "openai-responses", "openai-chat"} {
 		got := incompatibleAgentTools(
-			[]string{"claude-code", "codex", "kimi", "opencode", "pi", "reasonix"},
+			[]string{"claude-code", "codex", "deepseek-harness", "kimi", "opencode", "pi", "reasonix"},
 			map[string]bool{protocol: true},
 		)
 		if len(got) != 0 {
 			t.Fatalf("protocol %s incompatibleAgentTools() = %#v, want none", protocol, got)
 		}
+	}
+}
+
+func TestDeepSeekHarnessAcceptsGeminiThroughChatFacade(t *testing.T) {
+	got := incompatibleAgentTools(
+		[]string{"deepseek-harness"},
+		map[string]bool{"gemini": true},
+	)
+	if len(got) != 0 {
+		t.Fatalf("incompatibleAgentTools() = %#v, want none", got)
 	}
 }
 
