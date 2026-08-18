@@ -24,6 +24,41 @@ func validateAutomationTemplate(source string) error {
 	return nil
 }
 
+func validateAutomationStringTemplate(name, source string) error {
+	_, err := template.New(name).Funcs(automationTemplateFunctions()).Option("missingkey=error").Parse(source)
+	if err != nil {
+		return fmt.Errorf("%s无效: %w", name, err)
+	}
+	return nil
+}
+
+func renderAutomationString(name, source string, context map[string]any) (string, error) {
+	parsed, err := template.New(name).Funcs(automationTemplateFunctions()).Option("missingkey=error").Parse(source)
+	if err != nil {
+		return "", fmt.Errorf("%s无效: %w", name, err)
+	}
+	output := limitedBuffer{limit: automationRenderedInputLimit}
+	if err := parsed.Execute(&output, context); err != nil {
+		return "", fmt.Errorf("%s执行失败: %w", name, err)
+	}
+	return strings.TrimSpace(output.String()), nil
+}
+
+func renderAutomationCondition(source string, context map[string]any) (bool, error) {
+	value, err := renderAutomationString("执行条件", source, context)
+	if err != nil {
+		return false, err
+	}
+	switch strings.ToLower(value) {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	default:
+		return false, errors.New("执行条件必须渲染为 true 或 false")
+	}
+}
+
 func renderAutomationPatch(source string, context map[string]any) (map[string]any, error) {
 	parsed, err := template.New("sandbox-input").Funcs(automationTemplateFunctions()).Option("missingkey=error").Parse(source)
 	if err != nil {

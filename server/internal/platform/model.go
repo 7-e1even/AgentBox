@@ -106,13 +106,13 @@ type ServerPairing struct {
 }
 
 type ServerRegistration struct {
-	PairingToken       string   `json:"pairingToken"`
-	ServerID           string   `json:"serverId"`
-	Name               string   `json:"name"`
-	Hostname           string   `json:"hostname"`
-	OS                 string   `json:"os"`
-	Arch               string   `json:"arch"`
-	Capabilities       []string `json:"capabilities"`
+	PairingToken string   `json:"pairingToken"`
+	ServerID     string   `json:"serverId"`
+	Name         string   `json:"name"`
+	Hostname     string   `json:"hostname"`
+	OS           string   `json:"os"`
+	Arch         string   `json:"arch"`
+	Capabilities []string `json:"capabilities"`
 	// PreviousCredential is required when re-registering a known serverId:
 	// it must match the server's current credential to authorize rotation.
 	PreviousCredential string `json:"previousCredential"`
@@ -205,9 +205,13 @@ type WorkerJob struct {
 }
 
 type WorkerJobResult struct {
-	Success    bool   `json:"success"`
-	ExternalID string `json:"externalId"`
-	Message    string `json:"message"`
+	Success         bool   `json:"success"`
+	ExternalID      string `json:"externalId"`
+	Message         string `json:"message"`
+	ExitCode        *int   `json:"exitCode,omitempty"`
+	Output          string `json:"output,omitempty"`
+	OutputTruncated bool   `json:"outputTruncated,omitempty"`
+	TimedOut        bool   `json:"timedOut,omitempty"`
 }
 
 type ValidationError struct{ Message string }

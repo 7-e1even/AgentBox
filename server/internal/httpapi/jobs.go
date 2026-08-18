@@ -152,10 +152,10 @@ func removeLocalProxyHosts(values []string) []string {
 
 func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request) {
 	var result platform.WorkerJobResult
-	if !s.decodeJSON(w, request, &result) {
+	if !s.decodeJSONWithLimit(w, request, &result, 8<<20) {
 		return
 	}
-	if len(result.Message) > 768<<10 || len(result.ExternalID) > 255 {
+	if len(result.Message) > 768<<10 || len(result.Output) > 768<<10 || len(result.ExternalID) > 255 {
 		s.writeError(w, http.StatusBadRequest, "Worker 结果过长")
 		return
 	}

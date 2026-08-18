@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"reflect"
 	"strconv"
@@ -84,6 +85,67 @@ func TestVerifyAutomationDeliveryBearerAndHMAC(t *testing.T) {
 	}
 }
 
+func TestVerifyAutomationDeliveryProviderAdapters(t *testing.T) {
+	secret := "pipeline-webhook-secret"
+	key := []byte("01234567890123456789012345678901")
+	ciphertext, nonce, err := encryptSecret(key, secret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &Store{secretKey: key}
+	body := []byte(`{"ref":"refs/heads/main"}`)
+	stored := func(mode platform.AutomationAuthMode) storedAutomation {
+		return storedAutomation{
+			Automation: platform.Automation{Trigger: platform.AutomationTriggerInput{AuthMode: mode}},
+			SecretHash: hashToken(secret), SecretCiphertext: ciphertext, SecretNonce: nonce,
+		}
+	}
+
+	githubMAC := hmac.New(sha256.New, []byte(secret))
+	_, _ = githubMAC.Write(body)
+	github := platform.AutomationDelivery{Body: body, Headers: map[string]string{
+		"x-hub-signature-256": "sha256=" + hex.EncodeToString(githubMAC.Sum(nil)),
+	}}
+	if err := store.verifyAutomationDelivery(stored(platform.AutomationAuthGitHub), github); err != nil {
+		t.Fatalf("GitHub verification failed: %v", err)
+	}
+
+	gitlab := platform.AutomationDelivery{Body: body, Headers: map[string]string{"x-gitlab-token": secret}}
+	if err := store.verifyAutomationDelivery(stored(platform.AutomationAuthGitLab), gitlab); err != nil {
+		t.Fatalf("GitLab verification failed: %v", err)
+	}
+
+	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
+	standardMAC := hmac.New(sha256.New, []byte(secret))
+	_, _ = standardMAC.Write([]byte("delivery-17." + timestamp + "."))
+	_, _ = standardMAC.Write(body)
+	standard := platform.AutomationDelivery{Body: body, Headers: map[string]string{
+		"webhook-id": "delivery-17", "webhook-timestamp": timestamp,
+		"webhook-signature": "v1," + base64.StdEncoding.EncodeToString(standardMAC.Sum(nil)),
+	}}
+	if err := store.verifyAutomationDelivery(stored(platform.AutomationAuthStandardWebhook), standard); err != nil {
+		t.Fatalf("Standard Webhooks verification failed: %v", err)
+	}
+}
+
+func TestCanonicalAutomationEventUsesProviderMetadata(t *testing.T) {
+	receivedAt := time.Unix(100, 0).UTC()
+	event := canonicalAutomationEvent(platform.AutomationDelivery{Headers: map[string]string{
+		"x-github-delivery": "delivery-17", "x-github-event": "pull_request",
+	}}, platform.AutomationAuthGitHub, receivedAt)
+	if event.ID != "delivery-17" || event.Type != "pull_request" || event.Source != "github" || !event.Time.Equal(receivedAt) {
+		t.Fatalf("event = %#v", event)
+	}
+}
+
+func TestAutomationIdempotencyFallsBackToCanonicalEventID(t *testing.T) {
+	hash, fingerprint := automationIdempotency(platform.AutomationDelivery{}, platform.AutomationAuthGitHub,
+		platform.AutomationEvent{ID: "delivery-17"})
+	if len(hash) != sha256.Size || len(fingerprint) != 12 {
+		t.Fatalf("hash bytes = %d fingerprint = %q", len(hash), fingerprint)
+	}
+}
+
 func TestValidateAutomationIdempotencyKey(t *testing.T) {
 	if err := validateAutomationIdempotencyKey("delivery-123"); err != nil {
 		t.Fatal(err)
@@ -119,6 +181,21 @@ func TestMergeAutomationPatchUsesJSONMergePatchSemantics(t *testing.T) {
 	}
 }
 
+func TestRenderAutomationConditionAndString(t *testing.T) {
+	context := map[string]any{"event": map[string]any{"type": "pull_request"}, "payload": map[string]any{"sandboxId": "box-17"}}
+	matched, err := renderAutomationCondition(`{{ eq .event.type "pull_request" }}`, context)
+	if err != nil || !matched {
+		t.Fatalf("condition = %v, %v", matched, err)
+	}
+	target, err := renderAutomationString("目标模板", `{{ .payload.sandboxId }}`, context)
+	if err != nil || target != "box-17" {
+		t.Fatalf("target = %q, %v", target, err)
+	}
+	if _, err := renderAutomationCondition(`yes`, context); err == nil {
+		t.Fatal("expected non-boolean condition to fail")
+	}
+}
+
 func TestBuildAutomatedSandboxInputProtectsIdentityAndLifecycleFields(t *testing.T) {
 	projectID := "default"
 	input, _, err := buildAutomatedSandboxInput(
@@ -135,7 +212,9 @@ func TestBuildAutomatedSandboxInputProtectsIdentityAndLifecycleFields(t *testing
 			ID: "runtime-one", Kind: platform.KindRuntime, ProjectID: &projectID,
 			Name: "Runtime One", Enabled: true, Spec: map[string]any{"serverId": "template"},
 		}},
-		map[string]any{}, map[string]string{}, map[string]any{}, time.Unix(0, 0).UTC(),
+		map[string]any{}, map[string]string{}, map[string]any{}, platform.AutomationEvent{
+			Type: "event", Source: "generic", Time: time.Unix(0, 0).UTC(), ReceivedAt: time.Unix(0, 0).UTC(),
+		},
 	)
 	if err != nil {
 		t.Fatal(err)

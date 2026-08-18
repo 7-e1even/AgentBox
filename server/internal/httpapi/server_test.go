@@ -65,15 +65,15 @@ func (fakeStore) DeleteAutomation(context.Context, string) error { return nil }
 func (fakeStore) RotateAutomationSecret(context.Context, string, string) (platform.Automation, string, error) {
 	return platform.Automation{ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", EndpointID: "75778270-bdbf-4e2f-bbeb-b3133447a367"}, "abx_wh_rotated", nil
 }
-func (fakeStore) PreviewAutomation(context.Context, platform.AutomationPreviewInput) (platform.ResourceInputPreview, error) {
-	return platform.ResourceInputPreview{ID: "auto-preview", Kind: platform.KindSandbox, Name: "Preview", Enabled: true, Spec: map[string]any{}}, nil
+func (fakeStore) PreviewAutomation(context.Context, platform.AutomationPreviewInput) (platform.AutomationPreview, error) {
+	return platform.AutomationPreview{Matched: true, Input: &platform.ResourceInputPreview{ID: "auto-preview", Kind: platform.KindSandbox, Name: "Preview", Enabled: true, Spec: map[string]any{}}}, nil
 }
 func (fakeStore) TriggerAutomation(context.Context, platform.AutomationDelivery) (platform.AutomationTriggerResult, error) {
 	sandboxID := "auto-webhook"
 	return platform.AutomationTriggerResult{Run: platform.AutomationRun{
-		ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunQueued,
+		ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", EndpointID: "75778270-bdbf-4e2f-bbeb-b3133447a367", Status: platform.AutomationRunQueued,
 		SandboxID: &sandboxID,
-	}}, nil
+	}, StatusToken: "run-token"}, nil
 }
 func (fakeStore) TestAutomation(context.Context, string, []byte) (platform.AutomationTriggerResult, error) {
 	return platform.AutomationTriggerResult{Run: platform.AutomationRun{
@@ -84,6 +84,9 @@ func (fakeStore) ListAutomationRuns(context.Context, string, string, int) ([]pla
 	return []platform.AutomationRun{}, nil
 }
 func (fakeStore) GetAutomationRun(context.Context, string) (platform.AutomationRun, error) {
+	return platform.AutomationRun{ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunSucceeded}, nil
+}
+func (fakeStore) GetPublicAutomationRun(context.Context, string, string, string) (platform.AutomationRun, error) {
 	return platform.AutomationRun{ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunSucceeded}, nil
 }
 func (fakeStore) ListCredentials(context.Context) ([]platform.ManagedCredential, error) {
@@ -245,7 +248,25 @@ func TestAutomationWebhookDoesNotRequireUserSession(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/api/webhooks/75778270-bdbf-4e2f-bbeb-b3133447a367", strings.NewReader(`{"event":"pull_request"}`))
 	response := httptest.NewRecorder()
 	rawTestHandler().ServeHTTP(response, request)
-	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"status":"queued"`) {
+	if response.Code != http.StatusAccepted || !strings.Contains(response.Body.String(), `"status":"queued"`) ||
+		!strings.Contains(response.Body.String(), `"runToken":"run-token"`) || response.Header().Get("Location") == "" {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPublicAutomationRunUsesScopedTokenWithoutSession(t *testing.T) {
+	path := "/api/webhooks/75778270-bdbf-4e2f-bbeb-b3133447a367/runs/96b47a49-96d4-492d-85e6-8c14f0315ae8"
+	missing := httptest.NewRecorder()
+	rawTestHandler().ServeHTTP(missing, httptest.NewRequest(http.MethodGet, path, nil))
+	if missing.Code != http.StatusUnauthorized || !strings.Contains(missing.Body.String(), `"code":"run_token_invalid"`) {
+		t.Fatalf("missing token status = %d body = %s", missing.Code, missing.Body.String())
+	}
+
+	request := httptest.NewRequest(http.MethodGet, path, nil)
+	request.Header.Set("Authorization", "Bearer run-token")
+	response := httptest.NewRecorder()
+	rawTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"status":"succeeded"`) {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
 }

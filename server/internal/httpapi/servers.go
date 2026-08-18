@@ -1086,11 +1086,21 @@ complete_job() {
   SUCCESS=$2
   EXTERNAL_ID=$3
   MESSAGE=$4
+  EXIT_CODE=${5:-}
+  OUTPUT_FILE=${6:-/dev/null}
+  OUTPUT_TRUNCATED=${7:-false}
+  TIMED_OUT=${8:-false}
   BODY=$(jq -n \
     --argjson success "$SUCCESS" \
     --arg externalId "$EXTERNAL_ID" \
     --arg message "$MESSAGE" \
-    '{success:$success,externalId:$externalId,message:$message}')
+    --arg exitCode "$EXIT_CODE" \
+    --rawfile output "$OUTPUT_FILE" \
+    --argjson outputTruncated "$OUTPUT_TRUNCATED" \
+    --argjson timedOut "$TIMED_OUT" \
+    '{success:$success,externalId:$externalId,message:$message,
+      exitCode:(if $exitCode == "" then null else ($exitCode | tonumber) end),
+      output:$output,outputTruncated:$outputTruncated,timedOut:$timedOut}')
   curl -fsS -X POST \
     "$SERVER_URL/api/servers/$SERVER_ID/jobs/$JOB_ID/complete" \
     -H "Authorization: Bearer $CREDENTIAL" \
@@ -2564,6 +2574,60 @@ delete_sandbox() {
   fi
 }
 
+run_sandbox_task() {
+  JOB_FILE=$1
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  TARGET=$(sandbox_container_name "$JOB_FILE")
+  COMMAND=$(jq -r '.job.payload.command' "$JOB_FILE")
+  TIMEOUT_SECONDS=$(jq -r '.job.payload.timeoutSeconds // 900' "$JOB_FILE")
+  WORKDIR=$(jq -r '.job.payload.workdir // empty' "$JOB_FILE")
+  AGENTBOX_RUNTIME_DRIVER=$DRIVER
+  export AGENTBOX_RUNTIME_DRIVER
+  if [ -n "$WORKDIR" ]; then
+    docker exec -w "$WORKDIR" "$TARGET" sh -c '
+      TIMEOUT_MARKER=/tmp/agentbox-task-timeout.$$
+      rm -f "$TIMEOUT_MARKER"
+      sh -lc "$2" &
+      TASK_PID=$!
+      (sleep "$1"; : > "$TIMEOUT_MARKER"; kill -TERM "$TASK_PID" 2>/dev/null || true; sleep 2; kill -KILL "$TASK_PID" 2>/dev/null || true) &
+      WATCHDOG_PID=$!
+      set +e
+      wait "$TASK_PID"
+      STATUS=$?
+      set -e
+      if [ ! -f "$TIMEOUT_MARKER" ]; then
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+      else
+        STATUS=124
+      fi
+      rm -f "$TIMEOUT_MARKER"
+      exit "$STATUS"
+    ' agentbox-task "$TIMEOUT_SECONDS" "$COMMAND"
+  else
+    docker exec "$TARGET" sh -c '
+      TIMEOUT_MARKER=/tmp/agentbox-task-timeout.$$
+      rm -f "$TIMEOUT_MARKER"
+      sh -lc "$2" &
+      TASK_PID=$!
+      (sleep "$1"; : > "$TIMEOUT_MARKER"; kill -TERM "$TASK_PID" 2>/dev/null || true; sleep 2; kill -KILL "$TASK_PID" 2>/dev/null || true) &
+      WATCHDOG_PID=$!
+      set +e
+      wait "$TASK_PID"
+      STATUS=$?
+      set -e
+      if [ ! -f "$TIMEOUT_MARKER" ]; then
+        kill "$WATCHDOG_PID" 2>/dev/null || true
+        wait "$WATCHDOG_PID" 2>/dev/null || true
+      else
+        STATUS=124
+      fi
+      rm -f "$TIMEOUT_MARKER"
+      exit "$STATUS"
+    ' agentbox-task "$TIMEOUT_SECONDS" "$COMMAND"
+  fi
+}
+
 process_job() {
   JOB_FILE=$1
   JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
@@ -2602,6 +2666,36 @@ process_job() {
         complete_job "$JOB_ID" false "" "$MESSAGE"
       fi
       rm -f "$LOG_FILE"
+      ;;
+    run-sandbox-task)
+      LOG_FILE=$(mktemp)
+      OUTPUT_FILE=$(mktemp)
+      PIPE_DIR=$(mktemp -d)
+      OUTPUT_PIPE="$PIPE_DIR/output"
+      mkfifo "$OUTPUT_PIPE"
+      run_sandbox_task "$JOB_FILE" >"$OUTPUT_PIPE" 2>&1 &
+      TASK_PID=$!
+      (head -c 524289; cat >/dev/null) <"$OUTPUT_PIPE" >"$LOG_FILE" &
+      DRAIN_PID=$!
+      set +e
+      wait "$TASK_PID"
+      EXIT_CODE=$?
+      wait "$DRAIN_PID"
+      set -e
+      head -c 524288 "$LOG_FILE" >"$OUTPUT_FILE"
+      OUTPUT_TRUNCATED=false
+      if [ "$(wc -c < "$LOG_FILE")" -gt 524288 ]; then OUTPUT_TRUNCATED=true; fi
+      TIMED_OUT=false
+      if [ "$EXIT_CODE" -eq 124 ]; then TIMED_OUT=true; fi
+      if [ "$EXIT_CODE" -eq 0 ]; then
+        complete_job "$JOB_ID" true "" "Task completed" "$EXIT_CODE" "$OUTPUT_FILE" "$OUTPUT_TRUNCATED" false
+      elif [ "$TIMED_OUT" = true ]; then
+        complete_job "$JOB_ID" false "" "Task timed out" "$EXIT_CODE" "$OUTPUT_FILE" "$OUTPUT_TRUNCATED" true
+      else
+        complete_job "$JOB_ID" false "" "Task exited with code $EXIT_CODE" "$EXIT_CODE" "$OUTPUT_FILE" "$OUTPUT_TRUNCATED" false
+      fi
+      rm -f "$LOG_FILE" "$OUTPUT_FILE" "$OUTPUT_PIPE"
+      rmdir "$PIPE_DIR"
       ;;
     *) complete_job "$JOB_ID" false "" "Unsupported worker action: $ACTION" ;;
   esac

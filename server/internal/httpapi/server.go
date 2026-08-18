@@ -31,11 +31,12 @@ type PlatformStore interface {
 	UpdateAutomation(context.Context, string, platform.AutomationInput, string) (platform.Automation, error)
 	DeleteAutomation(context.Context, string) error
 	RotateAutomationSecret(context.Context, string, string) (platform.Automation, string, error)
-	PreviewAutomation(context.Context, platform.AutomationPreviewInput) (platform.ResourceInputPreview, error)
+	PreviewAutomation(context.Context, platform.AutomationPreviewInput) (platform.AutomationPreview, error)
 	TriggerAutomation(context.Context, platform.AutomationDelivery) (platform.AutomationTriggerResult, error)
 	TestAutomation(context.Context, string, []byte) (platform.AutomationTriggerResult, error)
 	ListAutomationRuns(context.Context, string, string, int) ([]platform.AutomationRun, error)
 	GetAutomationRun(context.Context, string) (platform.AutomationRun, error)
+	GetPublicAutomationRun(context.Context, string, string, string) (platform.AutomationRun, error)
 	ListCredentials(context.Context) ([]platform.ManagedCredential, error)
 	CreateCredential(context.Context, platform.CredentialInput) (platform.ManagedCredential, error)
 	UpdateCredential(context.Context, string, platform.CredentialInput) (platform.ManagedCredential, error)
@@ -194,6 +195,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	mux.HandleFunc("POST /api/servers/{id}/jobs/claim", server.claimWorkerJob)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/{jobId}/complete", server.completeWorkerJob)
 	mux.HandleFunc("POST /api/webhooks/{endpointId}", server.receiveAutomationWebhook)
+	mux.HandleFunc("GET /api/webhooks/{endpointId}/runs/{runId}", server.getPublicAutomationRun)
 	mux.HandleFunc("GET /api/servers/{id}/sessions/connect", server.connectWorkerSessions)
 	mux.HandleFunc("GET /api/sandboxes/{id}/session", server.connectSandboxSession)
 	mux.HandleFunc("GET /api/worker/install.sh", server.workerInstallScript)
@@ -312,7 +314,11 @@ func (s *Server) deleteResource(w http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) decodeJSON(w http.ResponseWriter, request *http.Request, target any) bool {
-	request.Body = http.MaxBytesReader(w, request.Body, 1<<20)
+	return s.decodeJSONWithLimit(w, request, target, 1<<20)
+}
+
+func (s *Server) decodeJSONWithLimit(w http.ResponseWriter, request *http.Request, target any, limit int64) bool {
+	request.Body = http.MaxBytesReader(w, request.Body, limit)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {

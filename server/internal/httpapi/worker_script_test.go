@@ -31,6 +31,21 @@ func TestWorkerOnlyAdvertisesUsableDocker(t *testing.T) {
 	}
 }
 
+func TestWorkerRunsBoundedSandboxTasks(t *testing.T) {
+	for _, expected := range []string{
+		`run_sandbox_task() {`,
+		`run-sandbox-task)`,
+		`head -c 524288 "$LOG_FILE"`,
+		`TIMED_OUT=true`,
+		`outputTruncated:$outputTruncated`,
+		`docker exec -w "$WORKDIR" "$TARGET" sh -c`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("sandbox task worker is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerCredentialFormatsFollowProtocol(t *testing.T) {
 	for _, mapping := range []string{
 		`$runtimeBase + .facadePath`,

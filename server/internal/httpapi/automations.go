@@ -148,7 +148,7 @@ func (s *Server) previewAutomation(w http.ResponseWriter, request *http.Request)
 		s.handleError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"input": preview})
+	s.writeJSON(w, http.StatusOK, preview)
 }
 
 func (s *Server) testAutomation(w http.ResponseWriter, request *http.Request) {
@@ -213,7 +213,7 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 	// endpoint_id 是 UUID 列：非法格式会让 Postgres 转型报错，
 	// 提前拦截，避免把 "地址不存在" 误报成 500。
 	if _, err := uuid.Parse(request.PathValue("endpointId")); err != nil {
-		s.writeError(w, http.StatusNotFound, "记录不存在")
+		s.writeAutomationWebhookError(w, http.StatusNotFound, "not_found", "Webhook 不存在", false)
 		return
 	}
 	request.Body = http.MaxBytesReader(w, request.Body, 1<<20)
@@ -221,10 +221,10 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 	if err != nil {
 		var maxBytesError *http.MaxBytesError
 		if errors.As(err, &maxBytesError) {
-			s.writeError(w, http.StatusRequestEntityTooLarge, "Webhook 请求不能超过 1 MiB")
+			s.writeAutomationWebhookError(w, http.StatusRequestEntityTooLarge, "payload_too_large", "Webhook 请求不能超过 1 MiB", false)
 			return
 		}
-		s.writeError(w, http.StatusBadRequest, "无法读取 Webhook 请求")
+		s.writeAutomationWebhookError(w, http.StatusBadRequest, "invalid_request", "无法读取 Webhook 请求", false)
 		return
 	}
 	headers := make(map[string]string, len(request.Header))
@@ -280,9 +280,14 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 	if result.Duplicate {
 		status = http.StatusOK
 	}
+	statusURL := workerRequestBaseURL(request, s.trustedProxy) + "/api/webhooks/" +
+		request.PathValue("endpointId") + "/runs/" + result.Run.ID
+	w.Header().Set("Location", statusURL)
+	w.Header().Set("Retry-After", "2")
 	response := map[string]any{
 		"runId": result.Run.ID, "sandboxId": result.Run.SandboxID,
 		"status": result.Run.Status, "duplicate": result.Duplicate,
+		"statusUrl": statusURL, "runToken": result.StatusToken, "pollAfterSeconds": 2,
 	}
 	if result.Run.ErrorMessage != "" {
 		response["error"] = result.Run.ErrorMessage
@@ -290,16 +295,59 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 	s.writeJSON(w, status, response)
 }
 
+func (s *Server) getPublicAutomationRun(w http.ResponseWriter, request *http.Request) {
+	if _, err := uuid.Parse(request.PathValue("endpointId")); err != nil {
+		s.writeAutomationWebhookError(w, http.StatusNotFound, "not_found", "Run 不存在", false)
+		return
+	}
+	if _, err := uuid.Parse(request.PathValue("runId")); err != nil {
+		s.writeAutomationWebhookError(w, http.StatusNotFound, "not_found", "Run 不存在", false)
+		return
+	}
+	prefix, token, found := strings.Cut(strings.TrimSpace(request.Header.Get("Authorization")), " ")
+	if !found || !strings.EqualFold(prefix, "Bearer") || token == "" {
+		s.writeAutomationWebhookError(w, http.StatusUnauthorized, "run_token_invalid", "Run Token 无效", false)
+		return
+	}
+	run, err := s.store.GetPublicAutomationRun(request.Context(), request.PathValue("endpointId"), request.PathValue("runId"), token)
+	if err != nil {
+		if errors.Is(err, store.ErrWebhookUnauthorized) {
+			s.writeAutomationWebhookError(w, http.StatusUnauthorized, "run_token_invalid", "Run Token 无效", false)
+			return
+		}
+		if errors.Is(err, store.ErrResourceNotFound) {
+			s.writeAutomationWebhookError(w, http.StatusNotFound, "not_found", "Run 不存在", false)
+			return
+		}
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"run": run})
+}
+
 func (s *Server) handleAutomationTriggerError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrWebhookUnauthorized):
-		s.writeError(w, http.StatusUnauthorized, "Webhook 认证无效")
+		s.writeAutomationWebhookError(w, http.StatusUnauthorized, "authentication_failed", "Webhook 认证无效", false)
 	case errors.Is(err, store.ErrAutomationDisabled):
-		s.writeError(w, http.StatusGone, "自动化已停用")
+		s.writeAutomationWebhookError(w, http.StatusGone, "automation_disabled", "自动化已停用", false)
 	case errors.Is(err, store.ErrAutomationRateLimit):
 		w.Header().Set("Retry-After", "60")
-		s.writeError(w, http.StatusTooManyRequests, "自动化触发过于频繁，请稍后重试")
+		s.writeAutomationWebhookError(w, http.StatusTooManyRequests, "rate_limited", "自动化触发过于频繁，请稍后重试", true)
+	case errors.Is(err, store.ErrAutomationIdempotencyConflict):
+		s.writeAutomationWebhookError(w, http.StatusConflict, "idempotency_conflict", "相同 Idempotency-Key 已用于不同 Payload", false)
+	case platform.IsAutomationValidationError(err), platform.IsValidationError(err):
+		s.writeAutomationWebhookError(w, http.StatusBadRequest, "invalid_request", err.Error(), false)
+	case errors.Is(err, store.ErrResourceNotFound):
+		s.writeAutomationWebhookError(w, http.StatusNotFound, "not_found", "Webhook 不存在", false)
 	default:
-		s.handleError(w, err)
+		s.logger.Error("automation webhook failed", "error", err)
+		s.writeAutomationWebhookError(w, http.StatusInternalServerError, "internal_error", "Webhook 处理失败", true)
 	}
+}
+
+func (s *Server) writeAutomationWebhookError(w http.ResponseWriter, status int, code, message string, retryable bool) {
+	s.writeJSON(w, status, map[string]any{"error": map[string]any{
+		"code": code, "message": message, "retryable": retryable,
+	}})
 }

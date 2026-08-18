@@ -167,6 +167,29 @@ var janitorStatements = []string{
 	`DELETE FROM automation_runs WHERE received_at < NOW() - INTERVAL '30 days'`,
 	// Expired login sessions (login only cleans up opportunistically).
 	`DELETE FROM user_sessions WHERE expires_at < NOW()`,
+	// Pending jobs with no worker and leased jobs whose worker disappeared must
+	// become terminal so automation concurrency cannot remain exhausted forever.
+	`UPDATE worker_jobs SET status = 'failed', lease_until = NULL,
+	  result_message = 'Worker 离线或任务超时未被认领', updated_at = NOW()
+	  WHERE status IN ('pending', 'leased')
+	    AND created_at < NOW() - INTERVAL '15 minutes'
+	    AND (lease_until IS NULL OR lease_until < NOW())`,
+	`UPDATE automation_runs run SET status = 'failed', error_code = 'worker_timeout',
+	  error_message = 'Worker 离线或任务超时未被认领', finished_at = NOW()
+	  WHERE run.status IN ('evaluating', 'queued', 'provisioning', 'running')
+	    AND EXISTS (
+	      SELECT 1 FROM worker_jobs job
+	      WHERE job.automation_run_id = run.id AND job.status = 'failed'
+	        AND job.result_message = 'Worker 离线或任务超时未被认领'
+	    )`,
+	`UPDATE worker_jobs job SET status = 'failed',
+	  result_message = '前置任务失败，任务未执行', updated_at = NOW()
+	  WHERE job.status = 'blocked'
+	    AND EXISTS (
+	      SELECT 1 FROM automation_runs run
+	      WHERE run.id = job.automation_run_id
+	        AND run.status IN ('failed', 'expired', 'skipped')
+	    )`,
 	// Sandboxes stuck in a transitional state because their creation/operation
 	// job was never claimed or its lease expired (worker offline or dead).
 	`UPDATE control_resources sandbox
@@ -216,6 +239,44 @@ func (s *Store) runJanitorPass(ctx context.Context) {
 				return
 			}
 			slog.Warn("store janitor statement failed", "error", err)
+		}
+	}
+	rows, err := s.pool.Query(ctx, `SELECT id FROM control_resources
+		WHERE kind = 'sandbox'
+		  AND spec->>'expiresAt' <> ''
+		  AND (spec->>'expiresAt')::timestamptz <= NOW()
+		  AND spec->>'status' NOT IN ('requested', 'starting', 'stopping', 'restarting', 'deleting')
+		ORDER BY updated_at LIMIT 50`)
+	if err != nil {
+		if ctx.Err() == nil {
+			slog.Warn("store janitor expired sandbox query failed", "error", err)
+		}
+		return
+	}
+	ids := make([]string, 0, 8)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	for _, id := range ids {
+		if _, err := s.OperateSandbox(ctx, id, "delete"); err != nil {
+			if !errors.Is(err, ErrConflict) && !errors.Is(err, ErrResourceNotFound) && ctx.Err() == nil {
+				slog.Warn("store janitor expired sandbox cleanup failed", "sandbox_id", id, "error", err)
+			}
+			continue
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE worker_jobs job SET automation_run_id = run.id
+			FROM automation_runs run
+			WHERE job.resource_id = $1 AND job.action = 'delete-sandbox' AND job.status = 'pending'
+			  AND run.sandbox_id = $1 AND run.expires_at <= NOW()`, id); err != nil && ctx.Err() == nil {
+			slog.Warn("store janitor expired sandbox tracking failed", "sandbox_id", id, "error", err)
+		}
+		if _, err := s.pool.Exec(ctx, `UPDATE automation_runs SET cleanup_status = 'pending'
+			WHERE sandbox_id = $1 AND expires_at <= NOW()`, id); err != nil && ctx.Err() == nil {
+			slog.Warn("store janitor expired sandbox run update failed", "sandbox_id", id, "error", err)
 		}
 	}
 }
@@ -1656,6 +1717,11 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	leaseDuration := workerJobLeaseDuration
 	if job.Action == "update-worker" {
 		leaseDuration = 5 * time.Minute
+	} else if job.Action == "run-sandbox-task" {
+		timeoutSeconds, _ := job.Payload["timeoutSeconds"].(float64)
+		if timeoutSeconds >= 10 && timeoutSeconds <= 3600 {
+			leaseDuration = time.Duration(timeoutSeconds)*time.Second + 2*time.Minute
+		}
 	}
 	if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET
     status = 'leased', lease_until = $1, attempts = attempts + 1, updated_at = $2
@@ -1675,6 +1741,14 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
       status = 'provisioning', started_at = COALESCE(started_at, $1)
       WHERE sandbox_id = $2 AND status = 'queued'`, now, job.ResourceID); err != nil {
 			return platform.WorkerJob{}, fmt.Errorf("update claimed automation run: %w", err)
+		}
+	}
+	if job.Action == "run-sandbox-task" {
+		if _, err := tx.Exec(ctx, `UPDATE automation_runs SET
+			status = 'running', started_at = COALESCE(started_at, $1)
+			WHERE id = (SELECT automation_run_id FROM worker_jobs WHERE id = $2)
+			  AND status IN ('queued', 'provisioning')`, now, job.ID); err != nil {
+			return platform.WorkerJob{}, fmt.Errorf("update claimed automation task: %w", err)
 		}
 	}
 	if job.Action == "update-worker" {
@@ -1902,14 +1976,19 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if result.Success {
 		status = "succeeded"
 	}
-	var resourceID pgtype.Text
+	var resourceID, automationRunID pgtype.Text
 	var action string
+	var payloadJSON []byte
+	now := time.Now().UTC()
 	err = tx.QueryRow(ctx, `UPDATE worker_jobs SET
-    status = $1, lease_until = NULL, result_message = $2, external_id = $3, updated_at = $4
-    WHERE id = $5 AND server_id = $6 AND status = 'leased'
-    RETURNING resource_id, action`, status, result.Message, result.ExternalID,
-		time.Now().UTC(), jobID, serverID,
-	).Scan(&resourceID, &action)
+		status = $1, lease_until = NULL, result_message = $2, external_id = $3,
+		result_exit_code = $4, result_output = $5, result_truncated = $6,
+		result_timed_out = $7, updated_at = $8
+		WHERE id = $9 AND server_id = $10 AND status = 'leased'
+		RETURNING resource_id, action, automation_run_id::text, payload`, status, result.Message,
+		result.ExternalID, result.ExitCode, result.Output, result.OutputTruncated, result.TimedOut,
+		now, jobID, serverID,
+	).Scan(&resourceID, &action, &automationRunID, &payloadJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrResourceNotFound
 	}
@@ -1917,7 +1996,6 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		return fmt.Errorf("complete worker job: %w", err)
 	}
 	if action == "update-worker" {
-		now := time.Now().UTC()
 		if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
       worker_version = CASE WHEN $1::boolean THEN worker_update_target ELSE worker_version END,
       worker_update_status = $2, worker_update_message = $3, updated_at = $4
@@ -1933,7 +2011,66 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if resourceID.Valid {
 		resourceIDValue = resourceID.String
 	}
+	var jobPayload map[string]any
+	if err := json.Unmarshal(payloadJSON, &jobPayload); err != nil {
+		return fmt.Errorf("decode completed worker job payload: %w", err)
+	}
+	if action == "run-sandbox-task" {
+		runStatus := "failed"
+		errorCode := "task_failed"
+		errorMessage := result.Message
+		if result.TimedOut {
+			runStatus = "expired"
+			errorCode = "task_timeout"
+			if errorMessage == "" {
+				errorMessage = "任务执行超时"
+			}
+		} else if result.Success {
+			runStatus = "succeeded"
+			errorCode = ""
+			errorMessage = ""
+		}
+		if automationRunID.Valid {
+			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = $1, exit_code = $2,
+				output = $3, output_truncated = $4, error_code = $5, error_message = $6,
+				finished_at = $7 WHERE id = $8`, runStatus, result.ExitCode, result.Output,
+				result.OutputTruncated, errorCode, errorMessage, now, automationRunID.String); err != nil {
+				return fmt.Errorf("finish automation task: %w", err)
+			}
+			cleanupPolicy, _ := jobPayload["cleanupPolicy"].(string)
+			shouldCleanup := cleanupPolicy == "always" || (cleanupPolicy == "on-success" && result.Success)
+			if shouldCleanup {
+				sandbox, loadErr := scanResource(tx.QueryRow(ctx, `SELECT `+resourceColumns+`
+					FROM control_resources WHERE id = $1 AND kind = 'sandbox' FOR UPDATE`, resourceIDValue))
+				if loadErr == nil {
+					_, loadErr = enqueueAutomationDeleteJob(ctx, tx, sandbox, automationRunID.String)
+				}
+				cleanupStatus := "pending"
+				if loadErr != nil {
+					cleanupStatus = "failed"
+				}
+				if _, err := tx.Exec(ctx, `UPDATE automation_runs SET cleanup_status = $1 WHERE id = $2`,
+					cleanupStatus, automationRunID.String); err != nil {
+					return fmt.Errorf("update automation task cleanup: %w", err)
+				}
+			}
+		}
+		return tx.Commit(ctx)
+	}
 	if result.Success && action == "delete-sandbox" {
+		if automationRunID.Valid {
+			var runAction string
+			if err := tx.QueryRow(ctx, `SELECT action_type FROM automation_runs WHERE id = $1`, automationRunID.String).Scan(&runAction); err == nil {
+				if runAction == "destroy-sandbox" {
+					if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'succeeded', cleanup_status = 'succeeded',
+						error_code = '', error_message = '', finished_at = $1 WHERE id = $2`, now, automationRunID.String); err != nil {
+						return fmt.Errorf("finish destroy automation run: %w", err)
+					}
+				} else if _, err := tx.Exec(ctx, `UPDATE automation_runs SET cleanup_status = 'succeeded' WHERE id = $1`, automationRunID.String); err != nil {
+					return fmt.Errorf("finish automation cleanup: %w", err)
+				}
+			}
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM control_resources
       WHERE id = $1 AND kind = 'sandbox'`, resourceIDValue); err != nil {
 			return fmt.Errorf("delete completed sandbox: %w", err)
@@ -1964,25 +2101,59 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
       'message', $3::text
     ), updated_at = $4
     WHERE id = $5 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
-		result.Message, time.Now().UTC(), resourceIDValue,
+		result.Message, now, resourceIDValue,
 	); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
 	if action == "create-sandbox" {
-		runStatus := "failed"
-		errorCode := "worker_failed"
-		errorMessage := result.Message
 		if result.Success {
-			runStatus = "succeeded"
-			errorCode = ""
-			errorMessage = ""
+			var taskJobID string
+			taskErr := pgx.ErrNoRows
+			if automationRunID.Valid {
+				taskErr = tx.QueryRow(ctx, `UPDATE worker_jobs SET status = 'pending',
+					payload = jsonb_set(payload, '{externalId}', to_jsonb($1::text), true), updated_at = $2
+					WHERE automation_run_id = $3 AND action = 'run-sandbox-task' AND status = 'blocked'
+					RETURNING id::text`, result.ExternalID, now, automationRunID.String).Scan(&taskJobID)
+			}
+			if taskErr == nil {
+				if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'queued', worker_job_id = $1,
+					error_code = '', error_message = '' WHERE id = $2`, taskJobID, automationRunID.String); err != nil {
+					return fmt.Errorf("queue automation task after creation: %w", err)
+				}
+			} else if !errors.Is(taskErr, pgx.ErrNoRows) {
+				return fmt.Errorf("unblock automation task: %w", taskErr)
+			} else if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'succeeded',
+				error_code = '', error_message = '', finished_at = $1
+				WHERE sandbox_id = $2 AND status IN ('queued', 'provisioning')`, now, resourceIDValue); err != nil {
+				return fmt.Errorf("finish sandbox creation automation: %w", err)
+			}
+		} else {
+			if automationRunID.Valid {
+				if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET status = 'failed', result_message = $1, updated_at = $2
+					WHERE automation_run_id = $3 AND action = 'run-sandbox-task' AND status = 'blocked'`,
+					"沙箱创建失败，任务未执行", now, automationRunID.String); err != nil {
+					return fmt.Errorf("fail blocked automation task: %w", err)
+				}
+			}
+			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'failed', error_code = 'worker_failed',
+				error_message = $1, finished_at = $2
+				WHERE sandbox_id = $3 AND status IN ('queued', 'provisioning')`, result.Message, now, resourceIDValue); err != nil {
+				return fmt.Errorf("fail sandbox creation automation: %w", err)
+			}
 		}
-		if _, err := tx.Exec(ctx, `UPDATE automation_runs SET
-      status = $1, error_code = $2, error_message = $3, finished_at = $4
-      WHERE sandbox_id = $5 AND status IN ('queued', 'provisioning')`,
-			runStatus, errorCode, errorMessage, time.Now().UTC(), resourceIDValue,
-		); err != nil {
-			return fmt.Errorf("update completed automation run: %w", err)
+	}
+	if action == "delete-sandbox" && !result.Success && automationRunID.Valid {
+		var runAction string
+		if err := tx.QueryRow(ctx, `SELECT action_type FROM automation_runs WHERE id = $1`, automationRunID.String).Scan(&runAction); err == nil {
+			if runAction == "destroy-sandbox" {
+				if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'failed', cleanup_status = 'failed',
+					error_code = 'worker_failed', error_message = $1, finished_at = $2 WHERE id = $3`,
+					result.Message, now, automationRunID.String); err != nil {
+					return fmt.Errorf("fail destroy automation run: %w", err)
+				}
+			} else if _, err := tx.Exec(ctx, `UPDATE automation_runs SET cleanup_status = 'failed' WHERE id = $1`, automationRunID.String); err != nil {
+				return fmt.Errorf("fail automation cleanup: %w", err)
+			}
 		}
 	}
 	if err := tx.Commit(ctx); err != nil {

@@ -132,17 +132,30 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
   server_id UUID NOT NULL REFERENCES managed_servers(id) ON DELETE CASCADE,
   resource_id TEXT REFERENCES control_resources(id) ON DELETE CASCADE,
   action TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('pending', 'leased', 'succeeded', 'failed')),
+  status TEXT NOT NULL CHECK (status IN ('blocked', 'pending', 'leased', 'succeeded', 'failed')),
   payload JSONB NOT NULL,
   lease_until TIMESTAMPTZ,
   attempts INTEGER NOT NULL DEFAULT 0,
   result_message TEXT NOT NULL DEFAULT '',
   external_id TEXT NOT NULL DEFAULT '',
+  result_exit_code INTEGER,
+  result_output TEXT NOT NULL DEFAULT '',
+  result_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+  result_timed_out BOOLEAN NOT NULL DEFAULT FALSE,
+  automation_run_id UUID,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
 );
 
 ALTER TABLE worker_jobs ALTER COLUMN resource_id DROP NOT NULL;
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_exit_code INTEGER;
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_output TEXT NOT NULL DEFAULT '';
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_truncated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_timed_out BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS automation_run_id UUID;
+ALTER TABLE worker_jobs DROP CONSTRAINT IF EXISTS worker_jobs_status_check;
+ALTER TABLE worker_jobs ADD CONSTRAINT worker_jobs_status_check
+  CHECK (status IN ('blocked', 'pending', 'leased', 'succeeded', 'failed'));
 
 CREATE INDEX IF NOT EXISTS idx_worker_jobs_claim
   ON worker_jobs(server_id, status, created_at);
@@ -415,16 +428,22 @@ CREATE TABLE IF NOT EXISTS automations (
   description TEXT NOT NULL DEFAULT '',
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   trigger_type TEXT NOT NULL CHECK (trigger_type = 'webhook'),
-  action_type TEXT NOT NULL CHECK (action_type = 'create-sandbox'),
-  auth_mode TEXT NOT NULL CHECK (auth_mode IN ('bearer', 'hmac-sha256')),
+  action_type TEXT NOT NULL CHECK (action_type IN ('create-sandbox', 'destroy-sandbox', 'run-task')),
+  auth_mode TEXT NOT NULL CHECK (auth_mode IN ('bearer', 'hmac-sha256', 'github-sha256', 'gitlab-token', 'standard-webhooks')),
   endpoint_id UUID NOT NULL UNIQUE,
   secret_hash BYTEA NOT NULL,
   secret_ciphertext BYTEA NOT NULL,
   secret_nonce BYTEA NOT NULL,
   secret_last_four TEXT NOT NULL,
-  template_id TEXT NOT NULL REFERENCES control_resources(id) ON DELETE RESTRICT,
+  template_id TEXT REFERENCES control_resources(id) ON DELETE RESTRICT,
   model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb,
   input_template TEXT NOT NULL,
+  condition_template TEXT NOT NULL DEFAULT 'true',
+  target_template TEXT NOT NULL DEFAULT '',
+  command_template TEXT NOT NULL DEFAULT '',
+  timeout_seconds INTEGER NOT NULL DEFAULT 900,
+  cleanup_policy TEXT NOT NULL DEFAULT 'never',
+  expires_after_seconds INTEGER NOT NULL DEFAULT 0,
   created_by UUID,
   updated_by UUID,
   last_triggered_at TIMESTAMPTZ,
@@ -435,6 +454,22 @@ CREATE TABLE IF NOT EXISTS automations (
 
 ALTER TABLE automations
   ADD COLUMN IF NOT EXISTS model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS condition_template TEXT NOT NULL DEFAULT 'true';
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS target_template TEXT NOT NULL DEFAULT '';
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS command_template TEXT NOT NULL DEFAULT '';
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS timeout_seconds INTEGER NOT NULL DEFAULT 900;
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS cleanup_policy TEXT NOT NULL DEFAULT 'never';
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS expires_after_seconds INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE automations ALTER COLUMN template_id DROP NOT NULL;
+ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_action_type_check;
+ALTER TABLE automations ADD CONSTRAINT automations_action_type_check
+  CHECK (action_type IN ('create-sandbox', 'destroy-sandbox', 'run-task'));
+ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_auth_mode_check;
+ALTER TABLE automations ADD CONSTRAINT automations_auth_mode_check
+  CHECK (auth_mode IN ('bearer', 'hmac-sha256', 'github-sha256', 'gitlab-token', 'standard-webhooks'));
+ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_cleanup_policy_check;
+ALTER TABLE automations ADD CONSTRAINT automations_cleanup_policy_check
+  CHECK (cleanup_policy IN ('never', 'on-success', 'always'));
 
 CREATE INDEX IF NOT EXISTS idx_automations_project_updated
   ON automations(project_id, enabled DESC, updated_at DESC);
@@ -447,25 +482,57 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   automation_id UUID REFERENCES automations(id) ON DELETE SET NULL,
   project_id TEXT NOT NULL,
   automation_name TEXT NOT NULL,
+  endpoint_id UUID,
+  action_type TEXT NOT NULL DEFAULT 'create-sandbox',
   template_id TEXT NOT NULL,
   template_name TEXT NOT NULL,
   trigger_source TEXT NOT NULL CHECK (trigger_source IN ('webhook', 'manual-test')),
-  auth_mode TEXT NOT NULL CHECK (auth_mode IN ('bearer', 'hmac-sha256')),
+  auth_mode TEXT NOT NULL CHECK (auth_mode IN ('bearer', 'hmac-sha256', 'github-sha256', 'gitlab-token', 'standard-webhooks')),
+  event_id TEXT NOT NULL DEFAULT '',
+  event_type TEXT NOT NULL DEFAULT '',
+  event_source TEXT NOT NULL DEFAULT 'generic',
+  event_time TIMESTAMPTZ,
   idempotency_hash BYTEA,
   idempotency_fingerprint TEXT NOT NULL DEFAULT '',
   payload_sha256 BYTEA NOT NULL,
   payload_bytes INTEGER NOT NULL,
   input_sha256 BYTEA,
-  status TEXT NOT NULL CHECK (status IN ('evaluating', 'queued', 'provisioning', 'succeeded', 'failed')),
+  status TEXT NOT NULL CHECK (status IN ('evaluating', 'queued', 'provisioning', 'running', 'succeeded', 'failed', 'skipped', 'expired')),
   sandbox_id TEXT,
   worker_job_id UUID REFERENCES worker_jobs(id) ON DELETE SET NULL,
   error_code TEXT NOT NULL DEFAULT '',
   error_message TEXT NOT NULL DEFAULT '',
+  exit_code INTEGER,
+  output TEXT NOT NULL DEFAULT '',
+  output_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+  cleanup_status TEXT NOT NULL DEFAULT '',
   received_at TIMESTAMPTZ NOT NULL,
   queued_at TIMESTAMPTZ,
   started_at TIMESTAMPTZ,
-  finished_at TIMESTAMPTZ
+  finished_at TIMESTAMPTZ,
+  expires_at TIMESTAMPTZ
 );
+
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS endpoint_id UUID;
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS action_type TEXT NOT NULL DEFAULT 'create-sandbox';
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_source TEXT NOT NULL DEFAULT 'generic';
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS exit_code INTEGER;
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS output TEXT NOT NULL DEFAULT '';
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS output_truncated BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS cleanup_status TEXT NOT NULL DEFAULT '';
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+ALTER TABLE automation_runs DROP CONSTRAINT IF EXISTS automation_runs_status_check;
+ALTER TABLE automation_runs ADD CONSTRAINT automation_runs_status_check
+  CHECK (status IN ('evaluating', 'queued', 'provisioning', 'running', 'succeeded', 'failed', 'skipped', 'expired'));
+ALTER TABLE automation_runs DROP CONSTRAINT IF EXISTS automation_runs_auth_mode_check;
+ALTER TABLE automation_runs ADD CONSTRAINT automation_runs_auth_mode_check
+  CHECK (auth_mode IN ('bearer', 'hmac-sha256', 'github-sha256', 'gitlab-token', 'standard-webhooks'));
+ALTER TABLE worker_jobs DROP CONSTRAINT IF EXISTS worker_jobs_automation_run_id_fkey;
+ALTER TABLE worker_jobs ADD CONSTRAINT worker_jobs_automation_run_id_fkey
+  FOREIGN KEY (automation_run_id) REFERENCES automation_runs(id) ON DELETE SET NULL;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_automation_runs_idempotency
   ON automation_runs(automation_id, idempotency_hash)

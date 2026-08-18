@@ -106,6 +106,12 @@ docker run --rm -v agentbox_agentbox-secrets:/data -v "$PWD":/backup alpine \
 - 在浏览器中使用 root 终端、文件管理器和代码编辑器运维沙箱
 - 使用 PostgreSQL 持久化配置，并加密保存模型凭据
 
+## Webhook 与流水线
+
+“自动化”页面可以把 GitHub、GitLab、Jenkins、n8n 或其他系统的事件转换为持久 Run，执行创建沙箱、在隔离沙箱中运行命令或销毁沙箱。首次请求返回独立的 `statusUrl` 和 `runToken`，调用方无需登录控制台即可轮询最终状态、退出码、输出和清理结果。
+
+完整的鉴权方式、事件字段、幂等语义、轮询脚本和各平台接入步骤见 [Webhook 流水线接入指南](docs/webhook-automation.md)。AgentBox 只提供一个可靠的隔离任务原语；条件分支、并行矩阵和跨步骤 DAG 仍应留在现有 CI/CD 或工作流系统中。
+
 ## 架构
 
 | 组件            | 职责                                      |

@@ -87,6 +87,13 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Skeleton } from "@/components/ui/skeleton"
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from "@/components/ui/sheet"
 import { Switch } from "@/components/ui/switch"
 import {
   Table,
@@ -106,15 +113,17 @@ import {
   automationTriggerResponseSchema,
   automationsResponseSchema,
   type Automation,
+  type AutomationActionType,
   type AutomationAuthMode,
   type AutomationInput,
+  type AutomationPreview,
   type AutomationRun,
   type AutomationRunStatus,
 } from "@/lib/automation-schema"
 import { appToast as toast } from "@/lib/app-toast"
 import { errorMessage, requestJson } from "@/lib/api-client"
 import type { ManagedCredential } from "@/lib/credential-schema"
-import type { Resource, ResourceInput } from "@/lib/platform-schema"
+import type { Resource } from "@/lib/platform-schema"
 
 const DEFAULT_INPUT_TEMPLATE = `{
   "name": "{{ .automation.name }}-{{ .run.shortId }}",
@@ -180,7 +189,10 @@ export function AutomationManagement({
   }, [loadData])
 
   const hasActiveRuns = runs.some(
-    (run) => run.status === "queued" || run.status === "provisioning"
+    (run) =>
+      run.status === "queued" ||
+      run.status === "provisioning" ||
+      run.status === "running"
   )
 
   useEffect(() => {
@@ -373,7 +385,7 @@ export function AutomationManagement({
                     <TableRow>
                       <TableHead className="pl-4">自动化</TableHead>
                       <TableHead>触发器</TableHead>
-                      <TableHead>沙箱模板</TableHead>
+                      <TableHead>动作</TableHead>
                       <TableHead>最近运行</TableHead>
                       <TableHead>状态</TableHead>
                       <TableHead className="pr-4 text-right">操作</TableHead>
@@ -416,13 +428,21 @@ export function AutomationManagement({
                           <TableCell>
                             <span className="flex items-center gap-2">
                               <WebhookIcon className="size-4 text-muted-foreground" />
-                              {automation.trigger.authMode === "bearer"
-                                ? "Bearer"
-                                : "HMAC"}
+                              {authModeLabel(automation.trigger.authMode)}
                             </span>
                           </TableCell>
                           <TableCell>
-                            {template?.name ?? automation.action.templateId}
+                            <div className="flex flex-col gap-0.5">
+                              <span>
+                                {actionTypeLabel(automation.action.type)}
+                              </span>
+                              <span className="text-xs text-muted-foreground">
+                                {automation.action.type === "destroy-sandbox"
+                                  ? "由 Payload 定位目标"
+                                  : (template?.name ??
+                                    automation.action.templateId)}
+                              </span>
+                            </div>
                           </TableCell>
                           <TableCell>
                             {latestRun ? (
@@ -500,6 +520,7 @@ export function AutomationManagement({
       {testing && (
         <TestAutomationDialog
           key={testing.id}
+          automation={testing}
           onOpenChange={(open) => !open && setTesting(null)}
           onConfirm={testAutomation}
         />
@@ -540,7 +561,7 @@ function AutomationEditor({
   const [rotating, setRotating] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
   const [previewPayload, setPreviewPayload] = useState("{}")
-  const [preview, setPreview] = useState<ResourceInput | null>(null)
+  const [preview, setPreview] = useState<AutomationPreview | null>(null)
   const [previewError, setPreviewError] = useState("")
   const [previewing, setPreviewing] = useState(false)
   const [formError, setFormError] = useState("")
@@ -563,6 +584,7 @@ function AutomationEditor({
       return
     }
     if (
+      parsed.data.action.type !== "destroy-sandbox" &&
       templateCredentialIds.some(
         (credentialID) => !parsed.data.action.modelBindings[credentialID]
       )
@@ -628,7 +650,7 @@ function AutomationEditor({
           }),
         })
       )
-      setPreview(result.input)
+      setPreview(result)
     } catch (error) {
       setPreview(null)
       setPreviewError(errorMessage(error))
@@ -673,7 +695,7 @@ function AutomationEditor({
             )}
           </div>
           <p className="text-sm text-muted-foreground">
-            Webhook 到达后渲染沙箱输入，并通过既有 Worker 链路创建沙箱。
+            把外部事件转换为可追踪的 Run，再交给既有 Worker 链路执行。
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -709,7 +731,7 @@ function AutomationEditor({
         </Alert>
       )}
 
-      {templates.length === 0 && (
+      {templates.length === 0 && input.action.type !== "destroy-sandbox" && (
         <Alert>
           <WorkflowIcon />
           <AlertTitle>需要一个已启用的沙箱模板</AlertTitle>
@@ -828,138 +850,354 @@ function AutomationEditor({
                         <SelectGroup>
                           <SelectItem value="bearer">Bearer Token</SelectItem>
                           <SelectItem value="hmac-sha256">
-                            HMAC-SHA256
+                            AgentBox HMAC-SHA256
+                          </SelectItem>
+                          <SelectItem value="github-sha256">GitHub</SelectItem>
+                          <SelectItem value="gitlab-token">GitLab</SelectItem>
+                          <SelectItem value="standard-webhooks">
+                            Standard Webhooks
                           </SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>
                     <FieldDescription>
-                      {input.trigger.authMode === "bearer"
-                        ? "适合通用 Webhook 工具，通过 Authorization 请求头发送。"
-                        : "验证时间戳和原始正文签名，可检测篡改与短期重放。"}
+                      {authModeDescription(input.trigger.authMode)}
                     </FieldDescription>
                   </Field>
+                  {!automation && (
+                    <Field>
+                      <FieldLabel htmlFor="automation-secret">
+                        自定义密钥（可选）
+                      </FieldLabel>
+                      <Input
+                        id="automation-secret"
+                        type="password"
+                        value={input.secret ?? ""}
+                        placeholder="留空则由 AgentBox 安全生成"
+                        onChange={(event) =>
+                          setInput((current) => ({
+                            ...current,
+                            secret: event.target.value || undefined,
+                          }))
+                        }
+                      />
+                      <FieldDescription>
+                        已由上游生成密钥时可直接复用；至少 16 个字符。
+                      </FieldDescription>
+                    </Field>
+                  )}
                 </FieldGroup>
               </FieldSet>
 
               <FieldSet>
-                <FieldLegend>创建沙箱动作</FieldLegend>
+                <FieldLegend>执行动作</FieldLegend>
                 <FieldGroup>
-                  <Field data-invalid={!input.action.templateId}>
-                    <FieldLabel htmlFor="automation-template">
-                      沙箱模板
+                  <Field>
+                    <FieldLabel htmlFor="automation-action">
+                      动作类型
                     </FieldLabel>
                     <Select
-                      value={input.action.templateId}
-                      onValueChange={(templateId) =>
-                        setInput((current) => {
-                          const nextTemplate = templates.find(
-                            (template) => template.id === templateId
-                          )
-                          const credentialIDs = resourceStringList(
-                            nextTemplate?.spec.credentialIds
-                          )
-                          return {
-                            ...current,
-                            action: {
-                              ...current.action,
-                              templateId,
-                              modelBindings: Object.fromEntries(
-                                credentialIDs.flatMap((credentialID) => {
-                                  const modelID =
-                                    current.action.modelBindings[credentialID]
-                                  return modelID
-                                    ? [[credentialID, modelID]]
-                                    : []
-                                })
-                              ),
-                            },
-                          }
-                        })
+                      value={input.action.type}
+                      onValueChange={(type) =>
+                        setInput((current) => ({
+                          ...current,
+                          action: {
+                            ...current.action,
+                            type: type as AutomationActionType,
+                          },
+                        }))
                       }
                     >
-                      <SelectTrigger
-                        id="automation-template"
-                        className="w-full"
-                        aria-invalid={!input.action.templateId}
-                      >
-                        <SelectValue placeholder="选择模板" />
+                      <SelectTrigger id="automation-action" className="w-full">
+                        <SelectValue />
                       </SelectTrigger>
                       <SelectContent>
                         <SelectGroup>
-                          {templates.map((template) => (
-                            <SelectItem key={template.id} value={template.id}>
-                              {template.name}
-                            </SelectItem>
-                          ))}
+                          <SelectItem value="create-sandbox">
+                            创建沙箱
+                          </SelectItem>
+                          <SelectItem value="run-task">
+                            创建沙箱并执行任务
+                          </SelectItem>
+                          <SelectItem value="destroy-sandbox">
+                            销毁沙箱
+                          </SelectItem>
                         </SelectGroup>
                       </SelectContent>
                     </Select>
-                    {!input.action.templateId && (
-                      <FieldError>请选择沙箱模板。</FieldError>
-                    )}
                     <FieldDescription>
-                      触发时读取模板最新配置，再应用高级 JSON Merge Patch。
+                      {actionTypeDescription(input.action.type)}
                     </FieldDescription>
                   </Field>
-                  {templateCredentialIds.map((credentialID) => {
-                    const credential = credentials.find(
-                      (item) => item.id === credentialID && item.enabled
-                    )
-                    const modelID =
-                      input.action.modelBindings[credentialID] ?? ""
-                    return (
-                      <Field key={credentialID} data-invalid={!modelID}>
-                        <FieldLabel
-                          htmlFor={`automation-model-${credentialID}`}
-                        >
-                          {credential?.name ?? credentialID} 模型
+
+                  {input.action.type === "destroy-sandbox" ? (
+                    <Field data-invalid={!input.action.targetTemplate}>
+                      <FieldLabel htmlFor="automation-target">
+                        目标沙箱模板
+                      </FieldLabel>
+                      <Textarea
+                        id="automation-target"
+                        className="font-mono text-xs"
+                        value={input.action.targetTemplate}
+                        aria-invalid={!input.action.targetTemplate}
+                        placeholder="{{ .payload.sandboxId }}"
+                        onChange={(event) =>
+                          setInput((current) => ({
+                            ...current,
+                            action: {
+                              ...current.action,
+                              targetTemplate: event.target.value,
+                            },
+                          }))
+                        }
+                      />
+                      {!input.action.targetTemplate && (
+                        <FieldError>请输入目标沙箱模板。</FieldError>
+                      )}
+                      <FieldDescription>
+                        必须渲染为当前项目中的沙箱 ID。
+                      </FieldDescription>
+                    </Field>
+                  ) : (
+                    <>
+                      <Field data-invalid={!input.action.templateId}>
+                        <FieldLabel htmlFor="automation-template">
+                          沙箱模板
                         </FieldLabel>
                         <Select
-                          value={modelID}
-                          disabled={
-                            !credential || credential.models.length === 0
-                          }
-                          onValueChange={(nextModelID) =>
-                            setInput((current) => ({
-                              ...current,
-                              action: {
-                                ...current.action,
-                                modelBindings: {
-                                  ...current.action.modelBindings,
-                                  [credentialID]: nextModelID,
+                          value={input.action.templateId}
+                          onValueChange={(templateId) =>
+                            setInput((current) => {
+                              const nextTemplate = templates.find(
+                                (template) => template.id === templateId
+                              )
+                              const credentialIDs = resourceStringList(
+                                nextTemplate?.spec.credentialIds
+                              )
+                              return {
+                                ...current,
+                                action: {
+                                  ...current.action,
+                                  templateId,
+                                  modelBindings: Object.fromEntries(
+                                    credentialIDs.flatMap((credentialID) => {
+                                      const modelID =
+                                        current.action.modelBindings[
+                                          credentialID
+                                        ]
+                                      return modelID
+                                        ? [[credentialID, modelID]]
+                                        : []
+                                    })
+                                  ),
                                 },
-                              },
-                            }))
+                              }
+                            })
                           }
                         >
                           <SelectTrigger
-                            id={`automation-model-${credentialID}`}
+                            id="automation-template"
                             className="w-full"
-                            aria-invalid={!modelID}
+                            aria-invalid={!input.action.templateId}
                           >
-                            <SelectValue placeholder="选择具体模型" />
+                            <SelectValue placeholder="选择模板" />
                           </SelectTrigger>
                           <SelectContent>
                             <SelectGroup>
-                              {credential?.models.map((model) => (
-                                <SelectItem key={model.id} value={model.id}>
-                                  {model.name}
+                              {templates.map((template) => (
+                                <SelectItem
+                                  key={template.id}
+                                  value={template.id}
+                                >
+                                  {template.name}
                                 </SelectItem>
                               ))}
                             </SelectGroup>
                           </SelectContent>
                         </Select>
-                        {!modelID && (
-                          <FieldError>
-                            {credential?.models.length
-                              ? "请选择具体模型。"
-                              : "该模型服务没有可用模型。"}
-                          </FieldError>
+                        {!input.action.templateId && (
+                          <FieldError>请选择沙箱模板。</FieldError>
                         )}
+                        <FieldDescription>
+                          触发时读取模板最新配置，再应用高级 JSON Merge Patch。
+                        </FieldDescription>
                       </Field>
-                    )
-                  })}
+                      {templateCredentialIds.map((credentialID) => {
+                        const credential = credentials.find(
+                          (item) => item.id === credentialID && item.enabled
+                        )
+                        const modelID =
+                          input.action.modelBindings[credentialID] ?? ""
+                        return (
+                          <Field key={credentialID} data-invalid={!modelID}>
+                            <FieldLabel
+                              htmlFor={`automation-model-${credentialID}`}
+                            >
+                              {credential?.name ?? credentialID} 模型
+                            </FieldLabel>
+                            <Select
+                              value={modelID}
+                              disabled={
+                                !credential || credential.models.length === 0
+                              }
+                              onValueChange={(nextModelID) =>
+                                setInput((current) => ({
+                                  ...current,
+                                  action: {
+                                    ...current.action,
+                                    modelBindings: {
+                                      ...current.action.modelBindings,
+                                      [credentialID]: nextModelID,
+                                    },
+                                  },
+                                }))
+                              }
+                            >
+                              <SelectTrigger
+                                id={`automation-model-${credentialID}`}
+                                className="w-full"
+                                aria-invalid={!modelID}
+                              >
+                                <SelectValue placeholder="选择具体模型" />
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectGroup>
+                                  {credential?.models.map((model) => (
+                                    <SelectItem key={model.id} value={model.id}>
+                                      {model.name}
+                                    </SelectItem>
+                                  ))}
+                                </SelectGroup>
+                              </SelectContent>
+                            </Select>
+                            {!modelID && (
+                              <FieldError>
+                                {credential?.models.length
+                                  ? "请选择具体模型。"
+                                  : "该模型服务没有可用模型。"}
+                              </FieldError>
+                            )}
+                          </Field>
+                        )
+                      })}
+                      {input.action.type === "run-task" && (
+                        <>
+                          <Field data-invalid={!input.action.commandTemplate}>
+                            <FieldLabel htmlFor="automation-command">
+                              任务命令
+                            </FieldLabel>
+                            <Textarea
+                              id="automation-command"
+                              className="min-h-24 font-mono text-xs"
+                              value={input.action.commandTemplate}
+                              placeholder="go test ./..."
+                              onChange={(event) =>
+                                setInput((current) => ({
+                                  ...current,
+                                  action: {
+                                    ...current.action,
+                                    commandTemplate: event.target.value,
+                                  },
+                                }))
+                              }
+                            />
+                            <FieldDescription>
+                              在沙箱工作目录中通过 POSIX shell
+                              执行，可使用事件模板变量。
+                            </FieldDescription>
+                          </Field>
+                          <div className="grid gap-4 sm:grid-cols-2">
+                            <Field>
+                              <FieldLabel htmlFor="automation-timeout">
+                                超时（秒）
+                              </FieldLabel>
+                              <Input
+                                id="automation-timeout"
+                                type="number"
+                                min={10}
+                                max={3600}
+                                value={input.action.timeoutSeconds}
+                                onChange={(event) =>
+                                  setInput((current) => ({
+                                    ...current,
+                                    action: {
+                                      ...current.action,
+                                      timeoutSeconds: Number(
+                                        event.target.value
+                                      ),
+                                    },
+                                  }))
+                                }
+                              />
+                            </Field>
+                            <Field>
+                              <FieldLabel htmlFor="automation-cleanup">
+                                任务后清理
+                              </FieldLabel>
+                              <Select
+                                value={input.action.cleanupPolicy}
+                                onValueChange={(cleanupPolicy) =>
+                                  setInput((current) => ({
+                                    ...current,
+                                    action: {
+                                      ...current.action,
+                                      cleanupPolicy:
+                                        cleanupPolicy as AutomationInput["action"]["cleanupPolicy"],
+                                    },
+                                  }))
+                                }
+                              >
+                                <SelectTrigger
+                                  id="automation-cleanup"
+                                  className="w-full"
+                                >
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent>
+                                  <SelectItem value="never">
+                                    保留沙箱
+                                  </SelectItem>
+                                  <SelectItem value="on-success">
+                                    成功后清理
+                                  </SelectItem>
+                                  <SelectItem value="always">
+                                    始终清理
+                                  </SelectItem>
+                                </SelectContent>
+                              </Select>
+                            </Field>
+                          </div>
+                        </>
+                      )}
+                      <Field>
+                        <FieldLabel htmlFor="automation-expiry">
+                          自动回收（分钟）
+                        </FieldLabel>
+                        <Input
+                          id="automation-expiry"
+                          type="number"
+                          min={0}
+                          max={43200}
+                          value={Math.floor(
+                            input.action.expiresAfterSeconds / 60
+                          )}
+                          onChange={(event) =>
+                            setInput((current) => ({
+                              ...current,
+                              action: {
+                                ...current.action,
+                                expiresAfterSeconds:
+                                  Number(event.target.value) * 60,
+                              },
+                            }))
+                          }
+                        />
+                        <FieldDescription>
+                          0 表示不按 TTL 自动回收。
+                        </FieldDescription>
+                      </Field>
+                    </>
+                  )}
                 </FieldGroup>
               </FieldSet>
             </FieldGroup>
@@ -981,10 +1219,9 @@ function AutomationEditor({
       <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
         <Card>
           <CardHeader>
-            <CardTitle>高级 Spec 表达式</CardTitle>
+            <CardTitle>高级条件与 Spec</CardTitle>
             <CardDescription>
-              使用 Go Template 渲染 JSON Merge
-              Patch。身份、项目、模板引用和生命周期字段由平台保留。
+              用 Go Template 过滤事件；创建类动作还可渲染 JSON Merge Patch。
             </CardDescription>
             <CardAction>
               <CollapsibleTrigger asChild>
@@ -1001,27 +1238,55 @@ function AutomationEditor({
           </CardHeader>
           <CollapsibleContent>
             <CardContent className="flex flex-col gap-4">
-              <Alert>
-                <BracesIcon />
-                <AlertTitle>完整 Spec 能力</AlertTitle>
-                <AlertDescription>
-                  表达式可以覆盖服务器、镜像、网络、初始化命令、能力与模型绑定；外部
-                  Payload 不能直接提交 Spec，渲染结果仍会经过完整沙箱校验。
-                </AlertDescription>
-              </Alert>
+              <Field>
+                <FieldLabel htmlFor="automation-condition">执行条件</FieldLabel>
+                <Textarea
+                  id="automation-condition"
+                  className="min-h-20 font-mono text-xs"
+                  value={input.conditionTemplate}
+                  placeholder={'{{ eq .event.type "pull_request" }}'}
+                  onChange={(event) =>
+                    setInput((current) => ({
+                      ...current,
+                      conditionTemplate: event.target.value,
+                    }))
+                  }
+                />
+                <FieldDescription>
+                  必须渲染为 true 或 false；false 会记录为“已跳过”，不会创建
+                  Worker Job。
+                </FieldDescription>
+              </Field>
+              {input.action.type !== "destroy-sandbox" && (
+                <Alert>
+                  <BracesIcon />
+                  <AlertTitle>完整 Spec 能力</AlertTitle>
+                  <AlertDescription>
+                    表达式可以覆盖服务器、镜像、网络、初始化命令、能力与模型绑定；外部
+                    Payload 不能直接提交 Spec，渲染结果仍会经过完整沙箱校验。
+                  </AlertDescription>
+                </Alert>
+              )}
               <div className="grid min-h-[28rem] overflow-hidden rounded-lg border xl:grid-cols-2">
                 <div className="min-h-80 border-b xl:border-r xl:border-b-0">
-                  <SandboxCodeEditor
-                    path="sandbox-input.json.tmpl"
-                    value={input.action.inputTemplate}
-                    onSave={() => void renderPreview()}
-                    onChange={(inputTemplate) =>
-                      setInput((current) => ({
-                        ...current,
-                        action: { ...current.action, inputTemplate },
-                      }))
-                    }
-                  />
+                  {input.action.type === "destroy-sandbox" ? (
+                    <div className="flex h-full min-h-80 items-center justify-center p-6 text-center text-sm text-muted-foreground">
+                      销毁动作不接受
+                      Spec；目标沙箱只由上方目标模板定位，并受项目边界校验。
+                    </div>
+                  ) : (
+                    <SandboxCodeEditor
+                      path="sandbox-input.json.tmpl"
+                      value={input.action.inputTemplate}
+                      onSave={() => void renderPreview()}
+                      onChange={(inputTemplate) =>
+                        setInput((current) => ({
+                          ...current,
+                          action: { ...current.action, inputTemplate },
+                        }))
+                      }
+                    />
+                  )}
                 </div>
                 <div className="flex min-h-80 flex-col bg-muted/20">
                   <div className="flex h-10 items-center justify-between border-b px-3">
@@ -1055,7 +1320,7 @@ function AutomationEditor({
                     </pre>
                   ) : (
                     <div className="flex flex-1 items-center justify-center p-6 text-center text-sm text-muted-foreground">
-                      填写测试 Payload 后验证，预览最终沙箱输入。
+                      填写测试 Payload 后验证条件与最终动作输入。
                     </div>
                   )}
                 </div>
@@ -1120,10 +1385,8 @@ function WebhookConnectionCard({
       <CardHeader>
         <CardTitle>Webhook 接入</CardTitle>
         <CardDescription>
-          {automation.trigger.authMode === "bearer"
-            ? "Bearer Token"
-            : "HMAC-SHA256"}{" "}
-          · 密钥末四位 {automation.secretLastFour}
+          {authModeLabel(automation.trigger.authMode)} · 密钥末四位{" "}
+          {automation.secretLastFour}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
@@ -1144,6 +1407,10 @@ function WebhookConnectionCard({
               <ClipboardIcon />
             </Button>
           </div>
+          <FieldDescription>
+            响应返回 statusUrl 与 runToken；流水线可按 pollAfterSeconds
+            轮询退出码、输出和清理状态。
+          </FieldDescription>
         </Field>
       </CardContent>
       <CardFooter className="justify-between gap-3">
@@ -1218,71 +1485,158 @@ function RunHistory({
   runs: AutomationRun[]
   title?: string
 }) {
+  const [selectedRun, setSelectedRun] = useState<AutomationRun | null>(null)
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>{title}</CardTitle>
-        <CardDescription>Webhook 接收、Worker 预配和最终结果。</CardDescription>
-      </CardHeader>
-      <CardContent>
-        {runs.length === 0 ? (
-          <div className="flex min-h-32 items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">
-            尚无运行记录
-          </div>
-        ) : (
-          <div className="overflow-hidden rounded-lg border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>状态</TableHead>
-                  <TableHead>自动化</TableHead>
-                  <TableHead>触发来源</TableHead>
-                  <TableHead>关联沙箱</TableHead>
-                  <TableHead>接收时间</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {runs.map((run) => (
-                  <TableRow key={run.id}>
-                    <TableCell>
-                      <RunStatusBadge status={run.status} />
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex max-w-64 flex-col gap-0.5">
-                        <span className="truncate font-medium">
-                          {run.automationName}
-                        </span>
-                        {run.errorMessage && (
-                          <span className="truncate text-xs text-destructive">
-                            {run.errorMessage}
-                          </span>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      {run.triggerSource === "manual-test"
-                        ? "控制台测试"
-                        : "Webhook"}
-                    </TableCell>
-                    <TableCell className="font-mono text-xs">
-                      {run.sandboxId ?? "—"}
-                    </TableCell>
-                    <TableCell>{formatDateTime(run.receivedAt)}</TableCell>
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle>{title}</CardTitle>
+          <CardDescription>
+            Webhook 接收、Worker 执行、输出与清理结果。
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {runs.length === 0 ? (
+            <div className="flex min-h-32 items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">
+              尚无运行记录
+            </div>
+          ) : (
+            <div className="overflow-hidden rounded-lg border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>状态</TableHead>
+                    <TableHead>自动化</TableHead>
+                    <TableHead>事件</TableHead>
+                    <TableHead>关联沙箱</TableHead>
+                    <TableHead>接收时间</TableHead>
+                    <TableHead className="text-right">详情</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        )}
-      </CardContent>
-    </Card>
+                </TableHeader>
+                <TableBody>
+                  {runs.map((run) => (
+                    <TableRow key={run.id}>
+                      <TableCell>
+                        <RunStatusBadge status={run.status} />
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex max-w-64 flex-col gap-0.5">
+                          <span className="truncate font-medium">
+                            {run.automationName}
+                          </span>
+                          {run.errorMessage && (
+                            <span className="truncate text-xs text-destructive">
+                              {run.errorMessage}
+                            </span>
+                          )}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-col gap-0.5">
+                          <span>{run.event.type}</span>
+                          <span className="text-xs text-muted-foreground">
+                            {run.triggerSource === "manual-test"
+                              ? "控制台测试"
+                              : run.event.source}
+                          </span>
+                        </div>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs">
+                        {run.sandboxId ?? "—"}
+                      </TableCell>
+                      <TableCell>{formatDateTime(run.receivedAt)}</TableCell>
+                      <TableCell className="text-right">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() => setSelectedRun(run)}
+                        >
+                          查看
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+      <Sheet
+        open={Boolean(selectedRun)}
+        onOpenChange={(open) => !open && setSelectedRun(null)}
+      >
+        <SheetContent className="overflow-y-auto data-[side=right]:sm:max-w-xl">
+          <SheetHeader>
+            <SheetTitle className="flex items-center gap-2">
+              {selectedRun && <RunStatusBadge status={selectedRun.status} />}
+              Run 详情
+            </SheetTitle>
+            <SheetDescription>
+              {selectedRun?.automationName} ·{" "}
+              {selectedRun && actionTypeLabel(selectedRun.actionType)}
+            </SheetDescription>
+          </SheetHeader>
+          {selectedRun && (
+            <div className="flex flex-col gap-5 px-4 pb-6">
+              <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
+                <dt className="text-muted-foreground">Run ID</dt>
+                <dd className="font-mono text-xs break-all">
+                  {selectedRun.id}
+                </dd>
+                <dt className="text-muted-foreground">事件</dt>
+                <dd>
+                  {selectedRun.event.source} / {selectedRun.event.type}
+                </dd>
+                <dt className="text-muted-foreground">事件 ID</dt>
+                <dd className="font-mono text-xs break-all">
+                  {selectedRun.event.id || "—"}
+                </dd>
+                <dt className="text-muted-foreground">沙箱</dt>
+                <dd className="font-mono text-xs break-all">
+                  {selectedRun.sandboxId ?? "—"}
+                </dd>
+                <dt className="text-muted-foreground">退出码</dt>
+                <dd>{selectedRun.exitCode ?? "—"}</dd>
+                <dt className="text-muted-foreground">清理</dt>
+                <dd>{selectedRun.cleanupStatus || "未请求"}</dd>
+                <dt className="text-muted-foreground">接收时间</dt>
+                <dd>{formatDateTime(selectedRun.receivedAt)}</dd>
+              </dl>
+              {selectedRun.errorMessage && (
+                <Alert variant="destructive">
+                  <XCircleIcon />
+                  <AlertTitle>{selectedRun.errorCode || "执行失败"}</AlertTitle>
+                  <AlertDescription>
+                    {selectedRun.errorMessage}
+                  </AlertDescription>
+                </Alert>
+              )}
+              <Field>
+                <FieldLabel>任务输出</FieldLabel>
+                <pre className="max-h-[28rem] min-h-32 overflow-auto rounded-lg border bg-muted/30 p-3 font-mono text-xs leading-5 whitespace-pre-wrap">
+                  {selectedRun.output || "该 Run 没有任务输出。"}
+                </pre>
+                {selectedRun.outputTruncated && (
+                  <FieldDescription>
+                    输出超过 512 KiB，已截断。
+                  </FieldDescription>
+                )}
+              </Field>
+            </div>
+          )}
+        </SheetContent>
+      </Sheet>
+    </>
   )
 }
 
 function TestAutomationDialog({
+  automation,
   onOpenChange,
   onConfirm,
 }: {
+  automation: Automation
   onOpenChange: (open: boolean) => void
   onConfirm: (payload: unknown) => void
 }) {
@@ -1306,8 +1660,8 @@ function TestAutomationDialog({
           </AlertDialogMedia>
           <AlertDialogTitle>发送真实测试事件？</AlertDialogTitle>
           <AlertDialogDescription>
-            这会执行表达式、提交 Worker
-            Job，并创建一个真实沙箱，占用目标服务器资源。
+            这会执行表达式并提交真实 Worker Job：
+            {actionTypeDescription(automation.action.type)}
           </AlertDialogDescription>
         </AlertDialogHeader>
         <Field data-invalid={Boolean(error)}>
@@ -1332,7 +1686,7 @@ function TestAutomationDialog({
         </Field>
         <AlertDialogFooter>
           <AlertDialogCancel>取消</AlertDialogCancel>
-          <AlertDialogAction onClick={confirm}>创建测试沙箱</AlertDialogAction>
+          <AlertDialogAction onClick={confirm}>执行测试 Run</AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
@@ -1363,6 +1717,11 @@ function RunStatusBadge({ status }: { status: AutomationRunStatus }) {
       variant: "secondary",
       icon: <LoaderCircleIcon className="animate-spin" />,
     },
+    running: {
+      label: "正在执行",
+      variant: "secondary",
+      icon: <LoaderCircleIcon className="animate-spin" />,
+    },
     succeeded: {
       label: "成功",
       variant: "default",
@@ -1370,6 +1729,16 @@ function RunStatusBadge({ status }: { status: AutomationRunStatus }) {
     },
     failed: {
       label: "失败",
+      variant: "destructive",
+      icon: <XCircleIcon />,
+    },
+    skipped: {
+      label: "已跳过",
+      variant: "outline",
+      icon: <CheckCircle2Icon />,
+    },
+    expired: {
+      label: "已超时",
       variant: "destructive",
       icon: <XCircleIcon />,
     },
@@ -1413,12 +1782,18 @@ function defaultAutomationInput(
     name: "",
     description: "",
     enabled: true,
+    conditionTemplate: "true",
     trigger: { type: "webhook", authMode: "bearer" },
     action: {
       type: "create-sandbox",
       templateId,
       modelBindings: {},
       inputTemplate: DEFAULT_INPUT_TEMPLATE,
+      targetTemplate: "{{ .payload.sandboxId }}",
+      commandTemplate: "",
+      timeoutSeconds: 900,
+      cleanupPolicy: "never",
+      expiresAfterSeconds: 0,
     },
   }
 }
@@ -1426,6 +1801,43 @@ function defaultAutomationInput(
 function resourceStringList(value: unknown) {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is string => typeof item === "string")
+}
+
+function authModeLabel(mode: AutomationAuthMode) {
+  return {
+    bearer: "Bearer Token",
+    "hmac-sha256": "AgentBox HMAC-SHA256",
+    "github-sha256": "GitHub",
+    "gitlab-token": "GitLab",
+    "standard-webhooks": "Standard Webhooks",
+  }[mode]
+}
+
+function authModeDescription(mode: AutomationAuthMode) {
+  return {
+    bearer: "适合 Jenkins、n8n 等通用调用方，通过 Authorization 请求头发送。",
+    "hmac-sha256": "验证 AgentBox 时间戳与原始正文签名，并限制五分钟重放窗口。",
+    "github-sha256":
+      "原生验证 X-Hub-Signature-256，并读取 GitHub Delivery 与事件类型。",
+    "gitlab-token": "原生验证 X-Gitlab-Token，并读取 GitLab 事件 UUID 与类型。",
+    "standard-webhooks": "验证 webhook-id、webhook-timestamp 与 v1 签名。",
+  }[mode]
+}
+
+function actionTypeLabel(type: AutomationActionType) {
+  return {
+    "create-sandbox": "创建沙箱",
+    "run-task": "执行隔离任务",
+    "destroy-sandbox": "销毁沙箱",
+  }[type]
+}
+
+function actionTypeDescription(type: AutomationActionType) {
+  return {
+    "create-sandbox": "创建持久沙箱，适合预览环境、人工接管和后续外部步骤。",
+    "run-task": "创建沙箱后执行命令，记录退出码与输出，并按策略清理。",
+    "destroy-sandbox": "从事件中定位当前项目的沙箱并异步销毁。",
+  }[type]
 }
 
 function webhookSample(
@@ -1440,6 +1852,37 @@ function webhookSample(
   -H 'Idempotency-Key: event-123' \\
   -H 'Content-Type: application/json' \\
   -d '{}'`
+  }
+  if (automation.trigger.authMode === "gitlab-token") {
+    return `curl -X POST '${webhookURL}' \
+  -H 'X-Gitlab-Token: ${value}' \
+  -H 'X-Gitlab-Event: Pipeline Hook' \
+  -H 'X-Gitlab-Event-UUID: event-123' \
+  -H 'Content-Type: application/json' \
+  -d '{}'`
+  }
+  if (automation.trigger.authMode === "github-sha256") {
+    return `BODY='{}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac '${value}' -hex | awk '{print $2}')
+curl -X POST '${webhookURL}' \
+  -H "X-Hub-Signature-256: sha256=$SIG" \
+  -H 'X-GitHub-Event: workflow_run' \
+  -H 'X-GitHub-Delivery: event-123' \
+  -H 'Content-Type: application/json' \
+  -d "$BODY"`
+  }
+  if (automation.trigger.authMode === "standard-webhooks") {
+    return `BODY='{}'
+ID='event-123'
+TS=$(date +%s)
+SIG=$(printf '%s.%s.%s' "$ID" "$TS" "$BODY" | openssl dgst -sha256 -hmac '${value}' -binary | openssl base64 -A)
+curl -X POST '${webhookURL}' \
+  -H "webhook-id: $ID" \
+  -H "webhook-timestamp: $TS" \
+  -H "webhook-signature: v1,$SIG" \
+  -H 'webhook-type: pipeline.completed' \
+  -H 'Content-Type: application/json' \
+  -d "$BODY"`
   }
   return `BODY='{}'
 TS=$(date +%s)
