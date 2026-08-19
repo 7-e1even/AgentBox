@@ -4,6 +4,8 @@ AgentBox 是面向 Coding Agent 的沙箱控制面：连接 Linux 服务器，�
 
 它负责“准备并运行 Agent 环境”，不负责项目任务或工作流编排。
 
+第一次使用请按[《AgentBox 使用指南》](docs/user-guide.md)完成部署、Worker 配对、模型服务、沙箱模板和工作台操作；Webhook 对接见[《Webhook 流水线接入指南》](docs/webhook-automation.md)。
+
 ## 快速部署
 
 需要 Docker Engine 和 Docker Compose v2。先下载项目：
