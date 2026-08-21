@@ -72,18 +72,22 @@ export function RuntimeImageCombobox({
     )
   }
 
-  const selectedOption =
-    options.find((option) => option.value === value) ?? null
+  const optionValues = options.map((option) => option.value)
+  const selectedValue = optionValues.includes(value) ? value : null
 
   return (
     <Combobox
-      items={options}
-      value={selectedOption}
+      items={optionValues}
+      value={selectedValue}
       inputValue={value}
       disabled={disabled}
-      itemToStringValue={(option) => option.value}
-      onInputValueChange={(nextValue) => onChange(nextValue)}
-      onValueChange={(option) => option && onChange(option.value)}
+      autoComplete="off"
+      onInputValueChange={(nextValue) => {
+        if (nextValue !== value) onChange(nextValue)
+      }}
+      onValueChange={(nextValue) => {
+        if (nextValue && nextValue !== value) onChange(nextValue)
+      }}
     >
       <ComboboxInput
         id={id}
@@ -97,7 +101,9 @@ export function RuntimeImageCombobox({
           没有匹配的缓存镜像，将在创建时按当前引用拉取
         </ComboboxEmpty>
         <ComboboxList className="[scrollbar-width:thin] [scrollbar-color:var(--border)_transparent] [scrollbar-gutter:stable] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
-          {(option) => {
+          {(optionValue) => {
+            const option = options.find((item) => item.value === optionValue)
+            if (!option) return null
             const local = choices.local.some(
               (item) => item.value === option.value
             )
@@ -108,7 +114,7 @@ export function RuntimeImageCombobox({
             return (
               <ComboboxItem
                 key={option.value}
-                value={option}
+                value={option.value}
                 className="px-2.5 py-2 pr-8"
               >
                 <span

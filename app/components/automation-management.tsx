@@ -110,6 +110,7 @@ import {
 import { appToast as toast } from "@/lib/app-toast"
 import { errorMessage, requestJson } from "@/lib/api-client"
 import type { ManagedCredential } from "@/lib/credential-schema"
+import { reconcileModelBindings } from "@/lib/model-bindings"
 import type { Resource } from "@/lib/platform-schema"
 
 export function AutomationManagement({
@@ -524,19 +525,32 @@ function AutomationEditor({
   onTest: (automation: Automation) => void
   onDelete: (automation: Automation) => void
 }) {
-  const [input, setInput] = useState<AutomationInput>(() =>
-    automation
-      ? automationInputSchema.parse({
-          projectId: automation.projectId,
-          name: automation.name,
-          description: automation.description,
-          enabled: automation.enabled,
-          trigger: automation.trigger,
-          templateId: automation.templateId,
-          modelBindings: automation.modelBindings,
-        })
-      : defaultAutomationInput(projectId, templates[0]?.id ?? "")
-  )
+  const [input, setInput] = useState<AutomationInput>(() => {
+    if (automation) {
+      const parsed = automationInputSchema.parse({
+        projectId: automation.projectId,
+        name: automation.name,
+        description: automation.description,
+        enabled: automation.enabled,
+        trigger: automation.trigger,
+        templateId: automation.templateId,
+        modelBindings: automation.modelBindings,
+      })
+      const template = templates.find((item) => item.id === parsed.templateId)
+      return {
+        ...parsed,
+        modelBindings: reconcileModelBindings(
+          resourceStringList(template?.spec.credentialIds),
+          credentials,
+          {
+            ...resourceStringRecord(template?.spec.modelBindings),
+            ...parsed.modelBindings,
+          }
+        ),
+      }
+    }
+    return defaultAutomationInput(projectId, templates[0], credentials)
+  })
   const [saving, setSaving] = useState(false)
   const [rotating, setRotating] = useState(false)
   const [formError, setFormError] = useState("")
@@ -822,14 +836,19 @@ function AutomationEditor({
                           templates.find((item) => item.id === templateId)?.spec
                             .credentialIds
                         )
-                        const selected = new Set(credentialIDs)
                         setInput((current) => ({
                           ...current,
                           templateId,
-                          modelBindings: Object.fromEntries(
-                            Object.entries(current.modelBindings).filter(
-                              ([credentialID]) => selected.has(credentialID)
-                            )
+                          modelBindings: reconcileModelBindings(
+                            credentialIDs,
+                            credentials,
+                            {
+                              ...current.modelBindings,
+                              ...resourceStringRecord(
+                                templates.find((item) => item.id === templateId)
+                                  ?.spec.modelBindings
+                              ),
+                            }
                           ),
                         }))
                       }}
@@ -1277,7 +1296,8 @@ function AutomationSkeleton() {
 
 function defaultAutomationInput(
   projectId: string,
-  templateId: string
+  template: Resource | undefined,
+  credentials: ManagedCredential[]
 ): AutomationInput {
   return {
     projectId,
@@ -1285,14 +1305,27 @@ function defaultAutomationInput(
     description: "",
     enabled: true,
     trigger: { type: "webhook", authMode: "bearer" },
-    templateId,
-    modelBindings: {},
+    templateId: template?.id ?? "",
+    modelBindings: reconcileModelBindings(
+      resourceStringList(template?.spec.credentialIds),
+      credentials,
+      resourceStringRecord(template?.spec.modelBindings)
+    ),
   }
 }
 
 function resourceStringList(value: unknown) {
   if (!Array.isArray(value)) return []
   return value.filter((item): item is string => typeof item === "string")
+}
+
+function resourceStringRecord(value: unknown) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, string] => typeof entry[1] === "string"
+    )
+  )
 }
 
 function authModeLabel(mode: AutomationAuthMode) {

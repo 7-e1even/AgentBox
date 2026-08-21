@@ -20,6 +20,7 @@ import {
   environmentVariablesError,
   sandboxEnvironmentVariables,
 } from "@/lib/environment-variables"
+import { reconcileModelBindings } from "@/lib/model-bindings"
 import {
   resourceInputSchema,
   type Resource,
@@ -106,8 +107,8 @@ export function SandboxEditorDialog({
     templates[0]
   const [input, setInput] = useState<ResourceInput>(() =>
     resource
-      ? sandboxInputFromResource(resource, initialTemplate)
-      : createSandboxInput(projectId, resources, initialTemplate)
+      ? sandboxInputFromResource(resource, initialTemplate, credentials)
+      : createSandboxInput(projectId, resources, initialTemplate, credentials)
   )
   const [error, setError] = useState("")
   const [saving, setSaving] = useState(false)
@@ -169,7 +170,14 @@ export function SandboxEditorDialog({
         ...current.spec,
         runtimeId,
         ...templateDefaults(nextTemplate),
-        modelBindings: {},
+        modelBindings: reconcileModelBindings(
+          stringList(nextTemplate?.spec.credentialIds),
+          credentials,
+          {
+            ...stringRecord(current.spec.modelBindings),
+            ...stringRecord(nextTemplate?.spec.modelBindings),
+          }
+        ),
       },
     }))
     setError("")
@@ -221,16 +229,15 @@ export function SandboxEditorDialog({
   }
 
   function selectCredentials(values: string[]) {
-    const selected = new Set(values)
     setInput((current) => ({
       ...current,
       spec: {
         ...current.spec,
         credentialIds: values,
-        modelBindings: Object.fromEntries(
-          Object.entries(stringRecord(current.spec.modelBindings)).filter(
-            ([id]) => selected.has(id)
-          )
+        modelBindings: reconcileModelBindings(
+          values,
+          credentials,
+          stringRecord(current.spec.modelBindings)
         ),
       },
     }))
@@ -283,14 +290,17 @@ export function SandboxEditorDialog({
     for (const item of selectedCredentials) {
       if (!item.credential) {
         setError(`模型服务 ${item.id} 不存在或已停用`)
+        focusModelField(item.id)
         return
       }
       if (item.credential.models.length === 0) {
         setError(`模型服务 ${item.credential.name} 还没有可选模型`)
+        focusModelField(item.id)
         return
       }
       if (!modelBindings[item.id]) {
         setError(`请为 ${item.credential.name} 选择具体模型`)
+        focusModelField(item.id)
         return
       }
     }
@@ -318,6 +328,12 @@ export function SandboxEditorDialog({
     } finally {
       setSaving(false)
     }
+  }
+
+  function focusModelField(credentialId: string) {
+    window.requestAnimationFrame(() => {
+      document.getElementById(`sandbox-model-${credentialId}`)?.focus()
+    })
   }
 
   return (
@@ -783,59 +799,83 @@ export function SandboxEditorDialog({
                 </Alert>
               ) : (
                 <div className="divide-y rounded-lg border">
-                  {selectedCredentials.map(({ id, credential }) => (
-                    <div
-                      key={id}
-                      className="grid gap-3 px-3 py-3 sm:grid-cols-[minmax(10rem,0.7fr)_minmax(15rem,1.3fr)] sm:items-center"
-                    >
-                      <div className="min-w-0">
-                        <div className="flex items-center gap-2">
-                          <span className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-muted/40 text-xs font-semibold">
-                            {credential?.name.slice(0, 1).toUpperCase() ?? "?"}
-                          </span>
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-medium">
-                              {credential?.name ?? id}
-                            </p>
-                            <p className="truncate text-xs text-muted-foreground">
-                              {credential?.protocol ?? "服务不可用"}
-                            </p>
+                  {selectedCredentials.map(({ id, credential }) => {
+                    const modelId = modelBindings[id] ?? ""
+                    return (
+                      <div
+                        key={id}
+                        className="grid gap-3 px-3 py-3 sm:grid-cols-[minmax(10rem,0.7fr)_minmax(15rem,1.3fr)] sm:items-center"
+                      >
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2">
+                            <span className="flex size-8 shrink-0 items-center justify-center rounded-md border bg-muted/40 text-xs font-semibold">
+                              {credential?.name.slice(0, 1).toUpperCase() ??
+                                "?"}
+                            </span>
+                            <div className="min-w-0">
+                              <p className="truncate text-sm font-medium">
+                                {credential?.name ?? id}
+                              </p>
+                              <p className="truncate text-xs text-muted-foreground">
+                                {credential?.protocol ?? "服务不可用"}
+                              </p>
+                            </div>
                           </div>
                         </div>
-                      </div>
-                      <Select
-                        value={modelBindings[id] ?? ""}
-                        disabled={!credential || credential.models.length === 0}
-                        onValueChange={(modelId) => updateModel(id, modelId)}
-                      >
-                        <SelectTrigger
-                          className="w-full"
-                          aria-label={`${credential?.name ?? id} 模型`}
+                        <Field
+                          data-invalid={Boolean(error) && !modelId}
+                          className="gap-1.5"
                         >
-                          <SelectValue
-                            placeholder={
-                              credential?.models.length
-                                ? "选择具体模型"
-                                : "请先获取模型列表"
+                          <Select
+                            value={modelId}
+                            disabled={
+                              !credential || credential.models.length === 0
                             }
-                          />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectGroup>
-                            <SelectLabel>{credential?.name ?? id}</SelectLabel>
-                            {credential?.models.map((model) => (
-                              <SelectItem key={model.id} value={model.id}>
-                                {model.name}
-                                {model.name !== model.id
-                                  ? ` · ${model.id}`
-                                  : ""}
-                              </SelectItem>
-                            ))}
-                          </SelectGroup>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                  ))}
+                            onValueChange={(nextModelId) =>
+                              updateModel(id, nextModelId)
+                            }
+                          >
+                            <SelectTrigger
+                              id={`sandbox-model-${id}`}
+                              className="w-full"
+                              aria-label={`${credential?.name ?? id} 模型`}
+                              aria-invalid={Boolean(error) && !modelId}
+                            >
+                              <SelectValue
+                                placeholder={
+                                  credential?.models.length
+                                    ? "选择具体模型"
+                                    : "请先获取模型列表"
+                                }
+                              />
+                            </SelectTrigger>
+                            <SelectContent>
+                              <SelectGroup>
+                                <SelectLabel>
+                                  {credential?.name ?? id}
+                                </SelectLabel>
+                                {credential?.models.map((model) => (
+                                  <SelectItem key={model.id} value={model.id}>
+                                    {model.name}
+                                    {model.name !== model.id
+                                      ? ` · ${model.id}`
+                                      : ""}
+                                  </SelectItem>
+                                ))}
+                              </SelectGroup>
+                            </SelectContent>
+                          </Select>
+                          {error && !modelId && (
+                            <FieldError>
+                              {credential?.models.length
+                                ? "请选择具体模型。"
+                                : "该模型服务没有可用模型。"}
+                            </FieldError>
+                          )}
+                        </Field>
+                      </div>
+                    )
+                  })}
                 </div>
               )}
               <FieldDescription>
@@ -922,7 +962,8 @@ function CapabilitySelector({
 function createSandboxInput(
   projectId: string,
   resources: Resource[],
-  template?: Resource
+  template: Resource | undefined,
+  credentials: ManagedCredential[]
 ): ResourceInput {
   return {
     id: uniqueSandboxId("sandbox", resources),
@@ -936,13 +977,21 @@ function createSandboxInput(
       status: "requested",
       runtimeId: template?.id ?? "",
       ...templateDefaults(template),
-      modelBindings: {},
+      modelBindings: reconcileModelBindings(
+        stringList(template?.spec.credentialIds),
+        credentials,
+        stringRecord(template?.spec.modelBindings)
+      ),
       workspace: "",
     },
   }
 }
 
-function sandboxInputFromResource(resource: Resource, template?: Resource) {
+function sandboxInputFromResource(
+  resource: Resource,
+  template: Resource | undefined,
+  credentials: ManagedCredential[]
+) {
   const input = resourceInputSchema.parse(resource)
   return {
     ...input,
@@ -950,6 +999,14 @@ function sandboxInputFromResource(resource: Resource, template?: Resource) {
       ...templateDefaults(template),
       ...input.spec,
       agentTools: supportedAgentToolList(input.spec.agentTools),
+      modelBindings: reconcileModelBindings(
+        stringList(input.spec.credentialIds),
+        credentials,
+        {
+          ...stringRecord(template?.spec.modelBindings),
+          ...stringRecord(input.spec.modelBindings),
+        }
+      ),
       environmentVariables: sandboxEnvironmentVariables(
         input.spec.environmentVariables
       ),
