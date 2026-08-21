@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -138,32 +137,12 @@ func (s *Server) rotateAutomationSecret(w http.ResponseWriter, request *http.Req
 	})
 }
 
-func (s *Server) previewAutomation(w http.ResponseWriter, request *http.Request) {
-	var input platform.AutomationPreviewInput
-	if !s.decodeJSON(w, request, &input) {
-		return
-	}
-	preview, err := s.store.PreviewAutomation(request.Context(), input)
-	if err != nil {
-		s.handleError(w, err)
-		return
-	}
-	s.writeJSON(w, http.StatusOK, preview)
-}
-
 func (s *Server) testAutomation(w http.ResponseWriter, request *http.Request) {
-	var input struct {
-		Payload any `json:"payload"`
-	}
+	var input struct{}
 	if !s.decodeJSON(w, request, &input) {
 		return
 	}
-	body, err := json.Marshal(input.Payload)
-	if err != nil {
-		s.writeError(w, http.StatusBadRequest, "测试 Payload 无效")
-		return
-	}
-	result, err := s.store.TestAutomation(request.Context(), request.PathValue("id"), body)
+	result, err := s.store.TestAutomation(request.Context(), request.PathValue("id"), []byte("{}"))
 	if err != nil {
 		s.recordLog(request, platform.LogEntry{
 			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "test",

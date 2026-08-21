@@ -24,5 +24,6 @@ describe("app section routes", () => {
     const paths = Object.values(APP_SECTION_PATHS)
 
     expect(paths).not.toContain("/agents")
+    expect(paths).not.toContain("/codex")
   })
 })

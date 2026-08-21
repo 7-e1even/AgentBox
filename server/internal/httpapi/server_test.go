@@ -51,22 +51,19 @@ func (fakeStore) CreateAutomation(_ context.Context, input platform.AutomationIn
 	return platform.Automation{
 		ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", ProjectID: input.ProjectID,
 		Name: input.Name, Description: input.Description, Enabled: input.Enabled,
-		Trigger: input.Trigger, Action: input.Action,
+		Trigger: input.Trigger, TemplateID: input.TemplateID,
 		EndpointID: "75778270-bdbf-4e2f-bbeb-b3133447a367", SecretLastFour: "test",
 	}, "abx_wh_test", nil
 }
 func (fakeStore) UpdateAutomation(_ context.Context, id string, input platform.AutomationInput, userID string) (platform.Automation, error) {
 	return platform.Automation{
 		ID: id, ProjectID: input.ProjectID, Name: input.Name, Description: input.Description,
-		Enabled: input.Enabled, Trigger: input.Trigger, Action: input.Action,
+		Enabled: input.Enabled, Trigger: input.Trigger, TemplateID: input.TemplateID,
 	}, nil
 }
 func (fakeStore) DeleteAutomation(context.Context, string) error { return nil }
 func (fakeStore) RotateAutomationSecret(context.Context, string, string) (platform.Automation, string, error) {
 	return platform.Automation{ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", EndpointID: "75778270-bdbf-4e2f-bbeb-b3133447a367"}, "abx_wh_rotated", nil
-}
-func (fakeStore) PreviewAutomation(context.Context, platform.AutomationPreviewInput) (platform.AutomationPreview, error) {
-	return platform.AutomationPreview{Matched: true, Input: &platform.ResourceInputPreview{ID: "auto-preview", Kind: platform.KindSandbox, Name: "Preview", Enabled: true, Spec: map[string]any{}}}, nil
 }
 func (fakeStore) TriggerAutomation(context.Context, platform.AutomationDelivery) (platform.AutomationTriggerResult, error) {
 	sandboxID := "auto-webhook"
@@ -234,8 +231,8 @@ func TestCreateAutomationReturnsOneTimeSecret(t *testing.T) {
     "name":"PR Preview",
     "description":"Create a sandbox",
     "enabled":true,
-    "trigger":{"type":"webhook","authMode":"bearer"},
-    "action":{"type":"create-sandbox","templateId":"runtime-one","inputTemplate":"{}"}
+	"trigger":{"type":"webhook","authMode":"bearer"},
+	"templateId":"runtime-one"
   }`))
 	response := httptest.NewRecorder()
 	testHandler().ServeHTTP(response, request)

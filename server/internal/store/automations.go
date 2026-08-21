@@ -1,7 +1,6 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
@@ -10,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"strconv"
 	"strings"
 	"time"
@@ -36,20 +34,17 @@ const (
 )
 
 const automationColumns = `id::text, project_id, name, description, enabled,
-  trigger_type, action_type, auth_mode, endpoint_id::text, secret_last_four,
-  COALESCE(template_id, ''), model_bindings, input_template, condition_template,
-  target_template, command_template, timeout_seconds, cleanup_policy, expires_after_seconds,
-  created_by::text, updated_by::text,
+  trigger_type, auth_mode, endpoint_id::text, secret_last_four,
+  COALESCE(template_id, ''), created_by::text, updated_by::text,
   last_triggered_at, secret_rotated_at, created_at, updated_at`
 
 const automationRunColumns = `id::text, automation_id::text, project_id, automation_name,
-  COALESCE(endpoint_id::text, ''), action_type, template_id, template_name,
+  COALESCE(endpoint_id::text, ''), template_id, template_name,
   trigger_source, auth_mode, event_id, event_type, event_source, event_time,
   idempotency_fingerprint,
   encode(payload_sha256, 'hex'), payload_bytes, COALESCE(encode(input_sha256, 'hex'), ''),
-  status, sandbox_id, worker_job_id::text, exit_code, output, output_truncated,
-  cleanup_status, error_code, error_message, received_at, queued_at, started_at,
-  finished_at, expires_at`
+  status, sandbox_id, worker_job_id::text, error_code, error_message,
+  received_at, queued_at, started_at, finished_at`
 
 type storedAutomation struct {
 	Automation       platform.Automation
@@ -60,7 +55,8 @@ type storedAutomation struct {
 
 func (s *Store) ListAutomations(ctx context.Context, projectID string) ([]platform.Automation, error) {
 	rows, err := s.pool.Query(ctx, `SELECT `+automationColumns+` FROM automations
-    WHERE project_id = $1 ORDER BY enabled DESC, updated_at DESC`, strings.TrimSpace(projectID))
+	    WHERE project_id = $1 AND action_type = 'create-sandbox'
+	    ORDER BY enabled DESC, updated_at DESC`, strings.TrimSpace(projectID))
 	if err != nil {
 		return nil, fmt.Errorf("list automations: %w", err)
 	}
@@ -78,7 +74,7 @@ func (s *Store) ListAutomations(ctx context.Context, projectID string) ([]platfo
 
 func (s *Store) GetAutomation(ctx context.Context, id string) (platform.Automation, error) {
 	automation, err := scanAutomation(s.pool.QueryRow(ctx, `SELECT `+automationColumns+`
-    FROM automations WHERE id = $1`, id))
+    FROM automations WHERE id = $1 AND action_type = 'create-sandbox'`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Automation{}, ErrResourceNotFound
 	}
@@ -93,13 +89,8 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, "", err
 	}
-	if err := validateAutomationInputTemplates(input); err != nil {
-		return platform.Automation{}, "", &platform.ValidationError{Message: err.Error()}
-	}
-	if input.Action.Type != "destroy-sandbox" {
-		if _, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.Action.TemplateID); err != nil {
-			return platform.Automation{}, "", err
-		}
+	if _, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID); err != nil {
+		return platform.Automation{}, "", err
 	}
 	secret := input.Secret
 	if secret == "" {
@@ -117,19 +108,14 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	automation, err := scanAutomation(s.pool.QueryRow(ctx, `INSERT INTO automations
     (id, project_id, name, description, enabled, trigger_type, action_type, auth_mode,
      endpoint_id, secret_hash, secret_ciphertext, secret_nonce, secret_last_four,
-     template_id, model_bindings, input_template, condition_template, target_template,
-     command_template, timeout_seconds, cleanup_policy, expires_after_seconds,
+     template_id, input_template,
      created_by, updated_by, secret_rotated_at, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, 'webhook', $6, $7, $8, $9, $10, $11,
-      $12, NULLIF($13, ''), $14, $15, $16, $17, $18, $19, $20, $21,
-      $22, $22, $23, $23, $23)
+	VALUES ($1, $2, $3, $4, $5, 'webhook', 'create-sandbox', $6, $7, $8, $9, $10,
+	  $11, $12, '{}'::text, $13, $13, $14, $14, $14)
     RETURNING `+automationColumns,
 		uuid.NewString(), input.ProjectID, input.Name, input.Description, input.Enabled,
-		input.Action.Type, input.Trigger.AuthMode, uuid.NewString(), hashToken(secret), ciphertext, nonce,
-		lastFour(secret), input.Action.TemplateID, automationModelBindingsJSON(input.Action.ModelBindings),
-		input.Action.InputTemplate, input.ConditionTemplate, input.Action.TargetTemplate,
-		input.Action.CommandTemplate, input.Action.TimeoutSeconds, input.Action.CleanupPolicy,
-		input.Action.ExpiresAfterSeconds, userID, now,
+		input.Trigger.AuthMode, uuid.NewString(), hashToken(secret), ciphertext, nonce,
+		lastFour(secret), input.TemplateID, userID, now,
 	))
 	if err != nil {
 		return platform.Automation{}, "", mapResourceError(err)
@@ -142,26 +128,16 @@ func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, err
 	}
-	if err := validateAutomationInputTemplates(input); err != nil {
-		return platform.Automation{}, &platform.ValidationError{Message: err.Error()}
-	}
-	if input.Action.Type != "destroy-sandbox" {
-		if _, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.Action.TemplateID); err != nil {
-			return platform.Automation{}, err
-		}
+	if _, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID); err != nil {
+		return platform.Automation{}, err
 	}
 	automation, err := scanAutomation(s.pool.QueryRow(ctx, `UPDATE automations SET
-	project_id = $1, name = $2, description = $3, enabled = $4, action_type = $5,
-	auth_mode = $6, template_id = NULLIF($7, ''), model_bindings = $8,
-	input_template = $9, condition_template = $10, target_template = $11,
-	command_template = $12, timeout_seconds = $13, cleanup_policy = $14,
-	expires_after_seconds = $15, updated_by = $16, updated_at = $17
-	WHERE id = $18 RETURNING `+automationColumns,
-		input.ProjectID, input.Name, input.Description, input.Enabled, input.Action.Type,
-		input.Trigger.AuthMode, input.Action.TemplateID, automationModelBindingsJSON(input.Action.ModelBindings),
-		input.Action.InputTemplate, input.ConditionTemplate, input.Action.TargetTemplate,
-		input.Action.CommandTemplate, input.Action.TimeoutSeconds, input.Action.CleanupPolicy,
-		input.Action.ExpiresAfterSeconds, userID, time.Now().UTC(), id,
+	project_id = $1, name = $2, description = $3, enabled = $4,
+	action_type = 'create-sandbox', auth_mode = $5, template_id = $6,
+	updated_by = $7, updated_at = $8
+	WHERE id = $9 AND action_type = 'create-sandbox' RETURNING `+automationColumns,
+		input.ProjectID, input.Name, input.Description, input.Enabled,
+		input.Trigger.AuthMode, input.TemplateID, userID, time.Now().UTC(), id,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Automation{}, ErrResourceNotFound
@@ -173,7 +149,7 @@ func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.
 }
 
 func (s *Store) DeleteAutomation(ctx context.Context, id string) error {
-	command, err := s.pool.Exec(ctx, "DELETE FROM automations WHERE id = $1", id)
+	command, err := s.pool.Exec(ctx, "DELETE FROM automations WHERE id = $1 AND action_type = 'create-sandbox'", id)
 	if err != nil {
 		return fmt.Errorf("delete automation: %w", err)
 	}
@@ -196,7 +172,7 @@ func (s *Store) RotateAutomationSecret(ctx context.Context, id, userID string) (
 	automation, err := scanAutomation(s.pool.QueryRow(ctx, `UPDATE automations SET
     secret_hash = $1, secret_ciphertext = $2, secret_nonce = $3, secret_last_four = $4,
     updated_by = $5, secret_rotated_at = $6, updated_at = $6
-    WHERE id = $7 RETURNING `+automationColumns,
+	    WHERE id = $7 AND action_type = 'create-sandbox' RETURNING `+automationColumns,
 		hashToken(secret), ciphertext, nonce, lastFour(secret), userID, now, id,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -206,73 +182,6 @@ func (s *Store) RotateAutomationSecret(ctx context.Context, id, userID string) (
 		return platform.Automation{}, "", fmt.Errorf("rotate automation secret: %w", err)
 	}
 	return automation, secret, nil
-}
-
-func (s *Store) PreviewAutomation(ctx context.Context, input platform.AutomationPreviewInput) (platform.AutomationPreview, error) {
-	platform.NormalizeAutomationInput(&input.Automation)
-	if err := platform.ValidateAutomationInput(input.Automation); err != nil {
-		return platform.AutomationPreview{}, err
-	}
-	if err := validateAutomationInputTemplates(input.Automation); err != nil {
-		return platform.AutomationPreview{}, &platform.ValidationError{Message: err.Error()}
-	}
-	now := time.Now().UTC()
-	event := canonicalAutomationEvent(platform.AutomationDelivery{Headers: input.Headers}, input.Automation.Trigger.AuthMode, now)
-	runID := uuid.NewString()
-	context := automationTemplateContext(input.Automation, "preview", runID, platform.Resource{}, input.Payload,
-		filteredAutomationHeaders(input.Headers), input.Query, event)
-	matched, err := renderAutomationCondition(input.Automation.ConditionTemplate, context)
-	if err != nil {
-		return platform.AutomationPreview{}, &platform.ValidationError{Message: err.Error()}
-	}
-	if !matched {
-		return platform.AutomationPreview{Matched: false}, nil
-	}
-	if input.Automation.Action.Type == "destroy-sandbox" {
-		target, err := renderAutomationString("目标模板", input.Automation.Action.TargetTemplate, context)
-		if err != nil || target == "" {
-			if err == nil {
-				err = errors.New("目标模板渲染结果不能为空")
-			}
-			return platform.AutomationPreview{}, &platform.ValidationError{Message: err.Error()}
-		}
-		return platform.AutomationPreview{Matched: true, Target: target}, nil
-	}
-	templateResource, err := loadAutomationTemplate(ctx, s.pool, input.Automation.ProjectID, input.Automation.Action.TemplateID)
-	if err != nil {
-		return platform.AutomationPreview{}, err
-	}
-	sandboxInput, encoded, err := buildAutomatedSandboxInput(
-		input.Automation, "preview", runID, templateResource, input.Payload,
-		filteredAutomationHeaders(input.Headers), input.Query, event,
-	)
-	if err != nil {
-		return platform.AutomationPreview{}, &platform.ValidationError{Message: err.Error()}
-	}
-	_ = encoded
-	if err := platform.Validate(sandboxInput); err != nil {
-		return platform.AutomationPreview{}, err
-	}
-	if err := s.ensureResourceReferences(ctx, sandboxInput, true); err != nil {
-		return platform.AutomationPreview{}, err
-	}
-	preview := platform.AutomationPreview{Matched: true, Input: &platform.ResourceInputPreview{
-		ID: sandboxInput.ID, Kind: sandboxInput.Kind, ProjectID: sandboxInput.ProjectID,
-		Name: sandboxInput.Name, Description: sandboxInput.Description,
-		Enabled: sandboxInput.Enabled, Spec: sandboxInput.Spec,
-	}}
-	if input.Automation.Action.Type == "run-task" {
-		context = automationTemplateContext(input.Automation, "preview", runID, templateResource, input.Payload,
-			filteredAutomationHeaders(input.Headers), input.Query, event)
-		preview.Command, err = renderAutomationString("任务命令模板", input.Automation.Action.CommandTemplate, context)
-		if err != nil || preview.Command == "" {
-			if err == nil {
-				err = errors.New("任务命令模板渲染结果不能为空")
-			}
-			return platform.AutomationPreview{}, &platform.ValidationError{Message: err.Error()}
-		}
-	}
-	return preview, nil
 }
 
 func (s *Store) TriggerAutomation(ctx context.Context, delivery platform.AutomationDelivery) (platform.AutomationTriggerResult, error) {
@@ -293,10 +202,6 @@ func (s *Store) triggerAutomation(
 	if err := validateAutomationIdempotencyKey(delivery.IdempotencyKey); err != nil {
 		return platform.AutomationTriggerResult{}, err
 	}
-	payload, err := decodeAutomationPayload(delivery.Body)
-	if err != nil {
-		return platform.AutomationTriggerResult{}, &platform.ValidationError{Message: err.Error()}
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return platform.AutomationTriggerResult{}, fmt.Errorf("begin automation trigger: %w", err)
@@ -307,7 +212,8 @@ func (s *Store) triggerAutomation(
 		where = "endpoint_id = $1"
 	}
 	stored, err := scanStoredAutomation(tx.QueryRow(ctx, `SELECT `+automationColumns+`,
-    secret_hash, secret_ciphertext, secret_nonce FROM automations WHERE `+where+` FOR UPDATE`, identifier))
+		secret_hash, secret_ciphertext, secret_nonce FROM automations
+		WHERE `+where+` AND action_type = 'create-sandbox' FOR UPDATE`, identifier))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.AutomationTriggerResult{}, ErrResourceNotFound
 	}
@@ -344,7 +250,7 @@ func (s *Store) triggerAutomation(
 	var recent, inflight int
 	if err := tx.QueryRow(ctx, `SELECT
       COUNT(*) FILTER (WHERE received_at >= $2),
-		COUNT(*) FILTER (WHERE status IN ('evaluating', 'queued', 'provisioning', 'running'))
+		COUNT(*) FILTER (WHERE status IN ('evaluating', 'queued', 'provisioning'))
     FROM automation_runs WHERE automation_id = $1`, stored.Automation.ID, time.Now().UTC().Add(-time.Minute)).Scan(&recent, &inflight); err != nil {
 		return platform.AutomationTriggerResult{}, fmt.Errorf("check automation limits: %w", err)
 	}
@@ -353,12 +259,8 @@ func (s *Store) triggerAutomation(
 	}
 
 	runID := uuid.NewString()
-	templateResource := platform.Resource{}
-	var templateErr error
-	if stored.Automation.Action.Type != "destroy-sandbox" {
-		templateResource, templateErr = loadAutomationTemplate(ctx, tx, stored.Automation.ProjectID, stored.Automation.Action.TemplateID)
-	}
-	templateName := stored.Automation.Action.TemplateID
+	templateResource, templateErr := loadAutomationTemplate(ctx, tx, stored.Automation.ProjectID, stored.Automation.TemplateID)
+	templateName := stored.Automation.TemplateID
 	if templateErr == nil {
 		templateName = templateResource.Name
 	}
@@ -366,72 +268,15 @@ func (s *Store) triggerAutomation(
 		ID: runID, AutomationID: stringPointer(stored.Automation.ID),
 		EndpointID: stored.Automation.EndpointID,
 		ProjectID:  stored.Automation.ProjectID, AutomationName: stored.Automation.Name,
-		ActionType: stored.Automation.Action.Type,
-		TemplateID: stored.Automation.Action.TemplateID, TemplateName: templateName,
+		TemplateID: stored.Automation.TemplateID, TemplateName: templateName,
 		TriggerSource: triggerSource, AuthMode: stored.Automation.Trigger.AuthMode,
 		Event:                  event,
 		IdempotencyFingerprint: fingerprint, PayloadSHA256: hex.EncodeToString(payloadHash[:]),
 		PayloadBytes: len(delivery.Body), Status: platform.AutomationRunEvaluating,
 		ReceivedAt: receivedAt,
 	}
-	if stored.Automation.Action.ExpiresAfterSeconds > 0 {
-		expiresAt := receivedAt.Add(time.Duration(stored.Automation.Action.ExpiresAfterSeconds) * time.Second)
-		run.ExpiresAt = &expiresAt
-	}
 	if err := insertAutomationRun(ctx, tx, run, idempotencyHash, payloadHash[:]); err != nil {
 		return platform.AutomationTriggerResult{}, err
-	}
-
-	context := automationTemplateContext(automationInputFromStored(stored.Automation), stored.Automation.ID,
-		runID, templateResource, payload, filteredAutomationHeaders(delivery.Headers), delivery.Query, event)
-	matched, conditionErr := renderAutomationCondition(stored.Automation.ConditionTemplate, context)
-	if conditionErr != nil {
-		return s.finishAutomationRun(ctx, tx, stored.Automation.ID, run, platform.AutomationRunFailed,
-			"condition_invalid", conditionErr.Error(), receivedAt)
-	}
-	if !matched {
-		return s.finishAutomationRun(ctx, tx, stored.Automation.ID, run, platform.AutomationRunSkipped, "", "", receivedAt)
-	}
-
-	if stored.Automation.Action.Type == "destroy-sandbox" {
-		targetID, renderErr := renderAutomationString("目标模板", stored.Automation.Action.TargetTemplate, context)
-		if renderErr != nil || targetID == "" {
-			if renderErr == nil {
-				renderErr = errors.New("目标模板渲染结果不能为空")
-			}
-			return s.finishAutomationRun(ctx, tx, stored.Automation.ID, run, platform.AutomationRunFailed,
-				"target_invalid", renderErr.Error(), receivedAt)
-		}
-		target, targetErr := scanResource(tx.QueryRow(ctx, `SELECT `+resourceColumns+`
-			FROM control_resources WHERE id = $1 AND kind = 'sandbox' AND project_id = $2 FOR UPDATE`, targetID, stored.Automation.ProjectID))
-		if errors.Is(targetErr, pgx.ErrNoRows) {
-			return s.finishAutomationRun(ctx, tx, stored.Automation.ID, run, platform.AutomationRunFailed,
-				"target_not_found", "目标沙箱不存在或不属于当前项目", receivedAt)
-		}
-		if targetErr != nil {
-			return platform.AutomationTriggerResult{}, fmt.Errorf("load automation target sandbox: %w", targetErr)
-		}
-		jobID, enqueueErr := enqueueAutomationDeleteJob(ctx, tx, target, runID)
-		if enqueueErr != nil {
-			return s.finishAutomationRun(ctx, tx, stored.Automation.ID, run, platform.AutomationRunFailed,
-				"target_invalid", enqueueErr.Error(), receivedAt)
-		}
-		queuedAt := time.Now().UTC()
-		if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'queued', sandbox_id = $1,
-			worker_job_id = $2, queued_at = $3 WHERE id = $4`, target.ID, jobID, queuedAt, runID); err != nil {
-			return platform.AutomationTriggerResult{}, fmt.Errorf("queue destroy automation run: %w", err)
-		}
-		if err := updateAutomationLastTriggered(ctx, tx, stored.Automation.ID, receivedAt); err != nil {
-			return platform.AutomationTriggerResult{}, err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return platform.AutomationTriggerResult{}, fmt.Errorf("commit destroy automation trigger: %w", err)
-		}
-		run.Status = platform.AutomationRunQueued
-		run.SandboxID = stringPointer(target.ID)
-		run.WorkerJobID = stringPointer(jobID)
-		run.QueuedAt = &queuedAt
-		return s.automationTriggerResult(run, false), nil
 	}
 
 	if templateErr != nil {
@@ -442,8 +287,7 @@ func (s *Store) triggerAutomation(
 			"template_invalid", templateErr.Error(), receivedAt)
 	}
 	sandboxInput, encodedInput, buildErr := buildAutomatedSandboxInput(
-		automationInputFromStored(stored.Automation), stored.Automation.ID, runID,
-		templateResource, payload, filteredAutomationHeaders(delivery.Headers), delivery.Query, event,
+		stored.Automation, runID, templateResource,
 	)
 	if buildErr == nil {
 		buildErr = platform.Validate(sandboxInput)
@@ -468,31 +312,9 @@ func (s *Store) triggerAutomation(
 	if err != nil {
 		return platform.AutomationTriggerResult{}, mapResourceError(err)
 	}
-	jobID, createPayload, err := enqueueAutomationSandboxJob(ctx, tx, resource, runID)
+	jobID, _, err := enqueueAutomationSandboxJob(ctx, tx, resource, runID)
 	if err != nil {
 		return platform.AutomationTriggerResult{}, err
-	}
-	if stored.Automation.Action.Type == "run-task" {
-		command, renderErr := renderAutomationString("任务命令模板", stored.Automation.Action.CommandTemplate, context)
-		if renderErr != nil || command == "" {
-			if renderErr == nil {
-				renderErr = errors.New("任务命令模板渲染结果不能为空")
-			}
-			return s.finishAutomationRun(ctx, tx, stored.Automation.ID, run, platform.AutomationRunFailed,
-				"command_invalid", renderErr.Error(), receivedAt)
-		}
-		taskPayload := map[string]any{
-			"sandboxId": resource.ID, "externalId": "", "driver": createPayload["driver"],
-			"workdir": createPayload["workdir"], "command": command,
-			"timeoutSeconds": stored.Automation.Action.TimeoutSeconds,
-			"cleanupPolicy":  string(stored.Automation.Action.CleanupPolicy),
-		}
-		if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-			(id, server_id, resource_id, action, status, payload, automation_run_id, created_at, updated_at)
-			VALUES ($1, $2, $3, 'run-sandbox-task', 'blocked', $4::jsonb, $5, $6, $6)`,
-			uuid.NewString(), resource.Spec["serverId"], resource.ID, mustMapJSON(taskPayload), runID, receivedAt); err != nil {
-			return platform.AutomationTriggerResult{}, fmt.Errorf("enqueue sandbox task: %w", err)
-		}
 	}
 	inputHash := sha256.Sum256(encodedInput)
 	queuedAt := time.Now().UTC()
@@ -520,7 +342,9 @@ func (s *Store) ListAutomationRuns(ctx context.Context, projectID, automationID 
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	query := `SELECT ` + automationRunColumns + ` FROM automation_runs WHERE project_id = $1`
+	query := `SELECT ` + automationRunColumns + ` FROM automation_runs
+		WHERE project_id = $1 AND action_type = 'create-sandbox'
+		  AND status IN ('evaluating', 'queued', 'provisioning', 'succeeded', 'failed')`
 	args := []any{strings.TrimSpace(projectID)}
 	if strings.TrimSpace(automationID) != "" {
 		query += ` AND automation_id = $2`
@@ -546,7 +370,8 @@ func (s *Store) ListAutomationRuns(ctx context.Context, projectID, automationID 
 
 func (s *Store) GetAutomationRun(ctx context.Context, id string) (platform.AutomationRun, error) {
 	run, err := scanAutomationRun(s.pool.QueryRow(ctx, `SELECT `+automationRunColumns+`
-    FROM automation_runs WHERE id = $1`, id))
+	    FROM automation_runs WHERE id = $1 AND action_type = 'create-sandbox'
+	      AND status IN ('evaluating', 'queued', 'provisioning', 'succeeded', 'failed')`, id))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.AutomationRun{}, ErrResourceNotFound
 	}
@@ -561,7 +386,8 @@ func (s *Store) GetPublicAutomationRun(ctx context.Context, endpointID, runID, t
 		return platform.AutomationRun{}, ErrWebhookUnauthorized
 	}
 	run, err := scanAutomationRun(s.pool.QueryRow(ctx, `SELECT `+automationRunColumns+`
-		FROM automation_runs WHERE id = $1 AND endpoint_id = $2`, runID, endpointID))
+		FROM automation_runs WHERE id = $1 AND endpoint_id = $2 AND action_type = 'create-sandbox'
+		  AND status IN ('evaluating', 'queued', 'provisioning', 'succeeded', 'failed')`, runID, endpointID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.AutomationRun{}, ErrResourceNotFound
 	}
@@ -573,16 +399,16 @@ func (s *Store) GetPublicAutomationRun(ctx context.Context, endpointID, runID, t
 
 func insertAutomationRun(ctx context.Context, tx pgx.Tx, run platform.AutomationRun, idempotencyHash, payloadHash []byte) error {
 	_, err := tx.Exec(ctx, `INSERT INTO automation_runs
-    (id, automation_id, project_id, automation_name, endpoint_id, action_type,
-     template_id, template_name, trigger_source, auth_mode, event_id, event_type,
-     event_source, event_time, idempotency_hash, idempotency_fingerprint,
-     payload_sha256, payload_bytes, status, error_code, error_message, received_at, expires_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-      $15, $16, $17, $18, $19, '', '', $20, $21)`,
+	(id, automation_id, project_id, automation_name, endpoint_id,
+	 template_id, template_name, trigger_source, auth_mode, event_id, event_type,
+	 event_source, event_time, idempotency_hash, idempotency_fingerprint,
+	 payload_sha256, payload_bytes, status, error_code, error_message, received_at)
+	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+	  $14, $15, $16, $17, $18, '', '', $19)`,
 		run.ID, run.AutomationID, run.ProjectID, run.AutomationName, run.EndpointID,
-		run.ActionType, run.TemplateID, run.TemplateName, run.TriggerSource, run.AuthMode,
+		run.TemplateID, run.TemplateName, run.TriggerSource, run.AuthMode,
 		run.Event.ID, run.Event.Type, run.Event.Source, run.Event.Time, nullableBytes(idempotencyHash),
-		run.IdempotencyFingerprint, payloadHash, run.PayloadBytes, run.Status, run.ReceivedAt, run.ExpiresAt,
+		run.IdempotencyFingerprint, payloadHash, run.PayloadBytes, run.Status, run.ReceivedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("insert automation run: %w", err)
@@ -637,92 +463,52 @@ func (s *Store) automationStatusToken(endpointID, runID string) string {
 }
 
 func buildAutomatedSandboxInput(
-	automation platform.AutomationInput,
-	automationID, runID string,
+	automation platform.Automation,
+	runID string,
 	templateResource platform.Resource,
-	payload any,
-	headers map[string]string,
-	query map[string]any,
-	event platform.AutomationEvent,
 ) (platform.Input, []byte, error) {
-	projectID := automation.ProjectID
 	shortID := strings.ReplaceAll(runID, "-", "")
 	if len(shortID) > 8 {
 		shortID = shortID[:8]
 	}
-	base := map[string]any{
-		"id":          "auto-" + strings.ReplaceAll(uuid.NewString(), "-", ""),
-		"kind":        "sandbox",
-		"projectId":   projectID,
-		"name":        automation.Name + "-" + shortID,
-		"description": "由自动化 " + automation.Name + " 创建",
-		"enabled":     true,
-		"spec":        cloneMap(templateResource.Spec),
-	}
-	base["spec"].(map[string]any)["modelBindings"] = automation.Action.ModelBindings
-	context := automationTemplateContext(automation, automationID, runID, templateResource, payload, headers, query, event)
-	patch, err := renderAutomationPatch(automation.Action.InputTemplate, context)
+	encodedSpec, err := json.Marshal(templateResource.Spec)
 	if err != nil {
-		return platform.Input{}, nil, err
+		return platform.Input{}, nil, fmt.Errorf("编码沙箱模板失败: %w", err)
 	}
-	merged := mergeAutomationPatch(base, patch)
-	merged["id"] = base["id"]
-	merged["kind"] = "sandbox"
-	merged["projectId"] = projectID
-	merged["enabled"] = true
-	spec, ok := merged["spec"].(map[string]any)
-	if !ok {
-		return platform.Input{}, nil, errors.New("沙箱 Spec 必须是 JSON 对象")
+	spec := map[string]any{}
+	if err := json.Unmarshal(encodedSpec, &spec); err != nil {
+		return platform.Input{}, nil, fmt.Errorf("读取沙箱模板失败: %w", err)
 	}
 	spec["runtimeId"] = templateResource.ID
 	spec["policy"] = "new"
 	spec["status"] = "requested"
-	spec["automationId"] = automationID
+	spec["automationId"] = automation.ID
 	spec["automationRunId"] = runID
-	if automation.Action.ExpiresAfterSeconds > 0 {
-		spec["expiresAt"] = event.ReceivedAt.Add(time.Duration(automation.Action.ExpiresAfterSeconds) * time.Second).Format(time.RFC3339Nano)
+	input := platform.Input{
+		ID:          "auto-" + strings.ReplaceAll(uuid.NewString(), "-", ""),
+		Kind:        platform.KindSandbox,
+		ProjectID:   stringPointer(automation.ProjectID),
+		Name:        automatedSandboxName(automation.Name, shortID),
+		Description: "由自动化 " + automation.Name + " 创建",
+		Enabled:     true,
+		Spec:        spec,
 	}
-	encoded, err := json.Marshal(merged)
+	platform.Normalize(&input)
+	encoded, err := json.Marshal(input)
 	if err != nil {
 		return platform.Input{}, nil, fmt.Errorf("编码沙箱输入失败: %w", err)
 	}
-	var input platform.Input
-	if err := json.Unmarshal(encoded, &input); err != nil {
-		return platform.Input{}, nil, fmt.Errorf("沙箱输入类型无效: %w", err)
-	}
-	platform.Normalize(&input)
 	return input, encoded, nil
 }
 
-func automationTemplateContext(
-	automation platform.AutomationInput,
-	automationID, runID string,
-	templateResource platform.Resource,
-	payload any,
-	headers map[string]string,
-	query map[string]any,
-	event platform.AutomationEvent,
-) map[string]any {
-	shortID := strings.ReplaceAll(runID, "-", "")
-	if len(shortID) > 8 {
-		shortID = shortID[:8]
+func automatedSandboxName(automationName, shortID string) string {
+	const maxRunes = 80
+	suffix := []rune("-" + shortID)
+	name := []rune(automationName)
+	if len(name)+len(suffix) > maxRunes {
+		name = name[:maxRunes-len(suffix)]
 	}
-	return map[string]any{
-		"payload": payload,
-		"headers": headers,
-		"query":   query,
-		"event": map[string]any{
-			"id": event.ID, "type": event.Type, "source": event.Source,
-			"time":       event.Time.Format(time.RFC3339Nano),
-			"receivedAt": event.ReceivedAt.Format(time.RFC3339Nano),
-		},
-		"run":        map[string]any{"id": runID, "shortId": shortID},
-		"automation": map[string]any{"id": automationID, "name": automation.Name},
-		"project":    map[string]any{"id": automation.ProjectID},
-		"template": map[string]any{
-			"id": templateResource.ID, "name": templateResource.Name, "spec": templateResource.Spec,
-		},
-	}
+	return string(name) + string(suffix)
 }
 
 func enqueueAutomationSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource, runID string) (string, map[string]any, error) {
@@ -745,43 +531,6 @@ func enqueueAutomationSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platfor
 		return "", nil, fmt.Errorf("enqueue automated sandbox creation: %w", err)
 	}
 	return jobID, payload, nil
-}
-
-func enqueueAutomationDeleteJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource, runID string) (string, error) {
-	status, _ := sandbox.Spec["status"].(string)
-	switch status {
-	case "requested", "starting", "stopping", "restarting", "deleting":
-		return "", errors.New("目标沙箱已有操作正在进行")
-	}
-	serverID, _ := sandbox.Spec["serverId"].(string)
-	driver, _ := sandbox.Spec["driver"].(string)
-	if driver == "" {
-		runtimeID, _ := sandbox.Spec["runtimeId"].(string)
-		if err := tx.QueryRow(ctx, `SELECT spec->>'driver' FROM control_resources
-			WHERE id = $1 AND kind = 'runtime'`, runtimeID).Scan(&driver); err != nil {
-			return "", fmt.Errorf("load sandbox runtime driver: %w", err)
-		}
-	}
-	if serverID == "" || driver == "" {
-		return "", errors.New("目标沙箱缺少服务器或隔离驱动信息")
-	}
-	jobID := uuid.NewString()
-	now := time.Now().UTC()
-	payload := map[string]any{
-		"sandboxId": sandbox.ID, "externalId": sandbox.Spec["externalId"], "driver": driver,
-	}
-	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-		(id, server_id, resource_id, action, status, payload, automation_run_id, created_at, updated_at)
-		VALUES ($1, $2, $3, 'delete-sandbox', 'pending', $4::jsonb, $5, $6, $6)`,
-		jobID, serverID, sandbox.ID, mustMapJSON(payload), runID, now); err != nil {
-		return "", fmt.Errorf("enqueue automated sandbox deletion: %w", err)
-	}
-	if _, err := tx.Exec(ctx, `UPDATE control_resources SET
-		spec = spec || jsonb_build_object('status', 'deleting'::text, 'message', '自动化正在删除沙箱'::text),
-		updated_at = $1 WHERE id = $2`, now, sandbox.ID); err != nil {
-		return "", fmt.Errorf("mark automated sandbox deletion: %w", err)
-	}
-	return jobID, nil
 }
 
 func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input platform.Input) error {
@@ -1087,55 +836,17 @@ func automationIdempotency(delivery platform.AutomationDelivery, mode platform.A
 	return sum[:], encoded[:12]
 }
 
-func decodeAutomationPayload(body []byte) (any, error) {
-	if len(body) == 0 {
-		return nil, errors.New("Webhook 请求内容不能为空")
-	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.UseNumber()
-	var payload any
-	if err := decoder.Decode(&payload); err != nil {
-		return nil, errors.New("Webhook 请求必须包含有效 JSON")
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		return nil, errors.New("Webhook 请求只能包含一个 JSON 值")
-	}
-	return payload, nil
-}
-
-func filteredAutomationHeaders(headers map[string]string) map[string]string {
-	result := make(map[string]string, len(headers))
-	for key, value := range headers {
-		normalized := strings.ToLower(strings.TrimSpace(key))
-		switch normalized {
-		case "authorization", "cookie", "proxy-authorization", "x-agentbox-signature",
-			"x-hub-signature-256", "x-gitlab-token", "webhook-signature":
-			continue
-		}
-		result[normalized] = value
-	}
-	return result
-}
-
 func scanAutomation(row pgx.Row) (platform.Automation, error) {
 	var result platform.Automation
-	var triggerType, actionType string
+	var triggerType string
 	var createdBy, updatedBy pgtype.Text
-	var modelBindingsJSON []byte
 	err := row.Scan(
 		&result.ID, &result.ProjectID, &result.Name, &result.Description, &result.Enabled,
-		&triggerType, &actionType, &result.Trigger.AuthMode, &result.EndpointID, &result.SecretLastFour,
-		&result.Action.TemplateID, &modelBindingsJSON, &result.Action.InputTemplate,
-		&result.ConditionTemplate, &result.Action.TargetTemplate, &result.Action.CommandTemplate,
-		&result.Action.TimeoutSeconds, &result.Action.CleanupPolicy, &result.Action.ExpiresAfterSeconds,
-		&createdBy, &updatedBy,
+		&triggerType, &result.Trigger.AuthMode, &result.EndpointID, &result.SecretLastFour,
+		&result.TemplateID, &createdBy, &updatedBy,
 		&result.LastTriggeredAt, &result.SecretRotatedAt, &result.CreatedAt, &result.UpdatedAt,
 	)
 	result.Trigger.Type = triggerType
-	result.Action.Type = actionType
-	if err == nil {
-		err = json.Unmarshal(modelBindingsJSON, &result.Action.ModelBindings)
-	}
 	if createdBy.Valid {
 		result.CreatedBy = &createdBy.String
 	}
@@ -1147,28 +858,19 @@ func scanAutomation(row pgx.Row) (platform.Automation, error) {
 
 func scanStoredAutomation(row pgx.Row) (storedAutomation, error) {
 	var result storedAutomation
-	var triggerType, actionType string
+	var triggerType string
 	var createdBy, updatedBy pgtype.Text
-	var modelBindingsJSON []byte
 	err := row.Scan(
 		&result.Automation.ID, &result.Automation.ProjectID, &result.Automation.Name,
-		&result.Automation.Description, &result.Automation.Enabled, &triggerType, &actionType,
+		&result.Automation.Description, &result.Automation.Enabled, &triggerType,
 		&result.Automation.Trigger.AuthMode, &result.Automation.EndpointID,
-		&result.Automation.SecretLastFour, &result.Automation.Action.TemplateID,
-		&modelBindingsJSON, &result.Automation.Action.InputTemplate,
-		&result.Automation.ConditionTemplate, &result.Automation.Action.TargetTemplate,
-		&result.Automation.Action.CommandTemplate, &result.Automation.Action.TimeoutSeconds,
-		&result.Automation.Action.CleanupPolicy, &result.Automation.Action.ExpiresAfterSeconds,
+		&result.Automation.SecretLastFour, &result.Automation.TemplateID,
 		&createdBy, &updatedBy,
 		&result.Automation.LastTriggeredAt, &result.Automation.SecretRotatedAt,
 		&result.Automation.CreatedAt, &result.Automation.UpdatedAt,
 		&result.SecretHash, &result.SecretCiphertext, &result.SecretNonce,
 	)
 	result.Automation.Trigger.Type = triggerType
-	result.Automation.Action.Type = actionType
-	if err == nil {
-		err = json.Unmarshal(modelBindingsJSON, &result.Automation.Action.ModelBindings)
-	}
 	if createdBy.Valid {
 		result.Automation.CreatedBy = &createdBy.String
 	}
@@ -1182,17 +884,15 @@ func scanAutomationRun(row pgx.Row) (platform.AutomationRun, error) {
 	var result platform.AutomationRun
 	var automationID, sandboxID, workerJobID pgtype.Text
 	var eventTime pgtype.Timestamptz
-	var exitCode pgtype.Int4
 	err := row.Scan(
 		&result.ID, &automationID, &result.ProjectID, &result.AutomationName,
-		&result.EndpointID, &result.ActionType, &result.TemplateID, &result.TemplateName,
+		&result.EndpointID, &result.TemplateID, &result.TemplateName,
 		&result.TriggerSource, &result.AuthMode, &result.Event.ID, &result.Event.Type,
 		&result.Event.Source, &eventTime,
 		&result.IdempotencyFingerprint, &result.PayloadSHA256, &result.PayloadBytes,
-		&result.InputSHA256, &result.Status, &sandboxID, &workerJobID, &exitCode,
-		&result.Output, &result.OutputTruncated, &result.CleanupStatus, &result.ErrorCode,
-		&result.ErrorMessage, &result.ReceivedAt, &result.QueuedAt, &result.StartedAt,
-		&result.FinishedAt, &result.ExpiresAt,
+		&result.InputSHA256, &result.Status, &sandboxID, &workerJobID,
+		&result.ErrorCode, &result.ErrorMessage, &result.ReceivedAt, &result.QueuedAt,
+		&result.StartedAt, &result.FinishedAt,
 	)
 	if automationID.Valid {
 		result.AutomationID = &automationID.String
@@ -1209,46 +909,7 @@ func scanAutomationRun(row pgx.Row) (platform.AutomationRun, error) {
 		result.Event.Time = result.ReceivedAt
 	}
 	result.Event.ReceivedAt = result.ReceivedAt
-	if exitCode.Valid {
-		value := int(exitCode.Int32)
-		result.ExitCode = &value
-	}
 	return result, err
-}
-
-func automationInputFromStored(automation platform.Automation) platform.AutomationInput {
-	return platform.AutomationInput{
-		ProjectID: automation.ProjectID, Name: automation.Name, Description: automation.Description,
-		Enabled: automation.Enabled, ConditionTemplate: automation.ConditionTemplate,
-		Trigger: automation.Trigger, Action: automation.Action,
-	}
-}
-
-func validateAutomationInputTemplates(input platform.AutomationInput) error {
-	if err := validateAutomationStringTemplate("执行条件", input.ConditionTemplate); err != nil {
-		return err
-	}
-	switch input.Action.Type {
-	case "create-sandbox":
-		return validateAutomationTemplate(input.Action.InputTemplate)
-	case "run-task":
-		if err := validateAutomationTemplate(input.Action.InputTemplate); err != nil {
-			return err
-		}
-		return validateAutomationStringTemplate("任务命令模板", input.Action.CommandTemplate)
-	case "destroy-sandbox":
-		return validateAutomationStringTemplate("目标模板", input.Action.TargetTemplate)
-	default:
-		return nil
-	}
-}
-
-func automationModelBindingsJSON(value map[string]string) []byte {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		panic(err)
-	}
-	return encoded
 }
 
 func newWebhookSecret() (string, error) {

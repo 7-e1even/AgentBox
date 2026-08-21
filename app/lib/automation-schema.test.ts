@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vitest"
 
-import { automationRunSchema, automationSchema } from "./automation-schema"
+import {
+  automationInputSchema,
+  automationRunSchema,
+  automationSchema,
+} from "./automation-schema"
 
 const timestamp = "2026-08-18T00:00:00Z"
 
 describe("automation schemas", () => {
-  it("keeps old automation records readable during rolling upgrades", () => {
+  it("parses a template-based sandbox automation", () => {
     const automation = automationSchema.parse({
       id: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388",
       projectId: "default",
@@ -13,12 +17,7 @@ describe("automation schemas", () => {
       description: "",
       enabled: true,
       trigger: { type: "webhook", authMode: "bearer" },
-      action: {
-        type: "create-sandbox",
-        templateId: "runtime-one",
-        modelBindings: {},
-        inputTemplate: "{}",
-      },
+      templateId: "runtime-one",
       endpointId: "75778270-bdbf-4e2f-bbeb-b3133447a367",
       secretLastFour: "test",
       createdBy: null,
@@ -29,9 +28,21 @@ describe("automation schemas", () => {
       updatedAt: timestamp,
     })
 
-    expect(automation.conditionTemplate).toBe("true")
-    expect(automation.action.timeoutSeconds).toBe(900)
-    expect(automation.action.cleanupPolicy).toBe("never")
+    expect(automation.templateId).toBe("runtime-one")
+  })
+
+  it("rejects legacy execution actions", () => {
+    const result = automationInputSchema.safeParse({
+      projectId: "default",
+      name: "Codex task",
+      description: "",
+      enabled: true,
+      trigger: { type: "webhook", authMode: "bearer" },
+      templateId: "runtime-one",
+      action: { type: "run-codex", templateId: "runtime-one" },
+    })
+
+    expect(result.success).toBe(false)
   })
 
   it("keeps old run records readable with canonical defaults", () => {
@@ -59,8 +70,6 @@ describe("automation schemas", () => {
       finishedAt: timestamp,
     })
 
-    expect(run.actionType).toBe("create-sandbox")
     expect(run.event.source).toBe("generic")
-    expect(run.output).toBe("")
   })
 })

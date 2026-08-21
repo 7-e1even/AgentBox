@@ -31,7 +31,6 @@ type PlatformStore interface {
 	UpdateAutomation(context.Context, string, platform.AutomationInput, string) (platform.Automation, error)
 	DeleteAutomation(context.Context, string) error
 	RotateAutomationSecret(context.Context, string, string) (platform.Automation, string, error)
-	PreviewAutomation(context.Context, platform.AutomationPreviewInput) (platform.AutomationPreview, error)
 	TriggerAutomation(context.Context, platform.AutomationDelivery) (platform.AutomationTriggerResult, error)
 	TestAutomation(context.Context, string, []byte) (platform.AutomationTriggerResult, error)
 	ListAutomationRuns(context.Context, string, string, int) ([]platform.AutomationRun, error)
@@ -164,7 +163,6 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	operator("POST /api/sandboxes/{id}/session-ticket", server.createSandboxSessionTicket)
 	authenticated("GET /api/automations", server.listAutomations)
 	operator("POST /api/automations", server.createAutomation)
-	operator("POST /api/automations/preview", server.previewAutomation)
 	authenticated("GET /api/automations/{id}", server.getAutomation)
 	operator("PATCH /api/automations/{id}", server.updateAutomation)
 	operator("DELETE /api/automations/{id}", server.deleteAutomation)
