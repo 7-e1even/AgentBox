@@ -31,7 +31,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
-  DropdownMenuItem,
+  DropdownMenuModalItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -190,9 +190,7 @@ export function ResourceView({
             icon={Icon}
             title={config.empty}
             description={config.description}
-            actionLabel={
-              canMutate ? `创建第一个${config.singular}` : undefined
-            }
+            actionLabel={canMutate ? `创建第一个${config.singular}` : undefined}
             onAction={canMutate ? onCreate : undefined}
           />
         ) : (
@@ -482,17 +480,17 @@ function ResourceActions({
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end">
         <DropdownMenuGroup>
-          <DropdownMenuItem onClick={onEdit}>
+          <DropdownMenuModalItem onOpen={onEdit}>
             <PencilIcon />
             编辑
-          </DropdownMenuItem>
+          </DropdownMenuModalItem>
         </DropdownMenuGroup>
         <DropdownMenuSeparator />
         <DropdownMenuGroup>
-          <DropdownMenuItem variant="destructive" onClick={onDelete}>
+          <DropdownMenuModalItem variant="destructive" onOpen={onDelete}>
             <Trash2Icon />
             删除
-          </DropdownMenuItem>
+          </DropdownMenuModalItem>
         </DropdownMenuGroup>
       </DropdownMenuContent>
     </DropdownMenu>

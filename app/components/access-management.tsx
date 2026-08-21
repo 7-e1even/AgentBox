@@ -70,7 +70,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
-  DropdownMenuItem,
+  DropdownMenuModalItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -410,10 +410,10 @@ function ServiceListItem({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end" className="w-36">
               <DropdownMenuGroup>
-                <DropdownMenuItem variant="destructive" onSelect={onDelete}>
+                <DropdownMenuModalItem variant="destructive" onOpen={onDelete}>
                   <Trash2Icon />
                   删除服务
-                </DropdownMenuItem>
+                </DropdownMenuModalItem>
               </DropdownMenuGroup>
             </DropdownMenuContent>
           </DropdownMenu>

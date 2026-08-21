@@ -28,7 +28,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
-  DropdownMenuItem,
+  DropdownMenuModalItem,
   DropdownMenuLabel,
   DropdownMenuShortcut,
   DropdownMenuTrigger,
@@ -458,19 +458,17 @@ function RuntimeCreateMenu({
             const Icon = definition.icon
             const ready = server.capabilities.includes(definition.capability)
             return (
-              <DropdownMenuItem
+              <DropdownMenuModalItem
                 key={driver}
                 disabled={!ready}
-                onSelect={() =>
+                onOpen={() =>
                   onCreateRuntime(server.id, image.reference, driver)
                 }
               >
                 <Icon />
                 {definition.label}
-                {!ready && (
-                  <DropdownMenuShortcut>未就绪</DropdownMenuShortcut>
-                )}
-              </DropdownMenuItem>
+                {!ready && <DropdownMenuShortcut>未就绪</DropdownMenuShortcut>}
+              </DropdownMenuModalItem>
             )
           })}
         </DropdownMenuGroup>

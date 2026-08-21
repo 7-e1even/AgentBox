@@ -42,7 +42,7 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
-  DropdownMenuItem,
+  DropdownMenuModalItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -332,21 +332,21 @@ function userColumns({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuGroup>
-                <DropdownMenuItem onClick={() => onEdit(user)}>
+                <DropdownMenuModalItem onOpen={() => onEdit(user)}>
                   <PencilIcon />
                   编辑
-                </DropdownMenuItem>
+                </DropdownMenuModalItem>
               </DropdownMenuGroup>
               <DropdownMenuSeparator />
               <DropdownMenuGroup>
-                <DropdownMenuItem
+                <DropdownMenuModalItem
                   variant="destructive"
                   disabled={isCurrent}
-                  onClick={() => onDelete(user)}
+                  onOpen={() => onDelete(user)}
                 >
                   <Trash2Icon />
                   删除
-                </DropdownMenuItem>
+                </DropdownMenuModalItem>
               </DropdownMenuGroup>
             </DropdownMenuContent>
           </DropdownMenu>

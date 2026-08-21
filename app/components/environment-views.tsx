@@ -58,6 +58,7 @@ import {
   DropdownMenuContent,
   DropdownMenuGroup,
   DropdownMenuItem,
+  DropdownMenuModalItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
@@ -600,9 +601,7 @@ function environmentColumns({
             }
             title={row.original.name}
             description={row.original.description || "可复用的 Agent 工作环境"}
-            onClick={
-              canMutate ? () => onEdit(row.original) : undefined
-            }
+            onClick={canMutate ? () => onEdit(row.original) : undefined}
           />
         )
       },
@@ -687,24 +686,19 @@ function environmentColumns({
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
               <DropdownMenuGroup>
-                <DropdownMenuItem
-                  onSelect={() => {
-                    // Let Radix restore focus from the menu before mounting a modal.
-                    requestAnimationFrame(() => onEdit(row.original))
-                  }}
-                >
+                <DropdownMenuModalItem onOpen={() => onEdit(row.original)}>
                   <PencilIcon />
                   编辑
-                </DropdownMenuItem>
+                </DropdownMenuModalItem>
               </DropdownMenuGroup>
               <DropdownMenuSeparator />
-              <DropdownMenuItem
+              <DropdownMenuModalItem
                 variant="destructive"
-                onClick={() => onDelete(row.original)}
+                onOpen={() => onDelete(row.original)}
               >
                 <Trash2Icon />
                 删除
-              </DropdownMenuItem>
+              </DropdownMenuModalItem>
             </DropdownMenuContent>
           </DropdownMenu>
           <Button
@@ -905,15 +899,15 @@ function sandboxColumns({
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
                 <DropdownMenuGroup>
-                  <DropdownMenuItem onClick={() => onOpen(sandbox)}>
+                  <DropdownMenuModalItem onOpen={() => onOpen(sandbox)}>
                     <Settings2Icon />
                     管理
-                  </DropdownMenuItem>
+                  </DropdownMenuModalItem>
                   {canMutate ? (
-                    <DropdownMenuItem onClick={() => onEdit(sandbox)}>
+                    <DropdownMenuModalItem onOpen={() => onEdit(sandbox)}>
                       <PencilIcon />
                       编辑配置
-                    </DropdownMenuItem>
+                    </DropdownMenuModalItem>
                   ) : null}
                   {canMutate && sandbox.spec.status === "running" && (
                     <DropdownMenuItem
@@ -928,7 +922,7 @@ function sandboxColumns({
                 {canMutate ? (
                   <>
                     <DropdownMenuSeparator />
-                    <DropdownMenuItem
+                    <DropdownMenuModalItem
                       variant="destructive"
                       disabled={
                         busy ||
@@ -940,11 +934,11 @@ function sandboxColumns({
                           "deleting",
                         ].includes(String(sandbox.spec.status ?? ""))
                       }
-                      onClick={() => onDelete(sandbox)}
+                      onOpen={() => onDelete(sandbox)}
                     >
                       <Trash2Icon />
                       删除
-                    </DropdownMenuItem>
+                    </DropdownMenuModalItem>
                   </>
                 ) : null}
               </DropdownMenuContent>
@@ -1046,7 +1040,7 @@ function SandboxDetailsDialog({
                 <TriangleAlertIcon className="size-4" />
                 失败原因
               </div>
-              <pre className="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-foreground">
+              <pre className="mt-2 max-h-48 overflow-auto font-mono text-xs leading-relaxed break-words whitespace-pre-wrap text-foreground">
                 {failureMessage}
               </pre>
             </div>
