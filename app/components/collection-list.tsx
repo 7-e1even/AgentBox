@@ -144,13 +144,15 @@ function CollectionTablePrimaryContent({
   return onClick ? (
     <button
       type="button"
-      className="flex min-w-0 items-center gap-3 text-left"
+      className="flex w-full min-w-0 items-center gap-3 overflow-hidden text-left"
       onClick={onClick}
     >
       {content}
     </button>
   ) : (
-    <div className="flex min-w-0 items-center gap-3">{content}</div>
+    <div className="flex w-full min-w-0 items-center gap-3 overflow-hidden">
+      {content}
+    </div>
   )
 }
 

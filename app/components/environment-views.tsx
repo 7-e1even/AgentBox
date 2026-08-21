@@ -531,6 +531,7 @@ export function SandboxesView({
           <DataTable
             data={sandboxes}
             columns={columns}
+            tableClassName="table-fixed"
             getRowId={(sandbox) => sandbox.id}
             initialPageSize={8}
             searchPlaceholder="搜索沙箱…"
@@ -783,7 +784,7 @@ function sandboxColumns({
       ),
       filterFn: (row, columnId, filterValue) =>
         (filterValue as string[]).includes(row.getValue(columnId)),
-      meta: { label: "状态" },
+      meta: { label: "状态", className: "w-24" },
     },
     {
       id: "environment",
@@ -798,7 +799,10 @@ function sandboxColumns({
           {String(getValue())}
         </span>
       ),
-      meta: { label: "沙箱模板", className: "hidden md:table-cell" },
+      meta: {
+        label: "沙箱模板",
+        className: "hidden w-36 md:table-cell",
+      },
     },
     {
       id: "tools",
@@ -819,7 +823,10 @@ function sandboxColumns({
           {String(getValue()) || "未安装"}
         </span>
       ),
-      meta: { label: "沙箱内 Agent", className: "hidden lg:table-cell" },
+      meta: {
+        label: "沙箱内 Agent",
+        className: "hidden w-44 lg:table-cell",
+      },
     },
     {
       id: "server",
@@ -834,7 +841,10 @@ function sandboxColumns({
           {String(getValue())}
         </span>
       ),
-      meta: { label: "服务器", className: "hidden xl:table-cell" },
+      meta: {
+        label: "服务器",
+        className: "hidden w-36 xl:table-cell",
+      },
     },
     {
       id: "actions",
@@ -846,10 +856,18 @@ function sandboxColumns({
             {sandbox.spec.status === "running" ? (
               <>
                 {canOpenWorkspace ? (
-                  <Button size="sm" variant="outline" asChild>
-                    <Link href={`/sandboxes/${sandbox.id}`}>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="px-2 sm:px-3"
+                    asChild
+                  >
+                    <Link
+                      href={`/sandboxes/${sandbox.id}`}
+                      aria-label={`打开 ${sandbox.name} 工作台`}
+                    >
                       <MonitorIcon data-icon="inline-start" />
-                      工作台
+                      <span className="hidden sm:inline">工作台</span>
                     </Link>
                   </Button>
                 ) : null}
@@ -857,6 +875,8 @@ function sandboxColumns({
                   <Button
                     size="sm"
                     variant="outline"
+                    className="px-2 sm:px-3"
+                    aria-label={`停止 ${sandbox.name}`}
                     disabled={busy}
                     onClick={() => void onAction(sandbox, "stop")}
                   >
@@ -865,7 +885,7 @@ function sandboxColumns({
                     ) : (
                       <SquareIcon />
                     )}
-                    停止
+                    <span className="hidden sm:inline">停止</span>
                   </Button>
                 ) : null}
               </>
@@ -875,6 +895,8 @@ function sandboxColumns({
                 <Button
                   size="sm"
                   variant="outline"
+                  className="px-2 sm:px-3"
+                  aria-label={`启动 ${sandbox.name}`}
                   disabled={busy}
                   onClick={() => void onAction(sandbox, "start")}
                 >
@@ -883,7 +905,7 @@ function sandboxColumns({
                   ) : (
                     <PlayIcon />
                   )}
-                  启动
+                  <span className="hidden sm:inline">启动</span>
                 </Button>
               ) : null
             ) : null}
@@ -948,7 +970,7 @@ function sandboxColumns({
       },
       enableSorting: false,
       enableHiding: false,
-      meta: { className: "w-48" },
+      meta: { className: "w-28 sm:w-48" },
     },
   ]
 }

@@ -1,7 +1,14 @@
 "use client"
 
 import type { RuntimeImageChoices } from "@/lib/runtime-images"
-import { Input } from "@/components/ui/input"
+import {
+  Combobox,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxInput,
+  ComboboxItem,
+  ComboboxList,
+} from "@/components/ui/combobox"
 import {
   Select,
   SelectContent,
@@ -65,31 +72,61 @@ export function RuntimeImageCombobox({
     )
   }
 
-  const listId = `${id}-choices`
+  const selectedOption =
+    options.find((option) => option.value === value) ?? null
 
   return (
-    <>
-      <Input
+    <Combobox
+      items={options}
+      value={selectedOption}
+      inputValue={value}
+      disabled={disabled}
+      itemToStringValue={(option) => option.value}
+      onInputValueChange={(nextValue) => onChange(nextValue)}
+      onValueChange={(option) => option && onChange(option.value)}
+    >
+      <ComboboxInput
         id={id}
-        list={options.length > 0 ? listId : undefined}
-        value={value}
         placeholder="搜索镜像，或输入 Registry 引用"
         disabled={disabled}
         aria-invalid={invalid || undefined}
-        autoComplete="off"
-        onChange={(event) => onChange(event.target.value)}
+        className="w-full"
       />
-      {options.length > 0 ? (
-        <datalist id={listId}>
-          {options.map((option) => (
-            <option
-              key={option.value}
-              value={option.value}
-              label={option.label}
-            />
-          ))}
-        </datalist>
-      ) : null}
-    </>
+      <ComboboxContent>
+        <ComboboxEmpty>
+          没有匹配的缓存镜像，将在创建时按当前引用拉取
+        </ComboboxEmpty>
+        <ComboboxList className="[scrollbar-width:thin] [scrollbar-color:var(--border)_transparent] [scrollbar-gutter:stable] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">
+          {(option) => {
+            const local = choices.local.some(
+              (item) => item.value === option.value
+            )
+            const detail = option.label.startsWith(option.value)
+              ? option.label.slice(option.value.length).replace(/^\s*·\s*/, "")
+              : option.label
+
+            return (
+              <ComboboxItem
+                key={option.value}
+                value={option}
+                className="px-2.5 py-2 pr-8"
+              >
+                <span
+                  className="min-w-0 flex-1 truncate font-mono text-xs"
+                  title={option.value}
+                >
+                  {option.value}
+                </span>
+                <span className="shrink-0 text-xs text-muted-foreground">
+                  {local
+                    ? `已缓存${detail ? ` · ${detail}` : ""}`
+                    : detail || "创建时拉取"}
+                </span>
+              </ComboboxItem>
+            )
+          }}
+        </ComboboxList>
+      </ComboboxContent>
+    </Combobox>
   )
 }

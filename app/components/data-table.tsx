@@ -88,6 +88,7 @@ type DataTableProps<TData, TValue> = {
   searchPlaceholder?: string
   searchValue: (row: TData) => string
   emptyMessage?: string
+  tableClassName?: string
 }
 
 const arrayFilter: FilterFn<unknown> = (row, columnId, filterValue) => {
@@ -104,6 +105,7 @@ function DataTable<TData, TValue>({
   searchPlaceholder = "搜索…",
   searchValue,
   emptyMessage = "没有符合条件的数据。",
+  tableClassName,
 }: DataTableProps<TData, TValue>) {
   const [sorting, setSorting] = React.useState<SortingState>([])
   const [columnFilters, setColumnFilters] =
@@ -147,7 +149,7 @@ function DataTable<TData, TValue>({
         onGlobalFilterChange={setGlobalFilter}
       />
       <div className="overflow-hidden rounded-lg border bg-card">
-        <Table>
+        <Table className={tableClassName}>
           <TableHeader>
             {table.getHeaderGroups().map((headerGroup) => (
               <TableRow key={headerGroup.id}>

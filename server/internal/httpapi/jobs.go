@@ -66,6 +66,11 @@ func attachWorkerRuntimeEndpoints(payload map[string]any, baseURL string) {
 	if baseURL == "" {
 		return
 	}
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Hostname() == "" {
+		return
+	}
+	payload["controlPlane"] = map[string]any{"allowNet": []string{parsed.Hostname()}}
 	credentials, ok := payload["credentials"].([]map[string]any)
 	if !ok {
 		return

@@ -33,7 +33,8 @@ func TestWorkerOnlyAdvertisesUsableDocker(t *testing.T) {
 
 func TestWorkerCredentialFormatsFollowProtocol(t *testing.T) {
 	for _, mapping := range []string{
-		`$runtimeBase + .facadePath`,
+		`RUNTIME_BASE=$(sandbox_runtime_base_url "$DRIVER")`,
+		`endpoint: ($runtimeBase + .facadePath`,
 		`anthropicEndpoint: ($runtimeBase + .facadePath + "/anthropic")`,
 		`openaiEndpoint: ($runtimeBase + .facadePath + "/openai/v1")`,
 		`case "$PROTOCOL" in`,
@@ -46,6 +47,20 @@ func TestWorkerCredentialFormatsFollowProtocol(t *testing.T) {
 	} {
 		if !strings.Contains(workerDaemon, mapping) {
 			t.Fatalf("worker credential mapping is missing %q", mapping)
+		}
+	}
+}
+
+func TestWorkerRestrictedNetworkAllowsItsReachableControlPlane(t *testing.T) {
+	for _, expected := range []string{
+		`server_url_host()`,
+		`sandbox_runtime_base_url()`,
+		`sandbox_control_plane_host()`,
+		`CONTROL_PLANE_HOST=$(sandbox_control_plane_host "$DRIVER")`,
+		`for ALLOWED_HOST in $CONTROL_PLANE_HOST $(jq -r`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker control-plane networking is missing %q", expected)
 		}
 	}
 }
@@ -550,9 +565,27 @@ func TestWorkerSelfUpdateConfirmsOnlyAfterServerAcceptsReport(t *testing.T) {
 	}
 	body := workerDaemon[start : start+end]
 	reportIndex := strings.Index(body, `if complete_job "$JOB_ID" true "" "Worker 已更新到 $TARGET_VERSION"; then`)
+	sealIndex := strings.Index(body, `/usr/local/lib/agentbox/agentbox-worker.previous || return 1`)
 	confirmIndex := strings.Index(body, `printf '%s\n' "$JOB_ID" > "$CONFIRMED"`)
-	if reportIndex < 0 || confirmIndex < 0 || reportIndex >= confirmIndex {
-		t.Fatal("the confirmed marker must be written only after the Server accepts the completion report")
+	if reportIndex < 0 || sealIndex < 0 || confirmIndex < 0 || reportIndex >= sealIndex || sealIndex >= confirmIndex {
+		t.Fatal("the accepted Worker binary must be sealed as the fallback before the confirmed marker is written")
+	}
+	cancelIndex := strings.Index(body, `systemctl stop "agentbox-worker-update-$JOB_ID.timer"`)
+	if cancelIndex < 0 || confirmIndex >= cancelIndex {
+		t.Fatal("the scheduled rollback units must be stopped after the update is confirmed")
+	}
+	successEnd := strings.Index(body[confirmIndex:], `elif complete_job`)
+	if successEnd < 0 {
+		t.Fatal("Worker update success branch end was not found")
+	}
+	successBody := body[confirmIndex : confirmIndex+successEnd]
+	cleanupIndex := strings.Index(successBody, `rm -f "$MARKER" "$CONFIRMED"`)
+	cancelSuccessIndex := strings.Index(successBody, `systemctl stop "agentbox-worker-update-$JOB_ID.timer"`)
+	if cleanupIndex >= 0 && (cancelSuccessIndex < 0 || cancelSuccessIndex >= cleanupIndex) {
+		t.Fatal("confirmation state may only be removed after the scheduled rollback units are stopped")
+	}
+	if !strings.Contains(workerDaemon, `rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed" "$0"`) {
+		t.Fatal("the scheduled rollback check must clean confirmation state after accepting the update")
 	}
 }
 
@@ -758,7 +791,7 @@ func TestWorkerInjectsProxyBeforeAgentInstallationWithoutPersistingSecret(t *tes
 		`append_env "$PROXY_ENV" NODE_USE_ENV_PROXY 1`,
 		`append_env "$PROXY_ENV" CLAUDE_CODE_PROXY_RESOLVES_HOSTS 1`,
 		`del(.credentials, .proxy)`,
-		`.job.payload.proxy.allowNet[]?`,
+		`.job.payload.controlPlane.allowNet[]?, .job.payload.proxy.allowNet[]?`,
 		`--allow-net "$ALLOWED_HOST"`,
 		`network: {mode: $network, allow_net: $allowNet}`,
 	} {
