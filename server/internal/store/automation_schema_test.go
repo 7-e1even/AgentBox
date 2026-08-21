@@ -9,6 +9,7 @@ func TestAutomationSchemaSupportsTemplateSandboxRuns(t *testing.T) {
 	for _, expected := range []string{
 		"'github-sha256', 'gitlab-token', 'standard-webhooks'",
 		"CHECK (action_type = 'create-sandbox')",
+		"model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb",
 		"automation_run_id UUID",
 		"'evaluating', 'queued', 'provisioning', 'succeeded', 'failed'",
 	} {

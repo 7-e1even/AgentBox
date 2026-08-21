@@ -115,6 +115,7 @@ import type { Resource } from "@/lib/platform-schema"
 export function AutomationManagement({
   projectId,
   resources,
+  credentials,
   canMutate,
 }: {
   projectId: string
@@ -277,6 +278,7 @@ export function AutomationManagement({
             key={editing === "new" ? `new:${projectId}` : editing.id}
             projectId={projectId}
             templates={templates}
+            credentials={credentials}
             automation={editing === "new" ? null : editing}
             secret={secret}
             runs={
@@ -502,6 +504,7 @@ export function AutomationManagement({
 function AutomationEditor({
   projectId,
   templates,
+  credentials,
   automation,
   secret,
   runs,
@@ -512,6 +515,7 @@ function AutomationEditor({
 }: {
   projectId: string
   templates: Resource[]
+  credentials: ManagedCredential[]
   automation: Automation | null
   secret: string
   runs: AutomationRun[]
@@ -529,12 +533,20 @@ function AutomationEditor({
           enabled: automation.enabled,
           trigger: automation.trigger,
           templateId: automation.templateId,
+          modelBindings: automation.modelBindings,
         })
       : defaultAutomationInput(projectId, templates[0]?.id ?? "")
   )
   const [saving, setSaving] = useState(false)
   const [rotating, setRotating] = useState(false)
   const [formError, setFormError] = useState("")
+
+  const selectedTemplate = templates.find(
+    (template) => template.id === input.templateId
+  )
+  const templateCredentialIds = resourceStringList(
+    selectedTemplate?.spec.credentialIds
+  )
 
   const webhookURL = automation
     ? `${typeof window === "undefined" ? "" : window.location.origin}/api/webhooks/${automation.endpointId}`
@@ -544,6 +556,14 @@ function AutomationEditor({
     const parsed = automationInputSchema.safeParse(input)
     if (!parsed.success) {
       setFormError(parsed.error.issues[0]?.message ?? "请检查自动化配置")
+      return
+    }
+    if (
+      templateCredentialIds.some(
+        (credentialID) => !parsed.data.modelBindings[credentialID]
+      )
+    ) {
+      setFormError("请为沙箱中的每个模型服务选择具体模型")
       return
     }
     setSaving(true)
@@ -797,12 +817,22 @@ function AutomationEditor({
                     </FieldLabel>
                     <Select
                       value={input.templateId}
-                      onValueChange={(templateId) =>
+                      onValueChange={(templateId) => {
+                        const credentialIDs = resourceStringList(
+                          templates.find((item) => item.id === templateId)?.spec
+                            .credentialIds
+                        )
+                        const selected = new Set(credentialIDs)
                         setInput((current) => ({
                           ...current,
                           templateId,
+                          modelBindings: Object.fromEntries(
+                            Object.entries(current.modelBindings).filter(
+                              ([credentialID]) => selected.has(credentialID)
+                            )
+                          ),
                         }))
-                      }
+                      }}
                     >
                       <SelectTrigger
                         id="automation-template"
@@ -825,9 +855,63 @@ function AutomationEditor({
                       <FieldError>请选择沙箱模板。</FieldError>
                     )}
                     <FieldDescription>
-                      镜像、资源、网络、Agent、模型与凭据都沿用模板最新配置。
+                      镜像、资源、网络、Agent 与可用模型服务沿用模板最新配置。
                     </FieldDescription>
                   </Field>
+                  {templateCredentialIds.map((credentialID) => {
+                    const credential = credentials.find(
+                      (item) => item.id === credentialID && item.enabled
+                    )
+                    const modelID = input.modelBindings[credentialID] ?? ""
+                    return (
+                      <Field key={credentialID} data-invalid={!modelID}>
+                        <FieldLabel
+                          htmlFor={`automation-model-${credentialID}`}
+                        >
+                          {credential?.name ?? credentialID} 模型
+                        </FieldLabel>
+                        <Select
+                          value={modelID}
+                          disabled={
+                            !credential || credential.models.length === 0
+                          }
+                          onValueChange={(nextModelID) =>
+                            setInput((current) => ({
+                              ...current,
+                              modelBindings: {
+                                ...current.modelBindings,
+                                [credentialID]: nextModelID,
+                              },
+                            }))
+                          }
+                        >
+                          <SelectTrigger
+                            id={`automation-model-${credentialID}`}
+                            className="w-full"
+                            aria-invalid={!modelID}
+                          >
+                            <SelectValue placeholder="选择具体模型" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectGroup>
+                              {credential?.models.map((model) => (
+                                <SelectItem key={model.id} value={model.id}>
+                                  {model.name}
+                                </SelectItem>
+                              ))}
+                            </SelectGroup>
+                          </SelectContent>
+                        </Select>
+                        {!modelID && (
+                          <FieldError>
+                            {credential?.models.length
+                              ? "请选择具体模型。"
+                              : "该模型服务没有可用模型。"}
+                          </FieldError>
+                        )}
+                      </Field>
+                    )
+                  })}
                 </FieldGroup>
               </FieldSet>
             </FieldGroup>
@@ -1202,7 +1286,13 @@ function defaultAutomationInput(
     enabled: true,
     trigger: { type: "webhook", authMode: "bearer" },
     templateId,
+    modelBindings: {},
   }
+}
+
+function resourceStringList(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === "string")
 }
 
 function authModeLabel(mode: AutomationAuthMode) {

@@ -15,29 +15,52 @@ func TestAutomationWebhookPersistsPollableIdempotentRun(t *testing.T) {
 	ctx := context.Background()
 	secret := "integration-webhook-secret-" + uuid.NewString()
 	templateID := "runtime-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	credentialID := "credential-" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	modelID := "integration-model"
+	if _, err := s.pool.Exec(ctx, `INSERT INTO provider_credentials
+	  (id, name, provider_id, protocol, endpoint, models, secret_ciphertext,
+	   secret_nonce, secret_last_four, enabled, created_at, updated_at)
+	  VALUES ($1, 'Automation integration credential', 'openai', 'openai-chat', '',
+	    $2::jsonb, '\\x00'::bytea, '\\x00'::bytea, 'test', TRUE, NOW(), NOW())`,
+		credentialID, `[{"id":"`+modelID+`","name":"Integration model","group":"test","source":"manual"}]`); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := s.pool.Exec(ctx, `INSERT INTO control_resources
 	  (id, kind, project_id, name, description, enabled, spec, created_at, updated_at)
 	  VALUES ($1, 'runtime', 'default', 'Automation integration template', '', TRUE,
-	    '{"driver":"docker"}'::jsonb, NOW(), NOW())`, templateID); err != nil {
+	    jsonb_build_object('driver', 'docker', 'credentialIds', jsonb_build_array($2::text)),
+	    NOW(), NOW())`, templateID, credentialID); err != nil {
 		t.Fatal(err)
 	}
-	automation, _, err := s.CreateAutomation(ctx, platform.AutomationInput{
-		ProjectID: "default", Name: "Integration webhook", Enabled: true,
-		Secret:     secret,
-		Trigger:    platform.AutomationTriggerInput{Type: "webhook", AuthMode: platform.AutomationAuthBearer},
-		TemplateID: templateID,
-	}, uuid.NewString())
-	if err != nil {
-		t.Fatal(err)
-	}
-	var runID string
+	var automationID, runID string
 	t.Cleanup(func() {
 		if runID != "" {
 			_, _ = s.pool.Exec(context.Background(), `DELETE FROM automation_runs WHERE id = $1`, runID)
 		}
-		_, _ = s.pool.Exec(context.Background(), `DELETE FROM automations WHERE id = $1`, automation.ID)
+		if automationID != "" {
+			_, _ = s.pool.Exec(context.Background(), `DELETE FROM automations WHERE id = $1`, automationID)
+		}
 		_, _ = s.pool.Exec(context.Background(), `DELETE FROM control_resources WHERE id = $1`, templateID)
+		_, _ = s.pool.Exec(context.Background(), `DELETE FROM provider_credentials WHERE id = $1`, credentialID)
 	})
+	automation, _, err := s.CreateAutomation(ctx, platform.AutomationInput{
+		ProjectID: "default", Name: "Integration webhook", Enabled: true,
+		Secret:        secret,
+		Trigger:       platform.AutomationTriggerInput{Type: "webhook", AuthMode: platform.AutomationAuthBearer},
+		TemplateID:    templateID,
+		ModelBindings: map[string]string{credentialID: modelID},
+	}, uuid.NewString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	automationID = automation.ID
+	if automation.ModelBindings[credentialID] != modelID {
+		t.Fatalf("created model bindings = %#v", automation.ModelBindings)
+	}
+	stored, err := s.GetAutomation(ctx, automation.ID)
+	if err != nil || stored.ModelBindings[credentialID] != modelID {
+		t.Fatalf("stored model bindings = %#v, %v", stored.ModelBindings, err)
+	}
 
 	delivery := platform.AutomationDelivery{
 		EndpointID: automation.EndpointID, Authorization: "Bearer " + secret,

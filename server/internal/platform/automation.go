@@ -23,13 +23,14 @@ type AutomationTriggerInput struct {
 }
 
 type AutomationInput struct {
-	ProjectID   string                 `json:"projectId"`
-	Name        string                 `json:"name"`
-	Description string                 `json:"description"`
-	Enabled     bool                   `json:"enabled"`
-	Secret      string                 `json:"secret,omitempty"`
-	Trigger     AutomationTriggerInput `json:"trigger"`
-	TemplateID  string                 `json:"templateId"`
+	ProjectID     string                 `json:"projectId"`
+	Name          string                 `json:"name"`
+	Description   string                 `json:"description"`
+	Enabled       bool                   `json:"enabled"`
+	Secret        string                 `json:"secret,omitempty"`
+	Trigger       AutomationTriggerInput `json:"trigger"`
+	TemplateID    string                 `json:"templateId"`
+	ModelBindings map[string]string      `json:"modelBindings"`
 }
 
 type Automation struct {
@@ -40,6 +41,7 @@ type Automation struct {
 	Enabled         bool                   `json:"enabled"`
 	Trigger         AutomationTriggerInput `json:"trigger"`
 	TemplateID      string                 `json:"templateId"`
+	ModelBindings   map[string]string      `json:"modelBindings"`
 	EndpointID      string                 `json:"endpointId"`
 	SecretLastFour  string                 `json:"secretLastFour"`
 	CreatedBy       *string                `json:"createdBy"`
@@ -118,6 +120,15 @@ func NormalizeAutomationInput(input *AutomationInput) {
 	input.Trigger.Type = strings.ToLower(strings.TrimSpace(input.Trigger.Type))
 	input.Trigger.AuthMode = AutomationAuthMode(strings.ToLower(strings.TrimSpace(string(input.Trigger.AuthMode))))
 	input.TemplateID = strings.TrimSpace(input.TemplateID)
+	modelBindings := make(map[string]string, len(input.ModelBindings))
+	for credentialID, modelID := range input.ModelBindings {
+		credentialID = strings.TrimSpace(credentialID)
+		modelID = strings.TrimSpace(modelID)
+		if credentialID != "" || modelID != "" {
+			modelBindings[credentialID] = modelID
+		}
+	}
+	input.ModelBindings = modelBindings
 }
 
 func ValidateAutomationInput(input AutomationInput) error {
@@ -143,6 +154,11 @@ func ValidateAutomationInput(input AutomationInput) error {
 	}
 	if input.TemplateID == "" {
 		return &ValidationError{Message: "请选择沙箱模板"}
+	}
+	for credentialID, modelID := range input.ModelBindings {
+		if credentialID == "" || modelID == "" {
+			return &ValidationError{Message: "请为沙箱中的每个模型服务选择具体模型"}
+		}
 	}
 	return nil
 }

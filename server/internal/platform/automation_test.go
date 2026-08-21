@@ -10,7 +10,8 @@ func validAutomationInput() AutomationInput {
 		Trigger: AutomationTriggerInput{
 			Type: "webhook", AuthMode: AutomationAuthBearer,
 		},
-		TemplateID: "runtime-one",
+		TemplateID:    "runtime-one",
+		ModelBindings: map[string]string{"credential-one": "model-one"},
 	}
 }
 
@@ -56,5 +57,14 @@ func TestValidateAutomationInputRejectsShortSecrets(t *testing.T) {
 	NormalizeAutomationInput(&input)
 	if err := ValidateAutomationInput(input); err == nil {
 		t.Fatal("expected short custom secret to fail")
+	}
+}
+
+func TestValidateAutomationInputRejectsBlankModelBindings(t *testing.T) {
+	input := validAutomationInput()
+	input.ModelBindings = map[string]string{"credential-one": ""}
+	NormalizeAutomationInput(&input)
+	if err := ValidateAutomationInput(input); err == nil {
+		t.Fatal("expected blank model binding to fail")
 	}
 }

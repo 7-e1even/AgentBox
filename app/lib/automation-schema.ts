@@ -20,6 +20,7 @@ export const automationInputSchema = z
       authMode: automationAuthModeSchema,
     }),
     templateId: z.string().min(1, "请选择沙箱模板"),
+    modelBindings: z.record(z.string(), z.string()),
   })
   .strict()
 

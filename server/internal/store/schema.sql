@@ -436,6 +436,7 @@ CREATE TABLE IF NOT EXISTS automations (
   secret_nonce BYTEA NOT NULL,
   secret_last_four TEXT NOT NULL,
   template_id TEXT REFERENCES control_resources(id) ON DELETE RESTRICT,
+  model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb,
   input_template TEXT NOT NULL DEFAULT '{}',
   created_by UUID,
   updated_by UUID,
@@ -446,6 +447,7 @@ CREATE TABLE IF NOT EXISTS automations (
 );
 
 ALTER TABLE automations ADD COLUMN IF NOT EXISTS input_template TEXT NOT NULL DEFAULT '{}';
+ALTER TABLE automations ADD COLUMN IF NOT EXISTS model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE automations ALTER COLUMN input_template SET DEFAULT '{}';
 ALTER TABLE automations ALTER COLUMN template_id DROP NOT NULL;
 ALTER TABLE automations DROP CONSTRAINT IF EXISTS automations_action_type_check;

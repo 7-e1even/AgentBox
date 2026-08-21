@@ -35,7 +35,7 @@ const (
 
 const automationColumns = `id::text, project_id, name, description, enabled,
   trigger_type, auth_mode, endpoint_id::text, secret_last_four,
-  COALESCE(template_id, ''), created_by::text, updated_by::text,
+  COALESCE(template_id, ''), model_bindings, created_by::text, updated_by::text,
   last_triggered_at, secret_rotated_at, created_at, updated_at`
 
 const automationRunColumns = `id::text, automation_id::text, project_id, automation_name,
@@ -89,7 +89,11 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, "", err
 	}
-	if _, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID); err != nil {
+	templateResource, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID)
+	if err != nil {
+		return platform.Automation{}, "", err
+	}
+	if err := validateAutomationModelBindings(ctx, s.pool, templateResource.Spec, input.ModelBindings); err != nil {
 		return platform.Automation{}, "", err
 	}
 	secret := input.Secret
@@ -108,14 +112,14 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	automation, err := scanAutomation(s.pool.QueryRow(ctx, `INSERT INTO automations
     (id, project_id, name, description, enabled, trigger_type, action_type, auth_mode,
      endpoint_id, secret_hash, secret_ciphertext, secret_nonce, secret_last_four,
-     template_id, input_template,
+     template_id, model_bindings, input_template,
      created_by, updated_by, secret_rotated_at, created_at, updated_at)
 	VALUES ($1, $2, $3, $4, $5, 'webhook', 'create-sandbox', $6, $7, $8, $9, $10,
-	  $11, $12, '{}'::text, $13, $13, $14, $14, $14)
+	  $11, $12, $13, '{}'::text, $14, $14, $15, $15, $15)
     RETURNING `+automationColumns,
 		uuid.NewString(), input.ProjectID, input.Name, input.Description, input.Enabled,
 		input.Trigger.AuthMode, uuid.NewString(), hashToken(secret), ciphertext, nonce,
-		lastFour(secret), input.TemplateID, userID, now,
+		lastFour(secret), input.TemplateID, automationModelBindingsJSON(input.ModelBindings), userID, now,
 	))
 	if err != nil {
 		return platform.Automation{}, "", mapResourceError(err)
@@ -128,16 +132,21 @@ func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, err
 	}
-	if _, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID); err != nil {
+	templateResource, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID)
+	if err != nil {
+		return platform.Automation{}, err
+	}
+	if err := validateAutomationModelBindings(ctx, s.pool, templateResource.Spec, input.ModelBindings); err != nil {
 		return platform.Automation{}, err
 	}
 	automation, err := scanAutomation(s.pool.QueryRow(ctx, `UPDATE automations SET
 	project_id = $1, name = $2, description = $3, enabled = $4,
 	action_type = 'create-sandbox', auth_mode = $5, template_id = $6,
-	updated_by = $7, updated_at = $8
-	WHERE id = $9 AND action_type = 'create-sandbox' RETURNING `+automationColumns,
+	model_bindings = $7, updated_by = $8, updated_at = $9
+	WHERE id = $10 AND action_type = 'create-sandbox' RETURNING `+automationColumns,
 		input.ProjectID, input.Name, input.Description, input.Enabled,
-		input.Trigger.AuthMode, input.TemplateID, userID, time.Now().UTC(), id,
+		input.Trigger.AuthMode, input.TemplateID, automationModelBindingsJSON(input.ModelBindings),
+		userID, time.Now().UTC(), id,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Automation{}, ErrResourceNotFound
@@ -484,6 +493,7 @@ func buildAutomatedSandboxInput(
 	spec["status"] = "requested"
 	spec["automationId"] = automation.ID
 	spec["automationRunId"] = runID
+	spec["modelBindings"] = automation.ModelBindings
 	input := platform.Input{
 		ID:          "auto-" + strings.ReplaceAll(uuid.NewString(), "-", ""),
 		Kind:        platform.KindSandbox,
@@ -601,6 +611,20 @@ func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input plat
 	}
 	allowedCredentialIDs := specStringList(effectiveSpec, "credentialIds")
 	modelBindings := specStringMap(effectiveSpec, "modelBindings")
+	if err := validateAutomationModelBindings(ctx, tx, effectiveSpec, modelBindings); err != nil {
+		return err
+	}
+	input.Spec["credentialIds"] = allowedCredentialIDs
+	return nil
+}
+
+func validateAutomationModelBindings(
+	ctx context.Context,
+	queryer automationQueryRow,
+	spec map[string]any,
+	modelBindings map[string]string,
+) error {
+	allowedCredentialIDs := specStringList(spec, "credentialIds")
 	if len(modelBindings) != len(allowedCredentialIDs) {
 		return &platform.ValidationError{Message: "请为沙箱中的每个模型服务选择具体模型"}
 	}
@@ -613,7 +637,7 @@ func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input plat
 			return &platform.ValidationError{Message: "请为沙箱中的每个模型服务选择具体模型"}
 		}
 		var protocol string
-		if err := tx.QueryRow(ctx, `SELECT protocol FROM provider_credentials
+		if err := queryer.QueryRow(ctx, `SELECT protocol FROM provider_credentials
         WHERE id = $1 AND enabled = TRUE
           AND models @> jsonb_build_array(jsonb_build_object('id', $2::text))`, credentialID, modelID).Scan(&protocol); errors.Is(err, pgx.ErrNoRows) {
 			return &platform.ValidationError{Message: "所选模型不存在、已停用或模型列表已更新"}
@@ -627,10 +651,9 @@ func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input plat
 			return &platform.ValidationError{Message: "所选模型服务不属于当前沙箱"}
 		}
 	}
-	if incompatible := incompatibleAgentTools(specStringList(effectiveSpec, "agentTools"), credentialProtocols); len(incompatible) > 0 {
+	if incompatible := incompatibleAgentTools(specStringList(spec, "agentTools"), credentialProtocols); len(incompatible) > 0 {
 		return &platform.ValidationError{Message: strings.Join(incompatible, "、") + " 与当前所选模型服务的接口协议不兼容"}
 	}
-	input.Spec["credentialIds"] = allowedCredentialIDs
 	return nil
 }
 
@@ -840,13 +863,17 @@ func scanAutomation(row pgx.Row) (platform.Automation, error) {
 	var result platform.Automation
 	var triggerType string
 	var createdBy, updatedBy pgtype.Text
+	var modelBindingsJSON []byte
 	err := row.Scan(
 		&result.ID, &result.ProjectID, &result.Name, &result.Description, &result.Enabled,
 		&triggerType, &result.Trigger.AuthMode, &result.EndpointID, &result.SecretLastFour,
-		&result.TemplateID, &createdBy, &updatedBy,
+		&result.TemplateID, &modelBindingsJSON, &createdBy, &updatedBy,
 		&result.LastTriggeredAt, &result.SecretRotatedAt, &result.CreatedAt, &result.UpdatedAt,
 	)
 	result.Trigger.Type = triggerType
+	if err == nil {
+		err = json.Unmarshal(modelBindingsJSON, &result.ModelBindings)
+	}
 	if createdBy.Valid {
 		result.CreatedBy = &createdBy.String
 	}
@@ -860,17 +887,21 @@ func scanStoredAutomation(row pgx.Row) (storedAutomation, error) {
 	var result storedAutomation
 	var triggerType string
 	var createdBy, updatedBy pgtype.Text
+	var modelBindingsJSON []byte
 	err := row.Scan(
 		&result.Automation.ID, &result.Automation.ProjectID, &result.Automation.Name,
 		&result.Automation.Description, &result.Automation.Enabled, &triggerType,
 		&result.Automation.Trigger.AuthMode, &result.Automation.EndpointID,
 		&result.Automation.SecretLastFour, &result.Automation.TemplateID,
-		&createdBy, &updatedBy,
+		&modelBindingsJSON, &createdBy, &updatedBy,
 		&result.Automation.LastTriggeredAt, &result.Automation.SecretRotatedAt,
 		&result.Automation.CreatedAt, &result.Automation.UpdatedAt,
 		&result.SecretHash, &result.SecretCiphertext, &result.SecretNonce,
 	)
 	result.Automation.Trigger.Type = triggerType
+	if err == nil {
+		err = json.Unmarshal(modelBindingsJSON, &result.Automation.ModelBindings)
+	}
 	if createdBy.Valid {
 		result.Automation.CreatedBy = &createdBy.String
 	}
@@ -878,6 +909,14 @@ func scanStoredAutomation(row pgx.Row) (storedAutomation, error) {
 		result.Automation.UpdatedBy = &updatedBy.String
 	}
 	return result, err
+}
+
+func automationModelBindingsJSON(value map[string]string) []byte {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return encoded
 }
 
 func scanAutomationRun(row pgx.Row) (platform.AutomationRun, error) {

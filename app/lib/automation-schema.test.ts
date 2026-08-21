@@ -18,6 +18,7 @@ describe("automation schemas", () => {
       enabled: true,
       trigger: { type: "webhook", authMode: "bearer" },
       templateId: "runtime-one",
+      modelBindings: { "credential-one": "model-one" },
       endpointId: "75778270-bdbf-4e2f-bbeb-b3133447a367",
       secretLastFour: "test",
       createdBy: null,
@@ -29,6 +30,22 @@ describe("automation schemas", () => {
     })
 
     expect(automation.templateId).toBe("runtime-one")
+    expect(automation.modelBindings).toEqual({
+      "credential-one": "model-one",
+    })
+  })
+
+  it("requires concrete model bindings in automation input", () => {
+    const result = automationInputSchema.safeParse({
+      projectId: "default",
+      name: "PR Preview",
+      description: "",
+      enabled: true,
+      trigger: { type: "webhook", authMode: "bearer" },
+      templateId: "runtime-one",
+    })
+
+    expect(result.success).toBe(false)
   })
 
   it("rejects legacy execution actions", () => {
@@ -39,6 +56,7 @@ describe("automation schemas", () => {
       enabled: true,
       trigger: { type: "webhook", authMode: "bearer" },
       templateId: "runtime-one",
+      modelBindings: {},
       action: { type: "run-codex", templateId: "runtime-one" },
     })
 
