@@ -6,6 +6,9 @@ set "APP_DIR=%ROOT%app"
 set "SERVER_DIR=%ROOT%server"
 set "API_URL=http://127.0.0.1:8091"
 set "WEB_URL=http://127.0.0.1:3000"
+if not defined AGENTBOX_WEB_MODE set "AGENTBOX_WEB_MODE=production"
+
+if /I not "%AGENTBOX_WEB_MODE%"=="production" if /I not "%AGENTBOX_WEB_MODE%"=="development" goto invalid_web_mode
 
 where go.exe >nul 2>&1 || goto missing_go
 where pnpm.cmd >nul 2>&1 || goto missing_pnpm
@@ -39,9 +42,18 @@ if exist "%APP_DIR%\.env.local" (
 if defined AGENTBOX_PUBLIC_URL set "ALLOWED_ORIGINS=!ALLOWED_ORIGINS!,!AGENTBOX_PUBLIC_URL!"
 set "AGENTBOX_API_URL=%API_URL%"
 
-echo Starting AgentBox API and Web...
-start "AgentBox API" /D "%SERVER_DIR%" cmd.exe /k "set PORT=8091&&go run ./cmd/agentbox"
-start "AgentBox Web" /D "%APP_DIR%" cmd.exe /k "set PORT=3000&&pnpm.cmd dev --hostname 0.0.0.0 --port 3000"
+if /I "%AGENTBOX_WEB_MODE%"=="production" (
+  echo Building AgentBox Web for production...
+  call pnpm.cmd --dir "%APP_DIR%" build || goto failed
+)
+
+echo Starting AgentBox API and Web ^(%AGENTBOX_WEB_MODE%^)...
+start "AgentBox API" /D "%SERVER_DIR%" cmd.exe /c "set PORT=8091&&go run ./cmd/agentbox"
+if /I "%AGENTBOX_WEB_MODE%"=="development" (
+  start "AgentBox Web" /D "%APP_DIR%" cmd.exe /c "set PORT=3000&&pnpm.cmd dev --hostname 0.0.0.0 --port 3000"
+) else (
+  start "AgentBox Web" /D "%APP_DIR%" cmd.exe /c "set PORT=3000&&pnpm.cmd start --hostname 0.0.0.0 --port 3000"
+)
 
 set "API_READY="
 set "WEB_READY="
@@ -62,7 +74,6 @@ echo.
 echo AgentBox is ready: %WEB_URL%
 echo API health: %API_URL%/healthz
 echo Close the two AgentBox terminal windows to stop the services.
-start "" "%WEB_URL%"
 exit /b 0
 
 :free_port
@@ -129,6 +140,10 @@ goto failed
 :missing_database
 echo DATABASE_URL is not configured and Docker is not available.
 echo Add DATABASE_URL to server\.env or start Docker Desktop.
+goto failed
+
+:invalid_web_mode
+echo AGENTBOX_WEB_MODE must be production or development.
 goto failed
 
 :failed
