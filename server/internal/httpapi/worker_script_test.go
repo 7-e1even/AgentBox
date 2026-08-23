@@ -150,7 +150,8 @@ func TestWorkerPreconfiguresClaudeCodeOnboarding(t *testing.T) {
 func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 	for _, expected := range []string{
 		`codebuddy) PACKAGE='@tencent-ai/codebuddy-code'`,
-		`deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue`,
+		`deepseek-harness) PACKAGE='@deepseek-ai/dsh'`,
+		`set -- "$@" "$PACKAGE@latest"`,
 		`grok) PACKAGE='@xai-official/grok'`,
 		`kimi) PACKAGE='@moonshot-ai/kimi-code'`,
 		`omp) PACKAGE='@oh-my-pi/pi-coding-agent'`,
@@ -267,7 +268,7 @@ func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
 		`major === 22 && minor >= 19`,
 		`apiKey: ("$AGENTBOX_KEY_" + (.id | env_id))`,
-		`INSTALLER_REVISION=3`,
+		`INSTALLER_REVISION=4`,
 		`LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {

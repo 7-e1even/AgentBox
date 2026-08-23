@@ -1517,7 +1517,7 @@ install_agent_tools() {
       codex) PACKAGE='@openai/codex' ;;
       claude-code) PACKAGE='@anthropic-ai/claude-code' ;;
       codebuddy) PACKAGE='@tencent-ai/codebuddy-code' ;;
-      deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue ;;
+      deepseek-harness) PACKAGE='@deepseek-ai/dsh' ;;
       gemini-cli) PACKAGE='@google/gemini-cli' ;;
       grok) PACKAGE='@xai-official/grok' ;;
       kimi) PACKAGE='@moonshot-ai/kimi-code' ;;
@@ -1682,7 +1682,7 @@ prepare_agent_image() {
   command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
 
   TOOL_SET=$(printf '%s\n' "$TOOLS" | paste -sd, -)
-  INSTALLER_REVISION=3
+  INSTALLER_REVISION=4
   CACHE_KEY=$(printf '%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
   CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
