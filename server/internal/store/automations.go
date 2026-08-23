@@ -84,6 +84,23 @@ func (s *Store) GetAutomation(ctx context.Context, id string) (platform.Automati
 	return automation, nil
 }
 
+func (s *Store) GetAutomationSecret(ctx context.Context, id string) (platform.Automation, string, error) {
+	stored, err := scanStoredAutomation(s.pool.QueryRow(ctx, `SELECT `+automationColumns+`,
+		secret_hash, secret_ciphertext, secret_nonce FROM automations
+		WHERE id = $1 AND action_type = 'create-sandbox'`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.Automation{}, "", ErrResourceNotFound
+	}
+	if err != nil {
+		return platform.Automation{}, "", fmt.Errorf("get automation secret: %w", err)
+	}
+	secret, err := decryptSecret(s.secretKey, stored.SecretCiphertext, stored.SecretNonce)
+	if err != nil {
+		return platform.Automation{}, "", err
+	}
+	return stored.Automation, secret, nil
+}
+
 func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationInput, userID string) (platform.Automation, string, error) {
 	platform.NormalizeAutomationInput(&input)
 	if err := platform.ValidateAutomationInput(input); err != nil {

@@ -36,6 +36,25 @@ func (s *Server) getAutomation(w http.ResponseWriter, request *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{"automation": automation})
 }
 
+func (s *Server) getAutomationSecret(w http.ResponseWriter, request *http.Request) {
+	automation, secret, err := s.store.GetAutomationSecret(request.Context(), request.PathValue("id"))
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "read-secret",
+		Message:      "查看自动化密钥 " + automation.Name,
+		ResourceKind: "automation", ResourceID: automation.ID, ResourceName: automation.Name,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"automation":  automation,
+		"secret":      secret,
+		"webhookPath": "/api/webhooks/" + automation.EndpointID,
+	})
+}
+
 func (s *Server) createAutomation(w http.ResponseWriter, request *http.Request) {
 	var input platform.AutomationInput
 	if !s.decodeJSON(w, request, &input) {

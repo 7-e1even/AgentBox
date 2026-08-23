@@ -27,6 +27,7 @@ type PlatformStore interface {
 	OperateSandbox(context.Context, string, string) (platform.Resource, error)
 	ListAutomations(context.Context, string) ([]platform.Automation, error)
 	GetAutomation(context.Context, string) (platform.Automation, error)
+	GetAutomationSecret(context.Context, string) (platform.Automation, string, error)
 	CreateAutomation(context.Context, platform.AutomationInput, string) (platform.Automation, string, error)
 	UpdateAutomation(context.Context, string, platform.AutomationInput, string) (platform.Automation, error)
 	DeleteAutomation(context.Context, string) error
@@ -164,6 +165,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	authenticated("GET /api/automations", server.listAutomations)
 	operator("POST /api/automations", server.createAutomation)
 	authenticated("GET /api/automations/{id}", server.getAutomation)
+	operator("GET /api/automations/{id}/secret", server.getAutomationSecret)
 	operator("PATCH /api/automations/{id}", server.updateAutomation)
 	operator("DELETE /api/automations/{id}", server.deleteAutomation)
 	operator("POST /api/automations/{id}/rotate-secret", server.rotateAutomationSecret)

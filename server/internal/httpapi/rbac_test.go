@@ -63,6 +63,7 @@ func TestViewerWriteRequestsAreForbidden(t *testing.T) {
 		{http.MethodDelete, "/api/servers/7b20f83b-6418-4a9f-8477-3dc7c35d6310", ""},
 		{http.MethodPost, "/api/servers/7b20f83b-6418-4a9f-8477-3dc7c35d6310/actions/update-worker", ""},
 		{http.MethodPost, "/api/automations", `{"projectId":"default","name":"a","trigger":{"type":"webhook"},"templateId":"t"}`},
+		{http.MethodGet, "/api/automations/5f7a65c5-1df2-4ac3-bdbf-753af92ac388/secret", ""},
 		{http.MethodDelete, "/api/automations/5f7a65c5-1df2-4ac3-bdbf-753af92ac388", ""},
 		{http.MethodPost, "/api/credentials", `{"providerId":"openai","name":"k","apiKey":"sk-test"}`},
 		{http.MethodDelete, "/api/credentials/openai-primary", ""},
@@ -125,6 +126,12 @@ func TestOperatorSandboxOperationsAreAllowed(t *testing.T) {
 		`{"projectId":"default","name":"a","trigger":{"type":"webhook"},"templateId":"t"}`)
 	if response.Code != http.StatusCreated {
 		t.Errorf("create automation: status = %d, want %d (body = %s)", response.Code, http.StatusCreated, response.Body.String())
+	}
+
+	response = rbacRequest(t, handler, http.MethodGet,
+		"/api/automations/5f7a65c5-1df2-4ac3-bdbf-753af92ac388/secret", "")
+	if response.Code != http.StatusOK {
+		t.Errorf("read automation secret: status = %d, want %d (body = %s)", response.Code, http.StatusOK, response.Body.String())
 	}
 }
 

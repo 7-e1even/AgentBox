@@ -61,6 +61,10 @@ func TestAutomationWebhookPersistsPollableIdempotentRun(t *testing.T) {
 	if err != nil || stored.ModelBindings[credentialID] != modelID {
 		t.Fatalf("stored model bindings = %#v, %v", stored.ModelBindings, err)
 	}
+	revealed, revealedSecret, err := s.GetAutomationSecret(ctx, automation.ID)
+	if err != nil || revealed.ID != automation.ID || revealedSecret != secret {
+		t.Fatalf("revealed automation = %#v secret matches = %v, %v", revealed, revealedSecret == secret, err)
+	}
 
 	delivery := platform.AutomationDelivery{
 		EndpointID: automation.EndpointID, Authorization: "Bearer " + secret,

@@ -4,12 +4,14 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react"
 import {
   ActivityIcon,
   CheckCircle2Icon,
+  ChevronDownIcon,
   ClipboardIcon,
   KeyRoundIcon,
   LoaderCircleIcon,
@@ -141,6 +143,9 @@ export function AutomationManagement({
   const [search, setSearch] = useState("")
   const [editing, setEditing] = useState<Automation | "new" | null>(null)
   const [secret, setSecret] = useState("")
+  const [secretLoading, setSecretLoading] = useState(false)
+  const [secretError, setSecretError] = useState("")
+  const secretRequestId = useRef(0)
   const [deleting, setDeleting] = useState<Automation | null>(null)
   const [testing, setTesting] = useState<Automation | null>(null)
 
@@ -204,6 +209,36 @@ export function AutomationManagement({
     return latest
   }, [runs])
 
+  function resetSecret() {
+    secretRequestId.current += 1
+    setSecret("")
+    setSecretLoading(false)
+    setSecretError("")
+  }
+
+  async function openAutomation(automation: Automation) {
+    const requestId = secretRequestId.current + 1
+    secretRequestId.current = requestId
+    setEditing(automation)
+    setSecret("")
+    setSecretError("")
+    setSecretLoading(true)
+    try {
+      const result = automationSecretResponseSchema.parse(
+        await requestJson<unknown>(`/api/automations/${automation.id}/secret`, {
+          cache: "no-store",
+        })
+      )
+      if (secretRequestId.current !== requestId) return
+      setSecret(result.secret)
+    } catch (error) {
+      if (secretRequestId.current !== requestId) return
+      setSecretError(errorMessage(error))
+    } finally {
+      if (secretRequestId.current === requestId) setSecretLoading(false)
+    }
+  }
+
   async function deleteAutomation() {
     if (!deleting) return
     try {
@@ -254,7 +289,7 @@ export function AutomationManagement({
               variant="outline"
               onClick={() => {
                 setEditing(null)
-                setSecret("")
+                resetSecret()
               }}
             >
               返回列表
@@ -264,7 +299,7 @@ export function AutomationManagement({
               disabled={templates.length === 0}
               onClick={() => {
                 setEditing("new")
-                setSecret("")
+                resetSecret()
               }}
             >
               <PlusIcon data-icon="inline-start" />
@@ -282,6 +317,8 @@ export function AutomationManagement({
             credentials={credentials}
             automation={editing === "new" ? null : editing}
             secret={secret}
+            secretLoading={secretLoading}
+            secretError={secretError}
             runs={
               editing === "new"
                 ? []
@@ -298,6 +335,10 @@ export function AutomationManagement({
               })
               setEditing(automation)
               setSecret(nextSecret)
+              if (nextSecret) {
+                setSecretLoading(false)
+                setSecretError("")
+              }
             }}
             onRotate={(automation, nextSecret) => {
               setAutomations((current) =>
@@ -307,7 +348,10 @@ export function AutomationManagement({
               )
               setEditing(automation)
               setSecret(nextSecret)
+              setSecretLoading(false)
+              setSecretError("")
             }}
+            onReloadSecret={(automation) => void openAutomation(automation)}
             onTest={setTesting}
             onDelete={setDeleting}
           />
@@ -353,7 +397,10 @@ export function AutomationManagement({
                   <EmptyContent>
                     <Button
                       disabled={templates.length === 0}
-                      onClick={() => setEditing("new")}
+                      onClick={() => {
+                        setEditing("new")
+                        resetSecret()
+                      }}
                     >
                       <PlusIcon data-icon="inline-start" />
                       创建第一个自动化
@@ -388,10 +435,7 @@ export function AutomationManagement({
                               className="flex min-w-0 items-center gap-3 text-left"
                               onClick={
                                 canMutate
-                                  ? () => {
-                                      setEditing(automation)
-                                      setSecret("")
-                                    }
+                                  ? () => void openAutomation(automation)
                                   : undefined
                               }
                             >
@@ -445,10 +489,7 @@ export function AutomationManagement({
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() => {
-                                  setEditing(automation)
-                                  setSecret("")
-                                }}
+                                onClick={() => void openAutomation(automation)}
                               >
                                 编辑
                               </Button>
@@ -508,9 +549,12 @@ function AutomationEditor({
   credentials,
   automation,
   secret,
+  secretLoading,
+  secretError,
   runs,
   onSaved,
   onRotate,
+  onReloadSecret,
   onTest,
   onDelete,
 }: {
@@ -519,9 +563,12 @@ function AutomationEditor({
   credentials: ManagedCredential[]
   automation: Automation | null
   secret: string
+  secretLoading: boolean
+  secretError: string
   runs: AutomationRun[]
   onSaved: (automation: Automation, secret: string) => void
   onRotate: (automation: Automation, secret: string) => void
+  onReloadSecret: (automation: Automation) => void
   onTest: (automation: Automation) => void
   onDelete: (automation: Automation) => void
 }) {
@@ -590,7 +637,7 @@ function AutomationEditor({
             body: JSON.stringify(parsed.data),
           })
         )
-        onSaved(result.automation, "")
+        onSaved(result.automation, secret)
         toast.success("自动化已保存")
       } else {
         const result = automationSecretResponseSchema.parse(
@@ -600,9 +647,7 @@ function AutomationEditor({
           })
         )
         onSaved(result.automation, result.secret)
-        toast.success("自动化已创建", {
-          description: "请立即保存 Webhook 密钥。",
-        })
+        toast.success("自动化已创建")
       }
     } catch (error) {
       setFormError(errorMessage(error))
@@ -689,21 +734,6 @@ function AutomationEditor({
           <AlertTitle>需要一个已启用的沙箱模板</AlertTitle>
           <AlertDescription>
             先在沙箱模板中创建并启用模板，再回来配置自动化。
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {secret && automation && (
-        <Alert>
-          <KeyRoundIcon />
-          <AlertTitle>立即保存新的 Webhook 密钥</AlertTitle>
-          <AlertDescription>
-            <div className="flex flex-col gap-2">
-              <code className="overflow-x-auto rounded-md bg-muted px-2 py-1 font-mono text-xs text-foreground">
-                {secret}
-              </code>
-              <span>完整密钥离开本页后无法再次读取，只能重新轮换。</span>
-            </div>
           </AlertDescription>
         </Alert>
       )}
@@ -942,8 +972,13 @@ function AutomationEditor({
             automation={automation}
             webhookURL={webhookURL}
             secret={secret}
+            secretLoading={secretLoading}
+            secretError={secretError}
             rotating={rotating}
             onRotate={() => void rotateSecret()}
+            onReloadSecret={() => {
+              if (automation) onReloadSecret(automation)
+            }}
           />
         </div>
       </div>
@@ -957,14 +992,20 @@ function WebhookConnectionCard({
   automation,
   webhookURL,
   secret,
+  secretLoading,
+  secretError,
   rotating,
   onRotate,
+  onReloadSecret,
 }: {
   automation: Automation | null
   webhookURL: string
   secret: string
+  secretLoading: boolean
+  secretError: string
   rotating: boolean
   onRotate: () => void
+  onReloadSecret: () => void
 }) {
   if (!automation) {
     return (
@@ -987,16 +1028,39 @@ function WebhookConnectionCard({
     <Card>
       <CardHeader>
         <CardTitle>Webhook 接入</CardTitle>
-        <CardDescription>
-          {authModeLabel(automation.trigger.authMode)} · 密钥末四位{" "}
-          {automation.secretLastFour}
-        </CardDescription>
+        <CardDescription>{authModeLabel(automation.trigger.authMode)}</CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <CopyField label="Webhook URL" value={webhookURL} />
-        <Field>
-          <FieldLabel>请求示例</FieldLabel>
-          <div className="relative overflow-hidden rounded-lg border bg-muted/20">
+        {secretLoading ? (
+          <Field>
+            <FieldLabel>Webhook 密钥</FieldLabel>
+            <Skeleton className="h-9 w-full" />
+          </Field>
+        ) : secretError ? (
+          <Alert variant="destructive">
+            <XCircleIcon />
+            <AlertTitle>无法读取 Webhook 密钥</AlertTitle>
+            <AlertDescription className="flex flex-col items-start gap-2">
+              <span>{secretError}</span>
+              <Button variant="outline" size="sm" onClick={onReloadSecret}>
+                重试读取
+              </Button>
+            </AlertDescription>
+          </Alert>
+        ) : secret ? (
+          <CopyField
+            label="Webhook 密钥"
+            value={secret}
+            copyLabel="复制密钥"
+          />
+        ) : null}
+        <details className="group overflow-hidden rounded-lg border">
+          <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-sm font-medium select-none">
+            请求示例
+            <ChevronDownIcon className="size-4 text-muted-foreground transition-transform group-open:rotate-180" />
+          </summary>
+          <div className="relative border-t bg-muted/20">
             <pre className="max-h-52 overflow-auto p-3 pr-12 font-mono text-xs leading-5 whitespace-pre-wrap">
               {sample}
             </pre>
@@ -1010,19 +1074,13 @@ function WebhookConnectionCard({
               <ClipboardIcon />
             </Button>
           </div>
-          <FieldDescription>
-            请求正文仅参与签名和幂等校验，不会修改沙箱模板。
-          </FieldDescription>
-        </Field>
+        </details>
       </CardContent>
-      <CardFooter className="justify-between gap-3">
-        <p className="text-xs text-muted-foreground">
-          幂等、限流与并发保护自动生效。
-        </p>
+      <CardFooter className="justify-end">
         <Button
           variant="outline"
           size="sm"
-          disabled={rotating}
+          disabled={rotating || secretLoading}
           onClick={onRotate}
         >
           {rotating ? (
@@ -1040,7 +1098,15 @@ function WebhookConnectionCard({
   )
 }
 
-function CopyField({ label, value }: { label: string; value: string }) {
+function CopyField({
+  label,
+  value,
+  copyLabel,
+}: {
+  label: string
+  value: string
+  copyLabel?: string
+}) {
   return (
     <Field>
       <FieldLabel>{label}</FieldLabel>
@@ -1048,11 +1114,13 @@ function CopyField({ label, value }: { label: string; value: string }) {
         <Input readOnly value={value} className="font-mono text-xs" />
         <Button
           variant="outline"
-          size="icon"
-          aria-label={`复制${label}`}
+          size={copyLabel ? "sm" : "icon"}
+          className="shrink-0"
+          aria-label={copyLabel ?? `复制${label}`}
           onClick={() => void copyText(value, `${label} 已复制`)}
         >
-          <ClipboardIcon />
+          <ClipboardIcon data-icon={copyLabel ? "inline-start" : undefined} />
+          {copyLabel}
         </Button>
       </div>
     </Field>

@@ -47,6 +47,12 @@ func (fakeStore) ListAutomations(context.Context, string) ([]platform.Automation
 func (fakeStore) GetAutomation(context.Context, string) (platform.Automation, error) {
 	return platform.Automation{ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", ProjectID: "default"}, nil
 }
+func (fakeStore) GetAutomationSecret(context.Context, string) (platform.Automation, string, error) {
+	return platform.Automation{
+		ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", Name: "PR Preview",
+		EndpointID: "75778270-bdbf-4e2f-bbeb-b3133447a367",
+	}, "abx_wh_visible", nil
+}
 func (fakeStore) CreateAutomation(_ context.Context, input platform.AutomationInput, userID string) (platform.Automation, string, error) {
 	return platform.Automation{
 		ID: "5f7a65c5-1df2-4ac3-bdbf-753af92ac388", ProjectID: input.ProjectID,
@@ -238,6 +244,19 @@ func TestCreateAutomationReturnsOneTimeSecret(t *testing.T) {
 	testHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusCreated || !strings.Contains(response.Body.String(), `"secret":"abx_wh_test"`) {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestGetAutomationSecretReturnsPlaintextWithoutCaching(t *testing.T) {
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/automations/5f7a65c5-1df2-4ac3-bdbf-753af92ac388/secret", nil)
+	response := httptest.NewRecorder()
+	testHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"secret":"abx_wh_visible"`) {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+	if got := response.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control = %q, want no-store", got)
 	}
 }
 
