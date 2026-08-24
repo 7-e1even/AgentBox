@@ -1044,79 +1044,89 @@ function SandboxDetailsDialog({
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-2xl">
-        <DialogHeader>
+      <DialogContent className="max-h-[calc(100dvh-2rem)] gap-3 overflow-y-auto sm:max-w-3xl">
+        <DialogHeader className="gap-1 pr-8">
           <DialogTitle>{sandbox.name}</DialogTitle>
           <DialogDescription>
-            查看这个沙箱的沙箱模板、运行位置和已配置能力。
+            沙箱模板、运行位置与配置概览。
           </DialogDescription>
         </DialogHeader>
 
-        <div className="grid gap-4">
-          <div className="grid gap-3 rounded-xl border p-4 sm:grid-cols-3">
-            <Detail label="状态" value={sandboxStatus(sandbox)} />
-            <Detail label="服务器" value={server?.name ?? "未知服务器"} />
-            <Detail label="沙箱模板" value={environment?.name ?? "未绑定"} />
-            <Detail label="实例" value={externalId} mono />
-            <Detail
-              label="沙箱内 Agent"
-              value={tools.length > 0 ? tools.join(" · ") : "未预装"}
-            />
-            <Detail
-              label="模型凭据"
-              value={
-                credentials.length > 0 ? `${credentials.length} 个` : "未配置"
-              }
-            />
-          </div>
+        <div className="space-y-3">
+          <div className="overflow-hidden rounded-xl border">
+            <div className="grid gap-x-4 gap-y-2.5 p-3 sm:grid-cols-3">
+              <Detail label="状态" value={sandboxStatus(sandbox)} />
+              <Detail label="服务器" value={server?.name ?? "未知服务器"} />
+              <Detail
+                label="沙箱模板"
+                value={environment?.name ?? "未绑定"}
+              />
+              <Detail label="实例" value={externalId} mono />
+              <Detail
+                label="沙箱内 Agent"
+                value={tools.length > 0 ? tools.join(" · ") : "未预装"}
+              />
+              <Detail
+                label="模型凭据"
+                value={
+                  credentials.length > 0
+                    ? `${credentials.length} 个`
+                    : "未配置"
+                }
+              />
+            </div>
 
-          {provisioning?.stage && (
-            <div className="grid gap-3 rounded-xl border bg-muted/20 p-4 sm:grid-cols-3">
-              <Detail
-                label="创建阶段"
-                value={provisioningStageLabel(provisioning.stage)}
-              />
-              <Detail
-                label="累计耗时"
-                value={provisioningDuration(provisioning.durationMs)}
-              />
-              <Detail
-                label="工具缓存"
-                value={provisioningCacheLabel(
-                  provisioning.cacheStatus,
-                  provisioning.cacheReason
-                )}
-              />
-              {provisioning.message && (
-                <div className="sm:col-span-3">
-                  <p className="text-xs text-muted-foreground">阶段说明</p>
-                  <p className="mt-1 text-sm break-words">
+            {provisioning?.stage && (
+              <div className="grid gap-x-4 gap-y-2.5 border-t bg-muted/20 px-3 py-2.5 sm:grid-cols-3">
+                <Detail
+                  label="创建阶段"
+                  value={provisioningStageLabel(provisioning.stage)}
+                />
+                <Detail
+                  label="累计耗时"
+                  value={provisioningDuration(provisioning.durationMs)}
+                />
+                <Detail
+                  label="工具缓存"
+                  value={provisioningCacheLabel(
+                    provisioning.cacheStatus,
+                    provisioning.cacheReason
+                  )}
+                />
+                {!failureMessage && provisioning.message && (
+                  <p className="line-clamp-2 text-xs break-words text-muted-foreground sm:col-span-3">
                     {provisioning.message}
                   </p>
-                </div>
-              )}
-            </div>
-          )}
+                )}
+              </div>
+            )}
+          </div>
 
           {failureMessage && (
-            <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-4">
+            <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-3">
               <div className="flex items-center gap-2 text-sm font-medium text-destructive">
                 <TriangleAlertIcon className="size-4" />
                 失败原因
               </div>
-              <pre className="mt-2 max-h-48 overflow-auto font-mono text-xs leading-relaxed break-words whitespace-pre-wrap text-foreground">
+              <pre className="mt-2 font-mono text-xs leading-5 break-words whitespace-pre-wrap text-foreground">
                 {failureMessage}
               </pre>
             </div>
           )}
 
-          <div className="grid gap-3 sm:grid-cols-2">
-            <CapabilityList title="Skills" values={skills} />
-            <CapabilityList title="MCP Servers" values={mcpServers} />
-          </div>
+          {skills.length > 0 || mcpServers.length > 0 ? (
+            <div className="grid gap-x-6 gap-y-3 border-t pt-3 sm:grid-cols-2">
+              <CapabilityList title="Skills" values={skills} />
+              <CapabilityList title="MCP Servers" values={mcpServers} />
+            </div>
+          ) : (
+            <p className="border-t pt-3 text-xs text-muted-foreground">
+              Skills 与 MCP Servers 均未配置
+            </p>
+          )}
         </div>
 
-        <DialogFooter>
+        <DialogFooter className="p-3">
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             关闭
           </Button>
@@ -1161,9 +1171,9 @@ function CapabilityList({
   values: string[]
 }) {
   return (
-    <div className="rounded-xl border p-4">
-      <p className="text-sm font-medium">{title}</p>
-      <div className="mt-2 flex flex-wrap gap-1.5">
+    <div className="min-w-0">
+      <p className="text-xs font-medium">{title}</p>
+      <div className="mt-1.5 flex flex-wrap gap-1.5">
         {values.length > 0 ? (
           values.map((value) => (
             <Badge key={value} variant="secondary">
