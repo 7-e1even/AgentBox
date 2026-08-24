@@ -32,6 +32,16 @@ const cacheReasonLabels: Record<string, string> = {
   "refresh-failed": "刷新失败",
 }
 
+const agentToolStatusLabels: Record<string, string> = {
+  pending: "等待安装",
+  running: "安装中",
+  installed: "等待验证",
+  verifying: "验证中",
+  succeeded: "已完成",
+  failed: "失败",
+  cached: "缓存复用",
+}
+
 export function provisioningStageLabel(stage: string) {
   return (stageLabels[stage] ?? stage) || "—"
 }
@@ -51,4 +61,8 @@ export function provisioningDuration(durationMs: number) {
   return remainingSeconds > 0
     ? `${minutes} 分 ${remainingSeconds} 秒`
     : `${minutes} 分`
+}
+
+export function provisioningAgentToolStatusLabel(status: string) {
+  return (agentToolStatusLabels[status] ?? status) || "等待安装"
 }

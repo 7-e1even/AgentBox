@@ -1917,6 +1917,36 @@ func advanceProvisioningProgress(current platform.ProvisioningProgress, input pl
 	if input.CacheReason != "" {
 		current.CacheReason = input.CacheReason
 	}
+	if input.AgentTool != "" {
+		toolIndex := -1
+		for index := range current.AgentTools {
+			if current.AgentTools[index].Tool == input.AgentTool {
+				toolIndex = index
+				break
+			}
+		}
+		if toolIndex == -1 {
+			current.AgentTools = append(current.AgentTools, platform.ProvisioningAgentTool{Tool: input.AgentTool})
+			toolIndex = len(current.AgentTools) - 1
+		}
+		tool := &current.AgentTools[toolIndex]
+		if tool.StartedAt == nil {
+			startedAt := now
+			tool.StartedAt = &startedAt
+		}
+		tool.Status = input.AgentToolStatus
+		tool.Message = input.Message
+		switch input.AgentToolStatus {
+		case "succeeded", "failed", "cached":
+			if tool.FinishedAt == nil {
+				finishedAt := now
+				tool.FinishedAt = &finishedAt
+			}
+		case "running", "installed", "verifying":
+			tool.FinishedAt = nil
+		}
+		tool.DurationMS = now.Sub(*tool.StartedAt).Milliseconds()
+	}
 	updatedAt := now
 	current.UpdatedAt = &updatedAt
 	current.DurationMS = now.Sub(*current.StartedAt).Milliseconds()
@@ -1946,6 +1976,21 @@ func finishProvisioningProgress(current platform.ProvisioningProgress, result pl
 	current.UpdatedAt = &updatedAt
 	current.FinishedAt = &finishedAt
 	current.DurationMS = now.Sub(*current.StartedAt).Milliseconds()
+	for index := range current.AgentTools {
+		tool := &current.AgentTools[index]
+		if tool.FinishedAt != nil {
+			continue
+		}
+		finishedAt := now
+		tool.FinishedAt = &finishedAt
+		tool.DurationMS = now.Sub(*tool.StartedAt).Milliseconds()
+		if result.Success {
+			tool.Status = "succeeded"
+		} else {
+			tool.Status = "failed"
+			tool.Message = result.Message
+		}
+	}
 	return current
 }
 

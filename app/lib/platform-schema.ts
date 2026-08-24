@@ -7,6 +7,15 @@ export const provisioningStageTimingSchema = z.object({
   durationMs: z.number().int().nonnegative(),
 })
 
+export const provisioningAgentToolSchema = z.object({
+  tool: z.string(),
+  status: z.string(),
+  message: z.string().default(""),
+  startedAt: z.string().datetime({ offset: true }).nullable().default(null),
+  finishedAt: z.string().datetime({ offset: true }).nullable().default(null),
+  durationMs: z.number().int().nonnegative().default(0),
+})
+
 export const provisioningProgressSchema = z.object({
   stage: z.string().default(""),
   message: z.string().default(""),
@@ -23,6 +32,7 @@ export const provisioningProgressSchema = z.object({
   finishedAt: z.string().datetime({ offset: true }).nullable().default(null),
   durationMs: z.number().int().nonnegative().default(0),
   timings: z.array(provisioningStageTimingSchema).default([]),
+  agentTools: z.array(provisioningAgentToolSchema).default([]),
 })
 
 export const resourceKindSchema = z.enum([

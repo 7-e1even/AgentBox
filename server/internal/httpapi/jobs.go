@@ -164,8 +164,17 @@ func (s *Server) reportWorkerJobProgress(w http.ResponseWriter, request *http.Re
 	input.Message = strings.TrimSpace(input.Message)
 	input.CacheStatus = strings.TrimSpace(input.CacheStatus)
 	input.CacheReason = strings.TrimSpace(input.CacheReason)
+	input.AgentTool = strings.TrimSpace(input.AgentTool)
+	input.AgentToolStatus = strings.TrimSpace(input.AgentToolStatus)
+	validAgentToolStatus := false
+	switch input.AgentToolStatus {
+	case "", "running", "installed", "verifying", "succeeded", "failed", "cached":
+		validAgentToolStatus = true
+	}
 	if input.Stage == "" || len(input.Stage) > 64 || len(input.Message) > 500 ||
-		len(input.CacheStatus) > 32 || len(input.CacheReason) > 200 {
+		len(input.CacheStatus) > 32 || len(input.CacheReason) > 200 ||
+		len(input.AgentTool) > 64 || !validAgentToolStatus ||
+		(input.AgentTool == "") != (input.AgentToolStatus == "") {
 		s.writeError(w, http.StatusBadRequest, "Worker 进度无效")
 		return
 	}

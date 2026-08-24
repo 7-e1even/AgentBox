@@ -1114,16 +1114,28 @@ report_job_progress() {
   MESSAGE=$2
   CACHE_STATUS=${3:-}
   CACHE_REASON=${4:-}
+  AGENT_TOOL=${5:-}
+  AGENT_TOOL_STATUS=${6:-}
   BODY=$(jq -n --arg stage "$STAGE" --arg message "$MESSAGE" \
     --arg cacheStatus "$CACHE_STATUS" --arg cacheReason "$CACHE_REASON" \
+    --arg agentTool "$AGENT_TOOL" --arg agentToolStatus "$AGENT_TOOL_STATUS" \
     '{stage:$stage,message:$message,
       cacheStatus:(if $cacheStatus == "" then null else $cacheStatus end),
-      cacheReason:(if $cacheReason == "" then null else $cacheReason end)}') || return 0
+      cacheReason:(if $cacheReason == "" then null else $cacheReason end),
+      agentTool:(if $agentTool == "" then null else $agentTool end),
+      agentToolStatus:(if $agentToolStatus == "" then null else $agentToolStatus end)}') || return 0
   curl -fsS -X POST \
     "$SERVER_URL/api/servers/$SERVER_ID/jobs/$JOB_ID/progress" \
     -H "Authorization: Bearer $CREDENTIAL" \
     -H 'Content-Type: application/json' \
     --data "$BODY" >/dev/null 2>&1 || true
+}
+
+report_agent_tool_progress() {
+  TOOL=$1
+  STATUS=$2
+  MESSAGE=$3
+  report_job_progress "$PROGRESS_STAGE" "$MESSAGE" "" "" "$TOOL" "$STATUS"
 }
 
 finalize_worker_update() {
@@ -1530,6 +1542,7 @@ install_agent_tools() {
   for TOOL in $TOOLS; do
     COMMAND=$(agent_tool_command "$TOOL") || { echo "unsupported Agent tool: $TOOL" >&2; return 1; }
     if [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
+      report_agent_tool_progress "$TOOL" cached "已复用 Agent 工具缓存：$TOOL"
       continue
     fi
     case "$TOOL" in
@@ -1537,7 +1550,7 @@ install_agent_tools() {
       codex) PACKAGE='@openai/codex' ;;
       claude-code) PACKAGE='@anthropic-ai/claude-code' ;;
       codebuddy) PACKAGE='@tencent-ai/codebuddy-code' ;;
-      deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue ;;
+      deepseek-harness) PACKAGE='@deepseek-ai/dsh@0.1.0-rc.7' ;;
       gemini-cli) PACKAGE='@google/gemini-cli' ;;
       grok) continue ;;
       kimi) PACKAGE='@moonshot-ai/kimi-code' ;;
@@ -1560,7 +1573,11 @@ install_agent_tools() {
       trae-cli) echo "TRAE CLI has no verified unattended Linux installer; use a custom prebuilt environment" >&2; return 1 ;;
       *) echo "unsupported Agent tool: $TOOL" >&2; return 1 ;;
     esac
-    set -- "$@" "$PACKAGE@latest"
+    case "$TOOL" in
+      deepseek-harness) PACKAGE_SPEC=$PACKAGE ;;
+      *) PACKAGE_SPEC="$PACKAGE@latest" ;;
+    esac
+    set -- "$@" "$TOOL" "$PACKAGE_SPEC"
   done
 
   if printf '%s\n' "$TOOLS" | grep -qx omp &&
@@ -1581,72 +1598,91 @@ install_agent_tools() {
     fi
   fi
   if [ "$#" -gt 0 ]; then
-    PACKAGE_INDEX=0
-    for PACKAGE_SPEC in "$@"; do
-      PACKAGE_INDEX=$((PACKAGE_INDEX + 1))
-      report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具包：$PACKAGE_SPEC"
-      if [ "$PACKAGE_SPEC" = opencode-ai@latest ]; then
-        PACKAGE_COMMAND='set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; npm install -g "$1"'
-      else
-        PACKAGE_COMMAND='npm install -g "$1"'
-      fi
-      if ! agent_tool_exec_logged "$CONTAINER" "npm-package-$PACKAGE_INDEX" \
-          sh -lc "$PACKAGE_COMMAND" agentbox "$PACKAGE_SPEC" >&2; then
-        echo "Agent tool package installation failed: $PACKAGE_SPEC" >&2
-        return 1
-      fi
+    NPM_PLAN=$(mktemp) || return 1
+    while [ "$#" -gt 0 ]; do
+      TOOL=$1
+      PACKAGE_SPEC=$2
+      shift 2
+      printf '%s\t%s\n' "$TOOL" "$PACKAGE_SPEC" >> "$NPM_PLAN"
+      report_agent_tool_progress "$TOOL" running "正在批量安装 Agent 工具包：$PACKAGE_SPEC"
     done
+    set --
+    TAB=$(printf '\t')
+    while IFS="$TAB" read -r TOOL PACKAGE_SPEC; do
+      set -- "$@" "$PACKAGE_SPEC"
+    done < "$NPM_PLAN"
+    if ! agent_tool_exec_logged "$CONTAINER" npm-packages sh -lc \
+        'set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; npm install -g "$@"' \
+        agentbox "$@" >&2; then
+      while IFS="$TAB" read -r TOOL PACKAGE_SPEC; do
+        report_agent_tool_progress "$TOOL" failed "Agent 工具包安装失败：$PACKAGE_SPEC"
+      done < "$NPM_PLAN"
+      rm -f "$NPM_PLAN"
+      echo "Agent tool package batch installation failed" >&2
+      return 1
+    fi
+    while IFS="$TAB" read -r TOOL PACKAGE_SPEC; do
+      report_agent_tool_progress "$TOOL" installed "Agent 工具包已安装，等待验证：$PACKAGE_SPEC"
+    done < "$NPM_PLAN"
+    rm -f "$NPM_PLAN"
   fi
   if [ "$INSTALL_PI" = true ]; then
-    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具：Pi"
+    report_agent_tool_progress pi running "正在安装 Agent 工具：Pi"
     if ! agent_tool_exec_logged "$CONTAINER" pi-cleanup npm uninstall -g @mariozechner/pi-coding-agent >&2; then
+      report_agent_tool_progress pi failed "Agent 工具包清理失败：Pi"
       echo "Agent tool package cleanup failed: pi" >&2
       return 1
     fi
     if ! agent_tool_exec_logged "$CONTAINER" pi npm install -g --force @earendil-works/pi-coding-agent@latest >&2; then
+      report_agent_tool_progress pi failed "Agent 工具安装失败：Pi"
       echo "Agent tool package installation failed: pi" >&2
       return 1
     fi
+    report_agent_tool_progress pi installed "Agent 工具已安装，等待验证：Pi"
   fi
   if [ "$INSTALL_OPENCODE" = true ]; then
-    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具：OpenCode"
+    report_agent_tool_progress opencode running "正在安装 Agent 工具：OpenCode"
     if ! install_boxlite_opencode "$CONTAINER" >&2; then
+      report_agent_tool_progress opencode failed "Agent 工具安装失败：OpenCode"
       echo "Agent tool package installation failed: opencode" >&2
       return 1
     fi
+    report_agent_tool_progress opencode installed "Agent 工具已安装，等待验证：OpenCode"
   fi
   for TOOL in $TOOLS; do
     COMMAND=$(agent_tool_command "$TOOL") || return 1
     if docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
       continue
     fi
-    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具：$TOOL"
+    report_agent_tool_progress "$TOOL" running "正在安装 Agent 工具：$TOOL"
     case "$TOOL" in
       antigravity)
         agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
-          'set -eu; case "$(uname -m)" in x86_64|amd64) PLATFORM=linux_amd64 ;; aarch64|arm64) PLATFORM=linux_arm64 ;; *) exit 1 ;; esac; TMP_DIR=$(mktemp -d); trap '\''rm -rf "$TMP_DIR"'\'' EXIT; MANIFEST=$(curl --connect-timeout 15 --max-time 60 -fsSL "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/$PLATFORM.json"); URL=$(printf "%s" "$MANIFEST" | jq -r .url); SHA512=$(printf "%s" "$MANIFEST" | jq -r .sha512); curl --connect-timeout 15 --max-time 300 -fsSL "$URL" -o "$TMP_DIR/agy.tar.gz"; printf "%s  %s\n" "$SHA512" "$TMP_DIR/agy.tar.gz" | sha512sum -c -; tar -xzf "$TMP_DIR/agy.tar.gz" -C "$TMP_DIR" antigravity; install -m 0755 "$TMP_DIR/antigravity" /usr/bin/agy' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
+          'set -eu; case "$(uname -m)" in x86_64|amd64) PLATFORM=linux_amd64 ;; aarch64|arm64) PLATFORM=linux_arm64 ;; *) exit 1 ;; esac; TMP_DIR=$(mktemp -d); trap '\''rm -rf "$TMP_DIR"'\'' EXIT; MANIFEST=$(curl --connect-timeout 15 --max-time 60 -fsSL "https://antigravity-cli-auto-updater-974169037036.us-central1.run.app/manifests/$PLATFORM.json"); URL=$(printf "%s" "$MANIFEST" | jq -r .url); SHA512=$(printf "%s" "$MANIFEST" | jq -r .sha512); curl --connect-timeout 15 --max-time 300 -fsSL "$URL" -o "$TMP_DIR/agy.tar.gz"; printf "%s  %s\n" "$SHA512" "$TMP_DIR/agy.tar.gz" | sha512sum -c -; tar -xzf "$TMP_DIR/agy.tar.gz" -C "$TMP_DIR" antigravity; install -m 0755 "$TMP_DIR/antigravity" /usr/bin/agy' >&2 || { report_agent_tool_progress "$TOOL" failed "Agent 工具安装失败：$TOOL"; echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
       cursor)
         agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
-          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://cursor.com/install -o "$INSTALLER"; bash "$INSTALLER"; if [ -x /root/.local/bin/cursor-agent ]; then ln -sf /root/.local/bin/cursor-agent /usr/bin/cursor-agent; elif [ -x /root/.cursor/bin/cursor-agent ]; then ln -sf /root/.cursor/bin/cursor-agent /usr/bin/cursor-agent; else exit 1; fi' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://cursor.com/install -o "$INSTALLER"; bash "$INSTALLER"; if [ -x /root/.local/bin/cursor-agent ]; then ln -sf /root/.local/bin/cursor-agent /usr/bin/cursor-agent; elif [ -x /root/.cursor/bin/cursor-agent ]; then ln -sf /root/.cursor/bin/cursor-agent /usr/bin/cursor-agent; else exit 1; fi' >&2 || { report_agent_tool_progress "$TOOL" failed "Agent 工具安装失败：$TOOL"; echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
       grok)
         agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
-          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://x.ai/cli/install.sh -o "$INSTALLER"; GROK_CHANNEL=stable GROK_BIN_DIR=/usr/local/bin bash "$INSTALLER"; test -x /usr/local/bin/grok' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://x.ai/cli/install.sh -o "$INSTALLER"; GROK_CHANNEL=stable GROK_BIN_DIR=/usr/local/bin bash "$INSTALLER"; test -x /usr/local/bin/grok' >&2 || { report_agent_tool_progress "$TOOL" failed "Agent 工具安装失败：$TOOL"; echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
       qwenpaw)
         agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
-          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -LsSf https://astral.sh/uv/install.sh -o "$INSTALLER"; sh "$INSTALLER" >/dev/null; timeout 3600 /root/.local/bin/uv tool install --python 3.12 qwenpaw; test -x /root/.local/bin/qwenpaw; ln -sf /root/.local/bin/qwenpaw /usr/bin/qwenpaw' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -LsSf https://astral.sh/uv/install.sh -o "$INSTALLER"; sh "$INSTALLER" >/dev/null; timeout 3600 /root/.local/bin/uv tool install --python 3.12 qwenpaw; test -x /root/.local/bin/qwenpaw; ln -sf /root/.local/bin/qwenpaw /usr/bin/qwenpaw' >&2 || { report_agent_tool_progress "$TOOL" failed "Agent 工具安装失败：$TOOL"; echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
     esac
+    report_agent_tool_progress "$TOOL" installed "Agent 工具已安装，等待验证：$TOOL"
   done
 
   VERSION_FILE=$(mktemp)
   printf '{}\n' > "$VERSION_FILE"
   for TOOL in $TOOLS; do
-    report_job_progress "$PROGRESS_STAGE" "正在验证 Agent 工具：$TOOL"
+    report_agent_tool_progress "$TOOL" verifying "正在验证 Agent 工具：$TOOL"
     COMMAND=$(agent_tool_command "$TOOL") || { rm -f "$VERSION_FILE"; return 1; }
     docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null" || {
+      report_agent_tool_progress "$TOOL" failed "Agent 工具验证失败：$TOOL"
       echo "Agent tool $TOOL was installed but command $COMMAND is unavailable" >&2
       rm -f "$VERSION_FILE"
       return 1
@@ -1657,6 +1693,7 @@ install_agent_tools() {
     jq --arg tool "$TOOL" --arg version "$VERSION" '. + {($tool): $version}' \
       "$VERSION_FILE" > "$NEXT_VERSION_FILE"
     mv "$NEXT_VERSION_FILE" "$VERSION_FILE"
+    report_agent_tool_progress "$TOOL" succeeded "Agent 工具已就绪：$TOOL"
   done
   if ! agent_tool_exec "$CONTAINER" mkdir -p /opt/agentbox ||
      ! agent_tool_exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json ||
@@ -1673,12 +1710,15 @@ best_cached_agent_base() {
   REQUESTED_TOOLS=$2
   NOW=$3
   TTL_SECONDS=$4
+  INSTALLER_REVISION=$5
   REQUESTED_COUNT=$(printf '%s\n' "$REQUESTED_TOOLS" | grep -c .)
   BEST_IMAGE=$BASE_IMAGE
   BEST_COUNT=0
   for IMAGE_ID in $(docker image ls -q --filter label=agentbox.runtime.cache=true | sort -u); do
     CANDIDATE_BASE=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.base" }}' "$IMAGE_ID" 2>/dev/null || true)
     [ "$CANDIDATE_BASE" = "$BASE_IMAGE" ] || continue
+    CANDIDATE_INSTALLER_REVISION=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.installer-revision" }}' "$IMAGE_ID" 2>/dev/null || true)
+    [ "$CANDIDATE_INSTALLER_REVISION" = "$INSTALLER_REVISION" ] || continue
     CANDIDATE_REFRESHED=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.refreshed" }}' "$IMAGE_ID" 2>/dev/null || true)
     case "$CANDIDATE_REFRESHED" in ''|*[!0-9]*) continue ;; esac
     CANDIDATE_AGE=$((NOW - CANDIDATE_REFRESHED))
@@ -1717,7 +1757,7 @@ prepare_agent_image() {
   command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
 
   TOOL_SET=$(printf '%s\n' "$TOOLS" | paste -sd, -)
-  INSTALLER_REVISION=6
+  INSTALLER_REVISION=7
   CACHE_KEY=$(printf '%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
   CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
@@ -1747,7 +1787,7 @@ prepare_agent_image() {
   esac
 
   report_job_progress agent-image "Agent 工具镜像缓存未命中，正在构建" miss "$CACHE_MISS_REASON"
-  BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS")
+  BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS" "$INSTALLER_REVISION")
   if [ "$BUILD_BASE_IMAGE" != "$BASE_IMAGE" ]; then
     report_job_progress agent-image "正在复用兼容的 Agent 工具缓存" partial compatible-subset
   fi

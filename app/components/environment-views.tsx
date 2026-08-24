@@ -1,13 +1,15 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import Link from "next/link"
 import {
   BotIcon,
   BoxIcon,
   CheckCircle2Icon,
+  ChevronDownIcon,
   ChevronRightIcon,
+  CircleIcon,
   ContainerIcon,
   KeyRoundIcon,
   LayoutTemplateIcon,
@@ -46,6 +48,11 @@ import {
   CardTitle,
 } from "@/components/ui/card"
 import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible"
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -73,15 +80,19 @@ import {
 import { Progress } from "@/components/ui/progress"
 import {
   provisioningProgressSchema,
+  type ProvisioningProgress,
   type Resource,
 } from "@/lib/platform-schema"
 import {
+  provisioningAgentToolStatusLabel,
   provisioningCacheLabel,
   provisioningDuration,
   provisioningStageLabel,
 } from "@/lib/provisioning"
+import { agentToolOptions } from "@/lib/agent-tools"
 import { runtimeInventoryImages } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
+import { cn } from "@/lib/utils"
 
 type EnvironmentProps = {
   resources: Resource[]
@@ -1041,26 +1052,29 @@ function SandboxDetailsDialog({
   const provisioning = provisioningResult.success
     ? provisioningResult.data
     : null
+  const isProvisioning = provisioning?.status === "running"
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!isProvisioning) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [isProvisioning])
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[calc(100dvh-2rem)] gap-3 overflow-y-auto sm:max-w-3xl">
         <DialogHeader className="gap-1 pr-8">
           <DialogTitle>{sandbox.name}</DialogTitle>
-          <DialogDescription>
-            沙箱模板、运行位置与配置概览。
-          </DialogDescription>
+          <DialogDescription>沙箱模板、运行位置与配置概览。</DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-3">
+        <div className="flex flex-col gap-3">
           <div className="overflow-hidden rounded-xl border">
             <div className="grid gap-x-4 gap-y-2.5 p-3 sm:grid-cols-3">
               <Detail label="状态" value={sandboxStatus(sandbox)} />
               <Detail label="服务器" value={server?.name ?? "未知服务器"} />
-              <Detail
-                label="沙箱模板"
-                value={environment?.name ?? "未绑定"}
-              />
+              <Detail label="沙箱模板" value={environment?.name ?? "未绑定"} />
               <Detail label="实例" value={externalId} mono />
               <Detail
                 label="沙箱内 Agent"
@@ -1069,9 +1083,7 @@ function SandboxDetailsDialog({
               <Detail
                 label="模型凭据"
                 value={
-                  credentials.length > 0
-                    ? `${credentials.length} 个`
-                    : "未配置"
+                  credentials.length > 0 ? `${credentials.length} 个` : "未配置"
                 }
               />
             </div>
@@ -1084,7 +1096,7 @@ function SandboxDetailsDialog({
                 />
                 <Detail
                   label="累计耗时"
-                  value={provisioningDuration(provisioning.durationMs)}
+                  value={provisioningElapsedDuration(provisioning, now)}
                 />
                 <Detail
                   label="工具缓存"
@@ -1101,6 +1113,15 @@ function SandboxDetailsDialog({
               </div>
             )}
           </div>
+
+          {tools.length > 0 && provisioning && (
+            <AgentToolProgressPanel
+              key={`${sandbox.id}:${provisioning.status}`}
+              tools={tools}
+              provisioning={provisioning}
+              now={now}
+            />
+          )}
 
           {failureMessage && (
             <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-3">
@@ -1141,6 +1162,188 @@ function SandboxDetailsDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
+  )
+}
+
+const activeAgentToolStatuses = new Set(["running", "installed", "verifying"])
+const finishedAgentToolStatuses = new Set(["succeeded", "failed", "cached"])
+const agentToolLabels = new Map<string, string>(
+  agentToolOptions.map((option) => [option.value, option.label])
+)
+
+function AgentToolProgressPanel({
+  tools,
+  provisioning,
+  now,
+}: {
+  tools: string[]
+  provisioning: ProvisioningProgress
+  now: number
+}) {
+  const isProvisioning = provisioning.status === "running"
+  const [open, setOpen] = useState(isProvisioning)
+
+  const reported = new Map(
+    provisioning.agentTools.map((progress) => [progress.tool, progress])
+  )
+  const items = tools.map((tool) => {
+    const progress = reported.get(tool)
+    let status = progress?.status ?? "pending"
+    if (
+      !progress &&
+      provisioning.cacheStatus === "hit" &&
+      provisioning.cacheReason === "exact-cache"
+    ) {
+      status = "cached"
+    } else if (!progress && provisioning.status === "succeeded") {
+      status = provisioning.cacheStatus === "hit" ? "cached" : "succeeded"
+    }
+    return { tool, progress, status }
+  })
+  const settled = items.filter((item) =>
+    finishedAgentToolStatuses.has(item.status)
+  ).length
+  const installed = items.filter(
+    (item) => item.status !== "pending" && item.status !== "running"
+  ).length
+  const failed = items.filter((item) => item.status === "failed").length
+  const progressValue = tools.length > 0 ? (installed / tools.length) * 100 : 0
+
+  return (
+    <Collapsible
+      className="overflow-hidden rounded-xl border bg-muted/10"
+      open={open}
+      onOpenChange={setOpen}
+    >
+      <div className="flex flex-col gap-2.5 p-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-medium">Agent 安装进度</p>
+              <Badge variant={failed > 0 ? "destructive" : "outline"}>
+                {failed > 0
+                  ? `${failed} 个失败`
+                  : provisioning.status === "running"
+                    ? `${installed}/${tools.length} 已安装`
+                    : `${settled}/${tools.length}`}
+              </Badge>
+            </div>
+            <p className="mt-1 truncate text-xs text-muted-foreground">
+              {provisioning.message || "等待 Worker 上报安装状态"}
+            </p>
+          </div>
+          <CollapsibleTrigger asChild>
+            <Button variant="ghost" size="sm">
+              {open ? "收起" : "查看"}
+              <ChevronDownIcon
+                data-icon="inline-end"
+                className={cn(
+                  "transition-transform duration-200",
+                  open && "rotate-180"
+                )}
+              />
+            </Button>
+          </CollapsibleTrigger>
+        </div>
+        <Progress
+          aria-label={`Agent 安装进度 ${installed}/${tools.length}`}
+          value={progressValue}
+        />
+      </div>
+
+      <CollapsibleContent>
+        <ul className="border-t">
+          {items.map(({ tool, progress, status }, index) => (
+            <li
+              className={cn(
+                "grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3 px-3 py-2.5",
+                index > 0 && "border-t",
+                activeAgentToolStatuses.has(status) && "bg-muted/40"
+              )}
+              key={tool}
+            >
+              <div className="flex min-w-0 items-center gap-2.5">
+                <AgentToolProgressIcon status={status} />
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium">
+                    {agentToolLabels.get(tool) ?? tool}
+                  </p>
+                  <p
+                    className="truncate text-xs text-muted-foreground"
+                    title={progress?.message}
+                  >
+                    {agentToolProgressMessage(progress?.message, status)}
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center justify-end gap-2">
+                <Badge variant={agentToolStatusBadge(status)}>
+                  {provisioningAgentToolStatusLabel(status)}
+                </Badge>
+                <span className="min-w-14 text-right font-mono text-xs text-muted-foreground tabular-nums">
+                  {agentToolDuration(progress, now)}
+                </span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      </CollapsibleContent>
+    </Collapsible>
+  )
+}
+
+function AgentToolProgressIcon({ status }: { status: string }) {
+  if (activeAgentToolStatuses.has(status)) {
+    return (
+      <LoaderCircleIcon className="size-4 shrink-0 animate-spin text-muted-foreground" />
+    )
+  }
+  if (status === "failed") {
+    return <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
+  }
+  if (status === "succeeded" || status === "cached") {
+    return <CheckCircle2Icon className="size-4 shrink-0 text-primary" />
+  }
+  return <CircleIcon className="size-4 shrink-0 text-muted-foreground" />
+}
+
+function agentToolStatusBadge(status: string) {
+  if (status === "failed") return "destructive" as const
+  if (activeAgentToolStatuses.has(status)) return "secondary" as const
+  return "outline" as const
+}
+
+function agentToolProgressMessage(message: string | undefined, status: string) {
+  if (message) return message
+  if (status === "cached") return "由缓存镜像提供"
+  if (status === "succeeded") return "旧任务未记录单项耗时"
+  return "等待开始"
+}
+
+function agentToolDuration(
+  progress: ProvisioningProgress["agentTools"][number] | undefined,
+  now: number
+) {
+  if (!progress?.startedAt) return "—"
+  const startedAt = Date.parse(progress.startedAt)
+  const finishedAt = progress.finishedAt ? Date.parse(progress.finishedAt) : now
+  if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt)) return "—"
+  return provisioningDuration(
+    Math.max(progress.durationMs, finishedAt - startedAt)
+  )
+}
+
+function provisioningElapsedDuration(
+  progress: ProvisioningProgress,
+  now: number
+) {
+  const startedAt = progress.startedAt ? Date.parse(progress.startedAt) : NaN
+  const liveDuration =
+    progress.status === "running" && Number.isFinite(startedAt)
+      ? now - startedAt
+      : 0
+  return provisioningDuration(
+    Math.max(0, progress.durationMs, liveDuration)
   )
 }
 

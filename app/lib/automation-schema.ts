@@ -101,6 +101,7 @@ export const automationRunSchema = z.object({
     finishedAt: null,
     durationMs: 0,
     timings: [],
+    agentTools: [],
   }),
 })
 

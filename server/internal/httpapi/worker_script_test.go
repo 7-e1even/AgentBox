@@ -150,8 +150,8 @@ func TestWorkerPreconfiguresClaudeCodeOnboarding(t *testing.T) {
 func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 	for _, expected := range []string{
 		`codebuddy) PACKAGE='@tencent-ai/codebuddy-code'`,
-		`deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue`,
-		`set -- "$@" "$PACKAGE@latest"`,
+		`deepseek-harness) PACKAGE='@deepseek-ai/dsh@0.1.0-rc.7'`,
+		`set -- "$@" "$TOOL" "$PACKAGE_SPEC"`,
 		`grok) continue`,
 		`https://x.ai/cli/install.sh`,
 		`GROK_CHANNEL=stable GROK_BIN_DIR=/usr/local/bin bash "$INSTALLER"`,
@@ -253,12 +253,10 @@ func TestWorkerKeepsLargeBoxLiteAgentToolOutputOffAttachStream(t *testing.T) {
 		`Agent tool installation timed out after ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800} seconds`,
 		`tail -c 3000 "$1"`,
 		`agent_tool_exec_logged "$CONTAINER" prerequisites sh -lc`,
-		`for PACKAGE_SPEC in "$@"; do`,
-		`agent_tool_exec_logged "$CONTAINER" "npm-package-$PACKAGE_INDEX"`,
-		`PACKAGE_COMMAND='set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; npm install -g "$1"'`,
-		`PACKAGE_COMMAND='npm install -g "$1"'`,
-		`sh -lc "$PACKAGE_COMMAND" agentbox "$PACKAGE_SPEC"`,
-		`Agent tool package installation failed: $PACKAGE_SPEC`,
+		`NPM_PLAN=$(mktemp)`,
+		`agent_tool_exec_logged "$CONTAINER" npm-packages sh -lc`,
+		`npm install -g "$@"`,
+		`Agent tool package batch installation failed`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("BoxLite quiet Agent tool install is missing %q", expected)
@@ -274,7 +272,7 @@ func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
 		`major === 22 && minor >= 19`,
 		`apiKey: ("$AGENTBOX_KEY_" + (.id | env_id))`,
-		`INSTALLER_REVISION=6`,
+		`INSTALLER_REVISION=7`,
 		`LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
@@ -302,7 +300,8 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 		`command -v $COMMAND >/dev/null`,
 		`curl --connect-timeout 15 --max-time 300`,
 		`best_cached_agent_base()`,
-		`BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS")`,
+		`CANDIDATE_INSTALLER_REVISION=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.installer-revision" }}' "$IMAGE_ID" 2>/dev/null || true)`,
+		`BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS" "$INSTALLER_REVISION")`,
 		`report_job_progress agent-image "已命中 Agent 工具镜像缓存" hit exact-cache`,
 		`report_job_progress agent-image "Agent 工具镜像缓存未命中，正在构建" miss "$CACHE_MISS_REASON"`,
 	} {
@@ -328,8 +327,11 @@ func TestWorkerReportsProvisioningStagesWithoutBlockingJobs(t *testing.T) {
 		`report_job_progress configuration "正在写入沙箱配置"`,
 		`report_job_progress setup "正在执行模板初始化命令"`,
 		`report_job_progress verify "正在验证沙箱可用性"`,
-		`report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具包：$PACKAGE_SPEC"`,
-		`report_job_progress "$PROGRESS_STAGE" "正在验证 Agent 工具：$TOOL"`,
+		`report_agent_tool_progress()`,
+		`--arg agentTool "$AGENT_TOOL" --arg agentToolStatus "$AGENT_TOOL_STATUS"`,
+		`report_agent_tool_progress "$TOOL" running`,
+		`report_agent_tool_progress "$TOOL" verifying`,
+		`report_agent_tool_progress "$TOOL" succeeded`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("Worker provisioning progress is missing %q", expected)

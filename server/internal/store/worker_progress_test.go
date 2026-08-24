@@ -69,3 +69,53 @@ func TestProvisioningHeartbeatDoesNotRestartCurrentStage(t *testing.T) {
 		t.Fatalf("stage start changed to %v", progress.StageStartedAt)
 	}
 }
+
+func TestProvisioningProgressTracksAgentToolStatusAndDuration(t *testing.T) {
+	startedAt := time.Date(2026, time.August, 24, 10, 0, 0, 0, time.UTC)
+	progress := advanceProvisioningProgress(platform.ProvisioningProgress{}, platform.WorkerJobProgressInput{
+		Stage: "agent-image", Message: "正在安装 Codex",
+		AgentTool: "codex", AgentToolStatus: "running",
+	}, startedAt)
+	progress = advanceProvisioningProgress(progress, platform.WorkerJobProgressInput{
+		Stage: "agent-image", Message: "Codex 已安装，等待验证",
+		AgentTool: "codex", AgentToolStatus: "installed",
+	}, startedAt.Add(2*time.Second))
+	progress = advanceProvisioningProgress(progress, platform.WorkerJobProgressInput{
+		Stage: "agent-image", Message: "正在验证 Codex",
+		AgentTool: "codex", AgentToolStatus: "verifying",
+	}, startedAt.Add(3*time.Second))
+	progress = advanceProvisioningProgress(progress, platform.WorkerJobProgressInput{
+		Stage: "agent-image", Message: "Codex 已就绪",
+		AgentTool: "codex", AgentToolStatus: "succeeded",
+	}, startedAt.Add(4*time.Second))
+	progress = advanceProvisioningProgress(progress, platform.WorkerJobProgressInput{
+		Stage: "agent-image", Message: "已复用 Grok 缓存",
+		AgentTool: "grok", AgentToolStatus: "cached",
+	}, startedAt.Add(5*time.Second))
+
+	if len(progress.AgentTools) != 2 {
+		t.Fatalf("agent tool progress = %d, want 2", len(progress.AgentTools))
+	}
+	if codex := progress.AgentTools[0]; codex.Status != "succeeded" || codex.DurationMS != 4000 || codex.FinishedAt == nil {
+		t.Fatalf("codex progress = %+v", codex)
+	}
+	if grok := progress.AgentTools[1]; grok.Status != "cached" || grok.DurationMS != 0 || grok.FinishedAt == nil {
+		t.Fatalf("grok progress = %+v", grok)
+	}
+}
+
+func TestProvisioningFailureClosesRunningAgentTool(t *testing.T) {
+	startedAt := time.Date(2026, time.August, 24, 10, 0, 0, 0, time.UTC)
+	progress := advanceProvisioningProgress(platform.ProvisioningProgress{}, platform.WorkerJobProgressInput{
+		Stage: "agent-image", Message: "正在安装 Grok",
+		AgentTool: "grok", AgentToolStatus: "running",
+	}, startedAt)
+	progress = finishProvisioningProgress(progress, platform.WorkerJobResult{
+		Success: false, Message: "Grok 下载失败",
+	}, startedAt.Add(5*time.Second))
+
+	tool := progress.AgentTools[0]
+	if tool.Status != "failed" || tool.DurationMS != 5000 || tool.Message != "Grok 下载失败" {
+		t.Fatalf("grok failure progress = %+v", tool)
+	}
+}

@@ -216,10 +216,12 @@ type WorkerJobResult struct {
 }
 
 type WorkerJobProgressInput struct {
-	Stage       string `json:"stage"`
-	Message     string `json:"message"`
-	CacheStatus string `json:"cacheStatus,omitempty"`
-	CacheReason string `json:"cacheReason,omitempty"`
+	Stage           string `json:"stage"`
+	Message         string `json:"message"`
+	CacheStatus     string `json:"cacheStatus,omitempty"`
+	CacheReason     string `json:"cacheReason,omitempty"`
+	AgentTool       string `json:"agentTool,omitempty"`
+	AgentToolStatus string `json:"agentToolStatus,omitempty"`
 }
 
 type ProvisioningStageTiming struct {
@@ -227,6 +229,15 @@ type ProvisioningStageTiming struct {
 	StartedAt  time.Time `json:"startedAt"`
 	FinishedAt time.Time `json:"finishedAt"`
 	DurationMS int64     `json:"durationMs"`
+}
+
+type ProvisioningAgentTool struct {
+	Tool       string     `json:"tool"`
+	Status     string     `json:"status"`
+	Message    string     `json:"message,omitempty"`
+	StartedAt  *time.Time `json:"startedAt,omitempty"`
+	FinishedAt *time.Time `json:"finishedAt,omitempty"`
+	DurationMS int64      `json:"durationMs,omitempty"`
 }
 
 type ProvisioningProgress struct {
@@ -241,6 +252,7 @@ type ProvisioningProgress struct {
 	FinishedAt     *time.Time                `json:"finishedAt,omitempty"`
 	DurationMS     int64                     `json:"durationMs,omitempty"`
 	Timings        []ProvisioningStageTiming `json:"timings,omitempty"`
+	AgentTools     []ProvisioningAgentTool   `json:"agentTools,omitempty"`
 }
 
 type ValidationError struct{ Message string }
