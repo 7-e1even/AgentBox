@@ -4,16 +4,14 @@ export type AgentToolOption = {
 }
 
 export type AgentProtocol =
-  | "openai-responses"
-  | "openai-chat"
-  | "anthropic"
-  | "gemini"
+  "openai-responses" | "openai-chat" | "anthropic" | "gemini"
 
 export const supportedAgentToolIds = [
   "claude-code",
   "codex",
   "deepseek-harness",
   "gemini-cli",
+  "grok",
   "kimi",
   "opencode",
   "pi",
@@ -27,6 +25,7 @@ export const agentToolOptions: AgentToolOption[] = [
   { value: "codex", label: "Codex" },
   { value: "deepseek-harness", label: "DeepSeek Harness" },
   { value: "gemini-cli", label: "Gemini CLI" },
+  { value: "grok", label: "Grok Build" },
   { value: "kimi", label: "Kimi Code" },
   { value: "opencode", label: "OpenCode" },
   { value: "pi", label: "Pi" },
@@ -45,6 +44,7 @@ const agentToolProtocols: Record<AgentToolId, readonly AgentProtocol[]> = {
     "gemini",
   ],
   "gemini-cli": ["gemini", "anthropic", "openai-chat", "openai-responses"],
+  grok: ["openai-responses", "anthropic", "openai-chat"],
   kimi: ["anthropic", "openai-chat", "openai-responses"],
   opencode: ["anthropic", "openai-chat", "openai-responses", "gemini"],
   pi: ["anthropic", "openai-chat", "openai-responses", "gemini"],
@@ -66,6 +66,7 @@ export function incompatibleAgentTools(
 ) {
   const available = new Set(protocols)
   return supportedAgentToolList(tools).filter(
-    (tool) => !agentToolProtocols[tool].some((protocol) => available.has(protocol))
+    (tool) =>
+      !agentToolProtocols[tool].some((protocol) => available.has(protocol))
   )
 }

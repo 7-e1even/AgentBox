@@ -11,6 +11,7 @@ describe("incompatibleAgentTools", () => {
           "codex",
           "deepseek-harness",
           "gemini-cli",
+          "grok",
           "kimi",
           "opencode",
           "pi",
@@ -29,6 +30,7 @@ describe("incompatibleAgentTools", () => {
           "codex",
           "deepseek-harness",
           "gemini-cli",
+          "grok",
           "kimi",
           "opencode",
           "pi",
@@ -47,6 +49,7 @@ describe("incompatibleAgentTools", () => {
           "codex",
           "deepseek-harness",
           "gemini-cli",
+          "grok",
           "kimi",
           "opencode",
           "pi",
@@ -59,5 +62,10 @@ describe("incompatibleAgentTools", () => {
 
   it("routes Gemini credentials through the Chat facade for DeepSeek Harness", () => {
     expect(incompatibleAgentTools(["deepseek-harness"], ["gemini"])).toEqual([])
+  })
+
+  it("routes Grok Build through the Responses facade", () => {
+    expect(incompatibleAgentTools(["grok"], ["openai-responses"])).toEqual([])
+    expect(incompatibleAgentTools(["grok"], ["anthropic"])).toEqual([])
   })
 })

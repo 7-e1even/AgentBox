@@ -32,6 +32,7 @@ var allowedAgentTools = map[string]bool{
 	"codex":            true,
 	"deepseek-harness": true,
 	"gemini-cli":       true,
+	"grok":             true,
 	"kimi":             true,
 	"opencode":         true,
 	"pi":               true,

@@ -150,9 +150,12 @@ func TestWorkerPreconfiguresClaudeCodeOnboarding(t *testing.T) {
 func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 	for _, expected := range []string{
 		`codebuddy) PACKAGE='@tencent-ai/codebuddy-code'`,
-		`deepseek-harness) PACKAGE='@deepseek-ai/dsh'`,
+		`deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue`,
 		`set -- "$@" "$PACKAGE@latest"`,
-		`grok) PACKAGE='@xai-official/grok'`,
+		`grok) continue`,
+		`https://x.ai/cli/install.sh`,
+		`GROK_CHANNEL=stable GROK_BIN_DIR=/usr/local/bin bash "$INSTALLER"`,
+		`test -x /usr/local/bin/grok`,
 		`kimi) PACKAGE='@moonshot-ai/kimi-code'`,
 		`omp) PACKAGE='@oh-my-pi/pi-coding-agent'`,
 		`openclaw) PACKAGE='openclaw'`,
@@ -182,6 +185,9 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("extended Agent support is missing %q", expected)
 		}
+	}
+	if strings.Contains(workerDaemon, "@xai-official/grok") {
+		t.Fatal("Grok Build must use the official released binary installer")
 	}
 }
 
@@ -268,7 +274,7 @@ func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
 		`major === 22 && minor >= 19`,
 		`apiKey: ("$AGENTBOX_KEY_" + (.id | env_id))`,
-		`INSTALLER_REVISION=4`,
+		`INSTALLER_REVISION=6`,
 		`LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
@@ -450,6 +456,10 @@ func TestWorkerConfiguresExtendedAgentCredentials(t *testing.T) {
 		`cat > /root/.qwen/settings.json`,
 		`append_env "$ENV_FILE" CURSOR_API_KEY "$SECRET"`,
 		`append_env "$ENV_FILE" XAI_API_KEY "$SECRET"`,
+		`GROK_CREDENTIAL=$(jq -c '`,
+		`GROK_ENDPOINT=$(printf '%s' "$GROK_CREDENTIAL" | jq -r '.openaiEndpoint')`,
+		`cat > /root/.grok/config.toml`,
+		`default = "agentbox"`,
 		`append_env "$ENV_FILE" QODERCN_PERSONAL_ACCESS_TOKEN "$SECRET"`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {

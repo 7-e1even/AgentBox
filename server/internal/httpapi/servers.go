@@ -1537,9 +1537,9 @@ install_agent_tools() {
       codex) PACKAGE='@openai/codex' ;;
       claude-code) PACKAGE='@anthropic-ai/claude-code' ;;
       codebuddy) PACKAGE='@tencent-ai/codebuddy-code' ;;
-      deepseek-harness) PACKAGE='@deepseek-ai/dsh' ;;
+      deepseek-harness) set -- "$@" '@deepseek-ai/dsh@0.1.0-rc.7'; continue ;;
       gemini-cli) PACKAGE='@google/gemini-cli' ;;
-      grok) PACKAGE='@xai-official/grok' ;;
+      grok) continue ;;
       kimi) PACKAGE='@moonshot-ai/kimi-code' ;;
       omp) PACKAGE='@oh-my-pi/pi-coding-agent' ;;
       openclaw) PACKAGE='openclaw' ;;
@@ -1630,6 +1630,10 @@ install_agent_tools() {
         agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
           'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://cursor.com/install -o "$INSTALLER"; bash "$INSTALLER"; if [ -x /root/.local/bin/cursor-agent ]; then ln -sf /root/.local/bin/cursor-agent /usr/bin/cursor-agent; elif [ -x /root/.cursor/bin/cursor-agent ]; then ln -sf /root/.cursor/bin/cursor-agent /usr/bin/cursor-agent; else exit 1; fi' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
         ;;
+      grok)
+        agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
+          'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://x.ai/cli/install.sh -o "$INSTALLER"; GROK_CHANNEL=stable GROK_BIN_DIR=/usr/local/bin bash "$INSTALLER"; test -x /usr/local/bin/grok' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
+        ;;
       qwenpaw)
         agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
           'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -LsSf https://astral.sh/uv/install.sh -o "$INSTALLER"; sh "$INSTALLER" >/dev/null; timeout 3600 /root/.local/bin/uv tool install --python 3.12 qwenpaw; test -x /root/.local/bin/qwenpaw; ln -sf /root/.local/bin/qwenpaw /usr/bin/qwenpaw' >&2 || { echo "Agent tool package installation failed: $TOOL" >&2; return 1; }
@@ -1713,7 +1717,7 @@ prepare_agent_image() {
   command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
 
   TOOL_SET=$(printf '%s\n' "$TOOLS" | paste -sd, -)
-  INSTALLER_REVISION=4
+  INSTALLER_REVISION=6
   CACHE_KEY=$(printf '%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
   CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
@@ -2084,6 +2088,27 @@ configure_credentials() {
     docker exec "$CONTAINER" mkdir -p /root/.codex
     docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.codex/config.toml' < "$CODEX_CONFIG"
     rm -f "$CODEX_CONFIG"
+  fi
+
+  if jq -e '.job.payload.agentTools | index("grok")' "$JOB_FILE" >/dev/null; then
+    GROK_CREDENTIAL=$(jq -c '
+      ([.job.payload.credentials[] | select(.protocol == "openai-responses")][0] //
+       [.job.payload.credentials[] | select(.protocol == "anthropic")][0] //
+       [.job.payload.credentials[] | select(.protocol == "openai-chat")][0] // empty)
+    ' "$JOB_FILE")
+    if [ -n "$GROK_CREDENTIAL" ]; then
+      GROK_ID=$(printf '%s' "$GROK_CREDENTIAL" | jq -r '.id')
+      GROK_ENV_ID=$(printf '%s' "$GROK_ID" | tr '[:lower:]-' '[:upper:]_')
+      GROK_ENDPOINT=$(printf '%s' "$GROK_CREDENTIAL" | jq -r '.openaiEndpoint')
+      GROK_MODEL=$(printf '%s' "$GROK_CREDENTIAL" | jq -r '.modelId')
+      GROK_CONFIG=$(mktemp)
+      printf '[model.agentbox]\nmodel = %s\nbase_url = %s\nname = "AgentBox"\nenv_key = "AGENTBOX_KEY_%s"\n\n[models]\ndefault = "agentbox"\n\n[cli]\ninstaller = "internal"\n' \
+        "$(printf '%s' "$GROK_MODEL" | jq -Rs .)" \
+        "$(printf '%s' "$GROK_ENDPOINT" | jq -Rs .)" "$GROK_ENV_ID" > "$GROK_CONFIG"
+      docker exec "$CONTAINER" mkdir -p /root/.grok
+      docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.grok/config.toml' < "$GROK_CONFIG"
+      rm -f "$GROK_CONFIG"
+    fi
   fi
 
   if jq -e '.job.payload.agentTools | index("gemini-cli")' "$JOB_FILE" >/dev/null &&
