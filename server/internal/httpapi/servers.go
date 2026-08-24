@@ -627,7 +627,7 @@ refresh_boxlite_images() {
 worker_local_oci_image() {
   IMAGE=$1
   command -v docker >/dev/null || return 2
-  command docker info >/dev/null 2>&1 || return 2
+  timeout 10 docker info >/dev/null 2>&1 || return 2
   IMAGE_JSON=$(command docker image inspect "$IMAGE" 2>/dev/null) || return 2
   IMAGE_ID=$(printf '%s' "$IMAGE_JSON" | jq -r '.[0].Id // empty')
   IMAGE_OS=$(printf '%s' "$IMAGE_JSON" | jq -r '.[0].Os // empty')
@@ -1005,7 +1005,7 @@ docker() {
 
 worker_capabilities() {
   CAPS=
-  command -v docker >/dev/null && docker info >/dev/null 2>&1 && CAPS='"docker"'
+  command -v docker >/dev/null && timeout 10 docker info >/dev/null 2>&1 && CAPS='"docker"'
   if [ -c /dev/kvm ]; then
     [ -n "$CAPS" ] && CAPS="$CAPS,"
     CAPS="$CAPS\"kvm-device\""
@@ -1028,7 +1028,7 @@ worker_capabilities() {
 worker_inventory() {
 	ARCH=$(worker_arch)
 	DOCKER_IMAGES='[]'
-  if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+  if command -v docker >/dev/null && timeout 10 docker info >/dev/null 2>&1; then
     DOCKER_IMAGES=$(docker image ls --no-trunc --format '{{json .}}' 2>/dev/null | jq -s --arg arch "$ARCH" '
       map(select((.Repository | startswith("agentbox/runtime-")) | not) | {
         id: .ID,
@@ -1106,6 +1106,24 @@ complete_job() {
     -H "Authorization: Bearer $CREDENTIAL" \
     -H 'Content-Type: application/json' \
     --data "$BODY" >/dev/null
+}
+
+report_job_progress() {
+  [ -n "${JOB_ID:-}" ] || return 0
+  STAGE=$1
+  MESSAGE=$2
+  CACHE_STATUS=${3:-}
+  CACHE_REASON=${4:-}
+  BODY=$(jq -n --arg stage "$STAGE" --arg message "$MESSAGE" \
+    --arg cacheStatus "$CACHE_STATUS" --arg cacheReason "$CACHE_REASON" \
+    '{stage:$stage,message:$message,
+      cacheStatus:(if $cacheStatus == "" then null else $cacheStatus end),
+      cacheReason:(if $cacheReason == "" then null else $cacheReason end)}') || return 0
+  curl -fsS -X POST \
+    "$SERVER_URL/api/servers/$SERVER_ID/jobs/$JOB_ID/progress" \
+    -H "Authorization: Bearer $CREDENTIAL" \
+    -H 'Content-Type: application/json' \
+    --data "$BODY" >/dev/null 2>&1 || true
 }
 
 finalize_worker_update() {
@@ -1497,8 +1515,10 @@ install_boxlite_opencode() {
 install_agent_tools() {
   CONTAINER=$1
   JOB_FILE=$2
+  PROGRESS_STAGE=${AGENTBOX_AGENT_TOOL_PROGRESS_STAGE:-agent-tools}
   TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u)
   [ -n "$TOOLS" ] || return 0
+  report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具依赖"
   if ! agent_tool_exec_logged "$CONTAINER" prerequisites sh -lc \
       'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git jq unzip python3' >&2; then
     echo "Agent tool prerequisite installation failed" >&2
@@ -1545,6 +1565,7 @@ install_agent_tools() {
 
   if printf '%s\n' "$TOOLS" | grep -qx omp &&
      ! docker exec "$CONTAINER" sh -lc 'command -v bun >/dev/null'; then
+    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具运行时：Bun"
     if ! agent_tool_exec_logged "$CONTAINER" bun sh -lc \
         'set -eu; INSTALLER=$(mktemp); trap '\''rm -f "$INSTALLER"'\'' EXIT; curl --connect-timeout 15 --max-time 300 -fsSL https://bun.sh/install -o "$INSTALLER"; bash "$INSTALLER" >/dev/null; test -x /root/.bun/bin/bun; ln -sf /root/.bun/bin/bun /usr/bin/bun' >&2; then
       echo "Agent tool runtime installation failed: bun" >&2
@@ -1552,6 +1573,7 @@ install_agent_tools() {
     fi
   fi
   if [ "$#" -gt 0 ] || [ "$INSTALL_PI" = true ]; then
+    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具运行时：Node.js"
     if ! agent_tool_exec_logged "$CONTAINER" node sh -lc \
         'if ! node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\'' 2>/dev/null; then curl -fsSL https://deb.nodesource.com/setup_22.x | sh; export DEBIAN_FRONTEND=noninteractive; apt-get install -y nodejs; fi; node -e '\''const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major > 22 || (major === 22 && minor >= 19) ? 0 : 1)'\''' >&2; then
       echo "Agent tool runtime installation failed: Node.js 22.19 or newer is required" >&2
@@ -1562,6 +1584,7 @@ install_agent_tools() {
     PACKAGE_INDEX=0
     for PACKAGE_SPEC in "$@"; do
       PACKAGE_INDEX=$((PACKAGE_INDEX + 1))
+      report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具包：$PACKAGE_SPEC"
       if [ "$PACKAGE_SPEC" = opencode-ai@latest ]; then
         PACKAGE_COMMAND='set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; npm install -g "$1"'
       else
@@ -1575,6 +1598,7 @@ install_agent_tools() {
     done
   fi
   if [ "$INSTALL_PI" = true ]; then
+    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具：Pi"
     if ! agent_tool_exec_logged "$CONTAINER" pi-cleanup npm uninstall -g @mariozechner/pi-coding-agent >&2; then
       echo "Agent tool package cleanup failed: pi" >&2
       return 1
@@ -1585,6 +1609,7 @@ install_agent_tools() {
     fi
   fi
   if [ "$INSTALL_OPENCODE" = true ]; then
+    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具：OpenCode"
     if ! install_boxlite_opencode "$CONTAINER" >&2; then
       echo "Agent tool package installation failed: opencode" >&2
       return 1
@@ -1595,6 +1620,7 @@ install_agent_tools() {
     if docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
       continue
     fi
+    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具：$TOOL"
     case "$TOOL" in
       antigravity)
         agent_tool_exec_logged "$CONTAINER" "$TOOL" sh -lc \
@@ -1614,6 +1640,7 @@ install_agent_tools() {
   VERSION_FILE=$(mktemp)
   printf '{}\n' > "$VERSION_FILE"
   for TOOL in $TOOLS; do
+    report_job_progress "$PROGRESS_STAGE" "正在验证 Agent 工具：$TOOL"
     COMMAND=$(agent_tool_command "$TOOL") || { rm -f "$VERSION_FILE"; return 1; }
     docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null" || {
       echo "Agent tool $TOOL was installed but command $COMMAND is unavailable" >&2
@@ -1677,7 +1704,11 @@ prepare_agent_image() {
   BASE_IMAGE=$1
   JOB_FILE=$2
   TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u)
-  [ -n "$TOOLS" ] || { printf '%s' "$BASE_IMAGE"; return 0; }
+  [ -n "$TOOLS" ] || {
+    report_job_progress agent-image "未选择 Agent 工具，使用基础镜像" not-needed no-agent-tools
+    printf '%s' "$BASE_IMAGE"
+    return 0
+  }
   command -v sha256sum >/dev/null || { echo "sha256sum is required for Agent runtime caching" >&2; return 1; }
   command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
 
@@ -1688,23 +1719,34 @@ prepare_agent_image() {
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
   BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY"
   NOW=$(date +%s)
-  TTL_HOURS=${AGENTBOX_AGENT_IMAGE_TTL_HOURS:-24}
-  case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=24 ;; esac
+  TTL_HOURS=${AGENTBOX_AGENT_IMAGE_TTL_HOURS:-168}
+  case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=168 ;; esac
   TTL_SECONDS=$((TTL_HOURS * 3600))
 
+  CACHE_MISS_REASON=not-found
   CACHED_AT=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.refreshed" }}' "$CACHE_IMAGE" 2>/dev/null || true)
   case "$CACHED_AT" in
-    ''|*[!0-9]*) ;;
+    ''|*[!0-9]*)
+      if docker image inspect "$CACHE_IMAGE" >/dev/null 2>&1; then
+        CACHE_MISS_REASON=invalid-metadata
+      fi
+      ;;
     *)
       AGE=$((NOW - CACHED_AT))
       if [ "$AGE" -ge 0 ] && [ "$AGE" -lt "$TTL_SECONDS" ]; then
+        report_job_progress agent-image "已命中 Agent 工具镜像缓存" hit exact-cache
         printf '%s' "$CACHE_IMAGE"
         return 0
       fi
+      CACHE_MISS_REASON=expired
       ;;
   esac
 
+  report_job_progress agent-image "Agent 工具镜像缓存未命中，正在构建" miss "$CACHE_MISS_REASON"
   BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS")
+  if [ "$BUILD_BASE_IMAGE" != "$BASE_IMAGE" ]; then
+    report_job_progress agent-image "正在复用兼容的 Agent 工具缓存" partial compatible-subset
+  fi
 
   if docker inspect "$BUILD_CONTAINER" >/dev/null 2>&1; then
     docker start "$BUILD_CONTAINER" >/dev/null
@@ -1718,7 +1760,7 @@ prepare_agent_image() {
     docker stop --time 10 "$BUILD_CONTAINER" >/dev/null 2>&1 || true
     return 1
   fi
-  if install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE" &&
+  if AGENTBOX_AGENT_TOOL_PROGRESS_STAGE=agent-image install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE" &&
      remove_proxy "$BUILD_CONTAINER" &&
      docker commit \
        --change "LABEL agentbox.runtime.cache=true" \
@@ -1730,6 +1772,7 @@ prepare_agent_image() {
      docker tag "$REFRESH_IMAGE" "$CACHE_IMAGE"; then
     docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
     docker image rm "$REFRESH_IMAGE" >/dev/null 2>&1 || true
+    report_job_progress agent-image "Agent 工具镜像缓存已更新" refreshed cache-created
     printf '%s' "$CACHE_IMAGE"
     return 0
   fi
@@ -1739,6 +1782,7 @@ prepare_agent_image() {
   docker image rm "$REFRESH_IMAGE" >/dev/null 2>&1 || true
   if docker image inspect "$CACHE_IMAGE" >/dev/null 2>&1; then
     echo "Agent runtime refresh failed; using the last working cached image" >&2
+    report_job_progress agent-image "缓存刷新失败，使用上次可用镜像" fallback refresh-failed
     printf '%s' "$CACHE_IMAGE"
     return 0
   fi
@@ -2389,6 +2433,8 @@ create_sandbox() {
   VOLUME="agentbox-$SANDBOX_ID-workspace"
   SANDBOX_PREEXISTED=false
 
+  report_job_progress runtime-check "正在检查 $DRIVER 运行时"
+
   cleanup_failed_create() {
     [ "$SANDBOX_PREEXISTED" = false ] || return 0
     if [ "$DRIVER" = docker ]; then
@@ -2401,15 +2447,17 @@ create_sandbox() {
 
   if [ "$DRIVER" = docker ]; then
     command -v docker >/dev/null || { echo "Docker is not installed" >&2; return 1; }
-    docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; return 1; }
+    timeout 10 docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable" >&2; return 1; }
     MEMORY=$(printf '%s' "$MEMORY_VALUE" | tr -d ' ' | sed -e 's/GiB$/g/' -e 's/MiB$/m/')
     if docker inspect "$TARGET" >/dev/null 2>&1; then
       SANDBOX_PREEXISTED=true
       OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET")
       [ "$OWNER" = "$SANDBOX_ID" ] || { echo "container name collision: $TARGET" >&2; return 1; }
+      report_job_progress runtime-create "正在启动已有沙箱实例"
       docker start "$TARGET" >/dev/null
     else
       RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")
+      report_job_progress runtime-create "正在创建 Docker 沙箱实例"
       set -- docker run -d --name "$TARGET" \
         --label "agentbox.sandbox=$SANDBOX_ID" \
         --restart unless-stopped --user 0:0 --workdir "$WORKDIR" \
@@ -2436,7 +2484,7 @@ create_sandbox() {
     RUNTIME_IMAGE=$IMAGE
     AGENT_TOOLS_PREINSTALLED=false
     if [ "$DRIVER" = boxlite ] && command -v docker >/dev/null &&
-       command docker info >/dev/null 2>&1 &&
+       timeout 10 docker info >/dev/null 2>&1 &&
        jq -e '.job.payload.agentTools? | length > 0' "$JOB_FILE" >/dev/null; then
       if ! RUNTIME_IMAGE=$(
         AGENTBOX_RUNTIME_DRIVER=docker
@@ -2449,14 +2497,19 @@ create_sandbox() {
       AGENT_TOOLS_PREINSTALLED=true
     fi
     if [ "$DRIVER" = microsandbox ]; then
+      report_job_progress image-prepare "正在准备 Microsandbox 镜像"
       if ! microsandbox_prepare_image "$IMAGE" >/dev/null; then
         echo "stage image-prepare failed: $DRIVER could not prepare $IMAGE" >&2
         return 1
       fi
-    elif ! runtime_call "$DRIVER" prepare-image "$RUNTIME_IMAGE" >/dev/null; then
-      echo "stage image-prepare failed: $DRIVER could not prepare $RUNTIME_IMAGE" >&2
-      return 1
+    else
+      report_job_progress image-prepare "正在准备 $DRIVER 镜像"
+      if ! runtime_call "$DRIVER" prepare-image "$RUNTIME_IMAGE" >/dev/null; then
+        echo "stage image-prepare failed: $DRIVER could not prepare $RUNTIME_IMAGE" >&2
+        return 1
+      fi
     fi
+    report_job_progress runtime-create "正在创建 $DRIVER 沙箱实例"
     set -- runtime_call "$DRIVER" create "$TARGET" "$RUNTIME_IMAGE" --cpus "$CPU_COUNT" \
       --memory "$MEMORY_MIB" --workdir "$WORKDIR" --network "$NETWORK"
     if [ "$DRIVER" = boxlite ] && [ "$NETWORK" = restricted ]; then
@@ -2497,6 +2550,7 @@ create_sandbox() {
     fi
   fi
 
+  report_job_progress configuration "正在写入沙箱配置"
   if [ "$DRIVER" = docker ]; then
     docker exec "$TARGET" mkdir -p /opt/agentbox
   else
@@ -2532,11 +2586,15 @@ create_sandbox() {
     echo "stage agent-wrappers failed: image $IMAGE could not install Agent wrappers" >&2
     return 1
   fi
-  if [ -n "$SETUP" ] && ! docker exec "$TARGET" sh -lc "$SETUP" >&2; then
-    cleanup_failed_create
-    echo "stage setup-command failed: image $IMAGE must provide a POSIX shell for setup commands" >&2
-    return 1
+  if [ -n "$SETUP" ]; then
+    report_job_progress setup "正在执行模板初始化命令"
+    if ! docker exec "$TARGET" sh -lc "$SETUP" >&2; then
+      cleanup_failed_create
+      echo "stage setup-command failed: image $IMAGE must provide a POSIX shell for setup commands" >&2
+      return 1
+    fi
   fi
+  report_job_progress verify "正在验证沙箱可用性"
   printf '%s' "$TARGET"
 }
 
@@ -2562,6 +2620,8 @@ start_sandbox() {
   TARGET=$(sandbox_container_name "$JOB_FILE")
   AGENTBOX_RUNTIME_DRIVER=$DRIVER
   export AGENTBOX_RUNTIME_DRIVER
+  report_job_progress runtime-check "正在检查 $DRIVER 运行时"
+  report_job_progress runtime-start "正在启动沙箱实例"
   if [ "$DRIVER" = docker ]; then
     docker inspect "$TARGET" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
     docker start "$TARGET" >/dev/null
@@ -2581,12 +2641,14 @@ start_sandbox() {
   fi
 
   if jq -e '.job.payload.credentials? and .job.payload.agentTools?' "$JOB_FILE" >/dev/null; then
+    report_job_progress configuration "正在同步沙箱配置"
     install_agent_tools "$TARGET" "$JOB_FILE"
     configure_credentials "$TARGET" "$JOB_FILE"
     configure_skills "$TARGET" "$JOB_FILE"
     configure_mcp_servers "$TARGET" "$JOB_FILE"
     install_agent_wrappers "$TARGET" "$JOB_FILE"
   fi
+  report_job_progress verify "正在验证沙箱可用性"
   printf '%s' "$TARGET"
 }
 

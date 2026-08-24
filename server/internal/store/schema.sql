@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
   action TEXT NOT NULL,
   status TEXT NOT NULL CHECK (status IN ('blocked', 'pending', 'leased', 'succeeded', 'failed')),
   payload JSONB NOT NULL,
+  progress JSONB NOT NULL DEFAULT '{}'::jsonb,
   lease_until TIMESTAMPTZ,
   attempts INTEGER NOT NULL DEFAULT 0,
   result_message TEXT NOT NULL DEFAULT '',
@@ -153,6 +154,7 @@ ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_output TEXT NOT NULL DEF
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_truncated BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_timed_out BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS automation_run_id UUID;
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS progress JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE worker_jobs DROP CONSTRAINT IF EXISTS worker_jobs_status_check;
 ALTER TABLE worker_jobs ADD CONSTRAINT worker_jobs_status_check
   CHECK (status IN ('blocked', 'pending', 'leased', 'succeeded', 'failed'));
@@ -491,7 +493,8 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   received_at TIMESTAMPTZ NOT NULL,
   queued_at TIMESTAMPTZ,
   started_at TIMESTAMPTZ,
-  finished_at TIMESTAMPTZ
+  finished_at TIMESTAMPTZ,
+  provisioning JSONB NOT NULL DEFAULT '{}'::jsonb
 );
 
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS endpoint_id UUID;
@@ -500,6 +503,7 @@ ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_id TEXT NOT NULL DEFA
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_source TEXT NOT NULL DEFAULT 'generic';
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS provisioning JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE automation_runs DROP CONSTRAINT IF EXISTS automation_runs_action_type_check;
 ALTER TABLE automation_runs ADD CONSTRAINT automation_runs_action_type_check
 	CHECK (action_type = 'create-sandbox') NOT VALID;
@@ -522,6 +526,10 @@ CREATE INDEX IF NOT EXISTS idx_automation_runs_project_received
 
 CREATE INDEX IF NOT EXISTS idx_automation_runs_automation_received
   ON automation_runs(automation_id, received_at DESC, id DESC);
+
+CREATE INDEX IF NOT EXISTS idx_automation_runs_worker_job
+  ON automation_runs(worker_job_id)
+  WHERE worker_job_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS system_logs (
   id BIGSERIAL PRIMARY KEY,

@@ -155,6 +155,31 @@ func removeLocalProxyHosts(values []string) []string {
 	return result
 }
 
+func (s *Server) reportWorkerJobProgress(w http.ResponseWriter, request *http.Request) {
+	var input platform.WorkerJobProgressInput
+	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {
+		return
+	}
+	input.Stage = strings.TrimSpace(input.Stage)
+	input.Message = strings.TrimSpace(input.Message)
+	input.CacheStatus = strings.TrimSpace(input.CacheStatus)
+	input.CacheReason = strings.TrimSpace(input.CacheReason)
+	if input.Stage == "" || len(input.Stage) > 64 || len(input.Message) > 500 ||
+		len(input.CacheStatus) > 32 || len(input.CacheReason) > 200 {
+		s.writeError(w, http.StatusBadRequest, "Worker 进度无效")
+		return
+	}
+	progress, err := s.store.ReportWorkerJobProgress(
+		request.Context(), request.PathValue("id"), authBearer(request),
+		request.PathValue("jobId"), input,
+	)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"progress": progress})
+}
+
 func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request) {
 	var result platform.WorkerJobResult
 	if !s.decodeJSONWithLimit(w, request, &result, 8<<20) {

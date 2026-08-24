@@ -114,6 +114,11 @@ import { errorMessage, requestJson } from "@/lib/api-client"
 import type { ManagedCredential } from "@/lib/credential-schema"
 import { reconcileModelBindings } from "@/lib/model-bindings"
 import type { Resource } from "@/lib/platform-schema"
+import {
+  provisioningCacheLabel,
+  provisioningDuration,
+  provisioningStageLabel,
+} from "@/lib/provisioning"
 
 export function AutomationManagement({
   projectId,
@@ -1134,7 +1139,8 @@ function RunHistory({
   runs: AutomationRun[]
   title?: string
 }) {
-  const [selectedRun, setSelectedRun] = useState<AutomationRun | null>(null)
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
+  const selectedRun = runs.find((run) => run.id === selectedRunId) ?? null
   return (
     <>
       <Card>
@@ -1164,7 +1170,15 @@ function RunHistory({
                   {runs.map((run) => (
                     <TableRow key={run.id}>
                       <TableCell>
-                        <RunStatusBadge status={run.status} />
+                        <div className="flex max-w-44 flex-col items-start gap-1">
+                          <RunStatusBadge status={run.status} />
+                          {run.provisioning.message &&
+                            ["queued", "provisioning"].includes(run.status) && (
+                              <span className="line-clamp-2 text-xs text-muted-foreground">
+                                {run.provisioning.message}
+                              </span>
+                            )}
+                        </div>
                       </TableCell>
                       <TableCell>
                         <div className="flex max-w-64 flex-col gap-0.5">
@@ -1189,7 +1203,7 @@ function RunHistory({
                         <Button
                           variant="ghost"
                           size="sm"
-                          onClick={() => setSelectedRun(run)}
+                          onClick={() => setSelectedRunId(run.id)}
                         >
                           查看
                         </Button>
@@ -1204,7 +1218,7 @@ function RunHistory({
       </Card>
       <Sheet
         open={Boolean(selectedRun)}
-        onOpenChange={(open) => !open && setSelectedRun(null)}
+        onOpenChange={(open) => !open && setSelectedRunId(null)}
       >
         <SheetContent className="overflow-y-auto data-[side=right]:sm:max-w-xl">
           <SheetHeader>
@@ -1247,6 +1261,9 @@ function RunHistory({
                     : "—"}
                 </dd>
               </dl>
+              {selectedRun.provisioning.stage && (
+                <ProvisioningDetails run={selectedRun} />
+              )}
               {selectedRun.errorMessage && (
                 <Alert variant="destructive">
                   <XCircleIcon />
@@ -1261,6 +1278,68 @@ function RunHistory({
         </SheetContent>
       </Sheet>
     </>
+  )
+}
+
+function ProvisioningDetails({ run }: { run: AutomationRun }) {
+  const progress = run.provisioning
+  return (
+    <div className="overflow-hidden rounded-lg border">
+      <div className="grid gap-3 border-b bg-muted/30 p-4 sm:grid-cols-3">
+        <DetailValue
+          label="当前阶段"
+          value={provisioningStageLabel(progress.stage)}
+        />
+        <DetailValue
+          label="累计耗时"
+          value={provisioningDuration(progress.durationMs)}
+        />
+        <DetailValue
+          label="工具缓存"
+          value={provisioningCacheLabel(
+            progress.cacheStatus,
+            progress.cacheReason
+          )}
+        />
+        {progress.message && (
+          <div className="sm:col-span-3">
+            <p className="text-xs text-muted-foreground">阶段说明</p>
+            <p className="mt-1 text-sm break-words">{progress.message}</p>
+          </div>
+        )}
+      </div>
+      {progress.timings.length > 0 && (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead>阶段</TableHead>
+              <TableHead className="text-right">耗时</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {progress.timings.map((timing, index) => (
+              <TableRow key={`${timing.stage}-${index}`}>
+                <TableCell>{provisioningStageLabel(timing.stage)}</TableCell>
+                <TableCell className="text-right font-mono text-xs">
+                  {provisioningDuration(timing.durationMs)}
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      )}
+    </div>
+  )
+}
+
+function DetailValue({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 truncate text-sm font-medium" title={value}>
+        {value}
+      </p>
+    </div>
   )
 }
 

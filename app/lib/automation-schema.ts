@@ -1,5 +1,7 @@
 import { z } from "zod"
 
+import { provisioningProgressSchema } from "./platform-schema"
+
 export const automationAuthModeSchema = z.enum([
   "bearer",
   "hmac-sha256",
@@ -82,6 +84,19 @@ export const automationRunSchema = z.object({
   queuedAt: z.string().datetime({ offset: true }).nullable(),
   startedAt: z.string().datetime({ offset: true }).nullable(),
   finishedAt: z.string().datetime({ offset: true }).nullable(),
+  provisioning: provisioningProgressSchema.default({
+    stage: "",
+    message: "",
+    status: "",
+    cacheStatus: "",
+    cacheReason: "",
+    startedAt: null,
+    stageStartedAt: null,
+    updatedAt: null,
+    finishedAt: null,
+    durationMs: 0,
+    timings: [],
+  }),
 })
 
 export const automationsResponseSchema = z.object({

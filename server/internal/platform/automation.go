@@ -71,29 +71,30 @@ type AutomationEvent struct {
 }
 
 type AutomationRun struct {
-	ID                     string              `json:"id"`
-	AutomationID           *string             `json:"automationId"`
-	EndpointID             string              `json:"endpointId,omitempty"`
-	ProjectID              string              `json:"projectId"`
-	AutomationName         string              `json:"automationName"`
-	TemplateID             string              `json:"templateId"`
-	TemplateName           string              `json:"templateName"`
-	TriggerSource          string              `json:"triggerSource"`
-	AuthMode               AutomationAuthMode  `json:"authMode"`
-	Event                  AutomationEvent     `json:"event"`
-	IdempotencyFingerprint string              `json:"idempotencyFingerprint"`
-	PayloadSHA256          string              `json:"payloadSha256"`
-	PayloadBytes           int                 `json:"payloadBytes"`
-	InputSHA256            string              `json:"inputSha256"`
-	Status                 AutomationRunStatus `json:"status"`
-	SandboxID              *string             `json:"sandboxId"`
-	WorkerJobID            *string             `json:"workerJobId"`
-	ErrorCode              string              `json:"errorCode"`
-	ErrorMessage           string              `json:"errorMessage"`
-	ReceivedAt             time.Time           `json:"receivedAt"`
-	QueuedAt               *time.Time          `json:"queuedAt"`
-	StartedAt              *time.Time          `json:"startedAt"`
-	FinishedAt             *time.Time          `json:"finishedAt"`
+	ID                     string               `json:"id"`
+	AutomationID           *string              `json:"automationId"`
+	EndpointID             string               `json:"endpointId,omitempty"`
+	ProjectID              string               `json:"projectId"`
+	AutomationName         string               `json:"automationName"`
+	TemplateID             string               `json:"templateId"`
+	TemplateName           string               `json:"templateName"`
+	TriggerSource          string               `json:"triggerSource"`
+	AuthMode               AutomationAuthMode   `json:"authMode"`
+	Event                  AutomationEvent      `json:"event"`
+	IdempotencyFingerprint string               `json:"idempotencyFingerprint"`
+	PayloadSHA256          string               `json:"payloadSha256"`
+	PayloadBytes           int                  `json:"payloadBytes"`
+	InputSHA256            string               `json:"inputSha256"`
+	Status                 AutomationRunStatus  `json:"status"`
+	SandboxID              *string              `json:"sandboxId"`
+	WorkerJobID            *string              `json:"workerJobId"`
+	ErrorCode              string               `json:"errorCode"`
+	ErrorMessage           string               `json:"errorMessage"`
+	ReceivedAt             time.Time            `json:"receivedAt"`
+	QueuedAt               *time.Time           `json:"queuedAt"`
+	StartedAt              *time.Time           `json:"startedAt"`
+	FinishedAt             *time.Time           `json:"finishedAt"`
+	Provisioning           ProvisioningProgress `json:"provisioning"`
 }
 
 type AutomationDelivery struct {

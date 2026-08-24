@@ -130,6 +130,9 @@ func (fakeStore) ResolveRuntimeLLMTarget(context.Context, string, string, string
 func (fakeStore) ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error) {
 	return platform.WorkerJob{}, store.ErrNoJob
 }
+func (fakeStore) ReportWorkerJobProgress(context.Context, string, string, string, platform.WorkerJobProgressInput) (platform.ProvisioningProgress, error) {
+	return platform.ProvisioningProgress{}, nil
+}
 func (fakeStore) CompleteWorkerJob(context.Context, string, string, string, platform.WorkerJobResult) error {
 	return nil
 }

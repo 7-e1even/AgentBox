@@ -44,7 +44,7 @@ const automationRunColumns = `id::text, automation_id::text, project_id, automat
   idempotency_fingerprint,
   encode(payload_sha256, 'hex'), payload_bytes, COALESCE(encode(input_sha256, 'hex'), ''),
   status, sandbox_id, worker_job_id::text, error_code, error_message,
-  received_at, queued_at, started_at, finished_at`
+  received_at, queued_at, started_at, finished_at, provisioning`
 
 type storedAutomation struct {
 	Automation       platform.Automation
@@ -940,6 +940,7 @@ func scanAutomationRun(row pgx.Row) (platform.AutomationRun, error) {
 	var result platform.AutomationRun
 	var automationID, sandboxID, workerJobID pgtype.Text
 	var eventTime pgtype.Timestamptz
+	var provisioningJSON []byte
 	err := row.Scan(
 		&result.ID, &automationID, &result.ProjectID, &result.AutomationName,
 		&result.EndpointID, &result.TemplateID, &result.TemplateName,
@@ -948,8 +949,11 @@ func scanAutomationRun(row pgx.Row) (platform.AutomationRun, error) {
 		&result.IdempotencyFingerprint, &result.PayloadSHA256, &result.PayloadBytes,
 		&result.InputSHA256, &result.Status, &sandboxID, &workerJobID,
 		&result.ErrorCode, &result.ErrorMessage, &result.ReceivedAt, &result.QueuedAt,
-		&result.StartedAt, &result.FinishedAt,
+		&result.StartedAt, &result.FinishedAt, &provisioningJSON,
 	)
+	if err == nil {
+		err = json.Unmarshal(provisioningJSON, &result.Provisioning)
+	}
 	if automationID.Valid {
 		result.AutomationID = &automationID.String
 	}

@@ -51,6 +51,7 @@ type PlatformStore interface {
 	DeleteNetworkProxy(context.Context, string) error
 	ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error)
 	ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error)
+	ReportWorkerJobProgress(context.Context, string, string, string, platform.WorkerJobProgressInput) (platform.ProvisioningProgress, error)
 	CompleteWorkerJob(context.Context, string, string, string, platform.WorkerJobResult) error
 	ListServers(context.Context) ([]platform.ManagedServer, error)
 	CreateServerPairing(context.Context) (platform.ServerPairing, error)
@@ -194,6 +195,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	mux.HandleFunc("POST /api/servers/{id}/heartbeat", server.heartbeatServer)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/claim", server.claimWorkerJob)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/{jobId}/complete", server.completeWorkerJob)
+	mux.HandleFunc("POST /api/servers/{id}/jobs/{jobId}/progress", server.reportWorkerJobProgress)
 	mux.HandleFunc("POST /api/webhooks/{endpointId}", server.receiveAutomationWebhook)
 	mux.HandleFunc("GET /api/webhooks/{endpointId}/runs/{runId}", server.getPublicAutomationRun)
 	mux.HandleFunc("GET /api/servers/{id}/sessions/connect", server.connectWorkerSessions)

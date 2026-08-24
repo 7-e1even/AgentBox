@@ -1,5 +1,30 @@
 import { z } from "zod"
 
+export const provisioningStageTimingSchema = z.object({
+  stage: z.string(),
+  startedAt: z.string().datetime({ offset: true }),
+  finishedAt: z.string().datetime({ offset: true }),
+  durationMs: z.number().int().nonnegative(),
+})
+
+export const provisioningProgressSchema = z.object({
+  stage: z.string().default(""),
+  message: z.string().default(""),
+  status: z.string().default(""),
+  cacheStatus: z.string().default(""),
+  cacheReason: z.string().default(""),
+  startedAt: z.string().datetime({ offset: true }).nullable().default(null),
+  stageStartedAt: z
+    .string()
+    .datetime({ offset: true })
+    .nullable()
+    .default(null),
+  updatedAt: z.string().datetime({ offset: true }).nullable().default(null),
+  finishedAt: z.string().datetime({ offset: true }).nullable().default(null),
+  durationMs: z.number().int().nonnegative().default(0),
+  timings: z.array(provisioningStageTimingSchema).default([]),
+})
+
 export const resourceKindSchema = z.enum([
   "project",
   "image",
@@ -39,3 +64,4 @@ export const resourceResponseSchema = z.object({ resource: resourceSchema })
 export type ResourceKind = z.infer<typeof resourceKindSchema>
 export type ResourceInput = z.infer<typeof resourceInputSchema>
 export type Resource = z.infer<typeof resourceSchema>
+export type ProvisioningProgress = z.infer<typeof provisioningProgressSchema>

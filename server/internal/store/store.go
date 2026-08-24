@@ -53,10 +53,11 @@ const (
 	workerJobLeaseDuration = 2 * time.Hour
 	runtimeLLMTokenTTL     = 30 * 24 * time.Hour
 	resourceUpdateSpecSQL  = `CASE WHEN kind = 'sandbox' THEN
-		($5::jsonb - 'status' - 'message' - 'externalId') || jsonb_build_object(
+		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning') || jsonb_build_object(
 			'status', spec->'status',
 			'message', spec->'message',
-			'externalId', spec->'externalId'
+			'externalId', spec->'externalId',
+			'provisioning', spec->'provisioning'
 		)
 	ELSE $5::jsonb END`
 )
@@ -1892,6 +1893,129 @@ func stringListContains(values []string, target string) bool {
 	return false
 }
 
+func advanceProvisioningProgress(current platform.ProvisioningProgress, input platform.WorkerJobProgressInput, now time.Time) platform.ProvisioningProgress {
+	if current.StartedAt == nil {
+		startedAt := now
+		current.StartedAt = &startedAt
+	}
+	if current.Stage != input.Stage {
+		if current.Stage != "" && current.StageStartedAt != nil {
+			current.Timings = append(current.Timings, platform.ProvisioningStageTiming{
+				Stage: current.Stage, StartedAt: *current.StageStartedAt, FinishedAt: now,
+				DurationMS: now.Sub(*current.StageStartedAt).Milliseconds(),
+			})
+		}
+		stageStartedAt := now
+		current.StageStartedAt = &stageStartedAt
+	}
+	current.Stage = input.Stage
+	current.Message = input.Message
+	current.Status = "running"
+	if input.CacheStatus != "" {
+		current.CacheStatus = input.CacheStatus
+	}
+	if input.CacheReason != "" {
+		current.CacheReason = input.CacheReason
+	}
+	updatedAt := now
+	current.UpdatedAt = &updatedAt
+	current.DurationMS = now.Sub(*current.StartedAt).Milliseconds()
+	return current
+}
+
+func finishProvisioningProgress(current platform.ProvisioningProgress, result platform.WorkerJobResult, now time.Time) platform.ProvisioningProgress {
+	if current.Stage == "" || current.StartedAt == nil {
+		return current
+	}
+	if current.StageStartedAt != nil {
+		current.Timings = append(current.Timings, platform.ProvisioningStageTiming{
+			Stage: current.Stage, StartedAt: *current.StageStartedAt, FinishedAt: now,
+			DurationMS: now.Sub(*current.StageStartedAt).Milliseconds(),
+		})
+	}
+	current.Stage = "failed"
+	current.Status = "failed"
+	if result.Success {
+		current.Stage = "completed"
+		current.Status = "succeeded"
+	}
+	current.Message = result.Message
+	current.StageStartedAt = nil
+	updatedAt := now
+	finishedAt := now
+	current.UpdatedAt = &updatedAt
+	current.FinishedAt = &finishedAt
+	current.DurationMS = now.Sub(*current.StartedAt).Milliseconds()
+	return current
+}
+
+func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credential, jobID string, input platform.WorkerJobProgressInput) (platform.ProvisioningProgress, error) {
+	if _, err := uuid.Parse(serverID); err != nil || len(credential) < 32 {
+		return platform.ProvisioningProgress{}, ErrWorkerUnauthorized
+	}
+	if _, err := uuid.Parse(jobID); err != nil {
+		return platform.ProvisioningProgress{}, ErrResourceNotFound
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.ProvisioningProgress{}, fmt.Errorf("begin report worker job progress: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var authenticated bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+    SELECT 1 FROM managed_servers WHERE id = $1 AND credential_hash = $2
+  )`, serverID, hashToken(credential)).Scan(&authenticated); err != nil {
+		return platform.ProvisioningProgress{}, fmt.Errorf("authenticate worker job progress: %w", err)
+	}
+	if !authenticated {
+		return platform.ProvisioningProgress{}, ErrWorkerUnauthorized
+	}
+	var resourceID pgtype.Text
+	var action string
+	var progressJSON []byte
+	err = tx.QueryRow(ctx, `SELECT resource_id, action, progress FROM worker_jobs
+    WHERE id = $1 AND server_id = $2 AND status = 'leased' FOR UPDATE`, jobID, serverID).Scan(
+		&resourceID, &action, &progressJSON,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.ProvisioningProgress{}, ErrResourceNotFound
+	}
+	if err != nil {
+		return platform.ProvisioningProgress{}, fmt.Errorf("select worker job progress: %w", err)
+	}
+	var progress platform.ProvisioningProgress
+	if err := json.Unmarshal(progressJSON, &progress); err != nil {
+		return platform.ProvisioningProgress{}, fmt.Errorf("decode worker job progress: %w", err)
+	}
+	now := time.Now().UTC()
+	progress = advanceProvisioningProgress(progress, input, now)
+	encoded, err := json.Marshal(progress)
+	if err != nil {
+		return platform.ProvisioningProgress{}, fmt.Errorf("encode worker job progress: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET progress = $1, lease_until = $2, updated_at = $3
+    WHERE id = $4`, encoded, now.Add(workerJobLeaseDuration), now, jobID); err != nil {
+		return platform.ProvisioningProgress{}, fmt.Errorf("update worker job progress: %w", err)
+	}
+	if resourceID.Valid && strings.Contains(action, "sandbox") {
+		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
+      spec = spec || jsonb_build_object('message', $1::text, 'provisioning', $2::jsonb), updated_at = $3
+      WHERE id = $4 AND kind = 'sandbox'`, input.Message, encoded, now, resourceID.String); err != nil {
+			return platform.ProvisioningProgress{}, fmt.Errorf("update sandbox progress: %w", err)
+		}
+	}
+	if action == "create-sandbox" {
+		if _, err := tx.Exec(ctx, `UPDATE automation_runs SET provisioning = $1
+      WHERE worker_job_id = $2 AND status IN ('queued', 'provisioning')`, encoded, jobID); err != nil {
+			return platform.ProvisioningProgress{}, fmt.Errorf("update automation run progress: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.ProvisioningProgress{}, fmt.Errorf("commit worker job progress: %w", err)
+	}
+	return progress, nil
+}
+
 func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, jobID string, result platform.WorkerJobResult) error {
 	if _, err := uuid.Parse(serverID); err != nil || len(credential) < 32 {
 		return ErrWorkerUnauthorized
@@ -1919,21 +2043,35 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	}
 	var resourceID pgtype.Text
 	var action string
+	var progressJSON []byte
 	now := time.Now().UTC()
 	err = tx.QueryRow(ctx, `UPDATE worker_jobs SET
 		status = $1, lease_until = NULL, result_message = $2, external_id = $3,
 		result_exit_code = $4, result_output = $5, result_truncated = $6,
 		result_timed_out = $7, updated_at = $8
 		WHERE id = $9 AND server_id = $10 AND status = 'leased'
-		RETURNING resource_id, action`, status, result.Message,
+		RETURNING resource_id, action, progress`, status, result.Message,
 		result.ExternalID, result.ExitCode, result.Output, result.OutputTruncated, result.TimedOut,
 		now, jobID, serverID,
-	).Scan(&resourceID, &action)
+	).Scan(&resourceID, &action, &progressJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrResourceNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("complete worker job: %w", err)
+	}
+	var progress platform.ProvisioningProgress
+	if err := json.Unmarshal(progressJSON, &progress); err != nil {
+		return fmt.Errorf("decode completed worker job progress: %w", err)
+	}
+	progress = finishProvisioningProgress(progress, result, now)
+	hasProgress := progress.Stage != ""
+	progressJSON, err = json.Marshal(progress)
+	if err != nil {
+		return fmt.Errorf("encode completed worker job progress: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET progress = $1 WHERE id = $2`, progressJSON, jobID); err != nil {
+		return fmt.Errorf("finalize worker job progress: %w", err)
 	}
 	if action == "update-worker" {
 		if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
@@ -1979,24 +2117,27 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
     spec = spec || jsonb_build_object(
       'status', $1::text,
       'externalId', $2::text,
-      'message', $3::text
-    ), updated_at = $4
-    WHERE id = $5 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
-		result.Message, now, resourceIDValue,
+	  'message', $3::text
+	) || CASE WHEN $4::boolean
+	  THEN jsonb_build_object('provisioning', $5::jsonb)
+	  ELSE '{}'::jsonb END,
+	updated_at = $6
+	WHERE id = $7 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
+		result.Message, hasProgress, progressJSON, now, resourceIDValue,
 	); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
 	if action == "create-sandbox" {
 		if result.Success {
 			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'succeeded',
-				error_code = '', error_message = '', finished_at = $1
-				WHERE sandbox_id = $2 AND status IN ('queued', 'provisioning')`, now, resourceIDValue); err != nil {
+				error_code = '', error_message = '', finished_at = $1, provisioning = $2
+				WHERE sandbox_id = $3 AND status IN ('queued', 'provisioning')`, now, progressJSON, resourceIDValue); err != nil {
 				return fmt.Errorf("finish sandbox creation automation: %w", err)
 			}
 		} else {
 			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'failed', error_code = 'worker_failed',
-				error_message = $1, finished_at = $2
-				WHERE sandbox_id = $3 AND status IN ('queued', 'provisioning')`, result.Message, now, resourceIDValue); err != nil {
+				error_message = $1, finished_at = $2, provisioning = $3
+				WHERE sandbox_id = $4 AND status IN ('queued', 'provisioning')`, result.Message, now, progressJSON, resourceIDValue); err != nil {
 				return fmt.Errorf("fail sandbox creation automation: %w", err)
 			}
 		}

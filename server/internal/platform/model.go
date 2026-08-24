@@ -214,6 +214,34 @@ type WorkerJobResult struct {
 	TimedOut        bool   `json:"timedOut,omitempty"`
 }
 
+type WorkerJobProgressInput struct {
+	Stage       string `json:"stage"`
+	Message     string `json:"message"`
+	CacheStatus string `json:"cacheStatus,omitempty"`
+	CacheReason string `json:"cacheReason,omitempty"`
+}
+
+type ProvisioningStageTiming struct {
+	Stage      string    `json:"stage"`
+	StartedAt  time.Time `json:"startedAt"`
+	FinishedAt time.Time `json:"finishedAt"`
+	DurationMS int64     `json:"durationMs"`
+}
+
+type ProvisioningProgress struct {
+	Stage          string                    `json:"stage,omitempty"`
+	Message        string                    `json:"message,omitempty"`
+	Status         string                    `json:"status,omitempty"`
+	CacheStatus    string                    `json:"cacheStatus,omitempty"`
+	CacheReason    string                    `json:"cacheReason,omitempty"`
+	StartedAt      *time.Time                `json:"startedAt,omitempty"`
+	StageStartedAt *time.Time                `json:"stageStartedAt,omitempty"`
+	UpdatedAt      *time.Time                `json:"updatedAt,omitempty"`
+	FinishedAt     *time.Time                `json:"finishedAt,omitempty"`
+	DurationMS     int64                     `json:"durationMs,omitempty"`
+	Timings        []ProvisioningStageTiming `json:"timings,omitempty"`
+}
+
 type ValidationError struct{ Message string }
 
 func (e *ValidationError) Error() string { return e.Message }

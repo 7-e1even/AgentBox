@@ -71,7 +71,15 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 import { Progress } from "@/components/ui/progress"
-import type { Resource } from "@/lib/platform-schema"
+import {
+  provisioningProgressSchema,
+  type Resource,
+} from "@/lib/platform-schema"
+import {
+  provisioningCacheLabel,
+  provisioningDuration,
+  provisioningStageLabel,
+} from "@/lib/provisioning"
 import { runtimeInventoryImages } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 
@@ -1027,6 +1035,12 @@ function SandboxDetailsDialog({
     sandbox.spec.status === "error" && typeof sandbox.spec.message === "string"
       ? sandbox.spec.message.trim()
       : ""
+  const provisioningResult = provisioningProgressSchema.safeParse(
+    sandbox.spec.provisioning
+  )
+  const provisioning = provisioningResult.success
+    ? provisioningResult.data
+    : null
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
@@ -1055,6 +1069,34 @@ function SandboxDetailsDialog({
               }
             />
           </div>
+
+          {provisioning?.stage && (
+            <div className="grid gap-3 rounded-xl border bg-muted/20 p-4 sm:grid-cols-3">
+              <Detail
+                label="创建阶段"
+                value={provisioningStageLabel(provisioning.stage)}
+              />
+              <Detail
+                label="累计耗时"
+                value={provisioningDuration(provisioning.durationMs)}
+              />
+              <Detail
+                label="工具缓存"
+                value={provisioningCacheLabel(
+                  provisioning.cacheStatus,
+                  provisioning.cacheReason
+                )}
+              />
+              {provisioning.message && (
+                <div className="sm:col-span-3">
+                  <p className="text-xs text-muted-foreground">阶段说明</p>
+                  <p className="mt-1 text-sm break-words">
+                    {provisioning.message}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
 
           {failureMessage && (
             <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-4">

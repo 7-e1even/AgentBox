@@ -22,11 +22,11 @@ func TestWorkerSetupChecksDependenciesBeforeRegistration(t *testing.T) {
 }
 
 func TestWorkerOnlyAdvertisesUsableDocker(t *testing.T) {
-	const capabilityCheck = `command -v docker >/dev/null && docker info >/dev/null 2>&1 && CAPS='"docker"'`
+	const capabilityCheck = `command -v docker >/dev/null && timeout 10 docker info >/dev/null 2>&1 && CAPS='"docker"'`
 	if got := strings.Count(workerDaemon, capabilityCheck); got != 1 {
 		t.Fatalf("usable Docker capability checks = %d, want 1 shared capability probe", got)
 	}
-	if !strings.Contains(workerDaemon, `docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable"`) {
+	if !strings.Contains(workerDaemon, `timeout 10 docker info >/dev/null 2>&1 || { echo "Docker daemon is unavailable"`) {
 		t.Fatal("sandbox creation does not fail fast when the Docker daemon is unavailable")
 	}
 }
@@ -283,7 +283,7 @@ func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 	for _, expected := range []string{
 		`prepare_agent_image()`,
-		`AGENTBOX_AGENT_IMAGE_TTL_HOURS:-24`,
+		`AGENTBOX_AGENT_IMAGE_TTL_HOURS:-168`,
 		`LABEL agentbox.runtime.cache=true`,
 		`LABEL agentbox.runtime.refreshed=$NOW`,
 		`cat > /opt/agentbox/agent-versions.json`,
@@ -297,6 +297,8 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 		`curl --connect-timeout 15 --max-time 300`,
 		`best_cached_agent_base()`,
 		`BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS")`,
+		`report_job_progress agent-image "已命中 Agent 工具镜像缓存" hit exact-cache`,
+		`report_job_progress agent-image "Agent 工具镜像缓存未命中，正在构建" miss "$CACHE_MISS_REASON"`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("Agent runtime cache is missing %q", expected)
@@ -307,6 +309,25 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 	}
 	if got := strings.Count(workerDaemon, `install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE"`); got != 1 {
 		t.Fatalf("cached image install calls = %d, want 1", got)
+	}
+}
+
+func TestWorkerReportsProvisioningStagesWithoutBlockingJobs(t *testing.T) {
+	for _, expected := range []string{
+		`report_job_progress()`,
+		`/jobs/$JOB_ID/progress`,
+		`--data "$BODY" >/dev/null 2>&1 || true`,
+		`report_job_progress runtime-check "正在检查 $DRIVER 运行时"`,
+		`report_job_progress runtime-create "正在创建 Docker 沙箱实例"`,
+		`report_job_progress configuration "正在写入沙箱配置"`,
+		`report_job_progress setup "正在执行模板初始化命令"`,
+		`report_job_progress verify "正在验证沙箱可用性"`,
+		`report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具包：$PACKAGE_SPEC"`,
+		`report_job_progress "$PROGRESS_STAGE" "正在验证 Agent 工具：$TOOL"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker provisioning progress is missing %q", expected)
+		}
 	}
 }
 
