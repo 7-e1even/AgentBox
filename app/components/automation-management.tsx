@@ -119,6 +119,7 @@ import {
   provisioningDuration,
   provisioningStageLabel,
 } from "@/lib/provisioning"
+import { shellSingleQuote } from "@/lib/shell-quote"
 
 export function AutomationManagement({
   projectId,
@@ -221,10 +222,14 @@ export function AutomationManagement({
     setSecretError("")
   }
 
-  async function openAutomation(automation: Automation) {
+  function editAutomation(automation: Automation) {
+    resetSecret()
+    setEditing(automation)
+  }
+
+  async function loadAutomationSecret(automation: Automation) {
     const requestId = secretRequestId.current + 1
     secretRequestId.current = requestId
-    setEditing(automation)
     setSecret("")
     setSecretError("")
     setSecretLoading(true)
@@ -246,15 +251,20 @@ export function AutomationManagement({
 
   async function deleteAutomation() {
     if (!deleting) return
+    const automation = deleting
     try {
-      await requestJson<void>(`/api/automations/${deleting.id}`, {
+      await requestJson<void>(`/api/automations/${automation.id}`, {
         method: "DELETE",
       })
       setAutomations((current) =>
-        current.filter((automation) => automation.id !== deleting.id)
+        current.filter((item) => item.id !== automation.id)
       )
+      if (editing !== "new" && editing?.id === automation.id) {
+        setEditing(null)
+        resetSecret()
+      }
       setDeleting(null)
-      toast.success("自动化已删除", { description: deleting.name })
+      toast.success("自动化已删除", { description: automation.name })
     } catch (error) {
       toast.error("删除失败", { description: errorMessage(error) })
     }
@@ -356,7 +366,7 @@ export function AutomationManagement({
               setSecretLoading(false)
               setSecretError("")
             }}
-            onReloadSecret={(automation) => void openAutomation(automation)}
+            onLoadSecret={(automation) => void loadAutomationSecret(automation)}
             onTest={setTesting}
             onDelete={setDeleting}
           />
@@ -440,7 +450,7 @@ export function AutomationManagement({
                               className="flex min-w-0 items-center gap-3 text-left"
                               onClick={
                                 canMutate
-                                  ? () => void openAutomation(automation)
+                                  ? () => editAutomation(automation)
                                   : undefined
                               }
                             >
@@ -494,7 +504,7 @@ export function AutomationManagement({
                               <Button
                                 variant="ghost"
                                 size="sm"
-                                onClick={() => void openAutomation(automation)}
+                                onClick={() => editAutomation(automation)}
                               >
                                 编辑
                               </Button>
@@ -559,7 +569,7 @@ function AutomationEditor({
   runs,
   onSaved,
   onRotate,
-  onReloadSecret,
+  onLoadSecret,
   onTest,
   onDelete,
 }: {
@@ -573,7 +583,7 @@ function AutomationEditor({
   runs: AutomationRun[]
   onSaved: (automation: Automation, secret: string) => void
   onRotate: (automation: Automation, secret: string) => void
-  onReloadSecret: (automation: Automation) => void
+  onLoadSecret: (automation: Automation) => void
   onTest: (automation: Automation) => void
   onDelete: (automation: Automation) => void
 }) {
@@ -605,6 +615,7 @@ function AutomationEditor({
   })
   const [saving, setSaving] = useState(false)
   const [rotating, setRotating] = useState(false)
+  const [confirmingRotation, setConfirmingRotation] = useState(false)
   const [formError, setFormError] = useState("")
 
   const selectedTemplate = templates.find(
@@ -980,13 +991,36 @@ function AutomationEditor({
             secretLoading={secretLoading}
             secretError={secretError}
             rotating={rotating}
-            onRotate={() => void rotateSecret()}
-            onReloadSecret={() => {
-              if (automation) onReloadSecret(automation)
+            onRequestRotate={() => setConfirmingRotation(true)}
+            onLoadSecret={() => {
+              if (automation) onLoadSecret(automation)
             }}
           />
         </div>
       </div>
+
+      <AlertDialog
+        open={confirmingRotation}
+        onOpenChange={setConfirmingRotation}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogMedia>
+              <KeyRoundIcon />
+            </AlertDialogMedia>
+            <AlertDialogTitle>轮换 Webhook 密钥？</AlertDialogTitle>
+            <AlertDialogDescription>
+              旧密钥会立即失效。请确认调用方可以同步更新后再继续。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void rotateSecret()}>
+              确认轮换
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       {automation && <RunHistory runs={runs} title="这条自动化的运行记录" />}
     </div>
@@ -1000,8 +1034,8 @@ function WebhookConnectionCard({
   secretLoading,
   secretError,
   rotating,
-  onRotate,
-  onReloadSecret,
+  onRequestRotate,
+  onLoadSecret,
 }: {
   automation: Automation | null
   webhookURL: string
@@ -1009,8 +1043,8 @@ function WebhookConnectionCard({
   secretLoading: boolean
   secretError: string
   rotating: boolean
-  onRotate: () => void
-  onReloadSecret: () => void
+  onRequestRotate: () => void
+  onLoadSecret: () => void
 }) {
   if (!automation) {
     return (
@@ -1033,7 +1067,9 @@ function WebhookConnectionCard({
     <Card>
       <CardHeader>
         <CardTitle>Webhook 接入</CardTitle>
-        <CardDescription>{authModeLabel(automation.trigger.authMode)}</CardDescription>
+        <CardDescription>
+          {authModeLabel(automation.trigger.authMode)}
+        </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-4">
         <CopyField label="Webhook URL" value={webhookURL} />
@@ -1048,18 +1084,31 @@ function WebhookConnectionCard({
             <AlertTitle>无法读取 Webhook 密钥</AlertTitle>
             <AlertDescription className="flex flex-col items-start gap-2">
               <span>{secretError}</span>
-              <Button variant="outline" size="sm" onClick={onReloadSecret}>
+              <Button variant="outline" size="sm" onClick={onLoadSecret}>
                 重试读取
               </Button>
             </AlertDescription>
           </Alert>
         ) : secret ? (
-          <CopyField
-            label="Webhook 密钥"
-            value={secret}
-            copyLabel="复制密钥"
-          />
-        ) : null}
+          <CopyField label="Webhook 密钥" value={secret} copyLabel="复制密钥" />
+        ) : (
+          <Field>
+            <FieldLabel>Webhook 密钥</FieldLabel>
+            <FieldDescription>
+              当前密钥末四位 {automation.secretLastFour}
+              。仅在配置调用方时显示完整值。
+            </FieldDescription>
+            <Button
+              variant="outline"
+              size="sm"
+              className="self-start"
+              onClick={onLoadSecret}
+            >
+              <KeyRoundIcon data-icon="inline-start" />
+              显示完整密钥
+            </Button>
+          </Field>
+        )}
         <details className="group overflow-hidden rounded-lg border">
           <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2 text-sm font-medium select-none">
             请求示例
@@ -1086,7 +1135,7 @@ function WebhookConnectionCard({
           variant="outline"
           size="sm"
           disabled={rotating || secretLoading}
-          onClick={onRotate}
+          onClick={onRequestRotate}
         >
           {rotating ? (
             <LoaderCircleIcon
@@ -1501,45 +1550,52 @@ function webhookSample(
   secret: string
 ) {
   const value = secret || "{webhook-secret}"
+  const variables = `WEBHOOK_URL=${shellSingleQuote(webhookURL)}
+WEBHOOK_SECRET=${shellSingleQuote(value)}`
   if (automation.trigger.authMode === "bearer") {
-    return `curl -X POST '${webhookURL}' \\
-  -H 'Authorization: Bearer ${value}' \\
+    return `${variables}
+curl -X POST "$WEBHOOK_URL" \\
+  -H "Authorization: Bearer $WEBHOOK_SECRET" \\
   -H 'Idempotency-Key: event-123' \\
   -H 'Content-Type: application/json' \\
   -d '{}'`
   }
   if (automation.trigger.authMode === "gitlab-token") {
-    return `curl -X POST '${webhookURL}' \\
-  -H 'X-Gitlab-Token: ${value}' \\
+    return `${variables}
+curl -X POST "$WEBHOOK_URL" \\
+  -H "X-Gitlab-Token: $WEBHOOK_SECRET" \\
   -H 'X-Gitlab-Event-UUID: event-123' \\
   -H 'Content-Type: application/json' \\
   -d '{}'`
   }
   if (automation.trigger.authMode === "github-sha256") {
-    return `BODY='{}'
-SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac '${value}' -hex | awk '{print $2}')
-curl -X POST '${webhookURL}' \\
+    return `${variables}
+BODY='{}'
+SIG=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print $2}')
+curl -X POST "$WEBHOOK_URL" \\
   -H "X-Hub-Signature-256: sha256=$SIG" \\
   -H 'X-GitHub-Delivery: event-123' \\
   -H 'Content-Type: application/json' \\
   -d "$BODY"`
   }
   if (automation.trigger.authMode === "standard-webhooks") {
-    return `BODY='{}'
+    return `${variables}
+BODY='{}'
 ID='event-123'
 TS=$(date +%s)
-SIG=$(printf '%s.%s.%s' "$ID" "$TS" "$BODY" | openssl dgst -sha256 -hmac '${value}' -binary | openssl base64 -A)
-curl -X POST '${webhookURL}' \\
+SIG=$(printf '%s.%s.%s' "$ID" "$TS" "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | openssl base64 -A)
+curl -X POST "$WEBHOOK_URL" \\
   -H "webhook-id: $ID" \\
   -H "webhook-timestamp: $TS" \\
   -H "webhook-signature: v1,$SIG" \\
   -H 'Content-Type: application/json' \\
   -d "$BODY"`
   }
-  return `BODY='{}'
+  return `${variables}
+BODY='{}'
 TS=$(date +%s)
-SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac '${value}' -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
-curl -X POST '${webhookURL}' \\
+SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+curl -X POST "$WEBHOOK_URL" \\
   -H "X-AgentBox-Timestamp: $TS" \\
   -H "X-AgentBox-Signature: v1=$SIG" \\
   -H 'Idempotency-Key: event-123' \\

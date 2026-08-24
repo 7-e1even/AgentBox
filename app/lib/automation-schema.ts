@@ -16,7 +16,12 @@ export const automationInputSchema = z
     name: z.string().trim().min(2, "名称至少需要 2 个字符").max(80),
     description: z.string().trim().max(500),
     enabled: z.boolean(),
-    secret: z.string().min(16).max(512).optional(),
+    secret: z
+      .string()
+      .min(16)
+      .max(512)
+      .refine((value) => !/[\r\n]/.test(value), "密钥不能包含换行符")
+      .optional(),
     trigger: z.object({
       type: z.literal("webhook"),
       authMode: automationAuthModeSchema,

@@ -48,6 +48,21 @@ describe("automation schemas", () => {
     expect(result.success).toBe(false)
   })
 
+  it("rejects multiline custom webhook secrets", () => {
+    const result = automationInputSchema.safeParse({
+      projectId: "default",
+      name: "PR Preview",
+      description: "",
+      enabled: true,
+      secret: "long-enough-secret\nsecond-line",
+      trigger: { type: "webhook", authMode: "bearer" },
+      templateId: "runtime-one",
+      modelBindings: { "credential-one": "model-one" },
+    })
+
+    expect(result.success).toBe(false)
+  })
+
   it("rejects legacy execution actions", () => {
     const result = automationInputSchema.safeParse({
       projectId: "default",

@@ -153,6 +153,9 @@ func ValidateAutomationInput(input AutomationInput) error {
 	if input.Secret != "" && (utf8.RuneCountInString(input.Secret) < 16 || utf8.RuneCountInString(input.Secret) > 512) {
 		return &ValidationError{Message: "自定义 Webhook 密钥需要 16 到 512 个字符"}
 	}
+	if strings.ContainsAny(input.Secret, "\r\n") {
+		return &ValidationError{Message: "自定义 Webhook 密钥不能包含换行符"}
+	}
 	if input.TemplateID == "" {
 		return &ValidationError{Message: "请选择沙箱模板"}
 	}

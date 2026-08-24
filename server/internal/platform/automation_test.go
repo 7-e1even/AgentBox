@@ -60,6 +60,15 @@ func TestValidateAutomationInputRejectsShortSecrets(t *testing.T) {
 	}
 }
 
+func TestValidateAutomationInputRejectsMultilineSecrets(t *testing.T) {
+	input := validAutomationInput()
+	input.Secret = "long-enough-secret\nsecond-line"
+	NormalizeAutomationInput(&input)
+	if err := ValidateAutomationInput(input); err == nil {
+		t.Fatal("expected multiline custom secret to fail")
+	}
+}
+
 func TestValidateAutomationInputRejectsBlankModelBindings(t *testing.T) {
 	input := validAutomationInput()
 	input.ModelBindings = map[string]string{"credential-one": ""}
