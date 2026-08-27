@@ -206,13 +206,21 @@ type WorkerJob struct {
 }
 
 type WorkerJobResult struct {
-	Success         bool   `json:"success"`
-	ExternalID      string `json:"externalId"`
-	Message         string `json:"message"`
-	ExitCode        *int   `json:"exitCode,omitempty"`
-	Output          string `json:"output,omitempty"`
-	OutputTruncated bool   `json:"outputTruncated,omitempty"`
-	TimedOut        bool   `json:"timedOut,omitempty"`
+	Success         bool            `json:"success"`
+	ExternalID      string          `json:"externalId"`
+	Message         string          `json:"message"`
+	ExitCode        *int            `json:"exitCode,omitempty"`
+	Output          string          `json:"output,omitempty"`
+	OutputTruncated bool            `json:"outputTruncated,omitempty"`
+	TimedOut        bool            `json:"timedOut,omitempty"`
+	Error           *WorkerJobError `json:"error,omitempty"`
+}
+
+type WorkerJobError struct {
+	Code      string            `json:"code"`
+	Stage     string            `json:"stage,omitempty"`
+	Retryable bool              `json:"retryable"`
+	Details   map[string]string `json:"details,omitempty"`
 }
 
 type WorkerJobProgressInput struct {

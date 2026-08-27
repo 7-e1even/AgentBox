@@ -44,6 +44,7 @@ const automationRunColumns = `id::text, automation_id::text, project_id, automat
   idempotency_fingerprint,
   encode(payload_sha256, 'hex'), payload_bytes, COALESCE(encode(input_sha256, 'hex'), ''),
   status, sandbox_id, worker_job_id::text, error_code, error_message,
+  error_stage, error_retryable, error_details,
   received_at, queued_at, started_at, finished_at, provisioning`
 
 type storedAutomation struct {
@@ -299,7 +300,7 @@ func (s *Store) triggerAutomation(
 		Event:                  event,
 		IdempotencyFingerprint: fingerprint, PayloadSHA256: hex.EncodeToString(payloadHash[:]),
 		PayloadBytes: len(delivery.Body), Status: platform.AutomationRunEvaluating,
-		ReceivedAt: receivedAt,
+		ReceivedAt: receivedAt, ErrorDetails: map[string]string{},
 	}
 	if err := insertAutomationRun(ctx, tx, run, idempotencyHash, payloadHash[:]); err != nil {
 		return platform.AutomationTriggerResult{}, err
@@ -940,7 +941,7 @@ func scanAutomationRun(row pgx.Row) (platform.AutomationRun, error) {
 	var result platform.AutomationRun
 	var automationID, sandboxID, workerJobID pgtype.Text
 	var eventTime pgtype.Timestamptz
-	var provisioningJSON []byte
+	var errorDetailsJSON, provisioningJSON []byte
 	err := row.Scan(
 		&result.ID, &automationID, &result.ProjectID, &result.AutomationName,
 		&result.EndpointID, &result.TemplateID, &result.TemplateName,
@@ -948,9 +949,13 @@ func scanAutomationRun(row pgx.Row) (platform.AutomationRun, error) {
 		&result.Event.Source, &eventTime,
 		&result.IdempotencyFingerprint, &result.PayloadSHA256, &result.PayloadBytes,
 		&result.InputSHA256, &result.Status, &sandboxID, &workerJobID,
-		&result.ErrorCode, &result.ErrorMessage, &result.ReceivedAt, &result.QueuedAt,
+		&result.ErrorCode, &result.ErrorMessage, &result.ErrorStage, &result.ErrorRetryable,
+		&errorDetailsJSON, &result.ReceivedAt, &result.QueuedAt,
 		&result.StartedAt, &result.FinishedAt, &provisioningJSON,
 	)
+	if err == nil {
+		err = json.Unmarshal(errorDetailsJSON, &result.ErrorDetails)
+	}
 	if err == nil {
 		err = json.Unmarshal(provisioningJSON, &result.Provisioning)
 	}

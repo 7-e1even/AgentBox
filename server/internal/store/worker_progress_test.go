@@ -14,11 +14,29 @@ func TestSchemaPersistsWorkerAndAutomationProvisioningProgress(t *testing.T) {
 		`provisioning JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS progress`,
 		`ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS provisioning`,
+		`result_error_code TEXT NOT NULL DEFAULT ''`,
+		`result_error_details JSONB NOT NULL DEFAULT '{}'::jsonb`,
 		`CREATE INDEX IF NOT EXISTS idx_automation_runs_worker_job`,
 	} {
 		if !strings.Contains(schema, expected) {
 			t.Fatalf("schema is missing %q", expected)
 		}
+	}
+}
+
+func TestNormalizedWorkerJobErrorKeepsStructuredFailureAndLegacyFallback(t *testing.T) {
+	structured := normalizedWorkerJobError(platform.WorkerJobResult{Error: &platform.WorkerJobError{
+		Code: "sandbox_create_failed", Stage: "mcp", Retryable: false,
+		Details: map[string]string{"action": "create-sandbox"},
+	}})
+	if structured.Code != "sandbox_create_failed" || structured.Stage != "mcp" ||
+		structured.Details["action"] != "create-sandbox" {
+		t.Fatalf("structured Worker error = %#v", structured)
+	}
+
+	legacy := normalizedWorkerJobError(platform.WorkerJobResult{TimedOut: true})
+	if legacy.Code != "worker_timeout" || legacy.Stage != "execution" || !legacy.Retryable {
+		t.Fatalf("legacy timed-out Worker error = %#v", legacy)
 	}
 }
 

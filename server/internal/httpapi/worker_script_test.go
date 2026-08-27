@@ -339,6 +339,23 @@ func TestWorkerReportsProvisioningStagesWithoutBlockingJobs(t *testing.T) {
 	}
 }
 
+func TestWorkerReportsStructuredFailureMetadata(t *testing.T) {
+	for _, expected := range []string{
+		`complete_job_failure()`,
+		`error:(if $success or $errorCode == "" then null else`,
+		`{code:$errorCode,retryable:$errorRetryable,details:$errorDetails}`,
+		`worker_error_stage()`,
+		`runtime-probe|runtime-image|image-prepare|runtime-create`,
+		`sandbox_create_failed`,
+		`worker_update_rolled_back`,
+		`worker_action_unsupported`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("structured Worker failure reporting is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerPreinstallsBoxLiteAgentToolsWithDockerCache(t *testing.T) {
 	for _, expected := range []string{
 		`AGENT_TOOLS_PREINSTALLED=false`,
@@ -489,6 +506,22 @@ func TestWorkerConfiguresExtendedAgentCredentials(t *testing.T) {
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("extended Agent credential config is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerConfiguresDeepSeekHarnessMCPBeforeLaunch(t *testing.T) {
+	for _, expected := range []string{
+		`else "abx_" + $raw[:13] + "_" + $raw[-14:]`,
+		`DSH MCP server names collide after normalization`,
+		`name: \"@deepseek-ai/dsh-mcp-client\"`,
+		`transport: streamable-http`,
+		`cat > /opt/agentbox/dsh-mcp.patch.yml`,
+		`exec /usr/bin/dsh --patch /opt/agentbox/dsh-mcp.patch.yml "$@"`,
+		`plugin|-V|--version|-h|--help|--dump-default-config`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("DeepSeek Harness MCP integration is missing %q", expected)
 		}
 	}
 }
@@ -653,7 +686,7 @@ func TestWorkerInstallerIncludesPinnedMicroVMRuntimeSDKs(t *testing.T) {
 		`sha256sum -c`,
 		`/usr/local/bin/boxlite`,
 		`/api/worker/agentbox-microsandbox-driver.go`,
-		`github.com/superradcompany/microsandbox/sdk/go v0.6.8`,
+		`github.com/superradcompany/microsandbox/sdk/go v0.6.15`,
 		`GOPROXY="${AGENTBOX_GOPROXY:-https://goproxy.cn,direct}" go mod tidy`,
 		`CGO_ENABLED=1 go build -tags agentbox_driver`,
 		`/usr/local/bin/agentbox-microsandbox-driver`,

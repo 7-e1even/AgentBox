@@ -1318,7 +1318,23 @@ function RunHistory({
                   <XCircleIcon />
                   <AlertTitle>{selectedRun.errorCode || "创建失败"}</AlertTitle>
                   <AlertDescription>
-                    {selectedRun.errorMessage}
+                    <div className="flex flex-col gap-2">
+                      <p className="break-words">{selectedRun.errorMessage}</p>
+                      {(selectedRun.errorStage ||
+                        selectedRun.errorRetryable) && (
+                        <div className="flex flex-wrap gap-2">
+                          {selectedRun.errorStage && (
+                            <Badge variant="outline">
+                              阶段 ·{" "}
+                              {provisioningStageLabel(selectedRun.errorStage)}
+                            </Badge>
+                          )}
+                          {selectedRun.errorRetryable && (
+                            <Badge variant="secondary">可重试</Badge>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </AlertDescription>
                 </Alert>
               )}

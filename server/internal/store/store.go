@@ -171,12 +171,15 @@ var janitorStatements = []string{
 	// Pending jobs with no worker and leased jobs whose worker disappeared must
 	// become terminal so automation concurrency cannot remain exhausted forever.
 	`UPDATE worker_jobs SET status = 'failed', lease_until = NULL,
-	  result_message = 'Worker 离线或任务超时未被认领', updated_at = NOW()
+	  result_message = 'Worker 离线或任务超时未被认领',
+	  result_error_code = 'worker_timeout', result_error_stage = 'dispatch',
+	  result_error_retryable = TRUE, result_error_details = '{}'::jsonb, updated_at = NOW()
 	  WHERE status IN ('pending', 'leased')
 	    AND created_at < NOW() - INTERVAL '15 minutes'
 	    AND (lease_until IS NULL OR lease_until < NOW())`,
 	`UPDATE automation_runs run SET status = 'failed', error_code = 'worker_timeout',
-	  error_message = 'Worker 离线或任务超时未被认领', finished_at = NOW()
+	  error_message = 'Worker 离线或任务超时未被认领', error_stage = 'dispatch',
+	  error_retryable = TRUE, error_details = '{}'::jsonb, finished_at = NOW()
 	  WHERE run.status IN ('evaluating', 'queued', 'provisioning')
 	    AND EXISTS (
 	      SELECT 1 FROM worker_jobs job
@@ -2086,6 +2089,11 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if result.Success {
 		status = "succeeded"
 	}
+	workerError := normalizedWorkerJobError(result)
+	errorDetailsJSON, err := json.Marshal(workerError.Details)
+	if err != nil {
+		return fmt.Errorf("encode worker job error details: %w", err)
+	}
 	var resourceID pgtype.Text
 	var action string
 	var progressJSON []byte
@@ -2093,10 +2101,12 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	err = tx.QueryRow(ctx, `UPDATE worker_jobs SET
 		status = $1, lease_until = NULL, result_message = $2, external_id = $3,
 		result_exit_code = $4, result_output = $5, result_truncated = $6,
-		result_timed_out = $7, updated_at = $8
-		WHERE id = $9 AND server_id = $10 AND status = 'leased'
+		result_timed_out = $7, result_error_code = $8, result_error_stage = $9,
+		result_error_retryable = $10, result_error_details = $11, updated_at = $12
+		WHERE id = $13 AND server_id = $14 AND status = 'leased'
 		RETURNING resource_id, action, progress`, status, result.Message,
 		result.ExternalID, result.ExitCode, result.Output, result.OutputTruncated, result.TimedOut,
+		workerError.Code, workerError.Stage, workerError.Retryable, errorDetailsJSON,
 		now, jobID, serverID,
 	).Scan(&resourceID, &action, &progressJSON)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -2175,14 +2185,18 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if action == "create-sandbox" {
 		if result.Success {
 			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'succeeded',
-				error_code = '', error_message = '', finished_at = $1, provisioning = $2
+				error_code = '', error_message = '', error_stage = '', error_retryable = FALSE,
+				error_details = '{}'::jsonb, finished_at = $1, provisioning = $2
 				WHERE sandbox_id = $3 AND status IN ('queued', 'provisioning')`, now, progressJSON, resourceIDValue); err != nil {
 				return fmt.Errorf("finish sandbox creation automation: %w", err)
 			}
 		} else {
-			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'failed', error_code = 'worker_failed',
-				error_message = $1, finished_at = $2, provisioning = $3
-				WHERE sandbox_id = $4 AND status IN ('queued', 'provisioning')`, result.Message, now, progressJSON, resourceIDValue); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'failed', error_code = $1,
+				error_message = $2, error_stage = $3, error_retryable = $4, error_details = $5,
+				finished_at = $6, provisioning = $7
+				WHERE sandbox_id = $8 AND status IN ('queued', 'provisioning')`, workerError.Code,
+				result.Message, workerError.Stage, workerError.Retryable, errorDetailsJSON,
+				now, progressJSON, resourceIDValue); err != nil {
 				return fmt.Errorf("fail sandbox creation automation: %w", err)
 			}
 		}
@@ -2191,6 +2205,29 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		return fmt.Errorf("commit worker job completion: %w", err)
 	}
 	return nil
+}
+
+func normalizedWorkerJobError(result platform.WorkerJobResult) platform.WorkerJobError {
+	if result.Success {
+		return platform.WorkerJobError{Details: map[string]string{}}
+	}
+	if result.Error != nil {
+		normalized := *result.Error
+		if normalized.Code == "" {
+			normalized.Code = "worker_failed"
+		}
+		if normalized.Details == nil {
+			normalized.Details = map[string]string{}
+		}
+		return normalized
+	}
+	if result.TimedOut {
+		return platform.WorkerJobError{
+			Code: "worker_timeout", Stage: "execution", Retryable: true,
+			Details: map[string]string{},
+		}
+	}
+	return platform.WorkerJobError{Code: "worker_failed", Details: map[string]string{}}
 }
 
 func randomToken() (string, error) {

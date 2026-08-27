@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -194,6 +195,10 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 	if !s.decodeJSONWithLimit(w, request, &result, 8<<20) {
 		return
 	}
+	if !normalizeWorkerJobResult(&result) {
+		s.writeError(w, http.StatusBadRequest, "Worker 错误详情无效")
+		return
+	}
 	if len(result.Message) > 768<<10 || len(result.Output) > 768<<10 || len(result.ExternalID) > 255 {
 		s.writeError(w, http.StatusBadRequest, "Worker 结果过长")
 		return
@@ -223,7 +228,60 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 		entry.Level = platform.LogLevelWarn
 		entry.Status = platform.LogStatusFailed
 		entry.Message = "Worker 任务失败"
+		if result.Error != nil {
+			entry.Detail["errorCode"] = result.Error.Code
+			entry.Detail["errorStage"] = result.Error.Stage
+			entry.Detail["retryable"] = result.Error.Retryable
+		}
 	}
 	s.recordLog(request, entry)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func normalizeWorkerJobResult(result *platform.WorkerJobResult) bool {
+	if result.Error == nil {
+		return true
+	}
+	if result.Success {
+		return false
+	}
+	result.Error.Code = strings.TrimSpace(result.Error.Code)
+	result.Error.Stage = strings.TrimSpace(result.Error.Stage)
+	if !validWorkerErrorToken(result.Error.Code, true) ||
+		!validWorkerErrorToken(result.Error.Stage, false) || len(result.Error.Details) > 16 {
+		return false
+	}
+	for key, value := range result.Error.Details {
+		if !validWorkerErrorDetailKey(key) || len(value) > 500 {
+			return false
+		}
+	}
+	encoded, err := json.Marshal(result.Error.Details)
+	return err == nil && len(encoded) <= 8<<10
+}
+
+func validWorkerErrorDetailKey(key string) bool {
+	switch key {
+	case "action", "driver", "runtime":
+		return true
+	default:
+		return false
+	}
+}
+
+func validWorkerErrorToken(value string, required bool) bool {
+	if value == "" {
+		return !required
+	}
+	if len(value) > 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') || character == '-' || character == '_' {
+			continue
+		}
+		return false
+	}
+	return true
 }

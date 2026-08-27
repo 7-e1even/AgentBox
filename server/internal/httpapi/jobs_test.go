@@ -4,7 +4,36 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"agentbox/internal/platform"
 )
+
+func TestNormalizeWorkerJobResultAcceptsBoundedStructuredError(t *testing.T) {
+	result := platform.WorkerJobResult{Error: &platform.WorkerJobError{
+		Code: "sandbox_create_failed", Stage: "image-prepare", Retryable: true,
+		Details: map[string]string{"action": "create-sandbox"},
+	}}
+	if !normalizeWorkerJobResult(&result) {
+		t.Fatal("valid structured Worker error was rejected")
+	}
+	if result.Error.Code != "sandbox_create_failed" || result.Error.Stage != "image-prepare" {
+		t.Fatalf("normalized Worker error = %#v", result.Error)
+	}
+}
+
+func TestNormalizeWorkerJobResultRejectsUnsafeErrorMetadata(t *testing.T) {
+	for _, workerError := range []*platform.WorkerJobError{
+		{Code: "Sandbox Failed"},
+		{Code: "sandbox_failed", Stage: "../../secret"},
+		{Code: "sandbox_failed", Details: map[string]string{"bad key": "value"}},
+		{Code: "sandbox_failed", Details: map[string]string{"api_key": "secret"}},
+	} {
+		result := platform.WorkerJobResult{Error: workerError}
+		if normalizeWorkerJobResult(&result) {
+			t.Fatalf("unsafe Worker error was accepted: %#v", workerError)
+		}
+	}
+}
 
 func TestWorkerRequestBaseURLUsesForwardedPublicAddress(t *testing.T) {
 	request := httptest.NewRequest("POST", "http://127.0.0.1:8091/api/servers/id/jobs/claim", nil)

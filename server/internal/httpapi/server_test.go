@@ -15,6 +15,28 @@ import (
 	"agentbox/internal/store"
 )
 
+type writeDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadline time.Time
+}
+
+func (r *writeDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	r.deadline = deadline
+	return nil
+}
+
+func TestStatusRecorderUnwrapsForStreamingWriteDeadline(t *testing.T) {
+	underlying := &writeDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	recorder := &statusRecorder{ResponseWriter: underlying, status: http.StatusOK}
+	want := time.Now().Add(time.Hour).Round(time.Second)
+	if err := http.NewResponseController(recorder).SetWriteDeadline(want); err != nil {
+		t.Fatal(err)
+	}
+	if !underlying.deadline.Equal(want) {
+		t.Fatalf("write deadline = %v, want %v", underlying.deadline, want)
+	}
+}
+
 type fakeStore struct{}
 
 type emptyUsersStore struct{ fakeStore }

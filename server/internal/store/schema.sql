@@ -143,6 +143,10 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
   result_output TEXT NOT NULL DEFAULT '',
   result_truncated BOOLEAN NOT NULL DEFAULT FALSE,
   result_timed_out BOOLEAN NOT NULL DEFAULT FALSE,
+  result_error_code TEXT NOT NULL DEFAULT '',
+  result_error_stage TEXT NOT NULL DEFAULT '',
+  result_error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+  result_error_details JSONB NOT NULL DEFAULT '{}'::jsonb,
   automation_run_id UUID,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
@@ -153,6 +157,10 @@ ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_exit_code INTEGER;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_output TEXT NOT NULL DEFAULT '';
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_truncated BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_timed_out BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_code TEXT NOT NULL DEFAULT '';
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_stage TEXT NOT NULL DEFAULT '';
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_retryable BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_details JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS automation_run_id UUID;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS progress JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE worker_jobs DROP CONSTRAINT IF EXISTS worker_jobs_status_check;
@@ -490,6 +498,9 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   worker_job_id UUID REFERENCES worker_jobs(id) ON DELETE SET NULL,
   error_code TEXT NOT NULL DEFAULT '',
   error_message TEXT NOT NULL DEFAULT '',
+  error_stage TEXT NOT NULL DEFAULT '',
+  error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+  error_details JSONB NOT NULL DEFAULT '{}'::jsonb,
   received_at TIMESTAMPTZ NOT NULL,
   queued_at TIMESTAMPTZ,
   started_at TIMESTAMPTZ,
@@ -504,6 +515,9 @@ ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DE
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_source TEXT NOT NULL DEFAULT 'generic';
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS provisioning JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS error_stage TEXT NOT NULL DEFAULT '';
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS error_retryable BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS error_details JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE automation_runs DROP CONSTRAINT IF EXISTS automation_runs_action_type_check;
 ALTER TABLE automation_runs ADD CONSTRAINT automation_runs_action_type_check
 	CHECK (action_type = 'create-sandbox') NOT VALID;

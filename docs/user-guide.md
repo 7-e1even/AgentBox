@@ -26,7 +26,7 @@ docker compose up -d
 docker compose ps
 ```
 
-本机或可信内网体验可以直接启动。长期运行或公开部署时，先把 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`；位于 Nginx、Caddy 等反向代理之后时，还要设置公开地址、允许来源和 `AGENTBOX_TRUSTED_PROXY=true`。
+本机或可信内网体验可以直接启动。长期运行或公开部署时，先把 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`；位于 Nginx、Caddy 等反向代理之后时，还要设置公开地址、允许来源和 `AGENTBOX_TRUSTED_PROXY=true`。终端、桌面和模型流还要求代理正确处理 WebSocket 与 SSE，参见[《传输与反向代理兼容矩阵》](transport-compatibility.md)。
 
 浏览器打开 `http://<控制面地址>:3000`。全新数据库会引导第一个用户创建管理员账号；之后使用用户名和密码登录，邮箱不是登录名。
 
@@ -110,6 +110,8 @@ sudo systemctl restart agentbox-worker
 
 - STDIO：填写启动命令和参数，例如通过 `npx` 启动 MCP Server；
 - HTTP：填写服务 URL；需要 Header 时使用密钥引用，不要把 Token 写进名称、简介或普通变量。
+
+DeepSeek Harness 使用随 DSH 固定版本安装的官方 MCP Client：STDIO 会映射为 `stdio`，HTTP 会映射为 `streamable-http`，并在 Agent 首轮交互前加载。DSH `0.1.0-rc.7` 的原生 MCP Client 不提供逐工具审批；在模板中选中某个 MCP Server，等同于信任它暴露的工具及其副作用。
 
 ![创建 MCP Server](images/user-guide/09-create-mcp-server.png)
 

@@ -11,6 +11,9 @@ func TestAutomationSchemaSupportsTemplateSandboxRuns(t *testing.T) {
 		"CHECK (action_type = 'create-sandbox')",
 		"model_bindings JSONB NOT NULL DEFAULT '{}'::jsonb",
 		"automation_run_id UUID",
+		"error_stage TEXT NOT NULL DEFAULT ''",
+		"error_retryable BOOLEAN NOT NULL DEFAULT FALSE",
+		"error_details JSONB NOT NULL DEFAULT '{}'::jsonb",
 		"'evaluating', 'queued', 'provisioning', 'succeeded', 'failed'",
 	} {
 		if !strings.Contains(schema, expected) {

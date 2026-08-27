@@ -106,5 +106,8 @@ describe("automation schemas", () => {
     expect(run.event.source).toBe("generic")
     expect(run.provisioning.stage).toBe("")
     expect(run.provisioning.timings).toEqual([])
+    expect(run.errorStage).toBe("")
+    expect(run.errorRetryable).toBe(false)
+    expect(run.errorDetails).toEqual({})
   })
 })

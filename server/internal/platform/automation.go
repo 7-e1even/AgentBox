@@ -90,6 +90,9 @@ type AutomationRun struct {
 	WorkerJobID            *string              `json:"workerJobId"`
 	ErrorCode              string               `json:"errorCode"`
 	ErrorMessage           string               `json:"errorMessage"`
+	ErrorStage             string               `json:"errorStage"`
+	ErrorRetryable         bool                 `json:"errorRetryable"`
+	ErrorDetails           map[string]string    `json:"errorDetails"`
 	ReceivedAt             time.Time            `json:"receivedAt"`
 	QueuedAt               *time.Time           `json:"queuedAt"`
 	StartedAt              *time.Time           `json:"startedAt"`

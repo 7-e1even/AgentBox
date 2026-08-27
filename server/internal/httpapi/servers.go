@@ -355,7 +355,7 @@ module agentbox/microsandbox-driver
 
 go 1.22
 
-require github.com/superradcompany/microsandbox/sdk/go v0.6.8
+require github.com/superradcompany/microsandbox/sdk/go v0.6.15
 EOF
   (
     cd "$microsandbox_build_tmp"
@@ -1090,6 +1090,10 @@ complete_job() {
   OUTPUT_FILE=${6:-/dev/null}
   OUTPUT_TRUNCATED=${7:-false}
   TIMED_OUT=${8:-false}
+  ERROR_CODE=${9:-}
+  ERROR_STAGE=${10:-}
+  ERROR_RETRYABLE=${11:-false}
+  ERROR_DETAILS=${12:-{}}
   BODY=$(jq -n \
     --argjson success "$SUCCESS" \
     --arg externalId "$EXTERNAL_ID" \
@@ -1098,14 +1102,45 @@ complete_job() {
     --rawfile output "$OUTPUT_FILE" \
     --argjson outputTruncated "$OUTPUT_TRUNCATED" \
     --argjson timedOut "$TIMED_OUT" \
+    --arg errorCode "$ERROR_CODE" \
+    --arg errorStage "$ERROR_STAGE" \
+    --argjson errorRetryable "$ERROR_RETRYABLE" \
+    --argjson errorDetails "$ERROR_DETAILS" \
     '{success:$success,externalId:$externalId,message:$message,
       exitCode:(if $exitCode == "" then null else ($exitCode | tonumber) end),
-      output:$output,outputTruncated:$outputTruncated,timedOut:$timedOut}')
+      output:$output,outputTruncated:$outputTruncated,timedOut:$timedOut,
+      error:(if $success or $errorCode == "" then null else
+        ({code:$errorCode,retryable:$errorRetryable,details:$errorDetails} +
+         if $errorStage == "" then {} else {stage:$errorStage} end)
+      end)}')
   curl -fsS -X POST \
     "$SERVER_URL/api/servers/$SERVER_ID/jobs/$JOB_ID/complete" \
     -H "Authorization: Bearer $CREDENTIAL" \
     -H 'Content-Type: application/json' \
     --data "$BODY" >/dev/null
+}
+
+complete_job_failure() {
+  JOB_ID=$1
+  ERROR_CODE=$2
+  ERROR_STAGE=$3
+  ERROR_RETRYABLE=$4
+  MESSAGE=$5
+  ACTION=$6
+  ERROR_DETAILS=$(jq -cn --arg action "$ACTION" '{action:$action}')
+  complete_job "$JOB_ID" false "" "$MESSAGE" "" /dev/null false false \
+    "$ERROR_CODE" "$ERROR_STAGE" "$ERROR_RETRYABLE" "$ERROR_DETAILS"
+}
+
+worker_error_stage() {
+  printf '%s' "$1" | sed -n 's/.*stage \([a-z0-9_-]*\) failed:.*/\1/p' | head -n 1
+}
+
+worker_error_retryable() {
+  case "$1" in
+    runtime-probe|runtime-image|image-prepare|runtime-create) printf '%s' true ;;
+    *) printf '%s' false ;;
+  esac
 }
 
 report_job_progress() {
@@ -1169,7 +1204,8 @@ finalize_worker_update() {
         rm -f "$MARKER"
       fi
     fi
-  elif complete_job "$JOB_ID" false "" "Worker 更新已回滚，当前版本 $CURRENT_VERSION"; then
+  elif complete_job_failure "$JOB_ID" worker_update_rolled_back worker-update true \
+      "Worker 更新已回滚，当前版本 $CURRENT_VERSION" update-worker; then
     rm -f "$MARKER" "$CONFIRMED"
     [ -z "$ROLLBACK_SCRIPT" ] || rm -f "$ROLLBACK_SCRIPT"
   fi
@@ -1197,7 +1233,7 @@ module agentbox/microsandbox-driver
 
 go 1.22
 
-require github.com/superradcompany/microsandbox/sdk/go v0.6.8
+require github.com/superradcompany/microsandbox/sdk/go v0.6.15
 EOF
   if ! (
     cd "$BUILD_DIR"
@@ -2488,6 +2524,48 @@ configure_mcp_servers() {
   docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /opt/agentbox/mcp.json' < "$MCP_MANIFEST"
   rm -f "$MCP_MANIFEST"
 
+  if jq -e '.job.payload.agentTools | index("deepseek-harness")' "$JOB_FILE" >/dev/null; then
+    DSH_MCP_PATCH=$(mktemp)
+    if ! jq -er '
+      def dsh_name:
+        (gsub("[^A-Za-z0-9_-]"; "_") | if length == 0 then "server" else . end) as $raw |
+        if ($raw | length) <= 28 then "abx_" + $raw
+        else "abx_" + $raw[:13] + "_" + $raw[-14:]
+        end;
+      .job.payload as $payload |
+      [$payload.mcpServers[] | . + {dshName: (.id | dsh_name)}] as $servers |
+      if (($servers | group_by(.dshName) | map(select(length > 1)) | length) > 0)
+      then error("DSH MCP server names collide after normalization")
+      else $servers[]
+      end |
+      .dshName as $server_name |
+      "- insert:\n" +
+      "  - id: " + (("agentbox-mcp-" + $server_name) | @json) + "\n" +
+      "    name: \"@deepseek-ai/dsh-mcp-client\"\n" +
+      "    config:\n" +
+      "      serverName: " + ($server_name | @json) + "\n" +
+      (if .spec.transport == "stdio" then
+        "      transport: stdio\n" +
+        "      command: " + (.spec.command | @json) + "\n" +
+        "      args: " + (((.spec.args // "") | [scan("[^[:space:]]+")]) | tojson) + "\n" +
+        "      env: {}\n" +
+        "      cwd: " + (($payload.workdir // "/workspace") | @json)
+      elif .spec.transport == "http" then
+        "      transport: streamable-http\n" +
+        "      url: " + (.spec.url | @json) + "\n" +
+        "      headers: {}"
+      else error("unsupported DSH MCP transport") end)
+    ' "$JOB_FILE" > "$DSH_MCP_PATCH"; then
+      rm -f "$DSH_MCP_PATCH"
+      echo "DSH MCP configuration is invalid" >&2
+      return 1
+    fi
+    docker exec "$CONTAINER" mkdir -p /opt/agentbox
+    docker exec -i "$CONTAINER" sh -c \
+      'umask 077; cat > /opt/agentbox/dsh-mcp.patch.yml' < "$DSH_MCP_PATCH"
+    rm -f "$DSH_MCP_PATCH"
+  fi
+
   if jq -e '.job.payload.agentTools | index("codex")' "$JOB_FILE" >/dev/null; then
     CODEX_CONFIG=$(mktemp)
     docker exec "$CONTAINER" sh -c 'test ! -f /root/.codex/config.toml || cat /root/.codex/config.toml' > "$CODEX_CONFIG"
@@ -2571,7 +2649,25 @@ install_agent_wrappers() {
     COMMAND=$(agent_tool_command "$TOOL") || continue
     docker exec "$CONTAINER" test -x "/usr/bin/$COMMAND" || continue
     WRAPPER=$(mktemp)
-    printf '#!/bin/sh\nset -a\n. /opt/agentbox/secrets/agentbox.env\n[ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env\nset +a\nexec /usr/bin/%s "$@"\n' "$COMMAND" > "$WRAPPER"
+    if [ "$TOOL" = deepseek-harness ]; then
+      printf '%s\n' \
+        '#!/bin/sh' \
+        'set -a' \
+        '. /opt/agentbox/secrets/agentbox.env' \
+        '[ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env' \
+        'set +a' \
+        'if [ ! -s /opt/agentbox/dsh-mcp.patch.yml ]; then exec /usr/bin/dsh "$@"; fi' \
+        'for arg in "$@"; do' \
+        '  case "$arg" in plugin|-V|--version|-h|--help|--dump-default-config) exec /usr/bin/dsh "$@" ;; esac' \
+        'done' \
+        'if [ "${1:-}" = web ]; then' \
+        '  shift' \
+        '  exec /usr/bin/dsh web --patch /opt/agentbox/dsh-mcp.patch.yml "$@"' \
+        'fi' \
+        'exec /usr/bin/dsh --patch /opt/agentbox/dsh-mcp.patch.yml "$@"' > "$WRAPPER"
+    else
+      printf '#!/bin/sh\nset -a\n. /opt/agentbox/secrets/agentbox.env\n[ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env\nset +a\nexec /usr/bin/%s "$@"\n' "$COMMAND" > "$WRAPPER"
+    fi
     docker exec -i "$CONTAINER" sh -c "cat > /usr/local/bin/$COMMAND && chmod 0755 /usr/local/bin/$COMMAND" < "$WRAPPER"
     rm -f "$WRAPPER"
   done
@@ -2884,7 +2980,7 @@ process_job() {
       LOG_FILE=$(mktemp)
       if ! update_worker "$JOB_FILE" 2>"$LOG_FILE"; then
         MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        complete_job "$JOB_ID" false "" "$MESSAGE"
+        complete_job_failure "$JOB_ID" worker_update_failed worker-update true "$MESSAGE" "$ACTION"
       fi
       rm -f "$LOG_FILE"
       ;;
@@ -2894,7 +2990,11 @@ process_job() {
         complete_job "$JOB_ID" true "$EXTERNAL_ID" "Sandbox created"
       else
         MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        complete_job "$JOB_ID" false "" "$MESSAGE"
+        ERROR_STAGE=$(worker_error_stage "$MESSAGE")
+        [ -n "$ERROR_STAGE" ] || ERROR_STAGE=create
+        ERROR_RETRYABLE=$(worker_error_retryable "$ERROR_STAGE")
+        complete_job_failure "$JOB_ID" sandbox_create_failed "$ERROR_STAGE" \
+          "$ERROR_RETRYABLE" "$MESSAGE" "$ACTION"
       fi
       rm -f "$LOG_FILE"
       ;;
@@ -2910,11 +3010,14 @@ process_job() {
         complete_job "$JOB_ID" true "$EXTERNAL_ID" "Sandbox operation completed"
       else
         MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        complete_job "$JOB_ID" false "" "$MESSAGE"
+        ERROR_STAGE=${ACTION%-sandbox}
+        ERROR_CODE=$(printf '%s_failed' "$ACTION" | tr '-' '_')
+        complete_job_failure "$JOB_ID" "$ERROR_CODE" "$ERROR_STAGE" false "$MESSAGE" "$ACTION"
       fi
       rm -f "$LOG_FILE"
       ;;
-    *) complete_job "$JOB_ID" false "" "Unsupported worker action: $ACTION" ;;
+    *) complete_job_failure "$JOB_ID" worker_action_unsupported dispatch false \
+         "Unsupported worker action: $ACTION" "$ACTION" ;;
   esac
 }
 
