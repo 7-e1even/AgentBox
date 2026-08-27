@@ -59,6 +59,7 @@ func TestViewerWriteRequestsAreForbidden(t *testing.T) {
 		{http.MethodDelete, "/api/resources/sandbox-one", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/actions/start", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/session-ticket", ""},
+		{http.MethodPost, "/api/sandboxes/sandbox-one/desktop-ticket", ""},
 		{http.MethodPost, "/api/server-pairings", ""},
 		{http.MethodDelete, "/api/servers/7b20f83b-6418-4a9f-8477-3dc7c35d6310", ""},
 		{http.MethodPost, "/api/servers/7b20f83b-6418-4a9f-8477-3dc7c35d6310/actions/update-worker", ""},
@@ -120,6 +121,11 @@ func TestOperatorSandboxOperationsAreAllowed(t *testing.T) {
 	response = rbacRequest(t, handler, http.MethodPost, "/api/sandboxes/sandbox-one/session-ticket", "")
 	if response.Code == http.StatusForbidden || response.Code == http.StatusUnauthorized {
 		t.Errorf("session-ticket: status = %d, 不应被角色门禁拦截 (body = %s)", response.Code, response.Body.String())
+	}
+
+	response = rbacRequest(t, handler, http.MethodPost, "/api/sandboxes/sandbox-one/desktop-ticket", "")
+	if response.Code == http.StatusForbidden || response.Code == http.StatusUnauthorized {
+		t.Errorf("desktop-ticket: status = %d, 不应被角色门禁拦截 (body = %s)", response.Code, response.Body.String())
 	}
 
 	response = rbacRequest(t, handler, http.MethodPost, "/api/automations",

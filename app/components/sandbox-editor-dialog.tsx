@@ -63,6 +63,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Separator } from "@/components/ui/separator"
+import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
@@ -549,6 +550,31 @@ export function SandboxEditorDialog({
                       }
                     />
                   </Field>
+                  <Field
+                    className="sm:col-span-2"
+                    data-disabled={resource ? true : undefined}
+                  >
+                    <div className="flex items-center justify-between gap-4 rounded-lg border bg-background px-3 py-2.5">
+                      <div className="min-w-0">
+                        <FieldLabel htmlFor="sandbox-desktop">
+                          图形桌面
+                        </FieldLabel>
+                        <FieldDescription>
+                          在沙箱内运行 1440 × 900 XFCE
+                          桌面，可在工作区中直接操作。要求 Debian/Ubuntu
+                          系镜像，建议至少 4 GiB 内存。
+                        </FieldDescription>
+                      </div>
+                      <Switch
+                        id="sandbox-desktop"
+                        checked={input.spec.desktop === true}
+                        disabled={Boolean(resource)}
+                        onCheckedChange={(checked) =>
+                          updateSpec("desktop", checked)
+                        }
+                      />
+                    </div>
+                  </Field>
                   <Field>
                     <FieldLabel htmlFor="sandbox-network">网络策略</FieldLabel>
                     <Select
@@ -1024,6 +1050,7 @@ function templateDefaults(template?: Resource) {
     setup: stringValue(template?.spec.setup),
     cpu: stringValue(template?.spec.cpu) || "2",
     memory: stringValue(template?.spec.memory) || "4 GiB",
+    desktop: template?.spec.desktop === true,
     network: stringValue(template?.spec.network) || "restricted",
     proxyId: stringValue(template?.spec.proxyId),
     agentTools: supportedAgentToolList(template?.spec.agentTools),

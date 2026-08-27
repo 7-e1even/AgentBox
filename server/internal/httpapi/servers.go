@@ -1711,7 +1711,8 @@ best_cached_agent_base() {
   NOW=$3
   TTL_SECONDS=$4
   INSTALLER_REVISION=$5
-  REQUESTED_COUNT=$(printf '%s\n' "$REQUESTED_TOOLS" | grep -c .)
+  DESKTOP=$6
+	REQUESTED_COUNT=$(printf '%s\n' "$REQUESTED_TOOLS" | awk 'NF { count++ } END { print count + 0 }')
   BEST_IMAGE=$BASE_IMAGE
   BEST_COUNT=0
   for IMAGE_ID in $(docker image ls -q --filter label=agentbox.runtime.cache=true | sort -u); do
@@ -1719,6 +1720,8 @@ best_cached_agent_base() {
     [ "$CANDIDATE_BASE" = "$BASE_IMAGE" ] || continue
     CANDIDATE_INSTALLER_REVISION=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.installer-revision" }}' "$IMAGE_ID" 2>/dev/null || true)
     [ "$CANDIDATE_INSTALLER_REVISION" = "$INSTALLER_REVISION" ] || continue
+    CANDIDATE_DESKTOP=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.desktop" }}' "$IMAGE_ID" 2>/dev/null || true)
+    [ "$CANDIDATE_DESKTOP" = "$DESKTOP" ] || continue
     CANDIDATE_REFRESHED=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.refreshed" }}' "$IMAGE_ID" 2>/dev/null || true)
     case "$CANDIDATE_REFRESHED" in ''|*[!0-9]*) continue ;; esac
     CANDIDATE_AGE=$((NOW - CANDIDATE_REFRESHED))
@@ -1744,11 +1747,114 @@ best_cached_agent_base() {
   printf '%s' "$BEST_IMAGE"
 }
 
+install_desktop_runtime() {
+  CONTAINER=$1
+  JOB_FILE=$2
+  jq -e '.job.payload.desktop == true' "$JOB_FILE" >/dev/null || return 0
+  report_job_progress desktop-install "正在安装沙箱图形桌面"
+  if ! docker exec "$CONTAINER" sh -lc 'command -v apt-get >/dev/null 2>&1'; then
+    echo "Desktop mode requires a Debian or Ubuntu image with apt-get" >&2
+    return 1
+  fi
+	if ! docker exec -e DEBIAN_FRONTEND=noninteractive "$CONTAINER" sh -lc '
+    apt-get update &&
+    apt-get install -y --no-install-recommends xfce4 xfce4-terminal xvfb x11vnc dbus-x11 socat xauth x11-utils ca-certificates fonts-dejavu-core &&
+    rm -rf /var/lib/apt/lists/*
+	' >&2; then
+    echo "Desktop packages could not be installed" >&2
+    return 1
+  fi
+  DESKTOP_START=$(mktemp)
+  cat > "$DESKTOP_START" <<'AGENTBOX_DESKTOP_START'
+#!/bin/sh
+set -eu
+
+DESKTOP_DIR=/opt/agentbox/desktop
+DISPLAY_NUMBER=:0
+mkdir -p "$DESKTOP_DIR" /run/user/0
+chmod 0700 /run/user/0
+export DISPLAY=$DISPLAY_NUMBER
+export XDG_RUNTIME_DIR=/run/user/0
+LISTEN_ADDRESS=$(cat "$DESKTOP_DIR/listen-address" 2>/dev/null || printf '127.0.0.1')
+case "$LISTEN_ADDRESS" in 127.0.0.1|0.0.0.0) ;; *) LISTEN_ADDRESS=127.0.0.1 ;; esac
+
+process_alive() {
+  PID_FILE=$1
+  EXPECTED_COMMAND=$2
+  [ -s "$PID_FILE" ] || return 1
+  PROCESS_PID=$(cat "$PID_FILE")
+  case "$PROCESS_PID" in ''|*[!0-9]*) return 1 ;; esac
+  [ -r "/proc/$PROCESS_PID/cmdline" ] &&
+    tr '\000' ' ' < "/proc/$PROCESS_PID/cmdline" | grep -Fq "$EXPECTED_COMMAND"
+}
+
+if ! process_alive "$DESKTOP_DIR/xvfb.pid" Xvfb; then
+  rm -f /tmp/.X0-lock /tmp/.X11-unix/X0
+  nohup Xvfb "$DISPLAY_NUMBER" -screen 0 1440x900x24 -nolisten tcp -ac \
+    >"$DESKTOP_DIR/xvfb.log" 2>&1 &
+  echo $! > "$DESKTOP_DIR/xvfb.pid"
+fi
+
+READY=false
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if xdpyinfo -display "$DISPLAY_NUMBER" >/dev/null 2>&1; then
+    READY=true
+    break
+  fi
+  sleep 0.2
+done
+[ "$READY" = true ] || { echo "Xvfb did not become ready" >&2; exit 1; }
+
+if ! process_alive "$DESKTOP_DIR/xfce.pid" dbus-run-session; then
+  nohup dbus-run-session -- sh -lc '
+    export DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/0 HOME=/root USER=root LOGNAME=root
+    exec startxfce4
+  ' >"$DESKTOP_DIR/xfce.log" 2>&1 &
+  echo $! > "$DESKTOP_DIR/xfce.pid"
+fi
+
+if ! process_alive "$DESKTOP_DIR/x11vnc.pid" x11vnc; then
+  nohup x11vnc -display "$DISPLAY_NUMBER" -rfbport 5900 -listen "$LISTEN_ADDRESS" \
+    -nopw -forever -shared -noxdamage -repeat \
+    >"$DESKTOP_DIR/x11vnc.log" 2>&1 &
+  echo $! > "$DESKTOP_DIR/x11vnc.pid"
+fi
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if socat -u OPEN:/dev/null TCP:127.0.0.1:5900 >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 0.2
+done
+echo "x11vnc did not become ready" >&2
+exit 1
+AGENTBOX_DESKTOP_START
+  if ! docker exec "$CONTAINER" mkdir -p /opt/agentbox/desktop ||
+     ! docker exec -i "$CONTAINER" sh -c 'cat > /opt/agentbox/desktop/start.sh && chmod 0755 /opt/agentbox/desktop/start.sh' < "$DESKTOP_START"; then
+    rm -f "$DESKTOP_START"
+    echo "Desktop startup script could not be written" >&2
+    return 1
+  fi
+  rm -f "$DESKTOP_START"
+}
+
+ensure_desktop() {
+  TARGET=$1
+  JOB_FILE=$2
+  jq -e '.job.payload.desktop == true' "$JOB_FILE" >/dev/null || return 0
+  report_job_progress desktop-start "正在启动沙箱图形桌面"
+  if ! docker exec "$TARGET" /opt/agentbox/desktop/start.sh; then
+    echo "stage desktop-start failed: sandbox desktop could not be started" >&2
+    return 1
+  fi
+}
+
 prepare_agent_image() {
   BASE_IMAGE=$1
   JOB_FILE=$2
   TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u)
-  [ -n "$TOOLS" ] || {
+	DESKTOP=$(jq -r 'if .job.payload.desktop == true then "true" else "false" end' "$JOB_FILE")
+	[ -n "$TOOLS" ] || [ "$DESKTOP" = true ] || {
     report_job_progress agent-image "未选择 Agent 工具，使用基础镜像" not-needed no-agent-tools
     printf '%s' "$BASE_IMAGE"
     return 0
@@ -1757,8 +1863,8 @@ prepare_agent_image() {
   command -v paste >/dev/null || { echo "paste is required for Agent runtime caching" >&2; return 1; }
 
   TOOL_SET=$(printf '%s\n' "$TOOLS" | paste -sd, -)
-  INSTALLER_REVISION=7
-  CACHE_KEY=$(printf '%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
+  INSTALLER_REVISION=10
+	CACHE_KEY=$(printf '%s\n%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$DESKTOP" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
   CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
   BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY"
@@ -1787,7 +1893,7 @@ prepare_agent_image() {
   esac
 
   report_job_progress agent-image "Agent 工具镜像缓存未命中，正在构建" miss "$CACHE_MISS_REASON"
-  BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS" "$INSTALLER_REVISION")
+	BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS" "$INSTALLER_REVISION" "$DESKTOP")
   if [ "$BUILD_BASE_IMAGE" != "$BASE_IMAGE" ]; then
     report_job_progress agent-image "正在复用兼容的 Agent 工具缓存" partial compatible-subset
   fi
@@ -1805,12 +1911,14 @@ prepare_agent_image() {
     return 1
   fi
   if AGENTBOX_AGENT_TOOL_PROGRESS_STAGE=agent-image install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE" &&
+     install_desktop_runtime "$BUILD_CONTAINER" "$JOB_FILE" &&
      remove_proxy "$BUILD_CONTAINER" &&
      docker commit \
        --change "LABEL agentbox.runtime.cache=true" \
        --change "LABEL agentbox.runtime.refreshed=$NOW" \
        --change "LABEL agentbox.runtime.base=$BASE_IMAGE" \
        --change "LABEL agentbox.runtime.tools=$TOOL_SET" \
+	     --change "LABEL agentbox.runtime.desktop=$DESKTOP" \
        --change "LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION" \
        "$BUILD_CONTAINER" "$REFRESH_IMAGE" >/dev/null &&
      docker tag "$REFRESH_IMAGE" "$CACHE_IMAGE"; then
@@ -2548,23 +2656,24 @@ create_sandbox() {
     MEMORY_MIB=$(memory_mib "$MEMORY_VALUE")
     RUNTIME_IMAGE=$IMAGE
     AGENT_TOOLS_PREINSTALLED=false
-    if [ "$DRIVER" = boxlite ] && command -v docker >/dev/null &&
+    if command -v docker >/dev/null &&
        timeout 10 docker info >/dev/null 2>&1 &&
-       jq -e '.job.payload.agentTools? | length > 0' "$JOB_FILE" >/dev/null; then
+	     { jq -e '.job.payload.desktop == true' "$JOB_FILE" >/dev/null ||
+	       { [ "$DRIVER" = boxlite ] && jq -e '.job.payload.agentTools? | length > 0' "$JOB_FILE" >/dev/null; }; }; then
       if ! RUNTIME_IMAGE=$(
         AGENTBOX_RUNTIME_DRIVER=docker
         export AGENTBOX_RUNTIME_DRIVER
         prepare_agent_image "$IMAGE" "$JOB_FILE"
       ); then
-        echo "stage agent-image failed: Docker could not preinstall the selected Agent tools for BoxLite" >&2
+	    echo "stage runtime-image failed: Docker could not preinstall the requested runtime features for $DRIVER" >&2
         return 1
       fi
       AGENT_TOOLS_PREINSTALLED=true
     fi
     if [ "$DRIVER" = microsandbox ]; then
       report_job_progress image-prepare "正在准备 Microsandbox 镜像"
-      if ! microsandbox_prepare_image "$IMAGE" >/dev/null; then
-        echo "stage image-prepare failed: $DRIVER could not prepare $IMAGE" >&2
+      if ! microsandbox_prepare_image "$RUNTIME_IMAGE" >/dev/null; then
+	    echo "stage image-prepare failed: $DRIVER could not prepare $RUNTIME_IMAGE" >&2
         return 1
       fi
     else
@@ -2659,6 +2768,18 @@ create_sandbox() {
       return 1
     fi
   fi
+  if jq -e '.job.payload.desktop == true' "$JOB_FILE" >/dev/null; then
+    if ! printf '%s\n' 127.0.0.1 | docker exec -i "$TARGET" sh -c \
+      'cat > /opt/agentbox/desktop/listen-address'; then
+      cleanup_failed_create
+      echo "stage desktop-config failed: sandbox desktop listener could not be configured" >&2
+      return 1
+    fi
+  fi
+  if ! ensure_desktop "$TARGET" "$JOB_FILE"; then
+    cleanup_failed_create
+    return 1
+  fi
   report_job_progress verify "正在验证沙箱可用性"
   printf '%s' "$TARGET"
 }
@@ -2713,6 +2834,7 @@ start_sandbox() {
     configure_mcp_servers "$TARGET" "$JOB_FILE"
     install_agent_wrappers "$TARGET" "$JOB_FILE"
   fi
+  ensure_desktop "$TARGET" "$JOB_FILE" || return 1
   report_job_progress verify "正在验证沙箱可用性"
   printf '%s' "$TARGET"
 }

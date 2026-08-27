@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,15 +32,16 @@ import (
 )
 
 const (
-	sessionReadLimit    = 1024 * 1024
-	sessionWriteTimeout = 10 * time.Second
-	boxliteBinary       = "/usr/local/bin/boxlite"
-	boxliteURL          = "http://127.0.0.1:48100"
-	boxliteGuestHelper  = "/opt/agentbox/agentbox-guest"
-	microsandboxBinary  = "/usr/local/bin/agentbox-microsandbox-driver"
-	uploadStagingDir    = "/var/lib/agentbox-worker/uploads"
-	stagedUploadMaxAge  = 24 * time.Hour
-	maxConcurrentRPCs   = 32
+	sessionReadLimit      = 1024 * 1024
+	sessionWriteTimeout   = 10 * time.Second
+	boxliteBinary         = "/usr/local/bin/boxlite"
+	boxliteURL            = "http://127.0.0.1:48100"
+	boxliteGuestHelper    = "/opt/agentbox/agentbox-guest"
+	microsandboxBinary    = "/usr/local/bin/agentbox-microsandbox-driver"
+	uploadStagingDir      = "/var/lib/agentbox-worker/uploads"
+	stagedUploadMaxAge    = 24 * time.Hour
+	maxConcurrentRPCs     = 32
+	desktopSessionCommand = "/opt/agentbox/desktop/start.sh && exec socat STDIO TCP:127.0.0.1:5900"
 )
 
 func Run(ctx context.Context, configPath string, stderr io.Writer) error {
@@ -136,6 +138,7 @@ type sessionManager struct {
 	conn     *websocket.Conn
 	writeMu  sync.Mutex
 	sessions map[string]*terminalSession
+	desktops map[string]*desktopSession
 	mu       sync.RWMutex
 	rpcSlots chan struct{}
 }
@@ -144,6 +147,7 @@ func newSessionManager(conn *websocket.Conn) *sessionManager {
 	return &sessionManager{
 		conn:     conn,
 		sessions: make(map[string]*terminalSession),
+		desktops: make(map[string]*desktopSession),
 		rpcSlots: make(chan struct{}, maxConcurrentRPCs),
 	}
 }
@@ -163,6 +167,7 @@ func (m *sessionManager) handle(incoming message) {
 	}
 	m.mu.RLock()
 	session := m.sessions[incoming.SessionID]
+	desktop := m.desktops[incoming.SessionID]
 	m.mu.RUnlock()
 	switch incoming.Type {
 	case "rpc":
@@ -188,6 +193,10 @@ func (m *sessionManager) handle(incoming message) {
 		if session != nil {
 			_ = session.resize(incoming.Cols, incoming.Rows)
 		}
+	case "desktop-input":
+		if desktop != nil {
+			_ = desktop.input(incoming.Data)
+		}
 	case "close":
 		if session != nil {
 			m.mu.Lock()
@@ -196,6 +205,14 @@ func (m *sessionManager) handle(incoming message) {
 			}
 			m.mu.Unlock()
 			session.close()
+		}
+		if desktop != nil {
+			m.mu.Lock()
+			if m.desktops[incoming.SessionID] == desktop {
+				delete(m.desktops, incoming.SessionID)
+			}
+			m.mu.Unlock()
+			desktop.close()
 		}
 	}
 }
@@ -210,6 +227,22 @@ func (m *sessionManager) open(incoming message) {
 	defer cancel()
 	if err := runtimeInspect(ctx, incoming.Driver, incoming.ExternalID); err != nil {
 		_ = m.send(message{Type: "error", SessionID: incoming.SessionID, Error: truncateError(err)})
+		return
+	}
+	if incoming.Mode == "desktop" {
+		desktop, err := startDesktopSession(m, incoming.SessionID, incoming.Driver, incoming.ExternalID)
+		if err != nil {
+			_ = m.send(message{Type: "error", SessionID: incoming.SessionID, Error: truncateError(err)})
+			return
+		}
+		m.mu.Lock()
+		previous := m.desktops[incoming.SessionID]
+		m.desktops[incoming.SessionID] = desktop
+		m.mu.Unlock()
+		if previous != nil {
+			previous.close()
+		}
+		_ = m.send(message{Type: "ready", SessionID: incoming.SessionID})
 		return
 	}
 	session, err := startTerminalSession(m, incoming.SessionID, incoming.Driver, incoming.ExternalID, incoming.Cols, incoming.Rows)
@@ -278,6 +311,21 @@ func (m *sessionManager) sessionClosed(id string, session *terminalSession) {
 	_ = m.send(message{Type: "closed", SessionID: id})
 }
 
+func (m *sessionManager) desktopClosed(id string, desktop *desktopSession, runErr error) {
+	m.mu.Lock()
+	if m.desktops[id] != desktop {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.desktops, id)
+	m.mu.Unlock()
+	if runErr != nil && !desktop.closedByUser.Load() {
+		_ = m.send(message{Type: "error", SessionID: id, Error: truncateError(runErr)})
+		return
+	}
+	_ = m.send(message{Type: "closed", SessionID: id})
+}
+
 func (m *sessionManager) closeAll() {
 	m.mu.Lock()
 	sessions := make([]*terminalSession, 0, len(m.sessions))
@@ -285,10 +333,160 @@ func (m *sessionManager) closeAll() {
 		sessions = append(sessions, session)
 	}
 	m.sessions = make(map[string]*terminalSession)
+	desktops := make([]*desktopSession, 0, len(m.desktops))
+	for _, desktop := range m.desktops {
+		desktops = append(desktops, desktop)
+	}
+	m.desktops = make(map[string]*desktopSession)
 	m.mu.Unlock()
 	for _, session := range sessions {
 		session.close()
 	}
+	for _, desktop := range desktops {
+		desktop.close()
+	}
+}
+
+type desktopSession struct {
+	manager      *sessionManager
+	id           string
+	command      *exec.Cmd
+	stdin        io.WriteCloser
+	stdout       io.ReadCloser
+	closed       atomic.Bool
+	closedByUser atomic.Bool
+	writeMu      sync.Mutex
+}
+
+func startDesktopSession(manager *sessionManager, id, driver, target string) (*desktopSession, error) {
+	if driver == "boxlite" {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			return nil, fmt.Errorf("listen for BoxLite desktop: %w", err)
+		}
+		defer listener.Close()
+		tcpListener, ok := listener.(*net.TCPListener)
+		if !ok {
+			return nil, errors.New("BoxLite desktop listener is not TCP")
+		}
+		port := tcpListener.Addr().(*net.TCPAddr).Port
+		bridgeCommand := fmt.Sprintf(
+			"/opt/agentbox/desktop/start.sh && exec socat TCP:host.boxlite.internal:%d TCP:127.0.0.1:5900",
+			port,
+		)
+		command := exec.Command(boxliteBinary, "--url", boxliteURL, "exec", "-u", "0:0", target, "--", "/bin/sh", "-lc", bridgeCommand)
+		command.Stdout = io.Discard
+		command.Stderr = io.Discard
+		if err := command.Start(); err != nil {
+			return nil, fmt.Errorf("start BoxLite desktop bridge: %w", err)
+		}
+		if err := tcpListener.SetDeadline(time.Now().Add(15 * time.Second)); err != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+			return nil, fmt.Errorf("set BoxLite desktop deadline: %w", err)
+		}
+		stream, err := tcpListener.Accept()
+		if err != nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+			return nil, fmt.Errorf("accept BoxLite desktop bridge: %w", err)
+		}
+		desktop := &desktopSession{manager: manager, id: id, command: command, stdin: stream, stdout: stream}
+		go desktop.pumpOutput()
+		return desktop, nil
+	}
+	command, err := desktopCommand(driver, target)
+	if err != nil {
+		return nil, err
+	}
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
+		return nil, err
+	}
+	command.Stderr = io.Discard
+	if err := command.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
+		return nil, err
+	}
+	desktop := &desktopSession{manager: manager, id: id, command: command, stdin: stdin, stdout: stdout}
+	go desktop.pumpOutput()
+	return desktop, nil
+}
+
+func desktopCommand(driver, target string) (*exec.Cmd, error) {
+	guestCommand := []string{"/bin/sh", "-lc", desktopSessionCommand}
+	switch driver {
+	case "docker":
+		return exec.Command("docker", append([]string{"exec", "-i", "-u", "0:0", target}, guestCommand...)...), nil
+	case "microsandbox":
+		return exec.Command(microsandboxBinary, append([]string{"exec", "--stdin", target, "--"}, guestCommand...)...), nil
+	default:
+		return nil, errors.New("unsupported sandbox desktop driver")
+	}
+}
+
+func (s *desktopSession) pumpOutput() {
+	buffer := make([]byte, 64*1024)
+	for {
+		count, err := s.stdout.Read(buffer)
+		if count > 0 {
+			_ = s.manager.send(message{
+				Type: "desktop-data", SessionID: s.id,
+				Data: base64.StdEncoding.EncodeToString(buffer[:count]),
+			})
+		}
+		if err != nil {
+			break
+		}
+	}
+	var runErr error
+	if s.command != nil {
+		runErr = s.command.Wait()
+	}
+	s.closed.Store(true)
+	_ = s.stdin.Close()
+	_ = s.stdout.Close()
+	s.manager.desktopClosed(s.id, s, runErr)
+}
+
+func (s *desktopSession) input(data string) error {
+	if s.closed.Load() {
+		return nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil || len(decoded) > sessionReadLimit {
+		return errors.New("invalid desktop input")
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err = s.stdin.Write(decoded)
+	return err
+}
+
+func (s *desktopSession) close() {
+	if !s.closed.CompareAndSwap(false, true) {
+		return
+	}
+	s.closedByUser.Store(true)
+	_ = s.stdin.Close()
+	_ = s.stdout.Close()
+	if s.command == nil || s.command.Process == nil {
+		return
+	}
+	_ = s.command.Process.Signal(syscall.SIGTERM)
+	process := s.command.Process
+	go func() {
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+		<-timer.C
+		_ = process.Kill()
+	}()
 }
 
 type terminalSession struct {

@@ -13,6 +13,7 @@ func TestEffectiveSandboxSpecUsesTemplateDefaultsAndInstanceOverrides(t *testing
 		"workdir":       "/workspace",
 		"cpu":           "2",
 		"memory":        "4 GiB",
+		"desktop":       false,
 		"credentialIds": []string{"template-key"},
 		"environmentVariables": []any{
 			map[string]any{"name": "NODE_ENV", "value": "development"},
@@ -22,6 +23,7 @@ func TestEffectiveSandboxSpecUsesTemplateDefaultsAndInstanceOverrides(t *testing
 		"serverId":      "sandbox-server",
 		"driver":        "boxlite",
 		"cpu":           "4",
+		"desktop":       true,
 		"credentialIds": []string{"sandbox-key"},
 		"status":        "requested",
 		"environmentVariables": []any{
@@ -45,6 +47,9 @@ func TestEffectiveSandboxSpecUsesTemplateDefaultsAndInstanceOverrides(t *testing
 	}
 	if got := effective["cpu"]; got != "4" {
 		t.Fatalf("cpu = %v, want sandbox override", got)
+	}
+	if got := effective["desktop"]; got != true {
+		t.Fatalf("desktop = %v, want sandbox override", got)
 	}
 	if got := effective["credentialIds"]; !reflect.DeepEqual(got, []string{"sandbox-key"}) {
 		t.Fatalf("credentialIds = %#v, want sandbox override", got)

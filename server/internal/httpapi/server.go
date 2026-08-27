@@ -163,6 +163,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	operator("DELETE /api/resources/{id}", server.deleteResource)
 	operator("POST /api/sandboxes/{id}/actions/{action}", server.operateSandbox)
 	operator("POST /api/sandboxes/{id}/session-ticket", server.createSandboxSessionTicket)
+	operator("POST /api/sandboxes/{id}/desktop-ticket", server.createSandboxDesktopTicket)
 	authenticated("GET /api/automations", server.listAutomations)
 	operator("POST /api/automations", server.createAutomation)
 	authenticated("GET /api/automations/{id}", server.getAutomation)
@@ -200,6 +201,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	mux.HandleFunc("GET /api/webhooks/{endpointId}/runs/{runId}", server.getPublicAutomationRun)
 	mux.HandleFunc("GET /api/servers/{id}/sessions/connect", server.connectWorkerSessions)
 	mux.HandleFunc("GET /api/sandboxes/{id}/session", server.connectSandboxSession)
+	mux.HandleFunc("GET /api/sandboxes/{id}/desktop", server.connectSandboxDesktop)
 	mux.HandleFunc("GET /api/worker/install.sh", server.workerInstallScript)
 	mux.HandleFunc("GET /api/worker/agentbox-worker", server.workerBinary)
 	mux.HandleFunc("GET /api/worker/agentbox-microsandbox-driver.go", server.workerMicrosandboxDriverSourceScript)
@@ -416,7 +418,8 @@ func (s *Server) recordAPIRequest(request *http.Request, status int, duration ti
 	path := request.URL.Path
 	if path == "/api/logs" || strings.HasSuffix(path, "/heartbeat") ||
 		(strings.HasPrefix(path, "/api/servers/") && strings.HasSuffix(path, "/sessions/connect")) ||
-		(strings.HasPrefix(path, "/api/sandboxes/") && strings.HasSuffix(path, "/session")) {
+		(strings.HasPrefix(path, "/api/sandboxes/") &&
+			(strings.HasSuffix(path, "/session") || strings.HasSuffix(path, "/desktop"))) {
 		return
 	}
 	level := platform.LogLevelInfo

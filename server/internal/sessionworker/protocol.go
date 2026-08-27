@@ -16,6 +16,7 @@ const (
 
 type message struct {
 	Type       string `json:"type"`
+	Mode       string `json:"mode,omitempty"`
 	SessionID  string `json:"sessionId,omitempty"`
 	RequestID  string `json:"requestId,omitempty"`
 	ExternalID string `json:"externalId,omitempty"`

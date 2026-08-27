@@ -582,6 +582,9 @@ func Validate(input Input) error {
 		if err := validateNetworkSpec(input.Spec); err != nil {
 			return err
 		}
+		if err := validateDesktopSpec(input.Spec); err != nil {
+			return err
+		}
 	}
 	if input.Kind == KindSandbox {
 		if err := require(input.Spec, "runtimeId", "请选择沙箱模板"); err != nil {
@@ -600,12 +603,26 @@ func Validate(input Input) error {
 		if err := validateNetworkSpec(input.Spec); err != nil {
 			return err
 		}
+		if err := validateDesktopSpec(input.Spec); err != nil {
+			return err
+		}
 	}
 	if input.Kind == KindVariable {
 		if err := require(input.Spec, "key", "请填写环境变量名"); err != nil {
 			return err
 		}
 		return require(input.Spec, "reference", "请填写变量或密钥引用")
+	}
+	return nil
+}
+
+func validateDesktopSpec(spec map[string]any) error {
+	value, exists := spec["desktop"]
+	if !exists || value == nil {
+		return nil
+	}
+	if _, ok := value.(bool); !ok {
+		return &ValidationError{Message: "图形桌面配置无效"}
 	}
 	return nil
 }

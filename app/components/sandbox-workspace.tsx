@@ -21,6 +21,7 @@ import {
   FolderIcon,
   FolderOpenIcon,
   InfoIcon,
+  MonitorIcon,
   PanelBottomIcon,
   PanelLeftIcon,
   PanelRightIcon,
@@ -35,6 +36,7 @@ import {
 import Link from "next/link"
 
 import { SandboxCodeEditor } from "@/components/sandbox-code-editor"
+import { SandboxDesktop } from "@/components/sandbox-desktop"
 import {
   SandboxTerminal,
   type SandboxTerminalHandle,
@@ -84,6 +86,7 @@ import {
   sandboxFileEntriesSchema,
   type SandboxFileEntry,
 } from "@/lib/sandbox-file-schema"
+import { isSandboxDesktopEnabled } from "@/lib/sandbox-desktop"
 import {
   SandboxSessionClient,
   sandboxFileReadMaxSize,
@@ -141,6 +144,7 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
   const [sessionState, setSessionState] =
     useState<SandboxSessionState>("disconnected")
   const [propertiesTab, setPropertiesTab] = useState("sandbox")
+  const [workspaceMode, setWorkspaceMode] = useState<"code" | "desktop">("code")
   const [showExplorer, setShowExplorer] = useState(true)
   const [showInspector, setShowInspector] = useState(false)
   const [showTerminal, setShowTerminal] = useState(true)
@@ -159,6 +163,8 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
       ? sandbox.spec.agentTools
       : inheritedAgents
   )
+  const desktopEnabled = isSandboxDesktopEnabled(sandbox?.spec, runtime?.spec)
+  const activeWorkspaceMode = desktopEnabled ? workspaceMode : "code"
   const activeFile = useMemo(
     () => openFiles.find((file) => file.path === activeFilePath) ?? null,
     [activeFilePath, openFiles]
@@ -1057,6 +1063,7 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
               server?.name ?? String(sandbox?.spec.serverId ?? "创建时选择"),
             ],
             ["Agent", sandboxAgents.join(" · ") || "未安装"],
+            ["图形桌面", desktopEnabled ? "已启用" : "未启用"],
             ["终端用户", "root"],
             ["实时会话", sessionStateLabel(sessionState)],
           ]
@@ -1135,62 +1142,69 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
           </Link>
         }
         center={
-          <div className="flex h-7 min-w-0 items-center justify-center gap-2 rounded-md border bg-muted/30 px-3 text-xs shadow-xs">
-            <BoxIcon
-              aria-hidden="true"
-              className="size-3.5 shrink-0 text-muted-foreground"
-            />
-            <span className="truncate font-mono text-foreground">
-              {sandbox?.id ?? "sandbox"}
-            </span>
-          </div>
+          <WorkspaceModeToggle
+            value={activeWorkspaceMode}
+            desktopEnabled={desktopEnabled}
+            onChange={setWorkspaceMode}
+            className="pointer-events-auto mx-auto"
+          />
         }
         action={
           <>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={
-                    showExplorer ? "隐藏资源管理器" : "显示资源管理器"
-                  }
-                  aria-pressed={showExplorer}
-                  onClick={() => setShowExplorer((visible) => !visible)}
-                >
-                  <PanelLeftIcon aria-hidden="true" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>资源管理器</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={showTerminal ? "隐藏终端" : "显示终端"}
-                  aria-pressed={showTerminal}
-                  onClick={() => setShowTerminal((visible) => !visible)}
-                >
-                  <PanelBottomIcon aria-hidden="true" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>终端</TooltipContent>
-            </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="icon-sm"
-                  aria-label={showInspector ? "隐藏检查器" : "显示检查器"}
-                  aria-pressed={showInspector}
-                  onClick={() => setShowInspector((visible) => !visible)}
-                >
-                  <PanelRightIcon aria-hidden="true" />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent>检查器</TooltipContent>
-            </Tooltip>
+            <WorkspaceModeToggle
+              value={activeWorkspaceMode}
+              desktopEnabled={desktopEnabled}
+              onChange={setWorkspaceMode}
+              className="lg:hidden"
+            />
+            {activeWorkspaceMode === "code" ? (
+              <>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={
+                        showExplorer ? "隐藏资源管理器" : "显示资源管理器"
+                      }
+                      aria-pressed={showExplorer}
+                      onClick={() => setShowExplorer((visible) => !visible)}
+                    >
+                      <PanelLeftIcon aria-hidden="true" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>资源管理器</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={showTerminal ? "隐藏终端" : "显示终端"}
+                      aria-pressed={showTerminal}
+                      onClick={() => setShowTerminal((visible) => !visible)}
+                    >
+                      <PanelBottomIcon aria-hidden="true" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>终端</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={showInspector ? "隐藏检查器" : "显示检查器"}
+                      aria-pressed={showInspector}
+                      onClick={() => setShowInspector((visible) => !visible)}
+                    >
+                      <PanelRightIcon aria-hidden="true" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>检查器</TooltipContent>
+                </Tooltip>
+              </>
+            ) : null}
           </>
         }
       />
@@ -1225,70 +1239,84 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
       ) : (
         <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
           <div className="min-h-0 flex-1 overflow-hidden">
-            <ResizablePanelGroup orientation="horizontal">
-              {showExplorer ? (
-                <>
-                  <ResizablePanel
-                    id="sandbox-explorer"
-                    defaultSize="250px"
-                    minSize="190px"
-                    maxSize="40%"
-                  >
-                    {renderExplorer()}
-                  </ResizablePanel>
-                  <ResizableHandle aria-label="调整资源管理器宽度" />
-                </>
-              ) : null}
-              <ResizablePanel id="sandbox-editor" minSize="320px">
-                <ResizablePanelGroup orientation="vertical">
-                  {showEditorPanel ? (
+            {activeWorkspaceMode === "desktop" ? (
+              <SandboxDesktop
+                sandboxId={sandbox.id}
+                active
+                running={isRunning}
+              />
+            ) : (
+              <ResizablePanelGroup orientation="horizontal">
+                {showExplorer ? (
+                  <>
                     <ResizablePanel
-                      id="sandbox-code"
-                      defaultSize={showTerminal ? "65%" : "100%"}
-                      minSize="180px"
+                      id="sandbox-explorer"
+                      defaultSize="250px"
+                      minSize="190px"
+                      maxSize="40%"
                     >
-                      {renderEditor()}
+                      {renderExplorer()}
                     </ResizablePanel>
-                  ) : null}
-                  {showTerminal ? (
-                    <>
-                      {showEditorPanel ? (
-                        <ResizableHandle aria-label="调整终端高度" />
-                      ) : null}
+                    <ResizableHandle aria-label="调整资源管理器宽度" />
+                  </>
+                ) : null}
+                <ResizablePanel id="sandbox-editor" minSize="320px">
+                  <ResizablePanelGroup orientation="vertical">
+                    {showEditorPanel ? (
                       <ResizablePanel
-                        id="sandbox-terminal"
-                        defaultSize={showEditorPanel ? "35%" : "100%"}
-                        minSize="120px"
-                        maxSize={showEditorPanel ? "70%" : "100%"}
+                        id="sandbox-code"
+                        defaultSize={showTerminal ? "65%" : "100%"}
+                        minSize="180px"
                       >
-                        {renderTerminal()}
+                        {renderEditor()}
                       </ResizablePanel>
-                    </>
-                  ) : null}
-                </ResizablePanelGroup>
-              </ResizablePanel>
-              {showInspector ? (
-                <>
-                  <ResizableHandle aria-label="调整检查器宽度" />
-                  <ResizablePanel
-                    id="sandbox-inspector"
-                    defaultSize="270px"
-                    minSize="220px"
-                    maxSize="40%"
-                  >
-                    {renderInspector()}
-                  </ResizablePanel>
-                </>
-              ) : null}
-            </ResizablePanelGroup>
+                    ) : null}
+                    {showTerminal ? (
+                      <>
+                        {showEditorPanel ? (
+                          <ResizableHandle aria-label="调整终端高度" />
+                        ) : null}
+                        <ResizablePanel
+                          id="sandbox-terminal"
+                          defaultSize={showEditorPanel ? "35%" : "100%"}
+                          minSize="120px"
+                          maxSize={showEditorPanel ? "70%" : "100%"}
+                        >
+                          {renderTerminal()}
+                        </ResizablePanel>
+                      </>
+                    ) : null}
+                  </ResizablePanelGroup>
+                </ResizablePanel>
+                {showInspector ? (
+                  <>
+                    <ResizableHandle aria-label="调整检查器宽度" />
+                    <ResizablePanel
+                      id="sandbox-inspector"
+                      defaultSize="270px"
+                      minSize="220px"
+                      maxSize="40%"
+                    >
+                      {renderInspector()}
+                    </ResizablePanel>
+                  </>
+                ) : null}
+              </ResizablePanelGroup>
+            )}
           </div>
           <footer className="flex h-6 shrink-0 items-center gap-3 border-t bg-sidebar px-2 text-[11px] text-sidebar-foreground">
             <span
               className="flex min-w-0 items-center gap-1"
               aria-live="polite"
             >
-              <WifiIcon aria-hidden="true" className="size-3" />
-              {sessionStateLabel(sessionState)}
+              {activeWorkspaceMode === "desktop" ? (
+                <MonitorIcon aria-hidden="true" className="size-3" />
+              ) : (
+                <WifiIcon aria-hidden="true" className="size-3" />
+              )}
+              {activeWorkspaceMode === "desktop"
+                ? "图形桌面"
+                : sessionStateLabel(sessionState)}
             </span>
             <span className="flex min-w-0 items-center gap-1">
               <ShieldCheckIcon aria-hidden="true" className="size-3" />
@@ -1315,6 +1343,44 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
         </div>
       )}
     </section>
+  )
+}
+
+function WorkspaceModeToggle({
+  value,
+  desktopEnabled,
+  onChange,
+  className,
+}: {
+  value: "code" | "desktop"
+  desktopEnabled: boolean
+  onChange: (value: "code" | "desktop") => void
+  className?: string
+}) {
+  return (
+    <ToggleGroup
+      type="single"
+      value={value}
+      onValueChange={(next) => next && onChange(next as "code" | "desktop")}
+      variant="outline"
+      size="sm"
+      spacing={0}
+      aria-label="工作区视图"
+      className={className}
+    >
+      <ToggleGroupItem value="code">
+        <Code2Icon aria-hidden="true" data-icon="inline-start" />
+        代码
+      </ToggleGroupItem>
+      <ToggleGroupItem
+        value="desktop"
+        disabled={!desktopEnabled}
+        title={desktopEnabled ? "打开图形桌面" : "此沙箱未启用图形桌面"}
+      >
+        <MonitorIcon aria-hidden="true" data-icon="inline-start" />
+        桌面
+      </ToggleGroupItem>
+    </ToggleGroup>
   )
 }
 

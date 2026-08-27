@@ -272,7 +272,7 @@ func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
 		`major === 22 && minor >= 19`,
 		`apiKey: ("$AGENTBOX_KEY_" + (.id | env_id))`,
-		`INSTALLER_REVISION=7`,
+		`INSTALLER_REVISION=10`,
 		`LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
@@ -301,7 +301,7 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 		`curl --connect-timeout 15 --max-time 300`,
 		`best_cached_agent_base()`,
 		`CANDIDATE_INSTALLER_REVISION=$(docker image inspect -f '{{ index .Config.Labels "agentbox.runtime.installer-revision" }}' "$IMAGE_ID" 2>/dev/null || true)`,
-		`BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS" "$INSTALLER_REVISION")`,
+		`BUILD_BASE_IMAGE=$(best_cached_agent_base "$BASE_IMAGE" "$TOOLS" "$NOW" "$TTL_SECONDS" "$INSTALLER_REVISION" "$DESKTOP")`,
 		`report_job_progress agent-image "已命中 Agent 工具镜像缓存" hit exact-cache`,
 		`report_job_progress agent-image "Agent 工具镜像缓存未命中，正在构建" miss "$CACHE_MISS_REASON"`,
 	} {
@@ -342,7 +342,7 @@ func TestWorkerReportsProvisioningStagesWithoutBlockingJobs(t *testing.T) {
 func TestWorkerPreinstallsBoxLiteAgentToolsWithDockerCache(t *testing.T) {
 	for _, expected := range []string{
 		`AGENT_TOOLS_PREINSTALLED=false`,
-		`if [ "$DRIVER" = boxlite ] && command -v docker >/dev/null`,
+		`if command -v docker >/dev/null`,
 		`AGENTBOX_RUNTIME_DRIVER=docker`,
 		`if ! RUNTIME_IMAGE=$(`,
 		`prepare_agent_image "$IMAGE" "$JOB_FILE"`,
@@ -355,6 +355,29 @@ func TestWorkerPreinstallsBoxLiteAgentToolsWithDockerCache(t *testing.T) {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("BoxLite Docker Agent image reuse is missing %q", expected)
 		}
+	}
+}
+
+func TestWorkerBuildsAndStartsSandboxDesktopForEveryDriver(t *testing.T) {
+	for _, expected := range []string{
+		`install_desktop_runtime()`,
+		`apt-get install -y --no-install-recommends xfce4 xfce4-terminal xvfb x11vnc dbus-x11 socat`,
+		`Xvfb "$DISPLAY_NUMBER" -screen 0 1440x900x24 -nolisten tcp -ac`,
+		`tr '\000' ' ' < "/proc/$PROCESS_PID/cmdline" | grep -Fq "$EXPECTED_COMMAND"`,
+		`x11vnc -display "$DISPLAY_NUMBER" -rfbport 5900 -listen "$LISTEN_ADDRESS"`,
+		`case "$LISTEN_ADDRESS" in 127.0.0.1|0.0.0.0)`,
+		"' >&2; then",
+		`LABEL agentbox.runtime.desktop=$DESKTOP`,
+		`jq -e '.job.payload.desktop == true' "$JOB_FILE"`,
+		`microsandbox_prepare_image "$RUNTIME_IMAGE"`,
+		`ensure_desktop "$TARGET" "$JOB_FILE"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("sandbox desktop provisioning is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerDaemon, `printf '%s\n' 0.0.0.0`) {
+		t.Fatal("sandbox desktop VNC listener must remain bound to loopback")
 	}
 }
 

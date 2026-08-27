@@ -23,8 +23,7 @@ const (
 	sandboxSessionTicketLifetime = 30 * time.Second
 	sandboxSessionReadLimit      = 1024 * 1024
 	sandboxSessionWriteTimeout   = 10 * time.Second
-	sandboxSessionPingInterval   = 30 * time.Second
-	sandboxSessionPingTimeout    = 10 * time.Second
+	sandboxWorkerKeepalive       = 20 * time.Second
 )
 
 type sandboxSessionTarget struct {
@@ -36,11 +35,13 @@ type sandboxSessionTarget struct {
 
 type sandboxSessionTicket struct {
 	Target    sandboxSessionTarget
+	Mode      string
 	ExpiresAt time.Time
 }
 
 type sessionMessage struct {
 	Type       string          `json:"type"`
+	Mode       string          `json:"mode,omitempty"`
 	SessionID  string          `json:"sessionId,omitempty"`
 	RequestID  string          `json:"requestId,omitempty"`
 	SandboxID  string          `json:"sandboxId,omitempty"`
@@ -63,12 +64,12 @@ type sessionSocket struct {
 	writeMu sync.Mutex
 }
 
-func (s *sessionSocket) write(message []byte) error {
+func (s *sessionSocket) write(messageType websocket.MessageType, message []byte) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), sandboxSessionWriteTimeout)
 	defer cancel()
-	return s.conn.Write(ctx, websocket.MessageText, message)
+	return s.conn.Write(ctx, messageType, message)
 }
 
 func (s *sessionSocket) writeJSON(message sessionMessage) error {
@@ -76,32 +77,11 @@ func (s *sessionSocket) writeJSON(message sessionMessage) error {
 	if err != nil {
 		return err
 	}
-	return s.write(encoded)
+	return s.write(websocket.MessageText, encoded)
 }
 
-// startSessionPing 每 30s 发送一次 ping 并等待 pong；超时未收到 pong 则关闭连接，
-// 使阻塞中的 Read 返回错误，从而触发 defer 里的 hub 清理。
-// coder/websocket v1.8 会在 Read 中自动回应对端 ping（read.go handleControl），
-// 浏览器亦由协议栈自动回 pong，因此对端无需任何改动。
-func startSessionPing(conn *websocket.Conn, done <-chan struct{}) {
-	go func() {
-		ticker := time.NewTicker(sandboxSessionPingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), sandboxSessionPingTimeout)
-				err := conn.Ping(ctx)
-				cancel()
-				if err != nil {
-					_ = conn.Close(websocket.StatusGoingAway, "ping timeout")
-					return
-				}
-			}
-		}
-	}()
+func (s *sessionSocket) writeBinary(message []byte) error {
+	return s.write(websocket.MessageBinary, message)
 }
 
 type workerSessionConnection struct {
@@ -112,6 +92,7 @@ type workerSessionConnection struct {
 type browserSessionConnection struct {
 	id       string
 	serverID string
+	mode     string
 	socket   *sessionSocket
 }
 
@@ -169,7 +150,7 @@ func (h *sessionHub) hasWorker(serverID string) bool {
 	return h.workers[serverID] != nil
 }
 
-func (h *sessionHub) issueTicket(target sandboxSessionTarget) (string, time.Time, error) {
+func (h *sessionHub) issueTicket(target sandboxSessionTarget, mode string) (string, time.Time, error) {
 	random := make([]byte, 32)
 	if _, err := rand.Read(random); err != nil {
 		return "", time.Time{}, fmt.Errorf("generate sandbox session ticket: %w", err)
@@ -183,16 +164,16 @@ func (h *sessionHub) issueTicket(target sandboxSessionTarget) (string, time.Time
 			delete(h.tickets, existing)
 		}
 	}
-	h.tickets[token] = sandboxSessionTicket{Target: target, ExpiresAt: expiresAt}
+	h.tickets[token] = sandboxSessionTicket{Target: target, Mode: mode, ExpiresAt: expiresAt}
 	return token, expiresAt, nil
 }
 
-func (h *sessionHub) consumeTicket(token, sandboxID string) (sandboxSessionTicket, bool) {
+func (h *sessionHub) consumeTicket(token, sandboxID, mode string) (sandboxSessionTicket, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	ticket, ok := h.tickets[token]
 	delete(h.tickets, token)
-	if !ok || ticket.Target.SandboxID != sandboxID || time.Now().UTC().After(ticket.ExpiresAt) {
+	if !ok || ticket.Target.SandboxID != sandboxID || ticket.Mode != mode || time.Now().UTC().After(ticket.ExpiresAt) {
 		return sandboxSessionTicket{}, false
 	}
 	return ticket, true
@@ -254,7 +235,15 @@ func (h *sessionHub) browserForWorker(serverID, sessionID string) *browserSessio
 }
 
 func (s *Server) createSandboxSessionTicket(w http.ResponseWriter, request *http.Request) {
-	target, err := s.resolveSandboxSessionTarget(request.Context(), request.PathValue("id"))
+	s.createSandboxConnectionTicket(w, request, "terminal")
+}
+
+func (s *Server) createSandboxDesktopTicket(w http.ResponseWriter, request *http.Request) {
+	s.createSandboxConnectionTicket(w, request, "desktop")
+}
+
+func (s *Server) createSandboxConnectionTicket(w http.ResponseWriter, request *http.Request, mode string) {
+	target, err := s.resolveSandboxSessionTarget(request.Context(), request.PathValue("id"), mode == "desktop")
 	if err != nil {
 		s.handleError(w, err)
 		return
@@ -263,23 +252,23 @@ func (s *Server) createSandboxSessionTicket(w http.ResponseWriter, request *http
 		s.writeError(w, http.StatusServiceUnavailable, "沙箱会话服务尚未连接，请先升级并重启目标 Worker")
 		return
 	}
-	token, expiresAt, err := s.sessions.issueTicket(target)
+	token, expiresAt, err := s.sessions.issueTicket(target, mode)
 	if err != nil {
 		s.handleError(w, err)
 		return
 	}
 	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategorySandbox, Action: "session-ticket",
-		Message:      "签发沙箱会话票据",
+		Category: platform.LogCategorySandbox, Action: mode + "-ticket",
+		Message:      "签发沙箱" + mode + "会话票据",
 		ResourceKind: string(platform.KindSandbox), ResourceID: target.SandboxID,
-		Detail: map[string]any{"serverId": target.ServerID, "driver": target.Driver},
+		Detail: map[string]any{"serverId": target.ServerID, "driver": target.Driver, "mode": mode},
 	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"ticket": token, "expiresAt": expiresAt,
 	})
 }
 
-func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID string) (sandboxSessionTarget, error) {
+func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID string, requireDesktop bool) (sandboxSessionTarget, error) {
 	resources, err := s.store.ListResources(ctx)
 	if err != nil {
 		return sandboxSessionTarget{}, err
@@ -301,14 +290,23 @@ func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID stri
 	serverID, _ := sandbox.Spec["serverId"].(string)
 	externalID, _ := sandbox.Spec["externalId"].(string)
 	driver, _ := sandbox.Spec["driver"].(string)
-	if driver == "" {
+	desktop, desktopSet := sandbox.Spec["desktop"].(bool)
+	if driver == "" || !desktopSet {
 		runtimeID, _ := sandbox.Spec["runtimeId"].(string)
 		for index := range resources {
 			if resources[index].Kind == platform.KindRuntime && resources[index].ID == runtimeID {
-				driver, _ = resources[index].Spec["driver"].(string)
+				if driver == "" {
+					driver, _ = resources[index].Spec["driver"].(string)
+				}
+				if !desktopSet {
+					desktop, _ = resources[index].Spec["desktop"].(bool)
+				}
 				break
 			}
 		}
+	}
+	if requireDesktop && !desktop {
+		return sandboxSessionTarget{}, fmt.Errorf("%w: sandbox desktop is not enabled", store.ErrConflict)
 	}
 	if serverID == "" || externalID == "" || driver == "" {
 		return sandboxSessionTarget{}, fmt.Errorf("%w: sandbox session target is incomplete", store.ErrConflict)
@@ -336,9 +334,6 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 		return
 	}
 	conn.SetReadLimit(sandboxSessionReadLimit)
-	pingDone := make(chan struct{})
-	defer close(pingDone)
-	startSessionPing(conn, pingDone)
 	worker := &workerSessionConnection{serverID: serverID, socket: &sessionSocket{conn: conn}}
 	if previous := s.sessions.registerWorker(worker); previous != nil {
 		_ = previous.socket.conn.Close(websocket.StatusServiceRestart, "worker session replaced")
@@ -350,9 +345,13 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 		ResourceKind: "server", ResourceID: serverID,
 	})
 	connectedAt := time.Now()
+	keepaliveDone := make(chan struct{})
 	defer func() {
+		close(keepaliveDone)
 		for _, session := range s.sessions.unregisterWorker(worker) {
-			_ = session.socket.writeJSON(sessionMessage{Type: "error", Error: "Worker 会话已断开，正在等待重连"})
+			if session.mode != "desktop" {
+				_ = session.socket.writeJSON(sessionMessage{Type: "error", Error: "Worker 会话已断开，正在等待重连"})
+			}
 			_ = session.socket.conn.Close(websocket.StatusTryAgainLater, "worker disconnected")
 		}
 		worker.socket.conn.CloseNow()
@@ -363,6 +362,21 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 			ResourceKind: "server", ResourceID: serverID,
 			DurationMS: time.Since(connectedAt).Milliseconds(),
 		})
+	}()
+	go func() {
+		ticker := time.NewTicker(sandboxWorkerKeepalive)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-keepaliveDone:
+				return
+			case <-ticker.C:
+				if err := worker.socket.writeJSON(sessionMessage{Type: "keepalive"}); err != nil {
+					worker.socket.conn.CloseNow()
+					return
+				}
+			}
+		}
 	}()
 
 	for {
@@ -378,14 +392,32 @@ func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Requ
 		if browser == nil {
 			continue
 		}
-		if err := browser.socket.write(payload); err != nil {
+		if browser.mode == "desktop" {
+			switch message.Type {
+			case "desktop-data":
+				data, decodeErr := base64.StdEncoding.DecodeString(message.Data)
+				if decodeErr != nil || len(data) > sandboxSessionReadLimit {
+					_ = browser.socket.conn.Close(websocket.StatusUnsupportedData, "invalid desktop frame")
+					continue
+				}
+				if err := browser.socket.writeBinary(data); err != nil {
+					_ = browser.socket.conn.Close(websocket.StatusInternalError, "browser write failed")
+				}
+			case "error":
+				_ = browser.socket.conn.Close(websocket.StatusInternalError, closeReason(message.Error))
+			case "closed":
+				_ = browser.socket.conn.Close(websocket.StatusNormalClosure, "desktop session closed")
+			}
+			continue
+		}
+		if err := browser.socket.write(websocket.MessageText, payload); err != nil {
 			_ = browser.socket.conn.Close(websocket.StatusInternalError, "browser write failed")
 		}
 	}
 }
 
 func (s *Server) connectSandboxSession(w http.ResponseWriter, request *http.Request) {
-	ticket, ok := s.sessions.consumeTicket(request.URL.Query().Get("ticket"), request.PathValue("id"))
+	ticket, ok := s.sessions.consumeTicket(request.URL.Query().Get("ticket"), request.PathValue("id"), "terminal")
 	if !ok {
 		s.writeError(w, http.StatusUnauthorized, "沙箱会话票据无效或已过期")
 		return
@@ -396,11 +428,8 @@ func (s *Server) connectSandboxSession(w http.ResponseWriter, request *http.Requ
 		return
 	}
 	conn.SetReadLimit(sandboxSessionReadLimit)
-	pingDone := make(chan struct{})
-	defer close(pingDone)
-	startSessionPing(conn, pingDone)
 	browser := &browserSessionConnection{
-		id: uuid.NewString(), serverID: ticket.Target.ServerID, socket: &sessionSocket{conn: conn},
+		id: uuid.NewString(), serverID: ticket.Target.ServerID, mode: "terminal", socket: &sessionSocket{conn: conn},
 	}
 	worker, ok := s.sessions.registerBrowser(browser)
 	if !ok {
@@ -451,6 +480,83 @@ func (s *Server) connectSandboxSession(w http.ResponseWriter, request *http.Requ
 			return
 		}
 	}
+}
+
+func (s *Server) connectSandboxDesktop(w http.ResponseWriter, request *http.Request) {
+	ticket, ok := s.sessions.consumeTicket(request.URL.Query().Get("ticket"), request.PathValue("id"), "desktop")
+	if !ok {
+		s.writeError(w, http.StatusUnauthorized, "沙箱桌面票据无效或已过期")
+		return
+	}
+	conn, err := websocket.Accept(w, request, s.sessions.acceptOptions(request))
+	if err != nil {
+		s.logger.Warn("accept browser desktop websocket", "sandbox_id", ticket.Target.SandboxID, "error", err)
+		return
+	}
+	conn.SetReadLimit(sandboxSessionReadLimit)
+	browser := &browserSessionConnection{
+		id: uuid.NewString(), serverID: ticket.Target.ServerID, mode: "desktop", socket: &sessionSocket{conn: conn},
+	}
+	worker, ok := s.sessions.registerBrowser(browser)
+	if !ok {
+		_ = conn.Close(websocket.StatusTryAgainLater, "worker session unavailable")
+		return
+	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategorySession, Action: "desktop-connect",
+		Message:      "沙箱桌面会话已建立",
+		ResourceKind: string(platform.KindSandbox), ResourceID: ticket.Target.SandboxID,
+		Detail: map[string]any{"serverId": ticket.Target.ServerID, "driver": ticket.Target.Driver},
+	})
+	connectedAt := time.Now()
+	defer func() {
+		if currentWorker := s.sessions.unregisterBrowser(browser); currentWorker != nil {
+			_ = currentWorker.socket.writeJSON(sessionMessage{Type: "close", SessionID: browser.id})
+		}
+		conn.CloseNow()
+		s.recordLog(request, platform.LogEntry{
+			Category: platform.LogCategorySession, Action: "desktop-close",
+			Message:      "沙箱桌面会话已关闭",
+			ResourceKind: string(platform.KindSandbox), ResourceID: ticket.Target.SandboxID,
+			DurationMS: time.Since(connectedAt).Milliseconds(),
+			Detail:     map[string]any{"serverId": ticket.Target.ServerID, "driver": ticket.Target.Driver},
+		})
+	}()
+	if err := worker.socket.writeJSON(sessionMessage{
+		Type: "open", Mode: "desktop", SessionID: browser.id, SandboxID: ticket.Target.SandboxID,
+		ExternalID: ticket.Target.ExternalID, Driver: ticket.Target.Driver,
+	}); err != nil {
+		_ = conn.Close(websocket.StatusTryAgainLater, "worker session unavailable")
+		return
+	}
+
+	for {
+		_, payload, err := conn.Read(context.Background())
+		if err != nil {
+			return
+		}
+		if len(payload) == 0 || len(payload) > sandboxSessionReadLimit {
+			_ = conn.Close(websocket.StatusMessageTooBig, "desktop frame is too large")
+			return
+		}
+		if err := worker.socket.writeJSON(sessionMessage{
+			Type: "desktop-input", SessionID: browser.id, Data: base64.StdEncoding.EncodeToString(payload),
+		}); err != nil {
+			_ = conn.Close(websocket.StatusTryAgainLater, "worker session unavailable")
+			return
+		}
+	}
+}
+
+func closeReason(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "desktop session failed"
+	}
+	if len(value) > 120 {
+		return value[:120]
+	}
+	return value
 }
 
 func validBrowserSessionMessage(payload []byte) (sessionMessage, bool) {

@@ -96,6 +96,30 @@ func TestEnvironmentTemplateRequiresServerInventorySelection(t *testing.T) {
 	}
 }
 
+func TestRuntimeAndSandboxRejectNonBooleanDesktop(t *testing.T) {
+	projectID := "default"
+	for _, input := range []Input{
+		{
+			ID: "runtime-desktop", Kind: KindRuntime, ProjectID: &projectID, Name: "Runtime Desktop",
+			Spec: map[string]any{
+				"serverId": "7b20f83b-6418-4a9f-8477-3dc7c35d6310", "driver": "docker",
+				"imageReference": "ubuntu:24.04", "desktop": "true",
+			},
+		},
+		{
+			ID: "sandbox-desktop", Kind: KindSandbox, ProjectID: &projectID, Name: "Sandbox Desktop",
+			Spec: map[string]any{
+				"runtimeId": "runtime-one", "serverId": "7b20f83b-6418-4a9f-8477-3dc7c35d6310",
+				"desktop": 1,
+			},
+		},
+	} {
+		if err := Validate(input); !IsValidationError(err) {
+			t.Fatalf("Validate(%s) error = %v, want invalid desktop rejection", input.Kind, err)
+		}
+	}
+}
+
 func TestSandboxRequiresTargetServer(t *testing.T) {
 	projectID := "default"
 	input := Input{

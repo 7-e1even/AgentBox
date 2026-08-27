@@ -52,6 +52,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Spinner } from "@/components/ui/spinner"
+import { Switch } from "@/components/ui/switch"
 import { Textarea } from "@/components/ui/textarea"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
 
@@ -78,6 +79,7 @@ type SpecField = {
   imageDriver?: string
   multiOptions?: Option[]
   environmentVariables?: boolean
+  boolean?: boolean
   advanced?: boolean
   emptyValue?: string
   disabled?: boolean
@@ -176,8 +178,7 @@ function fields(
           key: "reference",
           label: "OCI 镜像引用",
           placeholder: "ubuntu:24.04 或 registry.example.com/agent:latest",
-          description:
-            "保存镜像引用；实际拉取发生在沙箱创建阶段。",
+          description: "保存镜像引用；实际拉取发生在沙箱创建阶段。",
         },
         {
           key: "architecture",
@@ -192,7 +193,8 @@ function fields(
           key: "modes",
           label: "兼容类型",
           multiOptions: [{ value: "docker", label: "Docker 容器" }],
-          description: "镜像通过 OCI 运行时（Docker、BoxLite、Microsandbox）使用。",
+          description:
+            "镜像通过 OCI 运行时（Docker、BoxLite、Microsandbox）使用。",
         },
       ]
     case "runtime":
@@ -217,6 +219,13 @@ function fields(
           imageChoices,
           imageDriver: driver,
           description: runtimeImageDescription(driver),
+        },
+        {
+          key: "desktop",
+          label: "图形桌面",
+          boolean: true,
+          description:
+            "在沙箱内预装 XFCE 桌面，可直接从工作区操作；支持 Docker、BoxLite 和 Microsandbox，要求 Debian/Ubuntu 系镜像。",
         },
         {
           key: "agentTools",
@@ -434,6 +443,7 @@ function defaults(kind: ResourceKind) {
     runtime: {
       driver: "docker",
       imageReference: "ubuntu:24.04",
+      desktop: false,
       agentTools: ["codex"],
       workdir: "/workspace",
       cpu: "2",
@@ -482,7 +492,10 @@ function SpecFieldEditor({
   return (
     <Field
       className={
-        field.textarea || field.multiOptions || field.environmentVariables
+        field.textarea ||
+        field.multiOptions ||
+        field.environmentVariables ||
+        field.boolean
           ? "sm:col-span-2"
           : undefined
       }
@@ -497,7 +510,19 @@ function SpecFieldEditor({
       >
         {field.label}
       </FieldLabel>
-      {field.multiOptions ? (
+      {field.boolean ? (
+        <div className="flex items-center justify-between gap-4 rounded-lg border bg-muted/15 px-3 py-2.5">
+          <FieldDescription className="max-w-2xl">
+            {field.description}
+          </FieldDescription>
+          <Switch
+            id={`spec-${field.key}`}
+            checked={spec[field.key] === true}
+            disabled={field.disabled}
+            onCheckedChange={(checked) => onChange(field.key, checked)}
+          />
+        </div>
+      ) : field.multiOptions ? (
         <ToggleGroup
           type="multiple"
           variant="selection"
@@ -584,7 +609,7 @@ function SpecFieldEditor({
           onChange={(event) => onChange(field.key, event.target.value)}
         />
       )}
-      {(field.description || field.multiOptions) && (
+      {!field.boolean && (field.description || field.multiOptions) && (
         <FieldDescription aria-live="polite">
           {field.multiOptions &&
             `已选择 ${stringArray(spec[field.key]).length} 个`}
@@ -614,6 +639,7 @@ function nextSpec(
     )
     if (runtime) {
       next.serverId = runtime.spec.serverId
+      next.desktop = runtime.spec.desktop === true
       next.agentTools = supportedAgentToolList(runtime.spec.agentTools)
       next.credentialIds = stringArray(runtime.spec.credentialIds)
       next.environmentVariables = sandboxEnvironmentVariables(
@@ -1006,9 +1032,7 @@ export function ResourceEditorDialog({
             <details
               className="group rounded-xl border"
               open={advancedOpen}
-              onToggle={(event) =>
-                setAdvancedOpen(event.currentTarget.open)
-              }
+              onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
             >
               <summary className="cursor-pointer list-none px-4 py-3 text-sm font-medium">
                 高级配置
