@@ -48,6 +48,8 @@ type PlatformStore interface {
 	ListNetworkProxies(context.Context) ([]platform.ManagedNetworkProxy, error)
 	CreateNetworkProxy(context.Context, platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error)
 	UpdateNetworkProxy(context.Context, string, platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error)
+	CreateNetworkProxyCheck(context.Context, string, string, string) (platform.NetworkProxyCheck, error)
+	GetNetworkProxyCheck(context.Context, string, string) (platform.NetworkProxyCheck, error)
 	DeleteNetworkProxy(context.Context, string) error
 	ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error)
 	ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error)
@@ -186,6 +188,8 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	authenticated("GET /api/network-proxies", server.listNetworkProxies)
 	admin("POST /api/network-proxies", server.createNetworkProxy)
 	admin("PATCH /api/network-proxies/{id}", server.updateNetworkProxy)
+	admin("POST /api/network-proxies/{id}/check", server.checkNetworkProxy)
+	admin("GET /api/network-proxies/{id}/checks/{checkId}", server.getNetworkProxyCheck)
 	admin("DELETE /api/network-proxies/{id}", server.deleteNetworkProxy)
 	authenticated("GET /api/servers", server.listServers)
 	admin("DELETE /api/servers/{id}", server.deleteServer)

@@ -73,5 +73,38 @@ export const networkProxyResponseSchema = z.object({
   proxy: managedNetworkProxySchema,
 })
 
+export const networkProxyCheckResultSchema = z
+  .object({
+    checkId: z.string().uuid(),
+    proxyId: proxyIdSchema,
+    serverId: z.string().uuid(),
+    serverName: z.string().min(1),
+    scope: z.literal("worker"),
+    status: z.enum(["pending", "running", "completed"]),
+    ok: z.boolean().optional(),
+    latencyMs: z.number().int().nonnegative().optional(),
+    target: z.string().url(),
+    statusCode: z.number().int().min(100).max(599).optional(),
+    error: z.string().optional(),
+    checkedAt: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict()
+  .superRefine((result, context) => {
+    if (result.status === "completed" && result.ok === undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["ok"],
+        message: "已完成的 Worker 检测必须包含结果",
+      })
+    }
+  })
+
+export const networkProxyCheckResponseSchema = z.object({
+  result: networkProxyCheckResultSchema,
+})
+
 export type NetworkProxyInput = z.infer<typeof networkProxyInputSchema>
 export type ManagedNetworkProxy = z.infer<typeof managedNetworkProxySchema>
+export type NetworkProxyCheckResult = z.infer<
+  typeof networkProxyCheckResultSchema
+>

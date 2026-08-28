@@ -145,6 +145,20 @@ func (fakeStore) CreateNetworkProxy(_ context.Context, input platform.NetworkPro
 func (fakeStore) UpdateNetworkProxy(_ context.Context, _ string, input platform.NetworkProxyInput) (platform.ManagedNetworkProxy, error) {
 	return platform.ManagedNetworkProxy{ID: input.ID, Name: input.Name}, nil
 }
+func (fakeStore) CreateNetworkProxyCheck(_ context.Context, proxyID, serverID, target string) (platform.NetworkProxyCheck, error) {
+	return platform.NetworkProxyCheck{
+		ID: "754f76dd-2297-44e9-8204-a688be9be4a5", ProxyID: proxyID,
+		ServerID: serverID, ServerName: "Worker One", Scope: "worker", Status: "pending", Target: target,
+	}, nil
+}
+func (fakeStore) GetNetworkProxyCheck(_ context.Context, proxyID, checkID string) (platform.NetworkProxyCheck, error) {
+	ok := true
+	return platform.NetworkProxyCheck{
+		ID: checkID, ProxyID: proxyID, ServerID: "7b20f83b-6418-4a9f-8477-3dc7c35d6310",
+		ServerName: "Worker One", Scope: "worker", Status: "completed", OK: &ok,
+		Target: networkProxyCheckTarget,
+	}, nil
+}
 func (fakeStore) DeleteNetworkProxy(context.Context, string) error { return nil }
 func (fakeStore) ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error) {
 	return platform.RuntimeLLMTarget{}, store.ErrRuntimeUnauthorized

@@ -842,11 +842,169 @@ func (s *Store) UpdateNetworkProxy(ctx context.Context, id string, input platfor
 	return result, err
 }
 
+func (s *Store) CreateNetworkProxyCheck(
+	ctx context.Context,
+	proxyID, serverID, target string,
+) (platform.NetworkProxyCheck, error) {
+	proxyID = strings.TrimSpace(proxyID)
+	serverID = strings.TrimSpace(serverID)
+	if _, err := uuid.Parse(serverID); err != nil {
+		return platform.NetworkProxyCheck{}, &platform.ValidationError{Message: "请选择有效的在线 Worker"}
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("begin network proxy check: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var proxyExists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+      SELECT 1 FROM network_proxies WHERE id = $1
+    )`, proxyID).Scan(&proxyExists); err != nil {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("load network proxy check target: %w", err)
+	}
+	if !proxyExists {
+		return platform.NetworkProxyCheck{}, ErrResourceNotFound
+	}
+
+	var serverName string
+	var serverOnline bool
+	err = tx.QueryRow(ctx, `SELECT name,
+      last_seen_at > NOW() - INTERVAL '45 seconds'
+      FROM managed_servers WHERE id = $1`, serverID).Scan(&serverName, &serverOnline)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.NetworkProxyCheck{}, ErrResourceNotFound
+	}
+	if err != nil {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("load network proxy check Worker: %w", err)
+	}
+	if !serverOnline {
+		return platform.NetworkProxyCheck{}, &platform.ValidationError{Message: "所选 Worker 已离线，无法执行检测"}
+	}
+
+	var active bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+      SELECT 1 FROM worker_jobs
+      WHERE server_id = $1 AND action = 'check-network-proxy'
+        AND payload->>'proxyId' = $2 AND status IN ('pending', 'leased')
+    )`, serverID, proxyID).Scan(&active); err != nil {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("check active network proxy check: %w", err)
+	}
+	if active {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("%w: network proxy check already in progress", ErrConflict)
+	}
+
+	now := time.Now().UTC()
+	result := platform.NetworkProxyCheck{
+		ID: uuid.NewString(), ProxyID: proxyID, ServerID: serverID, ServerName: serverName,
+		Scope: "worker", Status: "pending", Target: target,
+	}
+	payload := mustMapJSON(map[string]any{"proxyId": proxyID, "target": target})
+	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
+      (id, server_id, resource_id, action, status, payload, created_at, updated_at)
+      VALUES ($1, $2, NULL, 'check-network-proxy', 'pending', $3::jsonb, $4, $4)`,
+		result.ID, serverID, payload, now); err != nil {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("enqueue network proxy check: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("commit network proxy check: %w", err)
+	}
+	return result, nil
+}
+
+func (s *Store) GetNetworkProxyCheck(ctx context.Context, proxyID, checkID string) (platform.NetworkProxyCheck, error) {
+	if _, err := uuid.Parse(checkID); err != nil {
+		return platform.NetworkProxyCheck{}, ErrResourceNotFound
+	}
+	var result platform.NetworkProxyCheck
+	var jobStatus, output string
+	err := s.pool.QueryRow(ctx, `SELECT jobs.id::text, jobs.payload->>'proxyId',
+      jobs.server_id::text, servers.name, jobs.status, jobs.payload->>'target', jobs.result_output
+      FROM worker_jobs AS jobs
+      JOIN managed_servers AS servers ON servers.id = jobs.server_id
+      WHERE jobs.id = $1 AND jobs.action = 'check-network-proxy'
+        AND jobs.payload->>'proxyId' = $2`, checkID, proxyID).Scan(
+		&result.ID, &result.ProxyID, &result.ServerID, &result.ServerName,
+		&jobStatus, &result.Target, &output,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.NetworkProxyCheck{}, ErrResourceNotFound
+	}
+	if err != nil {
+		return platform.NetworkProxyCheck{}, fmt.Errorf("get network proxy check: %w", err)
+	}
+	result.Scope = "worker"
+	switch jobStatus {
+	case "pending", "blocked":
+		result.Status = "pending"
+	case "leased":
+		result.Status = "running"
+	case "succeeded", "failed":
+		result.Status = "completed"
+		applyNetworkProxyCheckOutput(&result, output)
+	default:
+		return platform.NetworkProxyCheck{}, fmt.Errorf("unexpected network proxy check status %q", jobStatus)
+	}
+	return result, nil
+}
+
+func applyNetworkProxyCheckOutput(result *platform.NetworkProxyCheck, output string) {
+	var workerResult struct {
+		OK         bool      `json:"ok"`
+		LatencyMS  int64     `json:"latencyMs"`
+		Target     string    `json:"target"`
+		StatusCode int       `json:"statusCode"`
+		Error      string    `json:"error"`
+		CheckedAt  time.Time `json:"checkedAt"`
+	}
+	ok := false
+	if err := json.Unmarshal([]byte(output), &workerResult); err != nil {
+		result.OK = &ok
+		result.Error = "Worker 未返回有效的代理检测结果"
+		return
+	}
+	if workerResult.LatencyMS >= 0 && workerResult.LatencyMS <= 60_000 {
+		result.LatencyMS = workerResult.LatencyMS
+	}
+	if workerResult.StatusCode >= 100 && workerResult.StatusCode <= 599 {
+		result.StatusCode = workerResult.StatusCode
+	}
+	ok = workerResult.OK && result.StatusCode == http.StatusNoContent
+	result.OK = &ok
+	if !ok {
+		result.Error = safeNetworkProxyCheckError(workerResult.Error, result.StatusCode)
+	}
+	if !workerResult.CheckedAt.IsZero() {
+		result.CheckedAt = &workerResult.CheckedAt
+	}
+}
+
+func safeNetworkProxyCheckError(message string, statusCode int) string {
+	if statusCode != 0 && statusCode != http.StatusNoContent {
+		return fmt.Sprintf("检测地址返回 HTTP %d", statusCode)
+	}
+	switch message {
+	case "Worker 收到的代理检测任务无效",
+		"Worker 无法解析代理主机",
+		"Worker 无法连接代理",
+		"Worker 代理检测超时（10 秒）",
+		"Worker 代理 TLS 校验失败",
+		"Worker 无法通过代理访问检测地址":
+		return message
+	default:
+		return "Worker 无法通过代理访问检测地址"
+	}
+}
+
 func (s *Store) DeleteNetworkProxy(ctx context.Context, id string) error {
 	var referenced bool
 	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
     SELECT 1 FROM control_resources
     WHERE kind IN ('runtime', 'sandbox') AND spec->>'proxyId' = $1
+  ) OR EXISTS(
+    SELECT 1 FROM worker_jobs
+    WHERE action = 'check-network-proxy' AND payload->>'proxyId' = $1
+      AND status IN ('pending', 'leased')
   )`, id).Scan(&referenced); err != nil {
 		return fmt.Errorf("check network proxy bindings: %w", err)
 	}
@@ -923,7 +1081,7 @@ func (s *Store) PullCredentialModels(ctx context.Context, id string) ([]platform
 	}
 	response, err := safeProviderHTTPClient().Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("%w: 连接失败: %v", ErrProviderUnavailable, err)
+		return nil, fmt.Errorf("%w: %s", ErrProviderUnavailable, providerConnectionErrorMessage(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -1099,13 +1257,37 @@ func checkProviderCredential(ctx context.Context, providerID, protocol, endpoint
 	}
 	response, err := safeProviderHTTPClient().Do(request)
 	if err != nil {
-		return fmt.Errorf("连接失败: %w", err)
+		return errors.New(providerConnectionErrorMessage(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return fmt.Errorf("Provider 返回 HTTP %d", response.StatusCode)
 	}
 	return nil
+}
+
+// providerConnectionErrorMessage intentionally does not include err.Error().
+// A net/url.Error contains the full request URL, which may carry Gemini's API
+// key in its query string.
+func providerConnectionErrorMessage(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "连接 Provider 超时"
+	}
+	var netError net.Error
+	if errors.As(err, &netError) && netError.Timeout() {
+		return "连接 Provider 超时"
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "no such host"):
+		return "无法解析 Provider 主机"
+	case strings.Contains(message, "connection refused"):
+		return "Provider 拒绝连接"
+	case strings.Contains(message, "x509"), strings.Contains(message, "tls"):
+		return "Provider TLS 校验失败"
+	default:
+		return "无法连接 Provider"
+	}
 }
 
 func providerCheckRequest(ctx context.Context, providerID, protocol, endpoint, secret string) (*http.Request, error) {
@@ -1667,9 +1849,11 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 		if err := s.attachWorkerCredentials(ctx, tx, job.ResourceID, job.Payload); err != nil {
 			return platform.WorkerJob{}, err
 		}
-		if err := s.attachWorkerNetworkProxy(ctx, tx, job.Payload); err != nil {
-			return platform.WorkerJob{}, err
-		}
+	}
+	if err := s.attachWorkerNetworkProxy(
+		ctx, tx, job.Payload, job.Action == "check-network-proxy",
+	); err != nil {
+		return platform.WorkerJob{}, err
 	}
 	now := time.Now().UTC()
 	leaseDuration := workerJobLeaseDuration
@@ -1741,7 +1925,12 @@ func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, sandboxI
 	return nil
 }
 
-func (s *Store) attachWorkerNetworkProxy(ctx context.Context, tx pgx.Tx, payload map[string]any) error {
+func (s *Store) attachWorkerNetworkProxy(
+	ctx context.Context,
+	tx pgx.Tx,
+	payload map[string]any,
+	allowDisabled bool,
+) error {
 	proxyID, _ := payload["proxyId"].(string)
 	proxyID = strings.TrimSpace(proxyID)
 	if proxyID == "" {
@@ -1752,7 +1941,7 @@ func (s *Store) attachWorkerNetworkProxy(ctx context.Context, tx pgx.Tx, payload
 	var ciphertext, nonce, noProxyJSON []byte
 	if err := tx.QueryRow(ctx, `SELECT scheme, host, port, username,
       password_ciphertext, password_nonce, no_proxy
-    FROM network_proxies WHERE id = $1 AND enabled = TRUE`, proxyID).Scan(
+    FROM network_proxies WHERE id = $1 AND (enabled = TRUE OR $2)`, proxyID, allowDisabled).Scan(
 		&scheme, &host, &port, &username, &ciphertext, &nonce, &noProxyJSON,
 	); errors.Is(err, pgx.ErrNoRows) {
 		return &platform.ValidationError{Message: "环境引用了不存在或已停用的网络代理"}

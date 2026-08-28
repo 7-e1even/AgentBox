@@ -70,6 +70,8 @@ func TestViewerWriteRequestsAreForbidden(t *testing.T) {
 		{http.MethodDelete, "/api/credentials/openai-primary", ""},
 		{http.MethodDelete, "/api/credentials/openai-primary/models/custom-model", ""},
 		{http.MethodPost, "/api/network-proxies", `{"name":"p","url":"http://proxy:8080"}`},
+		{http.MethodPost, "/api/network-proxies/proxy-one/check", ""},
+		{http.MethodGet, "/api/network-proxies/proxy-one/checks/754f76dd-2297-44e9-8204-a688be9be4a5", ""},
 		{http.MethodDelete, "/api/network-proxies/proxy-one", ""},
 		{http.MethodGet, "/api/users", ""},
 		{http.MethodDelete, "/api/users/0954c4cd-8cce-4f3f-9d73-f03407c9afe1", ""},
@@ -157,6 +159,8 @@ func TestOperatorAdminOnlyAreasAreForbidden(t *testing.T) {
 		{http.MethodDelete, "/api/credentials/openai-primary"},
 		{http.MethodDelete, "/api/credentials/openai-primary/models/custom-model"},
 		{http.MethodPost, "/api/network-proxies"},
+		{http.MethodPost, "/api/network-proxies/proxy-one/check"},
+		{http.MethodGet, "/api/network-proxies/proxy-one/checks/754f76dd-2297-44e9-8204-a688be9be4a5"},
 		{http.MethodDelete, "/api/network-proxies/proxy-one"},
 	}
 	for _, testCase := range cases {

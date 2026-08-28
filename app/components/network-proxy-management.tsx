@@ -1,11 +1,15 @@
 "use client"
 
-import { useState } from "react"
+import { useMemo, useState } from "react"
 import {
+  CircleCheckIcon,
+  CircleXIcon,
   EyeIcon,
   EyeOffIcon,
+  GaugeIcon,
   NetworkIcon,
   PlusIcon,
+  RefreshCwIcon,
   SaveIcon,
   ShieldCheckIcon,
   Trash2Icon,
@@ -49,6 +53,7 @@ import {
 } from "@/components/ui/input-group"
 import {
   Item,
+  ItemActions,
   ItemContent,
   ItemDescription,
   ItemGroup,
@@ -71,24 +76,38 @@ import { Textarea } from "@/components/ui/textarea"
 import {
   networkProxyInputSchema,
   type ManagedNetworkProxy,
+  type NetworkProxyCheckResult,
   type NetworkProxyInput,
 } from "@/lib/network-proxy-schema"
+import type { ManagedServer } from "@/lib/server-schema"
 import { cn } from "@/lib/utils"
 
 type NetworkProxyManagementProps = {
   proxies: ManagedNetworkProxy[]
+  servers: ManagedServer[]
   canMutate: boolean
   onSave: (
     input: NetworkProxyInput,
     editing: ManagedNetworkProxy | null
   ) => Promise<ManagedNetworkProxy>
+  onCheck: (
+    proxy: ManagedNetworkProxy,
+    serverId: string
+  ) => Promise<NetworkProxyCheckResult>
   onDelete: (proxy: ManagedNetworkProxy) => Promise<void>
 }
 
+type ProxyCheckState =
+  | { status: "checking"; serverName: string }
+  | { status: "complete"; result: NetworkProxyCheckResult }
+  | { status: "error"; error: string; serverName: string }
+
 export function NetworkProxyManagement({
   proxies,
+  servers,
   canMutate,
   onSave,
+  onCheck,
   onDelete,
 }: NetworkProxyManagementProps) {
   const [selection, setSelection] = useState<string | null>(
@@ -97,9 +116,29 @@ export function NetworkProxyManagement({
   const [creating, setCreating] = useState(canMutate && proxies.length === 0)
   const [deleting, setDeleting] = useState<ManagedNetworkProxy | null>(null)
   const [deletingBusy, setDeletingBusy] = useState(false)
+  const [checks, setChecks] = useState<Record<string, ProxyCheckState>>({})
+  const [checkingAll, setCheckingAll] = useState(false)
+  const onlineServers = useMemo(
+    () => servers.filter((server) => server.status === "online"),
+    [servers]
+  )
+  const [checkServerId, setCheckServerId] = useState(
+    () => onlineServers[0]?.id ?? ""
+  )
+  const effectiveCheckServerId = onlineServers.some(
+    (server) => server.id === checkServerId
+  )
+    ? checkServerId
+    : (onlineServers[0]?.id ?? "")
+  const checkServer = onlineServers.find(
+    (server) => server.id === effectiveCheckServerId
+  )
   const selected = selection
     ? (proxies.find((item) => item.id === selection) ?? null)
     : null
+  const checkingAny = Object.values(checks).some(
+    (state) => state.status === "checking"
+  )
 
   async function confirmDelete() {
     if (!deleting) return
@@ -111,9 +150,59 @@ export function NetworkProxyManagement({
           proxies.find((item) => item.id !== deleting.id)?.id ?? null
         )
       }
+      setChecks((current) => {
+        const next = { ...current }
+        delete next[deleting.id]
+        return next
+      })
       setDeleting(null)
     } finally {
       setDeletingBusy(false)
+    }
+  }
+
+  async function runCheck(proxy: ManagedNetworkProxy) {
+    if (!checkServer) {
+      setChecks((current) => ({
+        ...current,
+        [proxy.id]: {
+          status: "error",
+          error: "没有在线 Worker 可执行检测",
+          serverName: "",
+        },
+      }))
+      return
+    }
+    setChecks((current) => ({
+      ...current,
+      [proxy.id]: { status: "checking", serverName: checkServer.name },
+    }))
+    try {
+      const result = await onCheck(proxy, checkServer.id)
+      setChecks((current) => ({
+        ...current,
+        [proxy.id]: { status: "complete", result },
+      }))
+    } catch (cause) {
+      setChecks((current) => ({
+        ...current,
+        [proxy.id]: {
+          status: "error",
+          error: cause instanceof Error ? cause.message : "检测请求失败",
+          serverName: checkServer.name,
+        },
+      }))
+    }
+  }
+
+  async function runAllChecks() {
+    setCheckingAll(true)
+    try {
+      for (const proxy of proxies) {
+        await runCheck(proxy)
+      }
+    } finally {
+      setCheckingAll(false)
     }
   }
 
@@ -124,10 +213,32 @@ export function NetworkProxyManagement({
         count={proxies.length}
         action={
           canMutate ? (
-            <Button size="sm" onClick={() => setCreating(true)}>
-              <PlusIcon data-icon="inline-start" />
-              添加代理
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                aria-label="检测全部代理"
+                disabled={
+                  checkingAny || proxies.length === 0 || !effectiveCheckServerId
+                }
+                onClick={() => void runAllChecks()}
+              >
+                {checkingAll ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <RefreshCwIcon data-icon="inline-start" />
+                )}
+                <span className="hidden sm:inline">检测全部</span>
+              </Button>
+              <Button
+                size="sm"
+                aria-label="添加网络代理"
+                onClick={() => setCreating(true)}
+              >
+                <PlusIcon data-icon="inline-start" />
+                <span className="hidden sm:inline">添加代理</span>
+              </Button>
+            </div>
           ) : undefined
         }
       />
@@ -163,6 +274,7 @@ export function NetworkProxyManagement({
                         >
                           {proxy.enabled ? "启用" : "停用"}
                         </Badge>
+                        <ProxyCheckBadge state={checks[proxy.id]} />
                       </ItemTitle>
                       <ItemDescription>
                         {proxy.scheme}://{formatHost(proxy.host)}:{proxy.port}
@@ -203,6 +315,11 @@ export function NetworkProxyManagement({
               }}
               onSave={async (input) => {
                 const saved = await onSave(input, null)
+                setChecks((current) => {
+                  const next = { ...current }
+                  delete next[saved.id]
+                  return next
+                })
                 setSelection(saved.id)
                 setCreating(false)
               }}
@@ -212,9 +329,19 @@ export function NetworkProxyManagement({
               key={selected.id}
               proxy={selected}
               canMutate={canMutate}
+              checkState={checks[selected.id]}
+              onlineServers={onlineServers}
+              checkServerId={effectiveCheckServerId}
+              onCheckServerChange={setCheckServerId}
+              onCheck={canMutate ? () => runCheck(selected) : undefined}
               onDelete={canMutate ? () => setDeleting(selected) : undefined}
               onSave={async (input) => {
                 const saved = await onSave(input, selected)
+                setChecks((current) => {
+                  const next = { ...current }
+                  delete next[saved.id]
+                  return next
+                })
                 setSelection(saved.id)
               }}
             />
@@ -279,12 +406,22 @@ function ProxyEditor({
   proxy,
   canMutate = true,
   onSave,
+  checkState,
+  onlineServers = [],
+  checkServerId = "",
+  onCheckServerChange,
+  onCheck,
   onCancel,
   onDelete,
 }: {
   proxy: ManagedNetworkProxy | null
   canMutate?: boolean
   onSave: (input: NetworkProxyInput) => Promise<void>
+  checkState?: ProxyCheckState
+  onlineServers?: ManagedServer[]
+  checkServerId?: string
+  onCheckServerChange?: (serverId: string) => void
+  onCheck?: () => Promise<void>
   onCancel?: () => void
   onDelete?: () => void
 }) {
@@ -361,13 +498,74 @@ function ProxyEditor({
         </p>
       </div>
 
+      {proxy && onCheck ? (
+        <Item variant="outline" size="sm">
+          <ItemMedia variant="icon">
+            <GaugeIcon />
+          </ItemMedia>
+          <ItemContent>
+            <ItemTitle>
+              连通性检测
+              <ProxyCheckBadge state={checkState} showUntested />
+            </ItemTitle>
+            <ItemDescription>
+              {proxyCheckDescription(
+                checkState,
+                onlineServers.find((server) => server.id === checkServerId)
+                  ?.name
+              )}
+            </ItemDescription>
+          </ItemContent>
+          <ItemActions>
+            <Select
+              value={checkServerId || undefined}
+              disabled={onlineServers.length === 0}
+              onValueChange={(value) => onCheckServerChange?.(value)}
+            >
+              <SelectTrigger
+                className="w-40"
+                aria-label="执行代理检测的 Worker"
+              >
+                <SelectValue placeholder="无在线 Worker" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectLabel>在线 Worker</SelectLabel>
+                  {onlineServers.map((server) => (
+                    <SelectItem key={server.id} value={server.id}>
+                      {server.name}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={
+                saving || !checkServerId || checkState?.status === "checking"
+              }
+              onClick={() => void onCheck()}
+            >
+              {checkState?.status === "checking" ? (
+                <Spinner data-icon="inline-start" />
+              ) : (
+                <RefreshCwIcon data-icon="inline-start" />
+              )}
+              检测
+            </Button>
+          </ItemActions>
+        </Item>
+      ) : null}
+
       <Alert>
         <ShieldCheckIcon />
         <AlertTitle>作用于环境内的安装和运行流量</AlertTitle>
         <AlertDescription>
           AgentBox 会注入标准大小写代理变量。BoxLite
           受限网络可仅放行代理和直连地址；Docker
-          仍依赖应用遵守代理变量。宿主机拉取镜像不走这里的代理。
+          仍依赖应用遵守代理变量。宿主机拉取镜像和 AgentBox LLM
+          网关发出的模型请求不走这里的代理。
         </AlertDescription>
       </Alert>
 
@@ -584,4 +782,69 @@ function createSlug(value: string) {
 
 function formatHost(host: string) {
   return host.includes(":") ? `[${host}]` : host
+}
+
+function ProxyCheckBadge({
+  state,
+  showUntested = false,
+}: {
+  state?: ProxyCheckState
+  showUntested?: boolean
+}) {
+  if (!state) {
+    return showUntested ? <Badge variant="outline">未检测</Badge> : null
+  }
+  if (state.status === "checking") {
+    return (
+      <Badge variant="outline">
+        <Spinner />
+        检测中
+      </Badge>
+    )
+  }
+  if (state.status === "error") {
+    return (
+      <Badge variant="destructive">
+        <CircleXIcon />
+        失败
+      </Badge>
+    )
+  }
+  if (state.result.ok) {
+    return (
+      <Badge variant="secondary">
+        <CircleCheckIcon />
+        可用 · {state.result.latencyMs ?? 0} ms
+      </Badge>
+    )
+  }
+  return (
+    <Badge variant="destructive">
+      <CircleXIcon />
+      失败
+    </Badge>
+  )
+}
+
+function proxyCheckDescription(
+  state?: ProxyCheckState,
+  selectedServerName?: string
+) {
+  if (!state) {
+    return selectedServerName
+      ? `由 Worker ${selectedServerName} 通过此代理访问 Google 204；不检测模型出口。`
+      : "没有在线 Worker 可执行代理检测。"
+  }
+  if (state.status === "checking") {
+    return `Worker ${state.serverName} 正在建立代理连接，最长等待 10 秒。`
+  }
+  if (state.status === "error") {
+    return state.serverName
+      ? `Worker ${state.serverName} · ${state.error}`
+      : state.error
+  }
+  if (state.result.ok) {
+    return `Worker ${state.result.serverName} · HTTP ${state.result.statusCode ?? 204} · ${state.result.latencyMs ?? 0} ms · Google 204`
+  }
+  return `Worker ${state.result.serverName} · ${state.result.error || "代理不可用"}`
 }

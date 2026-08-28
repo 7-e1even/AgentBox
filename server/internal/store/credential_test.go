@@ -3,8 +3,10 @@ package store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 	"testing"
@@ -173,5 +175,25 @@ func TestNormalizeKnownProviderEndpointKeepsProtocolAndKimiPathAligned(t *testin
 				t.Fatalf("normalizeKnownProviderEndpoint() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestProviderConnectionErrorMessageDoesNotExposeRequestSecrets(t *testing.T) {
+	t.Parallel()
+
+	const secret = "x"
+	err := &url.Error{
+		Op:  http.MethodGet,
+		URL: "https://generativelanguage.googleapis.com/v1beta/models?key=" + secret,
+		Err: errors.New("dial tcp: connection refused; Authorization: Bearer header-secret"),
+	}
+	message := providerConnectionErrorMessage(err)
+	for _, forbidden := range []string{secret, "key=", "generativelanguage.googleapis.com", "header-secret"} {
+		if strings.Contains(message, forbidden) {
+			t.Fatalf("providerConnectionErrorMessage() exposed %q in %q", forbidden, message)
+		}
+	}
+	if message != "Provider 拒绝连接" {
+		t.Fatalf("providerConnectionErrorMessage() = %q", message)
 	}
 }

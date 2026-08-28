@@ -901,6 +901,40 @@ func TestWorkerInjectsProxyBeforeAgentInstallationWithoutPersistingSecret(t *tes
 	if configureIndex < 0 || installIndex < 0 || configureIndex >= installIndex {
 		t.Fatal("Worker must inject proxy settings before installing Agent tools")
 	}
+
+	configureStart := strings.Index(workerDaemon, "configure_proxy()")
+	if configureStart < 0 {
+		t.Fatal("Worker proxy configuration function was not found")
+	}
+	configureEnd := strings.Index(workerDaemon[configureStart:], "\n}\n")
+	if configureEnd < 0 {
+		t.Fatal("Worker proxy configuration function was not found")
+	}
+	configureBody := workerDaemon[configureStart : configureStart+configureEnd]
+	setExportIndex := strings.Index(configureBody, `'  set -a'`)
+	sourceIndex := strings.Index(configureBody, `'  . /opt/agentbox/secrets/proxy.env'`)
+	clearExportIndex := strings.Index(configureBody, `'  set +a'`)
+	if setExportIndex < 0 || sourceIndex <= setExportIndex || clearExportIndex <= sourceIndex {
+		t.Fatal("Worker must export proxy variables while loading the proxy environment")
+	}
+}
+
+func TestWorkerNetworkProxyCheckRunsOnWorkerWithoutCommandLineSecret(t *testing.T) {
+	for _, expected := range []string{
+		`check_network_proxy()`,
+		`check-network-proxy)`,
+		`HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL" ALL_PROXY="$PROXY_URL"`,
+		`NO_PROXY='' no_proxy=''`,
+		`--connect-timeout 5 --max-time 10 "$TARGET"`,
+		`network_proxy_check_failed proxy-check true`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker proxy check is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerDaemon, `--proxy "$PROXY_URL"`) {
+		t.Fatal("Worker proxy check must not expose proxy credentials in curl command arguments")
+	}
 }
 
 func TestWorkerShellScriptsHaveValidSyntax(t *testing.T) {

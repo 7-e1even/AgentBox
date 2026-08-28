@@ -174,6 +174,21 @@ type ManagedNetworkProxy struct {
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
+type NetworkProxyCheck struct {
+	ID         string     `json:"checkId"`
+	ProxyID    string     `json:"proxyId"`
+	ServerID   string     `json:"serverId"`
+	ServerName string     `json:"serverName"`
+	Scope      string     `json:"scope"`
+	Status     string     `json:"status"`
+	OK         *bool      `json:"ok,omitempty"`
+	LatencyMS  int64      `json:"latencyMs,omitzero"`
+	Target     string     `json:"target"`
+	StatusCode int        `json:"statusCode,omitzero"`
+	Error      string     `json:"error,omitempty"`
+	CheckedAt  *time.Time `json:"checkedAt,omitempty"`
+}
+
 type CredentialModel struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`

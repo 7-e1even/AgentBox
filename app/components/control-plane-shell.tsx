@@ -35,8 +35,10 @@ import {
 import { PROJECT_COOKIE_NAME, resourcesForProject } from "@/lib/project-scope"
 import type { ManagedServer } from "@/lib/server-schema"
 import {
+  networkProxyCheckResponseSchema,
   networkProxyResponseSchema,
   type ManagedNetworkProxy,
+  type NetworkProxyCheckResult,
   type NetworkProxyInput,
 } from "@/lib/network-proxy-schema"
 import { appToast as toast } from "@/lib/app-toast"
@@ -320,6 +322,28 @@ export function ControlPlaneShell({
       toast.error("无法删除代理", { description: errorMessage(error) })
       throw error
     }
+  }
+
+  async function checkNetworkProxy(
+    proxy: ManagedNetworkProxy,
+    serverId: string
+  ): Promise<NetworkProxyCheckResult> {
+    let result = networkProxyCheckResponseSchema.parse(
+      await requestJson<unknown>(`/api/network-proxies/${proxy.id}/check`, {
+        method: "POST",
+        body: JSON.stringify({ serverId }),
+      })
+    ).result
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      if (result.status === "completed") return result
+      await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 750))
+      result = networkProxyCheckResponseSchema.parse(
+        await requestJson<unknown>(
+          `/api/network-proxies/${proxy.id}/checks/${result.checkId}`
+        )
+      ).result
+    }
+    throw new Error("Worker 检测超时，请确认 Worker 在线状态")
   }
 
   async function checkCredential(credential: ManagedCredential) {
@@ -672,8 +696,10 @@ export function ControlPlaneShell({
     ) : section === "proxies" ? (
       <NetworkProxyManagement
         proxies={proxies}
+        servers={servers}
         canMutate={isAdmin}
         onSave={saveNetworkProxy}
+        onCheck={checkNetworkProxy}
         onDelete={deleteNetworkProxy}
       />
     ) : section === "settings" ? (

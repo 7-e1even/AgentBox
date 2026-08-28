@@ -2065,7 +2065,12 @@ configure_proxy() {
   append_env "$PROXY_ENV" no_proxy "$NO_PROXY"
   append_env "$PROXY_ENV" NODE_USE_ENV_PROXY 1
   append_env "$PROXY_ENV" CLAUDE_CODE_PROXY_RESOLVES_HOSTS 1
-  printf '%s\n' '[ -r /opt/agentbox/secrets/proxy.env ] && . /opt/agentbox/secrets/proxy.env' > "$PROXY_LOADER"
+  printf '%s\n' \
+    'if [ -r /opt/agentbox/secrets/proxy.env ]; then' \
+    '  set -a' \
+    '  . /opt/agentbox/secrets/proxy.env' \
+    '  set +a' \
+    'fi' > "$PROXY_LOADER"
 
   if docker exec "$CONTAINER" mkdir -p /opt/agentbox/secrets /etc/profile.d &&
      docker exec "$CONTAINER" rm -rf /opt/agentbox/secrets/proxy.env /etc/profile.d/agentbox-proxy.sh &&
@@ -2971,11 +2976,78 @@ delete_sandbox() {
   fi
 }
 
+check_network_proxy() {
+  JOB_FILE=$1
+  PROXY_URL=$(jq -r '.job.payload.proxy.url // empty' "$JOB_FILE")
+  TARGET=$(jq -r '.job.payload.target // empty' "$JOB_FILE")
+  CHECKED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  if [ -z "$PROXY_URL" ] || [ -z "$TARGET" ]; then
+    jq -n --arg target "$TARGET" --arg checkedAt "$CHECKED_AT" \
+      '{ok:false,latencyMs:0,target:$target,error:"Worker 收到的代理检测任务无效",checkedAt:$checkedAt}'
+    return
+  fi
+
+  METRICS=$(
+    HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL" ALL_PROXY="$PROXY_URL" \
+    http_proxy="$PROXY_URL" https_proxy="$PROXY_URL" all_proxy="$PROXY_URL" \
+    NO_PROXY='' no_proxy='' \
+    curl -sS -o /dev/null -w '%{http_code}\t%{time_total}' \
+      --connect-timeout 5 --max-time 10 "$TARGET" 2>/dev/null
+  )
+  CURL_STATUS=$?
+  HTTP_STATUS=$(printf '%s' "$METRICS" | awk -F '\t' '{print $1}')
+  TOTAL_SECONDS=$(printf '%s' "$METRICS" | awk -F '\t' '{print $2}')
+  LATENCY_MS=0
+  if [ -n "$TOTAL_SECONDS" ]; then
+    LATENCY_MS=$(awk -v seconds="$TOTAL_SECONDS" 'BEGIN {
+      value = int(seconds * 1000); if (value < 1) value = 1; print value
+    }')
+  fi
+
+  OK=false
+  ERROR_MESSAGE=
+  if [ "$CURL_STATUS" -eq 0 ] && [ "$HTTP_STATUS" = 204 ]; then
+    OK=true
+  elif [ "$CURL_STATUS" -eq 0 ]; then
+    ERROR_MESSAGE="检测地址返回 HTTP $HTTP_STATUS"
+  else
+    case "$CURL_STATUS" in
+      5) ERROR_MESSAGE="Worker 无法解析代理主机" ;;
+      7) ERROR_MESSAGE="Worker 无法连接代理" ;;
+      28) ERROR_MESSAGE="Worker 代理检测超时（10 秒）" ;;
+      35|60) ERROR_MESSAGE="Worker 代理 TLS 校验失败" ;;
+      *) ERROR_MESSAGE="Worker 无法通过代理访问检测地址" ;;
+    esac
+  fi
+  jq -n --argjson ok "$OK" --argjson latencyMs "$LATENCY_MS" \
+    --arg target "$TARGET" --arg statusCode "$HTTP_STATUS" \
+    --arg error "$ERROR_MESSAGE" --arg checkedAt "$CHECKED_AT" \
+    '{ok:$ok,latencyMs:$latencyMs,target:$target,
+      statusCode:(if $statusCode == "" or $statusCode == "000" then null else ($statusCode | tonumber) end),
+      error:(if $error == "" then null else $error end),checkedAt:$checkedAt}'
+}
+
 process_job() {
   JOB_FILE=$1
   JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
   ACTION=$(jq -r '.job.action' "$JOB_FILE")
   case "$ACTION" in
+    check-network-proxy)
+      RESULT_FILE=$(mktemp)
+      if check_network_proxy "$JOB_FILE" > "$RESULT_FILE"; then
+        ERROR_DETAILS=$(jq -cn --arg action "$ACTION" '{action:$action}')
+        if jq -e '.ok == true' "$RESULT_FILE" >/dev/null; then
+          complete_job "$JOB_ID" true "" "Network proxy check succeeded" "" "$RESULT_FILE"
+        else
+          complete_job "$JOB_ID" false "" "Network proxy check failed" "" "$RESULT_FILE" \
+            false false network_proxy_check_failed proxy-check true "$ERROR_DETAILS"
+        fi
+      else
+        complete_job_failure "$JOB_ID" network_proxy_check_failed proxy-check true \
+          "Network proxy check failed" "$ACTION"
+      fi
+      rm -f "$RESULT_FILE"
+      ;;
     update-worker)
       LOG_FILE=$(mktemp)
       if ! update_worker "$JOB_FILE" 2>"$LOG_FILE"; then

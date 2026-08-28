@@ -2,9 +2,16 @@ package httpapi
 
 import (
 	"net/http"
+	"strings"
 
 	"agentbox/internal/platform"
 )
+
+const networkProxyCheckTarget = "https://www.gstatic.com/generate_204"
+
+type networkProxyCheckInput struct {
+	ServerID string `json:"serverId"`
+}
 
 func (s *Server) listNetworkProxies(w http.ResponseWriter, request *http.Request) {
 	proxies, err := s.store.ListNetworkProxies(request.Context())
@@ -62,6 +69,46 @@ func (s *Server) updateNetworkProxy(w http.ResponseWriter, request *http.Request
 		Detail: map[string]any{"scheme": proxy.Scheme, "host": proxy.Host, "enabled": proxy.Enabled},
 	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"proxy": proxy})
+}
+
+func (s *Server) checkNetworkProxy(w http.ResponseWriter, request *http.Request) {
+	proxyID := request.PathValue("id")
+	var input networkProxyCheckInput
+	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {
+		return
+	}
+	input.ServerID = strings.TrimSpace(input.ServerID)
+	result, err := s.store.CreateNetworkProxyCheck(
+		request.Context(), proxyID, input.ServerID, networkProxyCheckTarget,
+	)
+	if err != nil {
+		s.recordLog(request, platform.LogEntry{
+			Level: platform.LogLevelWarn, Category: platform.LogCategoryProxy, Action: "check",
+			Message: "请求 Worker 检测网络代理失败", Status: platform.LogStatusFailed,
+			ResourceKind: "proxy", ResourceID: proxyID,
+			Detail: map[string]any{"serverId": input.ServerID, "error": err.Error()},
+		})
+		s.handleError(w, err)
+		return
+	}
+	s.recordLog(request, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "check",
+		Message:      "已请求 Worker 检测网络代理",
+		ResourceKind: "proxy", ResourceID: proxyID,
+		Detail: map[string]any{"serverId": result.ServerID, "checkId": result.ID},
+	})
+	s.writeJSON(w, http.StatusAccepted, map[string]any{"result": result})
+}
+
+func (s *Server) getNetworkProxyCheck(w http.ResponseWriter, request *http.Request) {
+	result, err := s.store.GetNetworkProxyCheck(
+		request.Context(), request.PathValue("id"), request.PathValue("checkId"),
+	)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"result": result})
 }
 
 func (s *Server) deleteNetworkProxy(w http.ResponseWriter, request *http.Request) {
