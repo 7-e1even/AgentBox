@@ -8,6 +8,7 @@ class MockWebSocket {
 
   readyState = MockWebSocket.OPEN
   sent: string[] = []
+  closeCode: number | undefined
   private listeners = new Map<string, Set<(event: unknown) => void>>()
 
   constructor(public readonly url: string) {
@@ -24,7 +25,11 @@ class MockWebSocket {
     this.sent.push(data)
   }
 
-  close() {
+  close(code = 1000) {
+    if (code !== 1000 && (code < 3000 || code > 4999)) {
+      throw new DOMException("invalid WebSocket close code", "InvalidAccessError")
+    }
+    this.closeCode = code
     this.readyState = 3
     this.emit("close", {})
   }
@@ -98,13 +103,31 @@ describe("SandboxSessionClient", () => {
       await vi.advanceTimersByTimeAsync(1)
       expect(MockWebSocket.instances).toHaveLength(3)
 
-      // ready 后再次断开：退避重置为 1s
+      // 连接稳定 10 秒后再次断开：退避重置为 1s
       const third = MockWebSocket.instances[2]
       third.receive({ type: "ready" })
+      await vi.advanceTimersByTimeAsync(10_000)
       third.close()
       await vi.advanceTimersByTimeAsync(1000)
       expect(MockWebSocket.instances).toHaveLength(4)
 
+      client.stop()
+    })
+
+    it("短暂 ready 后立即断开时保留退避，避免重连风暴", async () => {
+      vi.stubGlobal("fetch", stubFetchTicket())
+      const { client, socket } = await connectReadyClient()
+
+      socket.close()
+      await vi.advanceTimersByTimeAsync(1000)
+      const second = MockWebSocket.instances[1]
+      second.receive({ type: "ready" })
+      second.receive({ type: "closed", retryable: true })
+
+      await vi.advanceTimersByTimeAsync(1999)
+      expect(MockWebSocket.instances).toHaveLength(2)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(MockWebSocket.instances).toHaveLength(3)
       client.stop()
     })
 
@@ -116,6 +139,70 @@ describe("SandboxSessionClient", () => {
       await vi.advanceTimersByTimeAsync(30_000)
       expect(MockWebSocket.instances).toHaveLength(1)
       expect(client.getState()).toBe("disconnected")
+    })
+
+    it("会话服务暂时不可用时保持连接中并退避重试", async () => {
+      const fetchTicket = vi.fn(async () =>
+        new Response(JSON.stringify({ error: "沙箱会话服务尚未连接" }), {
+          status: 503,
+          headers: { "Content-Type": "application/json" },
+        })
+      )
+      vi.stubGlobal("fetch", fetchTicket)
+      const client = new SandboxSessionClient("sandbox-1")
+
+      client.start()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(client.getState()).toBe("connecting")
+      expect(fetchTicket).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(999)
+      expect(fetchTicket).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(fetchTicket).toHaveBeenCalledTimes(2)
+      client.stop()
+    })
+
+    it("远程 shell 异常退出时自动创建新会话", async () => {
+      vi.stubGlobal("fetch", stubFetchTicket())
+      const { client, socket } = await connectReadyClient()
+
+      socket.receive({ type: "closed", retryable: true })
+      expect(client.getState()).toBe("connecting")
+      expect(socket.closeCode).toBe(4001)
+      await vi.advanceTimersByTimeAsync(999)
+      expect(MockWebSocket.instances).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(1)
+
+      expect(MockWebSocket.instances).toHaveLength(2)
+      expect(client.getState()).toBe("connecting")
+      client.stop()
+    })
+
+    it("BoxLite portal 瞬时错误按退避策略自动重连", async () => {
+      vi.stubGlobal("fetch", stubFetchTicket())
+      const { client, socket } = await connectReadyClient()
+
+      socket.receive({
+        type: "error",
+        error: "portal error: gRPC/tonic status: Unavailable, Connection refused",
+      })
+      expect(client.getState()).toBe("connecting")
+      await vi.advanceTimersByTimeAsync(1000)
+
+      expect(MockWebSocket.instances).toHaveLength(2)
+      client.stop()
+    })
+
+    it("远程 shell 正常退出时保留手动重连状态", async () => {
+      vi.stubGlobal("fetch", stubFetchTicket())
+      const { client, socket } = await connectReadyClient()
+
+      socket.receive({ type: "closed" })
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(MockWebSocket.instances).toHaveLength(1)
+      expect(client.getState()).toBe("disconnected")
+      client.stop()
     })
   })
 

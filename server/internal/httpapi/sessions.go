@@ -55,6 +55,7 @@ type sessionMessage struct {
 	Cols       int             `json:"cols,omitempty"`
 	Rows       int             `json:"rows,omitempty"`
 	OK         bool            `json:"ok,omitempty"`
+	Retryable  bool            `json:"retryable,omitempty"`
 	Result     json.RawMessage `json:"result,omitempty"`
 	Error      string          `json:"error,omitempty"`
 }

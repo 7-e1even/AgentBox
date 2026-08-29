@@ -8,6 +8,7 @@ type SessionMessage = {
   requestId?: string
   result?: unknown
   ok?: boolean
+  retryable?: boolean
 }
 
 type PendingRequest = {
@@ -36,9 +37,11 @@ export const sandboxFileReadMaxSize = 5 * 1024 * 1024
 export class SandboxSessionClient {
   private socket: WebSocket | null = null
   private state: SandboxSessionState = "disconnected"
+  private stateDetail: string | undefined
   private stopped = true
   private connectionGeneration = 0
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private reconnectResetTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectDelay = 1000
   private readonly stateListeners = new Set<StateListener>()
   private readonly outputListeners = new Set<OutputListener>()
@@ -62,6 +65,7 @@ export class SandboxSessionClient {
     this.connectionGeneration += 1
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
+    this.clearReconnectResetTimer()
     this.socket?.close(1000, "workspace closed")
     this.socket = null
     this.failPending(new Error("沙箱会话已关闭"))
@@ -76,6 +80,7 @@ export class SandboxSessionClient {
     this.connectionGeneration += 1
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
+    this.clearReconnectResetTimer()
     const socket = this.socket
     this.socket = null
     socket?.close(1000, "reconnect")
@@ -90,7 +95,7 @@ export class SandboxSessionClient {
 
   onState(listener: StateListener) {
     this.stateListeners.add(listener)
-    listener(this.state)
+    listener(this.state, this.stateDetail)
     return () => this.stateListeners.delete(listener)
   }
 
@@ -218,6 +223,7 @@ export class SandboxSessionClient {
       socket.addEventListener("close", () => {
         if (this.socket !== socket) return
         this.socket = null
+        this.clearReconnectResetTimer()
         this.failPending(new Error("Worker 会话已断开"))
         if (this.stopped) {
           this.setState("disconnected")
@@ -229,7 +235,7 @@ export class SandboxSessionClient {
     } catch (error) {
       this.socket = null
       const detail = error instanceof Error ? error.message : "实时会话连接失败"
-      this.setState("error", detail)
+      this.setState("connecting", `${detail}，正在重试`)
       if (!this.stopped) this.scheduleReconnect()
     }
   }
@@ -253,7 +259,14 @@ export class SandboxSessionClient {
       return
     }
     if (message.type === "ready") {
-      this.reconnectDelay = 1000
+      this.clearReconnectResetTimer()
+      const socket = this.socket
+      this.reconnectResetTimer = setTimeout(() => {
+        this.reconnectResetTimer = null
+        if (this.socket === socket && this.state === "ready") {
+          this.reconnectDelay = 1000
+        }
+      }, 10_000)
       this.setState("ready")
       const waiters = this.readyWaiters
       this.readyWaiters = []
@@ -266,6 +279,13 @@ export class SandboxSessionClient {
     }
     if (message.type === "error") {
       const detail = message.error || "沙箱会话发生错误"
+      if (message.retryable || isRetryableSessionError(detail)) {
+        for (const listener of this.outputListeners) {
+          listener(`\r\n\x1b[31m${detail}\x1b[0m\r\n`)
+        }
+        this.reconnectAfterSessionFailure(detail)
+        return
+      }
       this.setState("error", detail)
       for (const listener of this.outputListeners) {
         listener(`\r\n\x1b[31m${detail}\x1b[0m\r\n`)
@@ -273,6 +293,10 @@ export class SandboxSessionClient {
       return
     }
     if (message.type === "closed") {
+      if (message.retryable) {
+        this.reconnectAfterSessionFailure("远程 shell 异常退出")
+        return
+      }
       this.setState("disconnected", "远程 shell 已退出")
       return
     }
@@ -316,8 +340,25 @@ export class SandboxSessionClient {
     this.socket.send(JSON.stringify(value))
   }
 
+  private reconnectAfterSessionFailure(detail: string) {
+    const socket = this.socket
+    this.socket = null
+    this.clearReconnectResetTimer()
+    socket?.close(4001, "retry transient session failure")
+    this.failPending(new Error(detail))
+    this.setState("connecting", `${detail}，正在重新连接`)
+    this.scheduleReconnect()
+  }
+
+  private clearReconnectResetTimer() {
+    if (this.reconnectResetTimer) clearTimeout(this.reconnectResetTimer)
+    this.reconnectResetTimer = null
+  }
+
   private setState(state: SandboxSessionState, detail?: string) {
+    if (this.state === state && this.stateDetail === detail) return
     this.state = state
+    this.stateDetail = detail
     for (const listener of this.stateListeners) listener(state, detail)
   }
 
@@ -330,6 +371,19 @@ export class SandboxSessionClient {
     for (const waiter of this.readyWaiters) waiter.reject(error)
     this.readyWaiters = []
   }
+}
+
+function isRetryableSessionError(detail: string) {
+  const normalized = detail.toLowerCase()
+  return [
+    "portal error",
+    "grpc/tonic",
+    "status: unavailable",
+    "connection refused",
+    "h2 protocol error",
+    "transport error",
+    "worker session unavailable",
+  ].some((fragment) => normalized.includes(fragment))
 }
 
 function encodeBase64(bytes: Uint8Array) {

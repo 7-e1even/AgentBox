@@ -430,6 +430,12 @@ export function ControlPlaneShell({
     setResources(result.resources)
   }, [])
 
+  const handleSandboxResourceChange = useCallback((resource: Resource) => {
+    setResources((current) =>
+      current.map((item) => (item.id === resource.id ? resource : item))
+    )
+  }, [])
+
   const hasPendingSandboxes = resources.some(
     (item) =>
       item.kind === "sandbox" &&
@@ -649,6 +655,8 @@ export function ControlPlaneShell({
         busyId={sandboxBusyId}
         onAction={operateSandbox}
         onDelete={setDeletingResource}
+        onResourceChange={handleSandboxResourceChange}
+        onRefresh={refreshResources}
       />
     ) : section === "servers" ? (
       <ServerManagement

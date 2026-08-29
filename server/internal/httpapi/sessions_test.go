@@ -177,6 +177,18 @@ func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 		t.Fatalf("unexpected browser output: %s", outputPayload)
 	}
 
+	closed, _ := json.Marshal(sessionMessage{Type: "closed", SessionID: open.SessionID, Retryable: true})
+	if err := worker.Write(ctx, websocket.MessageText, closed); err != nil {
+		t.Fatal(err)
+	}
+	_, closedPayload, err := browser.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(closedPayload), `"retryable":true`) {
+		t.Fatalf("unexpected browser close message: %s", closedPayload)
+	}
+
 	uploadID := "3e8774b5-4921-4c8c-8927-2b7a30d518d2"
 	uploadRequest, _ := json.Marshal(sessionMessage{
 		Type: "rpc", RequestID: "upload-one", Operation: "upload-chunk",

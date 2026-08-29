@@ -300,7 +300,7 @@ func (m *sessionManager) handleRPC(incoming message) {
 	_ = m.send(result)
 }
 
-func (m *sessionManager) sessionClosed(id string, session *terminalSession) {
+func (m *sessionManager) sessionClosed(id string, session *terminalSession, retryable bool) {
 	m.mu.Lock()
 	if m.sessions[id] != session {
 		m.mu.Unlock()
@@ -308,7 +308,7 @@ func (m *sessionManager) sessionClosed(id string, session *terminalSession) {
 	}
 	delete(m.sessions, id)
 	m.mu.Unlock()
-	_ = m.send(message{Type: "closed", SessionID: id})
+	_ = m.send(message{Type: "closed", SessionID: id, Retryable: retryable})
 }
 
 func (m *sessionManager) desktopClosed(id string, desktop *desktopSession, runErr error) {
@@ -490,14 +490,15 @@ func (s *desktopSession) close() {
 }
 
 type terminalSession struct {
-	manager    *sessionManager
-	id         string
-	driver     string
-	target     string
-	command    *exec.Cmd
-	terminal   *os.File
-	closed     atomic.Bool
-	terminalMu sync.Mutex
+	manager      *sessionManager
+	id           string
+	driver       string
+	target       string
+	command      *exec.Cmd
+	terminal     *os.File
+	closed       atomic.Bool
+	closedByUser atomic.Bool
+	terminalMu   sync.Mutex
 }
 
 func startTerminalSession(manager *sessionManager, id, driver, target string, columns, rows int) (*terminalSession, error) {
@@ -543,11 +544,23 @@ func terminalCommand(driver, target string) (*exec.Cmd, error) {
 func (s *terminalSession) pumpOutput() {
 	decoder := streamDecoder{}
 	buffer := make([]byte, 32*1024)
+	transportTail := ""
+	transportFailed := false
 	for {
 		count, err := s.terminal.Read(buffer)
 		if count > 0 {
 			if data := decoder.decode(buffer[:count], false); data != "" {
 				_ = s.manager.send(message{Type: "output", SessionID: s.id, Data: data})
+				if s.driver == "boxlite" {
+					transportTail += data
+					if len(transportTail) > 2048 {
+						transportTail = transportTail[len(transportTail)-2048:]
+					}
+					if isBoxLiteAttachFailure(transportTail) {
+						transportFailed = true
+						break
+					}
+				}
 			}
 		}
 		if err != nil {
@@ -560,10 +573,14 @@ func (s *terminalSession) pumpOutput() {
 	if data := decoder.decode(nil, true); data != "" {
 		_ = s.manager.send(message{Type: "output", SessionID: s.id, Data: data})
 	}
-	_ = s.command.Wait()
+	if transportFailed && s.command.Process != nil {
+		_ = s.command.Process.Kill()
+	}
+	runErr := s.command.Wait()
+	retryable := (runErr != nil || transportFailed) && !s.closedByUser.Load()
 	s.closed.Store(true)
 	_ = s.terminal.Close()
-	s.manager.sessionClosed(s.id, s)
+	s.manager.sessionClosed(s.id, s, retryable)
 }
 
 func (s *terminalSession) input(data string) error {
@@ -590,6 +607,7 @@ func (s *terminalSession) close() {
 	if !s.closed.CompareAndSwap(false, true) {
 		return
 	}
+	s.closedByUser.Store(true)
 	_ = s.terminal.Close()
 	if s.command.Process == nil {
 		return

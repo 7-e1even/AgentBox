@@ -52,3 +52,23 @@ func TestGoSessionWorkerKeepsUploadAndEnvironmentContracts(t *testing.T) {
 		t.Fatal("interactive terminal does not load sandbox environment variables")
 	}
 }
+
+func TestBoxLiteAttachFailureDetection(t *testing.T) {
+	for _, output := range []string{
+		`Attach stream error: status: Unknown, message: "h2 protocol error: error reading a body from connection"`,
+		`portal error: gRPC/tonic error: status: Unavailable, message: "Connection refused"`,
+	} {
+		if !isBoxLiteAttachFailure(output) {
+			t.Fatalf("transport failure was not detected: %q", output)
+		}
+	}
+	for _, output := range []string{
+		"normal shell output",
+		"application reported connection refused",
+		"Attach stream error: command exited with status 2",
+	} {
+		if isBoxLiteAttachFailure(output) {
+			t.Fatalf("normal output was misclassified: %q", output)
+		}
+	}
+}

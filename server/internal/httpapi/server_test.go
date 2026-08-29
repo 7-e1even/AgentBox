@@ -63,6 +63,17 @@ func (fakeStore) OperateSandbox(_ context.Context, id, action string) (platform.
 	}
 	return platform.Resource{Input: platform.Input{ID: id, Kind: platform.KindSandbox, Name: action}}, nil
 }
+func (fakeStore) OperateSandboxAgentTools(_ context.Context, id, action string, tools []string) (platform.Resource, error) {
+	switch action {
+	case "check", "update":
+	default:
+		return platform.Resource{}, &platform.ValidationError{Message: "不支持的 Agent 工具操作"}
+	}
+	return platform.Resource{Input: platform.Input{
+		ID: id, Kind: platform.KindSandbox, Name: action,
+		Spec: map[string]any{"requestedAgentTools": tools},
+	}}, nil
+}
 func (fakeStore) ListAutomations(context.Context, string) ([]platform.Automation, error) {
 	return []platform.Automation{}, nil
 }
@@ -488,6 +499,20 @@ func TestSandboxCodexLoginActionIsRemoved(t *testing.T) {
 	testHandler().ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
+func TestSandboxAgentToolActionAcceptsSelectedTools(t *testing.T) {
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/sandboxes/sandbox-one/agent-tools/actions/update",
+		strings.NewReader(`{"tools":["codex","claude-code"]}`),
+	)
+	response := httptest.NewRecorder()
+	testHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted ||
+		!strings.Contains(response.Body.String(), `"requestedAgentTools":["codex","claude-code"]`) {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
 }
 

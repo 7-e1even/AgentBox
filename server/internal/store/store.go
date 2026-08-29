@@ -206,6 +206,30 @@ var janitorStatements = []string{
 	      ) latest
 	      WHERE latest.lease_until IS NULL OR latest.lease_until < NOW()
 	    )`,
+	`UPDATE control_resources sandbox
+	  SET spec = jsonb_set(
+	    sandbox.spec, '{agentToolOperation}',
+	    COALESCE(sandbox.spec->'agentToolOperation', '{}'::jsonb) || jsonb_build_object(
+	      'status', 'failed',
+	      'message', 'Worker 离线或 Agent 工具任务超时',
+	      'updatedAt', NOW(),
+	      'finishedAt', NOW()
+	    ), true
+	  ), updated_at = NOW()
+	  WHERE sandbox.kind = 'sandbox'
+	    AND sandbox.spec->'agentToolOperation'->>'status' IN ('queued', 'running')
+	    AND EXISTS (
+	      SELECT 1 FROM (
+	        SELECT job.status, job.action, job.result_error_code
+	        FROM worker_jobs job
+	        WHERE job.resource_id = sandbox.id
+	        ORDER BY job.created_at DESC
+	        LIMIT 1
+	      ) latest
+	      WHERE latest.status = 'failed'
+	        AND latest.action IN ('check-sandbox-agent-tools', 'update-sandbox-agent-tools')
+	        AND latest.result_error_code = 'worker_timeout'
+	    )`,
 }
 
 // startJanitor launches the background cleanup loop; Close stops it.
@@ -2234,7 +2258,19 @@ func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credentia
     WHERE id = $4`, encoded, now.Add(workerJobLeaseDuration), now, jobID); err != nil {
 		return platform.ProvisioningProgress{}, fmt.Errorf("update worker job progress: %w", err)
 	}
-	if resourceID.Valid && strings.Contains(action, "sandbox") {
+	if resourceID.Valid && isSandboxAgentToolAction(action) {
+		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
+      spec = jsonb_set(
+        spec, '{agentToolOperation}',
+        COALESCE(spec->'agentToolOperation', '{}'::jsonb) || jsonb_build_object(
+          'status', 'running', 'message', $1::text, 'progress', $2::jsonb,
+          'updatedAt', $3::timestamptz
+        ), true
+      ), updated_at = $3
+      WHERE id = $4 AND kind = 'sandbox'`, input.Message, encoded, now, resourceID.String); err != nil {
+			return platform.ProvisioningProgress{}, fmt.Errorf("update sandbox Agent tool progress: %w", err)
+		}
+	} else if resourceID.Valid && strings.Contains(action, "sandbox") {
 		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
       spec = spec || jsonb_build_object('message', $1::text, 'provisioning', $2::jsonb), updated_at = $3
       WHERE id = $4 AND kind = 'sandbox'`, input.Message, encoded, now, resourceID.String); err != nil {
@@ -2333,6 +2369,62 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if resourceID.Valid {
 		resourceIDValue = resourceID.String
 	}
+	if isSandboxAgentToolAction(action) {
+		agentTools := result.AgentTools
+		if len(agentTools) > 0 {
+			var sandboxSpecJSON []byte
+			if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+        WHERE id = $1 AND kind = 'sandbox' FOR UPDATE`, resourceIDValue).Scan(&sandboxSpecJSON); err != nil {
+				return fmt.Errorf("load sandbox Agent tool states: %w", err)
+			}
+			var sandboxSpec struct {
+				AgentTools []platform.SandboxAgentToolState `json:"agentToolVersions"`
+			}
+			if err := json.Unmarshal(sandboxSpecJSON, &sandboxSpec); err != nil {
+				return fmt.Errorf("decode sandbox Agent tool states: %w", err)
+			}
+			stateIndex := make(map[string]int, len(sandboxSpec.AgentTools))
+			for index, state := range sandboxSpec.AgentTools {
+				stateIndex[state.Tool] = index
+			}
+			for _, state := range agentTools {
+				if index, ok := stateIndex[state.Tool]; ok {
+					sandboxSpec.AgentTools[index] = state
+					continue
+				}
+				stateIndex[state.Tool] = len(sandboxSpec.AgentTools)
+				sandboxSpec.AgentTools = append(sandboxSpec.AgentTools, state)
+			}
+			agentTools = sandboxSpec.AgentTools
+		}
+		agentToolsJSON, err := json.Marshal(agentTools)
+		if err != nil {
+			return fmt.Errorf("encode completed Agent tool states: %w", err)
+		}
+		operationStatus := "failed"
+		if result.Success {
+			operationStatus = "succeeded"
+		}
+		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
+      spec = jsonb_set(
+        spec, '{agentToolOperation}',
+        COALESCE(spec->'agentToolOperation', '{}'::jsonb) || jsonb_build_object(
+          'status', $1::text, 'message', $2::text, 'progress', $3::jsonb,
+          'updatedAt', $4::timestamptz, 'finishedAt', $4::timestamptz
+        ), true
+      ) || CASE WHEN $5::boolean
+        THEN jsonb_build_object('agentToolVersions', $6::jsonb)
+        ELSE '{}'::jsonb END,
+      updated_at = $4
+      WHERE id = $7 AND kind = 'sandbox'`, operationStatus, result.Message,
+			progressJSON, now, len(result.AgentTools) > 0, agentToolsJSON, resourceIDValue); err != nil {
+			return fmt.Errorf("finish sandbox Agent tool operation: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit sandbox Agent tool completion: %w", err)
+		}
+		return nil
+	}
 	if result.Success && action == "delete-sandbox" {
 		if _, err := tx.Exec(ctx, `DELETE FROM control_resources
       WHERE id = $1 AND kind = 'sandbox'`, resourceIDValue); err != nil {
@@ -2417,6 +2509,10 @@ func normalizedWorkerJobError(result platform.WorkerJobResult) platform.WorkerJo
 		}
 	}
 	return platform.WorkerJobError{Code: "worker_failed", Details: map[string]string{}}
+}
+
+func isSandboxAgentToolAction(action string) bool {
+	return action == "check-sandbox-agent-tools" || action == "update-sandbox-agent-tools"
 }
 
 func randomToken() (string, error) {
@@ -2740,6 +2836,15 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	if err := json.Unmarshal(specJSON, &resource.Spec); err != nil {
 		return platform.Resource{}, fmt.Errorf("decode sandbox operation: %w", err)
 	}
+	var hasActiveJob bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+    SELECT 1 FROM worker_jobs WHERE resource_id = $1 AND status IN ('pending', 'leased')
+  )`, id).Scan(&hasActiveJob); err != nil {
+		return platform.Resource{}, fmt.Errorf("check active sandbox operation: %w", err)
+	}
+	if hasActiveJob {
+		return platform.Resource{}, fmt.Errorf("%w: sandbox already has an operation in progress", ErrConflict)
+	}
 	status, _ := resource.Spec["status"].(string)
 	if status == "requested" || status == "starting" || status == "stopping" || status == "restarting" || status == "deleting" {
 		return platform.Resource{}, fmt.Errorf("%w: sandbox already has an operation in progress", ErrConflict)
@@ -2794,6 +2899,105 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.Resource{}, fmt.Errorf("commit sandbox operation: %w", err)
+	}
+	maskResourceEnvironmentVariables(&resource)
+	return resource, nil
+}
+
+func (s *Store) OperateSandboxAgentTools(ctx context.Context, id, action string, requestedTools []string) (platform.Resource, error) {
+	workerAction := ""
+	message := ""
+	switch action {
+	case "check":
+		workerAction = "check-sandbox-agent-tools"
+		message = "正在排队检测 Agent 工具"
+	case "update":
+		workerAction = "update-sandbox-agent-tools"
+		message = "正在排队更新 Agent 工具"
+	default:
+		return platform.Resource{}, &platform.ValidationError{Message: "不支持的 Agent 工具操作"}
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.Resource{}, fmt.Errorf("begin sandbox Agent tool operation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var resource platform.Resource
+	var project pgtype.Text
+	var specJSON []byte
+	err = tx.QueryRow(ctx, `SELECT `+resourceColumns+` FROM control_resources
+    WHERE id = $1 AND kind = 'sandbox' FOR UPDATE`, id).Scan(
+		&resource.ID, &resource.Kind, &project, &resource.Name, &resource.Description,
+		&resource.Enabled, &specJSON, &resource.CreatedAt, &resource.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.Resource{}, ErrResourceNotFound
+	}
+	if err != nil {
+		return platform.Resource{}, fmt.Errorf("load sandbox for Agent tool operation: %w", err)
+	}
+	if project.Valid {
+		resource.ProjectID = &project.String
+	}
+	if err := json.Unmarshal(specJSON, &resource.Spec); err != nil {
+		return platform.Resource{}, fmt.Errorf("decode sandbox Agent tool operation: %w", err)
+	}
+	if status, _ := resource.Spec["status"].(string); status != "running" {
+		return platform.Resource{}, fmt.Errorf("%w: sandbox must be running", ErrConflict)
+	}
+	var hasActiveJob bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+    SELECT 1 FROM worker_jobs WHERE resource_id = $1 AND status IN ('pending', 'leased')
+  )`, id).Scan(&hasActiveJob); err != nil {
+		return platform.Resource{}, fmt.Errorf("check active sandbox Agent tool operation: %w", err)
+	}
+	if hasActiveJob {
+		return platform.Resource{}, fmt.Errorf("%w: sandbox already has an operation in progress", ErrConflict)
+	}
+
+	payload, _, _, err := buildSandboxJobPayload(ctx, tx, resource)
+	if err != nil {
+		return platform.Resource{}, err
+	}
+	selectedTools := specStringList(payload, "agentTools")
+	if len(selectedTools) == 0 {
+		return platform.Resource{}, &platform.ValidationError{Message: "沙箱没有配置 Agent 工具"}
+	}
+	tools, err := selectSandboxAgentTools(selectedTools, requestedTools)
+	if err != nil {
+		return platform.Resource{}, err
+	}
+
+	serverID, _ := resource.Spec["serverId"].(string)
+	if serverID == "" {
+		return platform.Resource{}, &platform.ValidationError{Message: "沙箱没有绑定服务器"}
+	}
+	payload["externalId"] = resource.Spec["externalId"]
+	payload["requestedAgentTools"] = tools
+	now := time.Now().UTC()
+	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
+    (id, server_id, resource_id, action, status, payload, created_at, updated_at)
+    VALUES ($1, $2, $3, $4, 'pending', $5::jsonb, $6, $6)`,
+		uuid.NewString(), serverID, id, workerAction, mustMapJSON(payload), now,
+	); err != nil {
+		return platform.Resource{}, fmt.Errorf("enqueue sandbox Agent tool operation: %w", err)
+	}
+	operation := map[string]any{
+		"action": action, "status": "queued", "toolIds": tools,
+		"message": message, "startedAt": now, "updatedAt": now,
+	}
+	resource, err = scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
+      spec = spec || jsonb_build_object('agentToolOperation', $1::jsonb), updated_at = $2
+      WHERE id = $3 AND kind = 'sandbox' RETURNING `+resourceColumns,
+		mustMapJSON(operation), now, id,
+	))
+	if err != nil {
+		return platform.Resource{}, fmt.Errorf("update sandbox Agent tool operation: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.Resource{}, fmt.Errorf("commit sandbox Agent tool operation: %w", err)
 	}
 	maskResourceEnvironmentVariables(&resource)
 	return resource, nil
@@ -3159,6 +3363,32 @@ func specStringList(spec map[string]any, key string) []string {
 		}
 	}
 	return result
+}
+
+func selectSandboxAgentTools(selectedTools, requestedTools []string) ([]string, error) {
+	allTools := len(requestedTools) == 0
+	requested := make(map[string]struct{}, len(requestedTools))
+	for _, tool := range requestedTools {
+		if tool == "" {
+			return nil, &platform.ValidationError{Message: "Agent 工具标识不能为空"}
+		}
+		requested[tool] = struct{}{}
+	}
+	tools := make([]string, 0, len(selectedTools))
+	for _, tool := range selectedTools {
+		if allTools {
+			tools = append(tools, tool)
+			continue
+		}
+		if _, ok := requested[tool]; ok {
+			tools = append(tools, tool)
+			delete(requested, tool)
+		}
+	}
+	if len(requested) > 0 || len(tools) == 0 {
+		return nil, &platform.ValidationError{Message: "只能操作该沙箱已配置的 Agent 工具"}
+	}
+	return tools, nil
 }
 
 func specStringMap(spec map[string]any, key string) map[string]string {

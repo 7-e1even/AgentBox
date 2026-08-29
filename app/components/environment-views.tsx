@@ -37,6 +37,7 @@ import {
 } from "@/components/collection-list"
 import { CollectionHeader } from "@/components/control-plane-view"
 import { DataTable, DataTableColumnHeader } from "@/components/data-table"
+import { SandboxAgentToolsPanel } from "@/components/sandbox-agent-tools-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -89,7 +90,10 @@ import {
   provisioningDuration,
   provisioningStageLabel,
 } from "@/lib/provisioning"
-import { agentToolOptions } from "@/lib/agent-tools"
+import {
+  agentToolOptions,
+  supportedAgentToolList,
+} from "@/lib/agent-tools"
 import { runtimeInventoryImages } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 import { cn } from "@/lib/utils"
@@ -474,6 +478,8 @@ export function SandboxesView({
   busyId,
   onAction,
   onDelete,
+  onResourceChange,
+  onRefresh,
 }: EnvironmentProps & {
   canMutate: boolean
   canOpenWorkspace: boolean
@@ -485,9 +491,12 @@ export function SandboxesView({
     action: "start" | "stop" | "restart" | "delete"
   ) => Promise<void>
   onDelete: (resource: Resource) => void
+  onResourceChange: (resource: Resource) => void
+  onRefresh: () => Promise<void>
 }) {
   const sandboxes = resources.filter((item) => item.kind === "sandbox")
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  const [agentToolsId, setAgentToolsId] = useState<string | null>(null)
   const columns = useMemo(
     () =>
       sandboxColumns({
@@ -497,6 +506,7 @@ export function SandboxesView({
         canMutate,
         canOpenWorkspace,
         onOpen: (sandbox) => setSelectedId(sandbox.id),
+        onOpenAgentTools: (sandbox) => setAgentToolsId(sandbox.id),
         onAction,
         onEdit,
         onDelete,
@@ -510,10 +520,13 @@ export function SandboxesView({
       onEdit,
       resources,
       servers,
+      setAgentToolsId,
       setSelectedId,
     ]
   )
   const selected = sandboxes.find((item) => item.id === selectedId) ?? null
+  const agentToolsSandbox =
+    sandboxes.find((item) => item.id === agentToolsId) ?? null
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <CollectionHeader
@@ -582,6 +595,15 @@ export function SandboxesView({
           resources={resources}
           canOpenWorkspace={canOpenWorkspace}
           onOpenChange={(open) => !open && setSelectedId(null)}
+        />
+      )}
+      {agentToolsSandbox && (
+        <SandboxAgentToolsDialog
+          sandbox={agentToolsSandbox}
+          resources={resources}
+          onResourceChange={onResourceChange}
+          onRefresh={onRefresh}
+          onOpenChange={(open) => !open && setAgentToolsId(null)}
         />
       )}
     </section>
@@ -748,6 +770,7 @@ function sandboxColumns({
   canMutate,
   canOpenWorkspace,
   onOpen,
+  onOpenAgentTools,
   onAction,
   onEdit,
   onDelete,
@@ -758,6 +781,7 @@ function sandboxColumns({
   canMutate: boolean
   canOpenWorkspace: boolean
   onOpen: (sandbox: Resource) => void
+  onOpenAgentTools: (sandbox: Resource) => void
   onAction: (
     resource: Resource,
     action: "start" | "stop" | "restart" | "delete"
@@ -895,6 +919,18 @@ function sandboxColumns({
                     size="sm"
                     variant="outline"
                     className="px-2 sm:px-3"
+                    aria-label={`更新 ${sandbox.name} Agent`}
+                    onClick={() => onOpenAgentTools(sandbox)}
+                  >
+                    <BotIcon data-icon="inline-start" />
+                    <span className="hidden lg:inline">Agent 更新</span>
+                  </Button>
+                ) : null}
+                {canMutate ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="px-2 sm:px-3"
                     aria-label={`停止 ${sandbox.name}`}
                     disabled={busy}
                     onClick={() => void onAction(sandbox, "stop")}
@@ -989,7 +1025,7 @@ function sandboxColumns({
       },
       enableSorting: false,
       enableHiding: false,
-      meta: { className: "w-28 sm:w-48" },
+      meta: { className: "w-28 sm:w-56 lg:w-72" },
     },
   ]
 }
@@ -1005,6 +1041,56 @@ function sandboxFilterStatus(sandbox: Resource) {
   ].includes(status)
     ? "pending"
     : status || "error"
+}
+
+function SandboxAgentToolsDialog({
+  sandbox,
+  resources,
+  onResourceChange,
+  onRefresh,
+  onOpenChange,
+}: {
+  sandbox: Resource
+  resources: Resource[]
+  onResourceChange: (resource: Resource) => void
+  onRefresh: () => Promise<void>
+  onOpenChange: (open: boolean) => void
+}) {
+  const runtime = resources.find(
+    (resource) => resource.id === sandbox.spec.runtimeId
+  )
+  const toolIds = supportedAgentToolList(
+    Array.isArray(sandbox.spec.agentTools)
+      ? sandbox.spec.agentTools
+      : runtime?.spec.agentTools
+  )
+
+  return (
+    <Dialog open onOpenChange={onOpenChange}>
+      <DialogContent className="flex h-[min(46rem,calc(100dvh-2rem))] w-[calc(100%-1.5rem)] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl">
+        <DialogHeader className="shrink-0 gap-1 border-b px-4 py-4 pr-12">
+          <DialogTitle className="flex items-center gap-2">
+            <BotIcon className="size-4" aria-hidden="true" />
+            Agent 更新
+          </DialogTitle>
+          <DialogDescription>
+            {sandbox.name} · 在当前沙箱内原地检测和更新
+            {sandbox.spec.driver === "boxlite"
+              ? "；更新期间终端会短暂重连。"
+              : "，不重建沙箱。"}
+          </DialogDescription>
+        </DialogHeader>
+        <SandboxAgentToolsPanel
+          sandboxId={sandbox.id}
+          spec={sandbox.spec}
+          toolIds={toolIds}
+          running={sandbox.spec.status === "running"}
+          onResourceChange={onResourceChange}
+          onRefresh={onRefresh}
+        />
+      </DialogContent>
+    </Dialog>
+  )
 }
 
 function SandboxDetailsDialog({

@@ -239,6 +239,9 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 }
 
 func normalizeWorkerJobResult(result *platform.WorkerJobResult) bool {
+	if !normalizeWorkerAgentTools(result.AgentTools) {
+		return false
+	}
 	if result.Error == nil {
 		return true
 	}
@@ -258,6 +261,52 @@ func normalizeWorkerJobResult(result *platform.WorkerJobResult) bool {
 	}
 	encoded, err := json.Marshal(result.Error.Details)
 	return err == nil && len(encoded) <= 8<<10
+}
+
+func normalizeWorkerAgentTools(tools []platform.SandboxAgentToolState) bool {
+	if len(tools) > 32 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(tools))
+	for index := range tools {
+		tool := &tools[index]
+		tool.Tool = strings.TrimSpace(tool.Tool)
+		tool.CurrentVersion = strings.TrimSpace(tool.CurrentVersion)
+		tool.LatestVersion = strings.TrimSpace(tool.LatestVersion)
+		tool.PreviousVersion = strings.TrimSpace(tool.PreviousVersion)
+		tool.Status = strings.TrimSpace(tool.Status)
+		tool.Message = strings.TrimSpace(tool.Message)
+		tool.Source = strings.TrimSpace(tool.Source)
+		if !validSandboxAgentTool(tool.Tool) || !validSandboxAgentToolStatus(tool.Status) ||
+			len(tool.CurrentVersion) > 128 || len(tool.LatestVersion) > 128 ||
+			len(tool.PreviousVersion) > 128 || len(tool.Message) > 500 || len(tool.Source) > 64 ||
+			tool.CheckedAt.IsZero() {
+			return false
+		}
+		if _, exists := seen[tool.Tool]; exists {
+			return false
+		}
+		seen[tool.Tool] = struct{}{}
+	}
+	return true
+}
+
+func validSandboxAgentTool(tool string) bool {
+	switch tool {
+	case "claude-code", "codex", "deepseek-harness", "gemini-cli", "grok", "kimi", "opencode", "pi", "reasonix":
+		return true
+	default:
+		return false
+	}
+}
+
+func validSandboxAgentToolStatus(status string) bool {
+	switch status {
+	case "installed", "not-installed", "broken", "updated", "unchanged", "failed":
+		return true
+	default:
+		return false
+	}
 }
 
 func validWorkerErrorDetailKey(key string) bool {

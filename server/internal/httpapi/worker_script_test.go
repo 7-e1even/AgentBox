@@ -186,8 +186,8 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 			t.Fatalf("extended Agent support is missing %q", expected)
 		}
 	}
-	if strings.Contains(workerDaemon, "@xai-official/grok") {
-		t.Fatal("Grok Build must use the official released binary installer")
+	if strings.Contains(workerDaemon, `grok) PACKAGE='@xai-official/grok'`) {
+		t.Fatal("Grok Build installation must keep using the official released binary installer")
 	}
 }
 
@@ -200,14 +200,106 @@ func TestWorkerInstallsOpenCodeWithoutGuestNPMForBoxLite(t *testing.T) {
 		`PLATFORM_PACKAGE=opencode-linux-x64`,
 		`PLATFORM_PACKAGE=opencode-linux-arm64`,
 		`"https://registry.npmjs.org/$PLATFORM_PACKAGE/latest"`,
+		`curl --connect-timeout 15 --max-time 60 --retry 3 -fsSL`,
+		`curl --connect-timeout 15 --max-time 300 --retry 3 -fsSL`,
 		`EXPECTED_SHA512=$(printf '%s' "${INTEGRITY#sha512-}" | base64 -d`,
 		`ACTUAL_SHA512=$(sha512sum "$ARCHIVE"`,
 		`tar -xzf "$ARCHIVE" -C "$TMP_DIR" package/bin/opencode`,
-		`boxlite_local_cli cp "$TMP_DIR/package/bin/opencode" "$CONTAINER:/usr/local/bin/opencode"`,
-		`agent_tool_exec "$CONTAINER" test -x /usr/local/bin/opencode`,
+		`copy_boxlite_agent_payload "$CONTAINER" "$TMP_DIR/package/bin/opencode"`,
+		`/opt/agentbox/opencode.upload`,
+		`boxlite_local_cli start "$BOXLITE_COPY_TARGET"`,
+		`boxlite_local_cli cp "$BOXLITE_COPY_SOURCE"`,
+		`UPLOAD=/opt/agentbox/opencode.upload`,
+		`agent_tool_exec "$CONTAINER" sh -lc`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("BoxLite OpenCode binary installer is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerInstallsBoxLiteCodexFromOfficialNPMPackage(t *testing.T) {
+	start := strings.Index(workerDaemon, "install_boxlite_codex()")
+	end := strings.Index(workerDaemon[start:], "\ninstall_agent_tools()")
+	if start < 0 || end < 0 {
+		t.Fatal("BoxLite Codex installer boundary was not found")
+	}
+	body := workerDaemon[start : start+end]
+	for _, expected := range []string{
+		`'https://registry.npmjs.org/@openai%2fcodex/latest'`,
+		`PLATFORM_VERSION=${PLATFORM_SPEC#npm:@openai/codex@}`,
+		`EXPECTED_SHA512=$(printf '%s' "${INTEGRITY#sha512-}" | base64 -d`,
+		`PART_COUNT=8`,
+		`curl --connect-timeout 15 --max-time 900 --retry 3 -fsSL`,
+		`archive_is_valid`,
+		`tar -xzf "$ARCHIVE" -C "$HOST_PACKAGE_TMP" --strip-components=1`,
+		`"$BINARY_MEMBER"`,
+		`publish_boxlite_codex_package "$CONTAINER" "$HOST_PACKAGE"`,
+		`boxlite_local_cli cp`,
+		`$BOXLITE_CODEX_HOST_PACKAGE/$BOXLITE_CODEX_BINARY_REL`,
+		`setsid -f sh -lc '\''sync'\''`,
+		`checkpoint_boxlite_agent_update "$BOXLITE_CODEX_TARGET"`,
+		`$BOXLITE_URL/v1/boxes/$BOXLITE_CHECKPOINT_TARGET/snapshots`,
+		`[ "$BOXLITE_CHECKPOINT_STATUS" != 201 ]`,
+		`boxlite_cli stop "$BOXLITE_CHECKPOINT_TARGET"`,
+		`[ "$BOXLITE_CHECKPOINT_BOX_STATUS" = stopped ]`,
+		`libkrun keeps an open fd to the live qcow2 inode`,
+		`boxlite_cli start "$BOXLITE_CHECKPOINT_TARGET"`,
+		`Codex publish was interrupted; restoring the BoxLite control service and retrying from the Worker cache`,
+		`[ "$#" -gt 0 ] || [ "$INSTALL_PI" = true ]`,
+		`codex) printf '%s' npm`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite Codex npm installer is missing %q", expected)
+		}
+	}
+	if strings.Contains(body, "api.github.com/repos/openai/codex") || strings.Contains(body, "npm install -g") {
+		t.Fatal("BoxLite Codex updates must use the reachable staged npm package path")
+	}
+}
+
+func TestWorkerReusesValidatedBoxLiteCodexVersionCache(t *testing.T) {
+	start := strings.Index(workerDaemon, "install_boxlite_codex()")
+	end := strings.Index(workerDaemon[start:], "\ninstall_agent_tools()")
+	if start < 0 || end < 0 {
+		t.Fatal("BoxLite Codex installer boundary was not found")
+	}
+	body := workerDaemon[start : start+end]
+	for _, expected := range []string{
+		`FINAL="/opt/agentbox/tools/codex/$1/$2"`,
+		`[ -x "$FINAL" ]`,
+		`"$FINAL" --version | grep -Fq "$1"`,
+		`report_agent_tool_progress codex cached "Codex $LATEST 已在沙箱缓存中"`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Fatalf("BoxLite Codex version cache is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerPublishesBoxLiteCodexAtomicallyAfterValidation(t *testing.T) {
+	start := strings.Index(workerDaemon, "install_boxlite_codex()")
+	end := strings.Index(workerDaemon[start:], "\ninstall_agent_tools()")
+	if start < 0 || end < 0 {
+		t.Fatal("BoxLite Codex installer boundary was not found")
+	}
+	binaryValidation := strings.Index(workerDaemon, `"$STAGE_BINARY" --version | grep -Fq "$LATEST"`)
+	binaryPublish := strings.Index(workerDaemon, `mv "$STAGE" "$FINAL"`)
+	linkValidation := strings.Index(workerDaemon[binaryPublish:], `"$LINK_TMP" --version | grep -Fq "$LATEST"`)
+	linkPublish := strings.Index(workerDaemon[binaryPublish:], `mv -f "$LINK_TMP" /usr/local/bin/codex`)
+	if binaryValidation < 0 || binaryPublish < 0 || binaryValidation >= binaryPublish ||
+		linkValidation < 0 || linkPublish < 0 || linkValidation >= linkPublish {
+		t.Fatal("Codex must be runnable before the live command is replaced atomically")
+	}
+}
+
+func TestWorkerSkipsReadyAgentToolPrerequisites(t *testing.T) {
+	for _, expected := range []string{
+		`for command in curl git jq unzip python3; do command -v "$command" >/dev/null || exit 1; done`,
+		`Agent 工具依赖已就绪`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Agent tool prerequisite cache is missing %q", expected)
 		}
 	}
 }
@@ -221,7 +313,6 @@ func TestWorkerRecoversBoxLitePortalDuringAgentToolInstall(t *testing.T) {
 		`stop_boxlite_server`,
 		`ensure_boxlite_server || return 1`,
 		`boxlite_cli start "$CONTAINER"`,
-		`agent_tool_exec "$CONTAINER" sh -lc`,
 		`Agent tool prerequisite installation failed`,
 		`Agent tool package installation failed`,
 		`agent_tool_exec_stdin "$CONTAINER" "$VERSION_FILE"`,
@@ -240,15 +331,21 @@ func TestWorkerKeepsLargeBoxLiteAgentToolOutputOffAttachStream(t *testing.T) {
 	for _, expected := range []string{
 		`agent_tool_exec_logged()`,
 		`if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" != boxlite ]; then`,
-		`LOG_FILE="/tmp/agentbox-$LABEL-install.log"`,
-		`STATUS_FILE="$LOG_FILE.status"`,
-		`PID_FILE="$LOG_FILE.pid"`,
+		`AGENT_EXEC_JOB_DIR=/opt/agentbox/jobs`,
+		`AGENT_EXEC_LOG_FILE="$AGENT_EXEC_JOB_DIR/$LABEL-install.log"`,
+		`AGENT_EXEC_STATUS_FILE="$AGENT_EXEC_LOG_FILE.status"`,
 		`INSTALL_ATTEMPT=1`,
 		`while [ "$INSTALL_ATTEMPT" -le 2 ]; do`,
-		`(trap "" HUP; "$@"; CODE=$?; printf "%s\n" "$CODE" >"$STATUS_FILE")`,
+		`boxlite_cli exec -d -u 0:0 "$CONTAINER" -- sh -lc`,
+		`printf "%s\n" "$CODE" >"$STATUS_FILE.tmp"`,
+		`mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"`,
 		`DEADLINE=$(($(date +%s) + ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800}))`,
 		`STATUS=$(docker exec "$CONTAINER" sh -lc 'test -f "$1" && cat "$1" || true'`,
-		`sleep "${AGENTBOX_AGENT_TOOL_POLL_SECONDS:-15}"`,
+		`PORTAL_FAILURES=0`,
+		`BoxLite portal remained unavailable while polling Agent tool installation; waiting for the detached task before recovery`,
+		`sleep 15`,
+		`if ! recover_boxlite_agent_tool_install "$CONTAINER" ||`,
+		`sleep "${AGENTBOX_AGENT_TOOL_POLL_SECONDS:-5}"`,
 		`Retrying Agent tool installation from the sandbox cache: $LABEL`,
 		`Agent tool installation timed out after ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800} seconds`,
 		`tail -c 3000 "$1"`,
@@ -262,11 +359,62 @@ func TestWorkerKeepsLargeBoxLiteAgentToolOutputOffAttachStream(t *testing.T) {
 			t.Fatalf("BoxLite quiet Agent tool install is missing %q", expected)
 		}
 	}
+	controlRecovery := strings.Index(workerDaemon, `BoxLite portal remained unavailable while polling Agent tool installation; waiting for the detached task before recovery`)
+	sandboxRecovery := -1
+	if controlRecovery >= 0 {
+		sandboxRecovery = strings.Index(workerDaemon[controlRecovery:], `recover_boxlite_agent_tool_install "$CONTAINER" || return 1`)
+	}
+	if controlRecovery < 0 || sandboxRecovery < 0 {
+		t.Fatal("BoxLite control service must be recovered before restarting the sandbox")
+	}
+}
+
+func TestWorkerRestartsSandboxOnlyAfterInPlaceAgentUpdateRetryFails(t *testing.T) {
+	for _, expected := range []string{
+		`[ "${AGENTBOX_AGENT_TOOL_MODE:-ensure}" = upgrade ]`,
+		`restarting the control service and sandbox before resuming`,
+		`stop_boxlite_server
+    ensure_boxlite_server || return 1`,
+		`retrying without restarting the sandbox`,
+		`recover_boxlite_agent_tool_install "$CONTAINER" || return 1`,
+		`! docker exec "$CONTAINER" true >/dev/null 2>&1`,
+		`正在恢复 BoxLite Agent 更新连接`,
+		`VERSION_ATTEMPT=1`,
+		`while [ "$VERSION_ATTEMPT" -le 3 ]`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("stable in-place Agent update is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerConfirmsSelfUpdateBeforeSlowRuntimeDiscovery(t *testing.T) {
+	confirmation := strings.Index(workerDaemon, "  finalize_worker_update || true\n  prepare_boxlite_config")
+	imageRefresh := strings.Index(workerDaemon, "  refresh_boxlite_images || {")
+	if confirmation < 0 || imageRefresh < 0 || confirmation > imageRefresh {
+		t.Fatal("Worker self-update must be confirmed before BoxLite runtime discovery")
+	}
+}
+
+func TestWorkerClaimsJobsEverySecond(t *testing.T) {
+	start := strings.Index(workerDaemon, "run_worker()")
+	if start < 0 {
+		t.Fatal("Worker run loop was not found")
+	}
+	body := workerDaemon[start:]
+	if !strings.Contains(body, "    sleep 1\n") {
+		t.Fatal("Worker must claim queued Agent updates within one second")
+	}
+	if strings.Contains(body, "    sleep 5\n") {
+		t.Fatal("Worker must not retain the five-second idle claim delay")
+	}
 }
 
 func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 	for _, expected := range []string{
-		`if [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"`,
+		`if [ "$MODE" = ensure ] && [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc '`,
+		`VERSION=$(timeout 20 "$1" --version 2>&1 | head -n 1)`,
+		`[ -n "$VERSION" ]`,
 		`pi) INSTALL_PI=true; continue ;;`,
 		`npm uninstall -g @mariozechner/pi-coding-agent`,
 		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
@@ -281,6 +429,74 @@ func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 	}
 	if strings.Contains(workerDaemon, `pi) PACKAGE='@mariozechner/pi-coding-agent'`) {
 		t.Fatal("Pi must not be installed from the deprecated package")
+	}
+}
+
+func TestWorkerChecksAndUpdatesSandboxAgentToolsInPlace(t *testing.T) {
+	for _, expected := range []string{
+		`check-sandbox-agent-tools)`,
+		`update-sandbox-agent-tools)`,
+		`check_agent_tools()`,
+		`update_agent_tools()`,
+		`.job.payload.requestedAgentTools[]?`,
+		`AGENTBOX_AGENT_TOOL_MODE=upgrade`,
+		`-name '\''.codex-*'\'' -exec rm -rf -- {} +`,
+		`npm install -g "$@" || { npm cache clean --force`,
+		`agent_tool_detect_version "$TARGET" "$TOOL_ID"`,
+		`https://registry.npmjs.org/$PACKAGE`,
+		`updated "Agent 工具已更新"`,
+		`unchanged "更新命令已完成，但版本没有变化"`,
+		`complete_agent_tool_job`,
+		`agentTools:($agentTools[0] // [])`,
+		`ERROR_DETAILS=${12:-}`,
+		`[ -n "$ERROR_DETAILS" ] || ERROR_DETAILS='{}'`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("sandbox Agent tool lifecycle is missing %q", expected)
+		}
+	}
+	if strings.Contains(workerDaemon, `${12:-{}}`) {
+		t.Fatal("Worker result JSON must not use an ambiguous shell default containing braces")
+	}
+	if strings.Contains(workerDaemon, `npm uninstall -g @openai/codex`) {
+		t.Fatal("Codex update must keep the working version until npm has installed its replacement")
+	}
+	if strings.Contains(workerDaemon, `docker rm -f "$TARGET"`) &&
+		!strings.Contains(workerDaemon, `prepare_agent_tool_operation()`) {
+		t.Fatal("Agent tool lifecycle must operate on the existing sandbox")
+	}
+}
+
+func TestWorkerSerializesBoxLiteAgentUpdatesWithInteractiveSessions(t *testing.T) {
+	for _, expected := range []string{
+		`pause_session_worker()`,
+		`resume_session_worker()`,
+		`[ "$UPDATE_DRIVER" != boxlite ] || pause_session_worker
+      if update_agent_tools`,
+		`report_job_progress agent-tools-update "正在恢复 BoxLite 终端连接"`,
+		`if [ "$UPDATE_ONLY_CODEX" = true ]; then`,
+		`checkpoint_boxlite_agent_update "$UPDATE_TARGET"`,
+		`recover_boxlite_agent_tool_install`,
+		`UPDATE_TARGET=$(sandbox_container_name "$JOB_FILE")`,
+		`"$UPDATE_TARGET"`,
+		`resume_session_worker
+      fi
+      if [ "$UPDATE_OK" = true ]`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("BoxLite Agent updates must serialize with interactive sessions: missing %q", expected)
+		}
+	}
+	updateStart := strings.Index(workerDaemon, "    update-sandbox-agent-tools)")
+	updateEnd := strings.Index(workerDaemon[updateStart:], "    update-worker)")
+	if updateStart < 0 || updateEnd < 0 {
+		t.Fatal("Agent update job boundary was not found")
+	}
+	updateBody := workerDaemon[updateStart : updateStart+updateEnd]
+	successBranch := strings.Index(updateBody, `if [ "$UPDATE_OK" = true ]; then`)
+	failureRecovery := strings.Index(updateBody, `elif ! recover_boxlite_agent_tool_install`)
+	if successBranch < 0 || failureRecovery < 0 || successBranch >= failureRecovery {
+		t.Fatal("successful BoxLite Agent updates must checkpoint before failure recovery")
 	}
 }
 
@@ -589,6 +805,36 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 	}
 }
 
+func TestWorkerSupervisesInteractiveSessionProcess(t *testing.T) {
+	for _, expected := range []string{
+		`ensure_session_worker()`,
+		`kill -0 "$SESSION_PID" >/dev/null 2>&1`,
+		`SESSION_STATE=$(ps -o stat= -p "$SESSION_PID" 2>/dev/null`,
+		`''|Z*) ;;`,
+		`wait "$SESSION_PID" >/dev/null 2>&1 || true`,
+		`/usr/local/bin/agentbox-worker session "$CONFIG" &`,
+		`SESSION_PID=$!`,
+		"  while :; do\n    finalize_worker_update || true\n    ensure_session_worker",
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("interactive session supervision is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerStartsInteractiveSessionBeforeSlowImageInventory(t *testing.T) {
+	start := strings.Index(workerDaemon, "run_worker()")
+	if start < 0 {
+		t.Fatal("worker run loop was not found")
+	}
+	body := workerDaemon[start:]
+	sessionIndex := strings.Index(body, "  ensure_session_worker\n")
+	inventoryIndex := strings.Index(body, "  refresh_boxlite_images || {")
+	if sessionIndex < 0 || inventoryIndex < 0 || sessionIndex > inventoryIndex {
+		t.Fatal("interactive sessions must start before the slow BoxLite image inventory refresh")
+	}
+}
+
 func TestWorkerSupportsVersionedAtomicSelfUpdate(t *testing.T) {
 	for _, expected := range []string{
 		`--arg workerVersion "$AGENTBOX_WORKER_VERSION"`,
@@ -603,7 +849,9 @@ func TestWorkerSupportsVersionedAtomicSelfUpdate(t *testing.T) {
 		`DOWNLOADED_VERSION=$("$WORKER_TMP" version`,
 		`/usr/local/lib/agentbox/agentbox-worker.previous`,
 		`mv -f "$NEXT" /usr/local/bin/agentbox-worker`,
-		`systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=20s`,
+		`systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=120s`,
+		`KillMode=control-group`,
+		`TimeoutStopSec=20s`,
 		`systemd-run --quiet --unit="agentbox-worker-restart-$JOB_ID" --on-active=1s`,
 		`finalize_worker_update`,
 		`trap cleanup_worker EXIT`,

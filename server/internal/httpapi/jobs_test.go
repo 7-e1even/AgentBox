@@ -4,6 +4,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"agentbox/internal/platform"
 )
@@ -31,6 +32,35 @@ func TestNormalizeWorkerJobResultRejectsUnsafeErrorMetadata(t *testing.T) {
 		result := platform.WorkerJobResult{Error: workerError}
 		if normalizeWorkerJobResult(&result) {
 			t.Fatalf("unsafe Worker error was accepted: %#v", workerError)
+		}
+	}
+}
+
+func TestNormalizeWorkerJobResultAcceptsAgentToolStates(t *testing.T) {
+	result := platform.WorkerJobResult{
+		Success: true,
+		AgentTools: []platform.SandboxAgentToolState{{
+			Tool: "codex", CurrentVersion: " 0.1.0 ", LatestVersion: "0.2.0",
+			Status: "updated", Source: "npm", CheckedAt: time.Now().UTC(),
+		}},
+	}
+	if !normalizeWorkerJobResult(&result) {
+		t.Fatal("valid Agent tool states were rejected")
+	}
+	if result.AgentTools[0].CurrentVersion != "0.1.0" {
+		t.Fatalf("current version was not normalized: %q", result.AgentTools[0].CurrentVersion)
+	}
+}
+
+func TestNormalizeWorkerJobResultRejectsUnknownOrDuplicateAgentTools(t *testing.T) {
+	for _, tools := range [][]platform.SandboxAgentToolState{
+		{{Tool: "unknown", Status: "installed"}},
+		{{Tool: "codex", Status: "installed"}, {Tool: "codex", Status: "updated"}},
+		{{Tool: "codex", Status: "pretend-updated"}},
+	} {
+		result := platform.WorkerJobResult{Success: true, AgentTools: tools}
+		if normalizeWorkerJobResult(&result) {
+			t.Fatalf("unsafe Agent tool states were accepted: %#v", tools)
 		}
 	}
 }

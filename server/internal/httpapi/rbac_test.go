@@ -58,6 +58,7 @@ func TestViewerWriteRequestsAreForbidden(t *testing.T) {
 		{http.MethodPatch, "/api/resources/sandbox-one", `{"kind":"sandbox","name":"x","spec":{}}`},
 		{http.MethodDelete, "/api/resources/sandbox-one", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/actions/start", ""},
+		{http.MethodPost, "/api/sandboxes/sandbox-one/agent-tools/actions/update", `{"tools":["codex"]}`},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/session-ticket", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/desktop-ticket", ""},
 		{http.MethodPost, "/api/server-pairings", ""},
@@ -111,6 +112,12 @@ func TestOperatorSandboxOperationsAreAllowed(t *testing.T) {
 	response := rbacRequest(t, handler, http.MethodPost, "/api/sandboxes/sandbox-one/actions/start", "")
 	if response.Code != http.StatusAccepted {
 		t.Errorf("sandbox action: status = %d, want %d (body = %s)", response.Code, http.StatusAccepted, response.Body.String())
+	}
+
+	response = rbacRequest(t, handler, http.MethodPost,
+		"/api/sandboxes/sandbox-one/agent-tools/actions/check", `{"tools":["codex"]}`)
+	if response.Code != http.StatusAccepted {
+		t.Errorf("Agent tool action: status = %d, want %d (body = %s)", response.Code, http.StatusAccepted, response.Body.String())
 	}
 
 	response = rbacRequest(t, handler, http.MethodPost, "/api/resources",

@@ -29,6 +29,7 @@ type message struct {
 	Cols       int    `json:"cols,omitempty"`
 	Rows       int    `json:"rows,omitempty"`
 	OK         bool   `json:"ok,omitempty"`
+	Retryable  bool   `json:"retryable,omitempty"`
 	Result     any    `json:"result,omitempty"`
 	Error      string `json:"error,omitempty"`
 }
@@ -93,4 +94,16 @@ func truncateError(err error) string {
 		return value[:4000]
 	}
 	return value
+}
+
+func isBoxLiteAttachFailure(output string) bool {
+	normalized := strings.ToLower(output)
+	if !strings.Contains(normalized, "attach stream error:") &&
+		!strings.Contains(normalized, "portal error:") {
+		return false
+	}
+	return strings.Contains(normalized, "h2 protocol error") ||
+		strings.Contains(normalized, "grpc/tonic") ||
+		strings.Contains(normalized, "status: unavailable") ||
+		strings.Contains(normalized, "connection refused")
 }

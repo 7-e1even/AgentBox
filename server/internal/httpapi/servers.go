@@ -460,7 +460,9 @@ Type=simple
 EnvironmentFile=-/etc/agentbox-worker-runtime.env
 ExecStart=/usr/local/bin/agentbox-worker run
 Restart=always
-RestartSec=5
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=20s
 
 [Install]
 WantedBy=multi-user.target
@@ -813,6 +815,7 @@ install_boxlite_guest() {
   # Provision the self-contained guest helper through the local runtime, then
   # restore the shared server used by concurrent terminal and file sessions.
   stop_boxlite_server
+  boxlite_local_cli start "$TARGET" >/dev/null 2>&1 || true
   if boxlite_local_cli cp /usr/local/bin/agentbox-worker \
       "$TARGET:/opt/agentbox/agentbox-guest" &&
      boxlite_local_cli exec -u 0:0 "$TARGET" -- \
@@ -1093,7 +1096,9 @@ complete_job() {
   ERROR_CODE=${9:-}
   ERROR_STAGE=${10:-}
   ERROR_RETRYABLE=${11:-false}
-  ERROR_DETAILS=${12:-{}}
+  ERROR_DETAILS=${12:-}
+  [ -n "$ERROR_DETAILS" ] || ERROR_DETAILS='{}'
+  AGENT_TOOLS_FILE=${13:-/dev/null}
   BODY=$(jq -n \
     --argjson success "$SUCCESS" \
     --arg externalId "$EXTERNAL_ID" \
@@ -1106,9 +1111,11 @@ complete_job() {
     --arg errorStage "$ERROR_STAGE" \
     --argjson errorRetryable "$ERROR_RETRYABLE" \
     --argjson errorDetails "$ERROR_DETAILS" \
+    --slurpfile agentTools "$AGENT_TOOLS_FILE" \
     '{success:$success,externalId:$externalId,message:$message,
       exitCode:(if $exitCode == "" then null else ($exitCode | tonumber) end),
       output:$output,outputTruncated:$outputTruncated,timedOut:$timedOut,
+      agentTools:($agentTools[0] // []),
       error:(if $success or $errorCode == "" then null else
         ({code:$errorCode,retryable:$errorRetryable,details:$errorDetails} +
          if $errorStage == "" then {} else {stage:$errorStage} end)
@@ -1130,6 +1137,18 @@ complete_job_failure() {
   ERROR_DETAILS=$(jq -cn --arg action "$ACTION" '{action:$action}')
   complete_job "$JOB_ID" false "" "$MESSAGE" "" /dev/null false false \
     "$ERROR_CODE" "$ERROR_STAGE" "$ERROR_RETRYABLE" "$ERROR_DETAILS"
+}
+
+complete_agent_tool_job() {
+  JOB_ID=$1
+  SUCCESS=$2
+  MESSAGE=$3
+  RESULT_FILE=$4
+  ACTION=$5
+  ERROR_CODE=${6:-}
+  ERROR_DETAILS=$(jq -cn --arg action "$ACTION" '{action:$action}')
+  complete_job "$JOB_ID" "$SUCCESS" "" "$MESSAGE" "" /dev/null false false \
+    "$ERROR_CODE" agent-tools false "$ERROR_DETAILS" "$RESULT_FILE"
 }
 
 worker_error_stage() {
@@ -1365,7 +1384,15 @@ ROLLBACK
     rm -f "$WORKER_TMP" "$MARKER" "$ROLLBACK_SCRIPT"
     return 1
   }
-  if ! systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=20s \
+  install -d -m 0755 /etc/systemd/system/agentbox-worker.service.d
+  cat > /etc/systemd/system/agentbox-worker.service.d/agentbox-restart.conf <<'UNIT'
+[Service]
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=20s
+UNIT
+  systemctl daemon-reload
+  if ! systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=120s \
       "$ROLLBACK_SCRIPT" "$MARKER" "$PREVIOUS" "$TARGET_VERSION"; then
     restore_worker_binary "$PREVIOUS"
     rm -f "$WORKER_TMP" "$MARKER" "$ROLLBACK_SCRIPT"
@@ -1412,7 +1439,13 @@ agent_tool_command() {
 recover_boxlite_agent_tool_install() {
   CONTAINER=$1
   [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ] || return 1
-  echo "BoxLite portal disconnected while installing Agent tools; restarting the sandbox and retrying once" >&2
+  if [ "${AGENTBOX_AGENT_TOOL_MODE:-ensure}" = upgrade ]; then
+    echo "BoxLite portal interrupted an Agent update; restarting the control service and sandbox before resuming" >&2
+    stop_boxlite_server
+    ensure_boxlite_server || return 1
+  else
+    echo "BoxLite portal disconnected while installing Agent tools; restarting the sandbox and retrying once" >&2
+  fi
   RESTART_LOG=$(mktemp "$STATE_DIR/boxlite-agent-tool-restart.XXXXXX") || return 1
   if boxlite_cli restart "$CONTAINER" >/dev/null 2>"$RESTART_LOG"; then
     rm -f "$RESTART_LOG"
@@ -1436,6 +1469,17 @@ agent_tool_exec() {
   if docker exec "$CONTAINER" "$@"; then
     return 0
   fi
+  if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ] &&
+     [ "${AGENTBOX_AGENT_TOOL_MODE:-ensure}" = upgrade ]; then
+    echo "BoxLite command stream was interrupted during an Agent update; retrying without restarting the sandbox" >&2
+    sleep 1
+    if docker exec "$CONTAINER" "$@"; then
+      return 0
+    fi
+    recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+    docker exec "$CONTAINER" "$@"
+    return
+  fi
   recover_boxlite_agent_tool_install "$CONTAINER" || return 1
   docker exec "$CONTAINER" "$@"
 }
@@ -1446,6 +1490,17 @@ agent_tool_exec_stdin() {
   shift 2
   if docker exec -i "$CONTAINER" "$@" < "$INPUT_FILE"; then
     return 0
+  fi
+  if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ] &&
+     [ "${AGENTBOX_AGENT_TOOL_MODE:-ensure}" = upgrade ]; then
+    echo "BoxLite input stream was interrupted during an Agent update; retrying without restarting the sandbox" >&2
+    sleep 1
+    if docker exec -i "$CONTAINER" "$@" < "$INPUT_FILE"; then
+      return 0
+    fi
+    recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+    docker exec -i "$CONTAINER" "$@" < "$INPUT_FILE"
+    return
   fi
   recover_boxlite_agent_tool_install "$CONTAINER" || return 1
   docker exec -i "$CONTAINER" "$@" < "$INPUT_FILE"
@@ -1459,31 +1514,60 @@ agent_tool_exec_logged() {
     agent_tool_exec "$CONTAINER" "$@"
     return
   fi
-  LOG_FILE="/tmp/agentbox-$LABEL-install.log"
-  STATUS_FILE="$LOG_FILE.status"
-  PID_FILE="$LOG_FILE.pid"
+  AGENT_EXEC_JOB_DIR=/opt/agentbox/jobs
+  AGENT_EXEC_LOG_FILE="$AGENT_EXEC_JOB_DIR/$LABEL-install.log"
+  AGENT_EXEC_STATUS_FILE="$AGENT_EXEC_LOG_FILE.status"
+  agent_tool_exec "$CONTAINER" install -d -m 0700 "$AGENT_EXEC_JOB_DIR" || return 1
   INSTALL_ATTEMPT=1
   while [ "$INSTALL_ATTEMPT" -le 2 ]; do
-    if ! agent_tool_exec "$CONTAINER" sh -lc \
-        'LOG_FILE=$1; STATUS_FILE=$2; PID_FILE=$3; shift 3; rm -f "$LOG_FILE" "$STATUS_FILE" "$PID_FILE"; (trap "" HUP; "$@"; CODE=$?; printf "%s\n" "$CODE" >"$STATUS_FILE") >"$LOG_FILE" 2>&1 </dev/null & printf "%s\n" "$!" >"$PID_FILE"' \
-        agentbox "$LOG_FILE" "$STATUS_FILE" "$PID_FILE" "$@"; then
-      return 1
+    if ! boxlite_cli exec -d -u 0:0 "$CONTAINER" -- sh -lc '
+        LOG_FILE=$1
+        STATUS_FILE=$2
+        shift 2
+        rm -f "$LOG_FILE" "$STATUS_FILE" "$STATUS_FILE.tmp"
+        "$@" >"$LOG_FILE" 2>&1
+        CODE=$?
+        printf "%s\n" "$CODE" >"$STATUS_FILE.tmp"
+        mv -f "$STATUS_FILE.tmp" "$STATUS_FILE"
+        exit "$CODE"
+      ' agentbox "$AGENT_EXEC_LOG_FILE" "$AGENT_EXEC_STATUS_FILE" "$@" >/dev/null; then
+      recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+      INSTALL_ATTEMPT=$((INSTALL_ATTEMPT + 1))
+      continue
     fi
     DEADLINE=$(($(date +%s) + ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800}))
     PORTAL_FAILED=false
+    PORTAL_FAILURES=0
     while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-      if ! STATUS=$(docker exec "$CONTAINER" sh -lc 'test -f "$1" && cat "$1" || true' agentbox "$STATUS_FILE"); then
-        PORTAL_FAILED=true
-        break
+      if ! STATUS=$(docker exec "$CONTAINER" sh -lc 'test -f "$1" && cat "$1" || true' agentbox "$AGENT_EXEC_STATUS_FILE"); then
+        PORTAL_FAILURES=$((PORTAL_FAILURES + 1))
+        if [ "$PORTAL_FAILURES" -lt 3 ]; then
+          sleep 1
+          continue
+        fi
+        echo "BoxLite portal remained unavailable while polling Agent tool installation; waiting for the detached task before recovery" >&2
+        sleep 15
+        if ! recover_boxlite_agent_tool_install "$CONTAINER" ||
+           ! STATUS=$(docker exec "$CONTAINER" sh -lc 'test -f "$1" && cat "$1" || true' agentbox "$AGENT_EXEC_STATUS_FILE"); then
+          PORTAL_FAILED=true
+          break
+        fi
+        if [ -z "$STATUS" ]; then
+          PORTAL_FAILED=true
+          break
+        fi
+        PORTAL_FAILURES=0
+      else
+        PORTAL_FAILURES=0
       fi
       case "$STATUS" in
         0)
-          docker exec "$CONTAINER" rm -f "$LOG_FILE" "$STATUS_FILE" "$PID_FILE" >/dev/null 2>&1 || true
+          docker exec "$CONTAINER" rm -f "$AGENT_EXEC_LOG_FILE" "$AGENT_EXEC_STATUS_FILE" >/dev/null 2>&1 || true
           return 0
           ;;
-        '' ) sleep "${AGENTBOX_AGENT_TOOL_POLL_SECONDS:-15}" ;;
+        '' ) sleep "${AGENTBOX_AGENT_TOOL_POLL_SECONDS:-5}" ;;
         * )
-          docker exec "$CONTAINER" sh -lc 'test ! -f "$1" || tail -c 3000 "$1"' agentbox "$LOG_FILE" >&2 || true
+          docker exec "$CONTAINER" sh -lc 'test ! -f "$1" || tail -c 3000 "$1"' agentbox "$AGENT_EXEC_LOG_FILE" >&2 || true
           return 1
           ;;
       esac
@@ -1497,12 +1581,147 @@ agent_tool_exec_logged() {
       fi
       return 1
     fi
-    docker exec "$CONTAINER" sh -lc 'test ! -s "$1" || kill "$(cat "$1")" 2>/dev/null || true; test ! -f "$2" || tail -c 3000 "$2"' \
-      agentbox "$PID_FILE" "$LOG_FILE" >&2 || true
+    recover_boxlite_agent_tool_install "$CONTAINER" || true
+    docker exec "$CONTAINER" sh -lc 'test ! -f "$1" || tail -c 3000 "$1"' \
+      agentbox "$AGENT_EXEC_LOG_FILE" >&2 || true
     echo "Agent tool installation timed out after ${AGENTBOX_AGENT_TOOL_INSTALL_TIMEOUT_SECONDS:-1800} seconds: $LABEL" >&2
     return 1
   done
   return 1
+}
+
+copy_boxlite_agent_payload() {
+  BOXLITE_COPY_TARGET=$1
+  BOXLITE_COPY_SOURCE=$2
+  BOXLITE_COPY_DESTINATION=$3
+  stop_boxlite_server
+  boxlite_local_cli start "$BOXLITE_COPY_TARGET" >/dev/null 2>&1 || true
+  if boxlite_local_cli cp "$BOXLITE_COPY_SOURCE" \
+      "$BOXLITE_COPY_TARGET:$BOXLITE_COPY_DESTINATION" >/dev/null; then
+    BOXLITE_COPY_STATUS=0
+  else
+    BOXLITE_COPY_STATUS=$?
+  fi
+  if ! ensure_boxlite_server; then
+    return 1
+  fi
+  return "$BOXLITE_COPY_STATUS"
+}
+
+checkpoint_boxlite_agent_update() {
+  BOXLITE_CHECKPOINT_TARGET=$1
+  sleep 6
+  ensure_boxlite_server || return 1
+
+  BOXLITE_CHECKPOINT_STOP_LOG=$(mktemp "$STATE_DIR/boxlite-agent-stop.XXXXXX") || return 1
+  if ! boxlite_cli stop "$BOXLITE_CHECKPOINT_TARGET" \
+      >/dev/null 2>"$BOXLITE_CHECKPOINT_STOP_LOG"; then
+    BOXLITE_CHECKPOINT_INSPECT=$(boxlite_cli inspect "$BOXLITE_CHECKPOINT_TARGET" 2>/dev/null || true)
+    BOXLITE_CHECKPOINT_BOX_STATUS=$(printf '%s' "$BOXLITE_CHECKPOINT_INSPECT" |
+      boxlite_inspect_status)
+    if [ "$BOXLITE_CHECKPOINT_BOX_STATUS" != stopped ]; then
+      cat "$BOXLITE_CHECKPOINT_STOP_LOG" >&2
+      rm -f "$BOXLITE_CHECKPOINT_STOP_LOG"
+      return 1
+    fi
+  fi
+  rm -f "$BOXLITE_CHECKPOINT_STOP_LOG"
+
+  # libkrun keeps an open fd to the live qcow2 inode. Recreate the runtime
+  # handle after stop so the snapshot cannot fork a disk that is still open.
+  stop_boxlite_server
+  ensure_boxlite_server || return 1
+  BOXLITE_CHECKPOINT_INSPECT=$(boxlite_cli inspect "$BOXLITE_CHECKPOINT_TARGET") || return 1
+  BOXLITE_CHECKPOINT_BOX_STATUS=$(printf '%s' "$BOXLITE_CHECKPOINT_INSPECT" |
+    boxlite_inspect_status)
+  [ "$BOXLITE_CHECKPOINT_BOX_STATUS" = stopped ] || return 1
+
+  BOXLITE_CHECKPOINT_NAME="agent-update-$(date +%s%N)"
+  BOXLITE_CHECKPOINT_RESULT=$(mktemp "$STATE_DIR/boxlite-agent-snapshot.XXXXXX") || return 1
+  BOXLITE_CHECKPOINT_STATUS=$(curl -sS -o "$BOXLITE_CHECKPOINT_RESULT" \
+    -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
+    -d "{\"name\":\"$BOXLITE_CHECKPOINT_NAME\"}" \
+    "$BOXLITE_URL/v1/boxes/$BOXLITE_CHECKPOINT_TARGET/snapshots" || true)
+  if [ "$BOXLITE_CHECKPOINT_STATUS" != 201 ]; then
+    cat "$BOXLITE_CHECKPOINT_RESULT" >&2
+    rm -f "$BOXLITE_CHECKPOINT_RESULT"
+    return 1
+  fi
+  rm -f "$BOXLITE_CHECKPOINT_RESULT"
+
+  stop_boxlite_server
+  ensure_boxlite_server || return 1
+  boxlite_cli start "$BOXLITE_CHECKPOINT_TARGET" >/dev/null
+}
+
+publish_boxlite_codex_package() {
+  BOXLITE_CODEX_TARGET=$1
+  BOXLITE_CODEX_HOST_PACKAGE=$2
+  BOXLITE_CODEX_LATEST=$3
+  BOXLITE_CODEX_BINARY_REL=$4
+  BOXLITE_CODEX_STAGE="/opt/agentbox/tools/codex/.stage-$BOXLITE_CODEX_LATEST-$$"
+  BOXLITE_CODEX_FINAL="/opt/agentbox/tools/codex/$BOXLITE_CODEX_LATEST"
+  BOXLITE_CODEX_STATUS=0
+
+  stop_boxlite_server
+  boxlite_local_cli start "$BOXLITE_CODEX_TARGET" >/dev/null 2>&1 || true
+  if ! boxlite_local_cli exec "$BOXLITE_CODEX_TARGET" -- sh -lc '
+      set -eu
+      STAGE=$1
+      BINARY_REL=$2
+      rm -rf "$STAGE"
+      install -d -m 0755 "$STAGE/${BINARY_REL%/*}"
+    ' agentbox "$BOXLITE_CODEX_STAGE" "$BOXLITE_CODEX_BINARY_REL" >/dev/null; then
+    BOXLITE_CODEX_STATUS=1
+  fi
+
+  if [ "$BOXLITE_CODEX_STATUS" -eq 0 ] &&
+     ! boxlite_local_cli cp \
+        "$BOXLITE_CODEX_HOST_PACKAGE/$BOXLITE_CODEX_BINARY_REL" \
+        "$BOXLITE_CODEX_TARGET:$BOXLITE_CODEX_STAGE/$BOXLITE_CODEX_BINARY_REL" \
+        >/dev/null; then
+    BOXLITE_CODEX_STATUS=1
+  fi
+
+  if [ "$BOXLITE_CODEX_STATUS" -eq 0 ] &&
+     ! boxlite_local_cli exec "$BOXLITE_CODEX_TARGET" -- sh -lc '
+      set -eu
+      LATEST=$1
+      BINARY_REL=$2
+      STAGE=$3
+      FINAL=$4
+      STAGE_BINARY="$STAGE/$BINARY_REL"
+      LINK_TMP="/usr/local/bin/.codex-agentbox.$$.tmp"
+      OLD_FINAL="/opt/agentbox/tools/codex/.old-$LATEST-$$"
+      trap '\''rm -f "$LINK_TMP"'\'' EXIT HUP INT TERM
+      chmod 0755 "$STAGE_BINARY"
+      "$STAGE_BINARY" --version | grep -Fq "$LATEST"
+      rm -rf "$OLD_FINAL"
+      [ ! -e "$FINAL" ] || mv "$FINAL" "$OLD_FINAL"
+      if ! mv "$STAGE" "$FINAL"; then
+        [ ! -e "$OLD_FINAL" ] || mv "$OLD_FINAL" "$FINAL"
+        exit 1
+      fi
+      FINAL_BINARY="$FINAL/$BINARY_REL"
+      "$FINAL_BINARY" --version | grep -Fq "$LATEST"
+      ln -s "$FINAL_BINARY" "$LINK_TMP"
+      "$LINK_TMP" --version | grep -Fq "$LATEST"
+      mv -f "$LINK_TMP" /usr/local/bin/codex
+      /usr/local/bin/codex --version | grep -Fq "$LATEST"
+      setsid -f sh -lc '\''sync'\'' >/dev/null 2>&1
+      trap - EXIT HUP INT TERM
+      rm -rf "$OLD_FINAL"
+    ' agentbox "$BOXLITE_CODEX_LATEST" "$BOXLITE_CODEX_BINARY_REL" \
+      "$BOXLITE_CODEX_STAGE" "$BOXLITE_CODEX_FINAL" >/dev/null; then
+    BOXLITE_CODEX_STATUS=1
+  fi
+
+  if [ "$BOXLITE_CODEX_STATUS" -eq 0 ]; then
+    checkpoint_boxlite_agent_update "$BOXLITE_CODEX_TARGET" || BOXLITE_CODEX_STATUS=1
+  elif ! ensure_boxlite_server; then
+    return 1
+  fi
+  return "$BOXLITE_CODEX_STATUS"
 }
 
 install_boxlite_opencode() {
@@ -1518,7 +1737,7 @@ install_boxlite_opencode() {
   TMP_DIR=$(mktemp -d "$STATE_DIR/opencode.XXXXXX") || return 1
   META_FILE="$TMP_DIR/metadata.json"
   ARCHIVE="$TMP_DIR/opencode.tgz"
-  if ! curl --connect-timeout 15 --max-time 60 -fsSL \
+  if ! curl --connect-timeout 15 --max-time 60 --retry 3 -fsSL \
       "https://registry.npmjs.org/$PLATFORM_PACKAGE/latest" -o "$META_FILE"; then
     rm -rf "$TMP_DIR"
     return 1
@@ -1532,7 +1751,8 @@ install_boxlite_opencode() {
     rm -rf "$TMP_DIR"
     return 1
   fi
-  if ! curl --connect-timeout 15 --max-time 300 -fsSL "$TARBALL_URL" -o "$ARCHIVE"; then
+  if ! curl --connect-timeout 15 --max-time 300 --retry 3 -fsSL \
+      "$TARBALL_URL" -o "$ARCHIVE"; then
     rm -rf "$TMP_DIR"
     return 1
   fi
@@ -1548,42 +1768,258 @@ install_boxlite_opencode() {
     rm -rf "$TMP_DIR"
     return 1
   fi
-  stop_boxlite_server
-  if boxlite_local_cli cp "$TMP_DIR/package/bin/opencode" "$CONTAINER:/usr/local/bin/opencode"; then
+  OPENCODE_SIZE=$(wc -c < "$TMP_DIR/package/bin/opencode")
+  if copy_boxlite_agent_payload "$CONTAINER" "$TMP_DIR/package/bin/opencode" \
+      /opt/agentbox/opencode.upload; then
     STATUS=0
   else
     STATUS=$?
   fi
   rm -rf "$TMP_DIR"
-  ensure_boxlite_server || { [ "$STATUS" -ne 0 ] || STATUS=$?; }
   [ "$STATUS" -eq 0 ] || return "$STATUS"
-  agent_tool_exec "$CONTAINER" test -x /usr/local/bin/opencode
+  agent_tool_exec "$CONTAINER" sh -lc '
+    set -eu
+    UPLOAD=/opt/agentbox/opencode.upload
+    EXPECTED_SIZE=$1
+    [ "$(wc -c < "$UPLOAD")" -eq "$EXPECTED_SIZE" ]
+    chmod 0755 "$UPLOAD"
+    "$UPLOAD" --version >/dev/null
+    mv -f "$UPLOAD" /usr/local/bin/opencode
+    /usr/local/bin/opencode --version >/dev/null
+  ' agentbox "$OPENCODE_SIZE"
+}
+
+install_boxlite_codex() {
+  CONTAINER=$1
+  case "$(uname -m)" in
+    x86_64|amd64)
+      PLATFORM=linux-x64
+      BINARY_MEMBER=package/vendor/x86_64-unknown-linux-musl/bin/codex
+      ;;
+    aarch64|arm64)
+      PLATFORM=linux-arm64
+      BINARY_MEMBER=package/vendor/aarch64-unknown-linux-musl/bin/codex
+      ;;
+    *) echo "Codex does not provide a BoxLite binary for $(uname -m)" >&2; return 1 ;;
+  esac
+  BINARY_REL=${BINARY_MEMBER#package/}
+
+  CACHE_DIR="$STATE_DIR/agent-tool-cache/codex"
+  install -d -m 0700 "$CACHE_DIR" || return 1
+  LATEST_META=$(mktemp "$CACHE_DIR/latest.XXXXXX") || return 1
+  PLATFORM_META=$(mktemp "$CACHE_DIR/platform.XXXXXX") || { rm -f "$LATEST_META"; return 1; }
+  cleanup_codex_metadata() {
+    rm -f "$LATEST_META" "$PLATFORM_META"
+  }
+  if ! curl --connect-timeout 15 --max-time 60 --retry 3 -fsSL \
+      'https://registry.npmjs.org/@openai%2fcodex/latest' -o "$LATEST_META"; then
+    cleanup_codex_metadata
+    return 1
+  fi
+  LATEST=$(jq -r '.version // empty' "$LATEST_META")
+  PLATFORM_SPEC=$(jq -r --arg package "@openai/codex-$PLATFORM" \
+    '.optionalDependencies[$package] // empty' "$LATEST_META")
+  PLATFORM_VERSION=${PLATFORM_SPEC#npm:@openai/codex@}
+  case "$LATEST" in ""|*[!0-9A-Za-z._-]*) cleanup_codex_metadata; return 1 ;; esac
+  if [ "$PLATFORM_VERSION" = "$PLATFORM_SPEC" ] ||
+     [ "$PLATFORM_VERSION" != "$LATEST-$PLATFORM" ]; then
+    echo "Codex npm metadata does not contain the expected $PLATFORM package" >&2
+    cleanup_codex_metadata
+    return 1
+  fi
+  if ! curl --connect-timeout 15 --max-time 60 --retry 3 -fsSL \
+      "https://registry.npmjs.org/@openai%2fcodex/$PLATFORM_VERSION" \
+      -o "$PLATFORM_META"; then
+    cleanup_codex_metadata
+    return 1
+  fi
+  PACKAGE_NAME=$(jq -r '.name // empty' "$PLATFORM_META")
+  PACKAGE_VERSION=$(jq -r '.version // empty' "$PLATFORM_META")
+  TARBALL_URL=$(jq -r '.dist.tarball // empty' "$PLATFORM_META")
+  INTEGRITY=$(jq -r '.dist.integrity // empty' "$PLATFORM_META")
+  cleanup_codex_metadata
+  if [ "$PACKAGE_NAME" != '@openai/codex' ] ||
+     [ "$PACKAGE_VERSION" != "$PLATFORM_VERSION" ] ||
+     [ -z "$TARBALL_URL" ] || [ "${INTEGRITY#sha512-}" = "$INTEGRITY" ]; then
+    echo "Codex npm platform metadata is incomplete" >&2
+    return 1
+  fi
+  EXPECTED_SHA512=$(printf '%s' "${INTEGRITY#sha512-}" | base64 -d | od -An -tx1 | tr -d ' \n')
+  case "$EXPECTED_SHA512" in
+    ''|*[!0-9a-f]*) echo "Codex npm integrity value is invalid" >&2; return 1 ;;
+  esac
+  ARCHIVE="$CACHE_DIR/codex-$PLATFORM_VERSION.tgz"
+  archive_is_valid() {
+    [ -s "$ARCHIVE" ] &&
+      [ "$(sha512sum "$ARCHIVE" | cut -d ' ' -f 1)" = "$EXPECTED_SHA512" ]
+  }
+
+  CODEX_LATEST_VERSION=$LATEST
+  export CODEX_LATEST_VERSION
+  if docker exec "$CONTAINER" sh -lc '
+      set -eu
+      FINAL="/opt/agentbox/tools/codex/$1/$2"
+      [ -x "$FINAL" ]
+      "$FINAL" --version | grep -Fq "$1"
+      LINK_TMP="/usr/local/bin/.codex-agentbox.$$.tmp"
+      trap '\''rm -f "$LINK_TMP"'\'' EXIT HUP INT TERM
+      ln -s "$FINAL" "$LINK_TMP"
+      "$LINK_TMP" --version | grep -Fq "$1"
+      mv -f "$LINK_TMP" /usr/local/bin/codex
+      trap - EXIT HUP INT TERM
+    ' agentbox "$LATEST" "$BINARY_REL"; then
+    report_agent_tool_progress codex cached "Codex $LATEST 已在沙箱缓存中"
+    return 0
+  fi
+
+  if ! archive_is_valid; then
+    report_agent_tool_progress codex running "正在从 npm 官方源并行下载 Codex $LATEST"
+    TOTAL_SIZE=$(curl --connect-timeout 15 --max-time 60 --retry 3 -fsSI \
+      -r 0-0 "$TARBALL_URL" | tr -d '\r' |
+      awk 'tolower($1) == "content-range:" { split($3, value, "/"); print value[2] }' |
+      tail -n 1)
+    case "$TOTAL_SIZE" in
+      ''|*[!0-9]*) TOTAL_SIZE= ;;
+    esac
+    if [ -n "$TOTAL_SIZE" ] && [ "$TOTAL_SIZE" -gt 8388608 ]; then
+      PART_COUNT=8
+      PART_SIZE=$(((TOTAL_SIZE + PART_COUNT - 1) / PART_COUNT))
+      PIDS=
+      PART_INDEX=0
+      while [ "$PART_INDEX" -lt "$PART_COUNT" ]; do
+        RANGE_START=$((PART_INDEX * PART_SIZE))
+        RANGE_END=$((RANGE_START + PART_SIZE - 1))
+        [ "$RANGE_END" -lt "$TOTAL_SIZE" ] || RANGE_END=$((TOTAL_SIZE - 1))
+        PART_FILE="$ARCHIVE.part.$PART_INDEX"
+        (
+          EXPECTED_SIZE=$((RANGE_END - RANGE_START + 1))
+          CURRENT_SIZE=0
+          [ ! -f "$PART_FILE" ] || CURRENT_SIZE=$(wc -c < "$PART_FILE")
+          if [ "$CURRENT_SIZE" -gt "$EXPECTED_SIZE" ]; then
+            rm -f "$PART_FILE"
+            CURRENT_SIZE=0
+          fi
+          if [ "$CURRENT_SIZE" -lt "$EXPECTED_SIZE" ]; then
+            DOWNLOAD_START=$((RANGE_START + CURRENT_SIZE))
+            curl --connect-timeout 15 --max-time 900 --retry 3 -fsSL \
+              -r "$DOWNLOAD_START-$RANGE_END" "$TARBALL_URL" >> "$PART_FILE"
+          fi
+          [ "$(wc -c < "$PART_FILE")" -eq "$EXPECTED_SIZE" ]
+        ) &
+        PIDS="$PIDS $!"
+        PART_INDEX=$((PART_INDEX + 1))
+      done
+      DOWNLOAD_STATUS=0
+      for PART_PID in $PIDS; do
+        wait "$PART_PID" || DOWNLOAD_STATUS=1
+      done
+      [ "$DOWNLOAD_STATUS" -eq 0 ] || return 1
+      ARCHIVE_TMP="$ARCHIVE.tmp"
+      : > "$ARCHIVE_TMP"
+      PART_INDEX=0
+      while [ "$PART_INDEX" -lt "$PART_COUNT" ]; do
+        cat "$ARCHIVE.part.$PART_INDEX" >> "$ARCHIVE_TMP" || return 1
+        PART_INDEX=$((PART_INDEX + 1))
+      done
+      [ "$(wc -c < "$ARCHIVE_TMP")" -eq "$TOTAL_SIZE" ] || return 1
+      mv -f "$ARCHIVE_TMP" "$ARCHIVE"
+    else
+      ARCHIVE_TMP="$ARCHIVE.tmp"
+      if ! curl --connect-timeout 15 --max-time 900 --retry 3 -fsSL \
+          "$TARBALL_URL" -o "$ARCHIVE_TMP"; then
+        rm -f "$ARCHIVE_TMP"
+        return 1
+      fi
+      mv -f "$ARCHIVE_TMP" "$ARCHIVE"
+    fi
+  fi
+  if ! archive_is_valid || ! tar -tzf "$ARCHIVE" "$BINARY_MEMBER" >/dev/null; then
+    echo "Codex npm package integrity check failed" >&2
+    rm -f "$ARCHIVE"
+    return 1
+  fi
+  rm -f "$ARCHIVE".part.*
+
+  HOST_PACKAGE="$CACHE_DIR/codex-$PLATFORM_VERSION.upload"
+  HOST_BINARY="$HOST_PACKAGE/$BINARY_REL"
+  if [ ! -x "$HOST_BINARY" ] ||
+     ! "$HOST_BINARY" --version 2>/dev/null | grep -Fq "$LATEST"; then
+    HOST_PACKAGE_TMP="$HOST_PACKAGE.tmp.$$"
+    rm -rf "$HOST_PACKAGE_TMP"
+    install -d -m 0700 "$HOST_PACKAGE_TMP"
+    if ! tar -xzf "$ARCHIVE" -C "$HOST_PACKAGE_TMP" --strip-components=1 \
+        "$BINARY_MEMBER" ||
+       ! "$HOST_PACKAGE_TMP/$BINARY_REL" --version 2>/dev/null | grep -Fq "$LATEST"; then
+      rm -rf "$HOST_PACKAGE_TMP"
+      echo "Codex npm binary validation failed on the Worker" >&2
+      return 1
+    fi
+    rm -rf "$HOST_PACKAGE"
+    mv "$HOST_PACKAGE_TMP" "$HOST_PACKAGE"
+  fi
+  report_agent_tool_progress codex running "正在将 Codex $LATEST 发布到沙箱"
+  PUBLISH_ATTEMPT=1
+  while [ "$PUBLISH_ATTEMPT" -le 2 ]; do
+    if publish_boxlite_codex_package "$CONTAINER" "$HOST_PACKAGE" \
+        "$LATEST" "$BINARY_REL"; then
+      return 0
+    fi
+    echo "Codex publish was interrupted; restoring the BoxLite control service and retrying from the Worker cache" >&2
+    PUBLISH_ATTEMPT=$((PUBLISH_ATTEMPT + 1))
+    if [ "$PUBLISH_ATTEMPT" -le 2 ]; then
+      recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+    fi
+  done
+  return 1
 }
 
 install_agent_tools() {
   CONTAINER=$1
   JOB_FILE=$2
+  MODE=${AGENTBOX_AGENT_TOOL_MODE:-ensure}
   PROGRESS_STAGE=${AGENTBOX_AGENT_TOOL_PROGRESS_STAGE:-agent-tools}
   TOOLS=$(jq -r '.job.payload.agentTools[]?' "$JOB_FILE" | sort -u)
   [ -n "$TOOLS" ] || return 0
-  report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具依赖"
-  if ! agent_tool_exec_logged "$CONTAINER" prerequisites sh -lc \
-      'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git jq unzip python3' >&2; then
-    echo "Agent tool prerequisite installation failed" >&2
-    return 1
+  if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ] && [ "$MODE" = upgrade ] &&
+     ! docker exec "$CONTAINER" true >/dev/null 2>&1; then
+    report_job_progress "$PROGRESS_STAGE" "正在恢复 BoxLite Agent 更新连接"
+    recover_boxlite_agent_tool_install "$CONTAINER" || return 1
+    docker exec "$CONTAINER" true >/dev/null 2>&1 || return 1
+  fi
+  if ! docker exec "$CONTAINER" sh -lc \
+      'for command in curl git jq unzip python3; do command -v "$command" >/dev/null || exit 1; done'; then
+    report_job_progress "$PROGRESS_STAGE" "正在安装 Agent 工具依赖"
+    if ! agent_tool_exec_logged "$CONTAINER" prerequisites sh -lc \
+        'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y curl ca-certificates git jq unzip python3' >&2; then
+      echo "Agent tool prerequisite installation failed" >&2
+      return 1
+    fi
+  else
+    report_job_progress "$PROGRESS_STAGE" "Agent 工具依赖已就绪"
   fi
   INSTALL_PI=false
   INSTALL_OPENCODE=false
+  INSTALL_CODEX=false
   set --
   for TOOL in $TOOLS; do
     COMMAND=$(agent_tool_command "$TOOL") || { echo "unsupported Agent tool: $TOOL" >&2; return 1; }
-    if [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
+    if [ "$MODE" = ensure ] && [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc '
+        command -v "$1" >/dev/null || exit 1
+        VERSION=$(timeout 20 "$1" --version 2>&1 | head -n 1)
+        [ -n "$VERSION" ]
+      ' agentbox "$COMMAND"; then
       report_agent_tool_progress "$TOOL" cached "已复用 Agent 工具缓存：$TOOL"
       continue
     fi
     case "$TOOL" in
       antigravity|cursor|qwenpaw) continue ;;
-      codex) PACKAGE='@openai/codex' ;;
+      codex)
+        if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ]; then
+          INSTALL_CODEX=true
+          continue
+        fi
+        PACKAGE='@openai/codex'
+        ;;
       claude-code) PACKAGE='@anthropic-ai/claude-code' ;;
       codebuddy) PACKAGE='@tencent-ai/codebuddy-code' ;;
       deepseek-harness) PACKAGE='@deepseek-ai/dsh@0.1.0-rc.7' ;;
@@ -1648,7 +2084,7 @@ install_agent_tools() {
       set -- "$@" "$PACKAGE_SPEC"
     done < "$NPM_PLAN"
     if ! agent_tool_exec_logged "$CONTAINER" npm-packages sh -lc \
-        'set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; npm install -g "$@"' \
+        'set -eu; find /usr/local/lib/node_modules -maxdepth 1 -type d -name '\''.opencode-ai-*'\'' -exec rm -rf -- {} +; if [ -d /usr/local/lib/node_modules/@openai ]; then find /usr/local/lib/node_modules/@openai -maxdepth 1 -type d -name '\''.codex-*'\'' -exec rm -rf -- {} +; fi; npm install -g "$@" || { npm cache clean --force >/dev/null 2>&1 || true; npm install -g "$@"; }' \
         agentbox "$@" >&2; then
       while IFS="$TAB" read -r TOOL PACKAGE_SPEC; do
         report_agent_tool_progress "$TOOL" failed "Agent 工具包安装失败：$PACKAGE_SPEC"
@@ -1685,6 +2121,15 @@ install_agent_tools() {
     fi
     report_agent_tool_progress opencode installed "Agent 工具已安装，等待验证：OpenCode"
   fi
+  if [ "$INSTALL_CODEX" = true ]; then
+    report_agent_tool_progress codex running "正在准备 Codex npm 官方包"
+    if ! install_boxlite_codex "$CONTAINER" >&2; then
+      report_agent_tool_progress codex failed "Agent 工具安装失败：Codex"
+      echo "Agent tool package installation failed: codex" >&2
+      return 1
+    fi
+    report_agent_tool_progress codex installed "Codex npm 官方包已安装，等待验证"
+  fi
   for TOOL in $TOOLS; do
     COMMAND=$(agent_tool_command "$TOOL") || return 1
     if docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null"; then
@@ -1717,13 +2162,15 @@ install_agent_tools() {
   for TOOL in $TOOLS; do
     report_agent_tool_progress "$TOOL" verifying "正在验证 Agent 工具：$TOOL"
     COMMAND=$(agent_tool_command "$TOOL") || { rm -f "$VERSION_FILE"; return 1; }
-    docker exec "$CONTAINER" sh -lc "command -v $COMMAND >/dev/null" || {
+    VERSION=$(docker exec "$CONTAINER" sh -lc '
+      command -v "$1" >/dev/null || exit 1
+      timeout 20 "$1" --version 2>&1 | head -n 1
+    ' agentbox "$COMMAND" 2>/dev/null) || {
       report_agent_tool_progress "$TOOL" failed "Agent 工具验证失败：$TOOL"
       echo "Agent tool $TOOL was installed but command $COMMAND is unavailable" >&2
       rm -f "$VERSION_FILE"
       return 1
     }
-    VERSION=$(docker exec "$CONTAINER" sh -lc "timeout 20 $COMMAND --version 2>&1 | head -n 1" 2>/dev/null || true)
     [ -n "$VERSION" ] || VERSION=installed
     NEXT_VERSION_FILE=$(mktemp)
     jq --arg tool "$TOOL" --arg version "$VERSION" '. + {($tool): $version}' \
@@ -1731,6 +2178,17 @@ install_agent_tools() {
     mv "$NEXT_VERSION_FILE" "$VERSION_FILE"
     report_agent_tool_progress "$TOOL" succeeded "Agent 工具已就绪：$TOOL"
   done
+  if [ "$MODE" != ensure ]; then
+    EXISTING_VERSION_FILE=$(mktemp)
+    MERGED_VERSION_FILE=$(mktemp)
+    if agent_tool_exec "$CONTAINER" cat /opt/agentbox/agent-versions.json > "$EXISTING_VERSION_FILE" 2>/dev/null &&
+       jq -s '.[0] * .[1]' "$EXISTING_VERSION_FILE" "$VERSION_FILE" > "$MERGED_VERSION_FILE" 2>/dev/null; then
+      mv "$MERGED_VERSION_FILE" "$VERSION_FILE"
+    else
+      rm -f "$MERGED_VERSION_FILE"
+    fi
+    rm -f "$EXISTING_VERSION_FILE"
+  fi
   if ! agent_tool_exec "$CONTAINER" mkdir -p /opt/agentbox ||
      ! agent_tool_exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json ||
      ! agent_tool_exec_stdin "$CONTAINER" "$VERSION_FILE" sh -c 'cat > /opt/agentbox/agent-versions.json'; then
@@ -1739,6 +2197,206 @@ install_agent_tools() {
     return 1
   fi
   rm -f "$VERSION_FILE"
+}
+
+agent_tool_npm_package() {
+  case "$1" in
+    claude-code) printf '%s' '@anthropic-ai/claude-code' ;;
+    codex) printf '%s' '@openai/codex' ;;
+    deepseek-harness) printf '%s' '@deepseek-ai/dsh' ;;
+    gemini-cli) printf '%s' '@google/gemini-cli' ;;
+    grok) printf '%s' '@xai-official/grok' ;;
+    kimi) printf '%s' '@moonshot-ai/kimi-code' ;;
+    opencode) printf '%s' 'opencode-ai' ;;
+    pi) printf '%s' '@earendil-works/pi-coding-agent' ;;
+    reasonix) printf '%s' 'reasonix' ;;
+    *) return 1 ;;
+  esac
+}
+
+agent_tool_source() {
+  case "$1" in
+    codex) printf '%s' npm ;;
+    grok) printf '%s' official-installer ;;
+    opencode)
+      if [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ]; then
+        printf '%s' boxlite-binary
+      else
+        printf '%s' npm
+      fi
+      ;;
+    *) printf '%s' npm ;;
+  esac
+}
+
+agent_tool_detect_version() {
+  CONTAINER=$1
+  TOOL_ID=$2
+  COMMAND=$(agent_tool_command "$TOOL_ID") || return 1
+  VERSION_ATTEMPT=1
+  while [ "$VERSION_ATTEMPT" -le 3 ]; do
+    if RAW_VERSION=$(docker exec "$CONTAINER" sh -lc \
+        'command -v "$1" >/dev/null || exit 1; timeout 20 "$1" --version 2>&1 | head -n 3' \
+        agentbox "$COMMAND" 2>/dev/null); then
+      break
+    fi
+    [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ] || return 2
+    VERSION_ATTEMPT=$((VERSION_ATTEMPT + 1))
+    [ "$VERSION_ATTEMPT" -le 3 ] || return 2
+    sleep 1
+  done
+  VERSION=$(printf '%s\n' "$RAW_VERSION" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?' | head -n 1)
+  [ -n "$VERSION" ] || return 2
+  printf '%s' "$VERSION"
+}
+
+agent_tool_latest_version() {
+  CONTAINER=$1
+  TOOL_ID=$2
+  if [ "$TOOL_ID" = deepseek-harness ]; then
+    printf '%s' 0.1.0-rc.7
+    return
+  fi
+  PACKAGE=$(agent_tool_npm_package "$TOOL_ID") || return 1
+  docker exec "$CONTAINER" sh -lc '
+    set -a
+    [ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env
+    set +a
+    curl --connect-timeout 15 --max-time 60 -fsSL "$1/latest" | jq -r ".version // empty"
+  ' agentbox "https://registry.npmjs.org/$PACKAGE" 2>/dev/null
+}
+
+append_agent_tool_state() {
+  RESULT_FILE=$1
+  TOOL_ID=$2
+  CURRENT_VERSION=$3
+  LATEST_VERSION=$4
+  PREVIOUS_VERSION=$5
+  STATUS=$6
+  MESSAGE=$7
+  SOURCE=$8
+  CHECKED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  NEXT_RESULT_FILE=$(mktemp)
+  jq --arg tool "$TOOL_ID" --arg currentVersion "$CURRENT_VERSION" \
+    --arg latestVersion "$LATEST_VERSION" --arg previousVersion "$PREVIOUS_VERSION" \
+    --arg status "$STATUS" --arg message "$MESSAGE" --arg source "$SOURCE" \
+    --arg checkedAt "$CHECKED_AT" \
+    '. + [{tool:$tool,currentVersion:$currentVersion,latestVersion:$latestVersion,
+      previousVersion:$previousVersion,status:$status,message:$message,
+      source:$source,checkedAt:$checkedAt}]' "$RESULT_FILE" > "$NEXT_RESULT_FILE"
+  mv "$NEXT_RESULT_FILE" "$RESULT_FILE"
+}
+
+prepare_agent_tool_operation() {
+  JOB_FILE=$1
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  case "$DRIVER" in docker|boxlite|microsandbox) ;; *) return 1 ;; esac
+  AGENTBOX_RUNTIME_DRIVER=$DRIVER
+  export AGENTBOX_RUNTIME_DRIVER
+  TARGET=$(sandbox_container_name "$JOB_FILE")
+  if [ "$DRIVER" = docker ]; then
+    docker inspect "$TARGET" >/dev/null 2>&1 || return 1
+  else
+    runtime_call "$DRIVER" inspect "$TARGET" >/dev/null 2>&1 || return 1
+  fi
+  configure_proxy "$TARGET" "$JOB_FILE"
+}
+
+check_agent_tools() {
+  JOB_FILE=$1
+  RESULT_FILE=$2
+  printf '[]\n' > "$RESULT_FILE"
+  prepare_agent_tool_operation "$JOB_FILE" || return 1
+  TOOLS=$(jq -r '.job.payload.requestedAgentTools[]?' "$JOB_FILE")
+  [ -n "$TOOLS" ] || return 1
+  PROGRESS_STAGE=agent-tools-check
+  export PROGRESS_STAGE
+  for TOOL_ID in $TOOLS; do
+    report_agent_tool_progress "$TOOL_ID" running "正在检测 Agent 工具：$TOOL_ID"
+    LATEST_VERSION=$(agent_tool_latest_version "$TARGET" "$TOOL_ID" || true)
+    SOURCE=$(agent_tool_source "$TOOL_ID")
+    COMMAND=$(agent_tool_command "$TOOL_ID") || return 1
+    if ! docker exec "$TARGET" sh -lc 'command -v "$1" >/dev/null' agentbox "$COMMAND"; then
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "$LATEST_VERSION" "" \
+        not-installed "Agent 工具尚未安装" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具尚未安装：$TOOL_ID"
+      continue
+    fi
+    if CURRENT_VERSION=$(agent_tool_detect_version "$TARGET" "$TOOL_ID"); then
+      MESSAGE="已检测当前版本"
+      [ -n "$LATEST_VERSION" ] || MESSAGE="已检测当前版本，但暂时无法查询最新版本"
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$CURRENT_VERSION" "$LATEST_VERSION" "" \
+        installed "$MESSAGE" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具检测完成：$TOOL_ID"
+    else
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "$LATEST_VERSION" "" \
+        broken "命令存在，但无法读取版本" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" failed "Agent 工具版本检测失败：$TOOL_ID"
+    fi
+  done
+}
+
+update_agent_tools() {
+  JOB_FILE=$1
+  RESULT_FILE=$2
+  printf '[]\n' > "$RESULT_FILE"
+  prepare_agent_tool_operation "$JOB_FILE" || return 1
+  TOOLS=$(jq -r '.job.payload.requestedAgentTools[]?' "$JOB_FILE")
+  [ -n "$TOOLS" ] || return 1
+  FAILURES=0
+  PROGRESS_STAGE=agent-tools-update
+  export PROGRESS_STAGE
+  for TOOL_ID in $TOOLS; do
+    BEFORE_VERSION=$(agent_tool_detect_version "$TARGET" "$TOOL_ID" || true)
+    if [ "$TOOL_ID" = codex ] && [ "$DRIVER" = boxlite ]; then
+      CODEX_LATEST_VERSION=
+      LATEST_VERSION=
+    else
+      LATEST_VERSION=$(agent_tool_latest_version "$TARGET" "$TOOL_ID" || true)
+    fi
+    SOURCE=$(agent_tool_source "$TOOL_ID")
+    TOOL_JOB_FILE=$(mktemp)
+    jq --arg tool "$TOOL_ID" '.job.payload.agentTools = [$tool]' "$JOB_FILE" > "$TOOL_JOB_FILE"
+    report_agent_tool_progress "$TOOL_ID" running "正在更新 Agent 工具：$TOOL_ID"
+    PREVIOUS_MODE=${AGENTBOX_AGENT_TOOL_MODE:-}
+    PREVIOUS_STAGE=${AGENTBOX_AGENT_TOOL_PROGRESS_STAGE:-}
+    AGENTBOX_AGENT_TOOL_MODE=upgrade
+    AGENTBOX_AGENT_TOOL_PROGRESS_STAGE=agent-tools-update
+    export AGENTBOX_AGENT_TOOL_MODE AGENTBOX_AGENT_TOOL_PROGRESS_STAGE
+    if install_agent_tools "$TARGET" "$TOOL_JOB_FILE"; then
+      UPDATE_OK=true
+    else
+      UPDATE_OK=false
+    fi
+    AGENTBOX_AGENT_TOOL_MODE=$PREVIOUS_MODE
+    AGENTBOX_AGENT_TOOL_PROGRESS_STAGE=$PREVIOUS_STAGE
+    export AGENTBOX_AGENT_TOOL_MODE AGENTBOX_AGENT_TOOL_PROGRESS_STAGE
+    rm -f "$TOOL_JOB_FILE"
+    AFTER_VERSION=$(agent_tool_detect_version "$TARGET" "$TOOL_ID" || true)
+    if [ -z "$LATEST_VERSION" ] && [ "$TOOL_ID" = codex ] && [ "$DRIVER" = boxlite ]; then
+      LATEST_VERSION=${CODEX_LATEST_VERSION:-}
+    fi
+    [ -n "$LATEST_VERSION" ] || LATEST_VERSION=$(agent_tool_latest_version "$TARGET" "$TOOL_ID" || true)
+    if [ "$UPDATE_OK" != true ] || [ -z "$AFTER_VERSION" ]; then
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
+        "$BEFORE_VERSION" failed "Agent 工具更新失败" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" failed "Agent 工具更新失败：$TOOL_ID"
+      FAILURES=$((FAILURES + 1))
+    elif [ -z "$BEFORE_VERSION" ]; then
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
+        "" updated "Agent 工具已安装" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具已安装：$TOOL_ID"
+    elif [ "$AFTER_VERSION" != "$BEFORE_VERSION" ]; then
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
+        "$BEFORE_VERSION" updated "Agent 工具已更新" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具已更新：$TOOL_ID"
+    else
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
+        "$BEFORE_VERSION" unchanged "更新命令已完成，但版本没有变化" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具版本未变化：$TOOL_ID"
+    fi
+  done
+  [ "$FAILURES" -eq 0 ]
 }
 
 best_cached_agent_base() {
@@ -3048,6 +3706,61 @@ process_job() {
       fi
       rm -f "$RESULT_FILE"
       ;;
+    check-sandbox-agent-tools)
+      RESULT_FILE=$(mktemp)
+      LOG_FILE=$(mktemp)
+      if check_agent_tools "$JOB_FILE" "$RESULT_FILE" 2>"$LOG_FILE"; then
+        complete_agent_tool_job "$JOB_ID" true "Agent 工具检测完成" "$RESULT_FILE" "$ACTION"
+      else
+        MESSAGE=$(tail -c 3500 "$LOG_FILE")
+        [ -n "$MESSAGE" ] || MESSAGE="Agent 工具检测失败"
+        complete_agent_tool_job "$JOB_ID" false "$MESSAGE" "$RESULT_FILE" "$ACTION" \
+          sandbox_agent_tools_check_failed
+      fi
+      rm -f "$RESULT_FILE" "$LOG_FILE"
+      ;;
+    update-sandbox-agent-tools)
+      RESULT_FILE=$(mktemp)
+      LOG_FILE=$(mktemp)
+      UPDATE_OK=false
+      UPDATE_DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+      UPDATE_TARGET=$(sandbox_container_name "$JOB_FILE")
+      UPDATE_ONLY_CODEX=$(jq -r \
+        '[.job.payload.requestedAgentTools[]?] == ["codex"]' "$JOB_FILE")
+      [ "$UPDATE_DRIVER" != boxlite ] || pause_session_worker
+      if update_agent_tools "$JOB_FILE" "$RESULT_FILE" >"$LOG_FILE" 2>&1; then
+        UPDATE_OK=true
+      fi
+      if [ "$UPDATE_DRIVER" = boxlite ]; then
+        report_job_progress agent-tools-update "正在恢复 BoxLite 终端连接"
+        if [ "$UPDATE_OK" = true ]; then
+          if [ "$UPDATE_ONLY_CODEX" = true ]; then
+            ensure_boxlite_server >>"$LOG_FILE" 2>&1 || UPDATE_OK=false
+          elif ! docker exec "$UPDATE_TARGET" sh -lc \
+              'setsid -f sh -lc '\''sync'\'' >/dev/null 2>&1' \
+              >>"$LOG_FILE" 2>&1 ||
+               ! checkpoint_boxlite_agent_update "$UPDATE_TARGET" \
+                 >>"$LOG_FILE" 2>&1; then
+            echo "BoxLite update checkpoint or terminal recovery failed" >>"$LOG_FILE"
+            UPDATE_OK=false
+          fi
+        elif ! recover_boxlite_agent_tool_install \
+              "$UPDATE_TARGET" \
+              >>"$LOG_FILE" 2>&1; then
+          echo "BoxLite sandbox recovery failed after Agent update" >>"$LOG_FILE"
+        fi
+        resume_session_worker
+      fi
+      if [ "$UPDATE_OK" = true ]; then
+        complete_agent_tool_job "$JOB_ID" true "Agent 工具更新完成" "$RESULT_FILE" "$ACTION"
+      else
+        MESSAGE=$(tail -c 3500 "$LOG_FILE")
+        [ -n "$MESSAGE" ] || MESSAGE="部分 Agent 工具更新失败"
+        complete_agent_tool_job "$JOB_ID" false "$MESSAGE" "$RESULT_FILE" "$ACTION" \
+          sandbox_agent_tools_update_failed
+      fi
+      rm -f "$RESULT_FILE" "$LOG_FILE"
+      ;;
     update-worker)
       LOG_FILE=$(mktemp)
       if ! update_worker "$JOB_FILE" 2>"$LOG_FILE"; then
@@ -3119,22 +3832,47 @@ run_worker() {
   SERVER_URL=$(sed -n '1p' "$CONFIG")
   SERVER_ID=$(sed -n '2p' "$CONFIG")
   CREDENTIAL=$(sed -n '3p' "$CONFIG")
+  # Confirm a freshly installed Worker before any potentially slow runtime
+  # discovery. The rollback timer is intentionally short so a broken binary
+  # cannot leave the server unmanaged.
+  finalize_worker_update || true
   prepare_boxlite_config
-  refresh_boxlite_images || {
-    [ -s "$BOXLITE_IMAGES_FILE" ] || printf '[]\n' > "$BOXLITE_IMAGES_FILE"
-    echo "warning: BoxLite image inventory is unavailable" >&2
-  }
   AGENTBOX_BOXLITE_SERVER_MODE=1
   export AGENTBOX_BOXLITE_SERVER_MODE
   ensure_boxlite_server || echo "warning: BoxLite service is unavailable" >&2
-  finalize_worker_update || true
   heartbeat_loop &
   HEARTBEAT_PID=$!
   SESSION_PID=
-  if [ -x /usr/local/bin/agentbox-worker ]; then
-    /usr/local/bin/agentbox-worker session "$CONFIG" &
-    SESSION_PID=$!
-  fi
+  ensure_session_worker() {
+    SESSION_STATE=
+    if [ -n "$SESSION_PID" ] && kill -0 "$SESSION_PID" >/dev/null 2>&1; then
+      SESSION_STATE=$(ps -o stat= -p "$SESSION_PID" 2>/dev/null | tr -d ' ' || true)
+    fi
+    case "$SESSION_STATE" in
+      ''|Z*) ;;
+      *) return 0 ;;
+    esac
+    if [ -n "$SESSION_PID" ]; then
+      wait "$SESSION_PID" >/dev/null 2>&1 || true
+      SESSION_PID=
+    fi
+    if [ -x /usr/local/bin/agentbox-worker ]; then
+      /usr/local/bin/agentbox-worker session "$CONFIG" &
+      SESSION_PID=$!
+    else
+      return 0
+    fi
+  }
+  pause_session_worker() {
+    [ -n "$SESSION_PID" ] || return 0
+    kill "$SESSION_PID" >/dev/null 2>&1 || true
+    wait "$SESSION_PID" >/dev/null 2>&1 || true
+    SESSION_PID=
+  }
+  resume_session_worker() {
+    ensure_session_worker
+  }
+  ensure_session_worker
   cleanup_worker() {
     kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true
     [ -z "$SESSION_PID" ] || kill "$SESSION_PID" >/dev/null 2>&1 || true
@@ -3144,8 +3882,15 @@ run_worker() {
   }
   trap cleanup_worker EXIT
   trap 'exit 0' INT TERM
+  # Image discovery can take tens of seconds on a busy BoxLite host. Keep the
+  # heartbeat and interactive session available while the inventory refreshes.
+  refresh_boxlite_images || {
+    [ -s "$BOXLITE_IMAGES_FILE" ] || printf '[]\n' > "$BOXLITE_IMAGES_FILE"
+    echo "warning: BoxLite image inventory is unavailable" >&2
+  }
   while :; do
     finalize_worker_update || true
+    ensure_session_worker
     [ "${AGENTBOX_BOXLITE_SERVER_MODE:-}" != 1 ] || ensure_boxlite_server || true
     JOB_FILE=$(mktemp)
     HTTP_STATUS=$(curl -sS -o "$JOB_FILE" -w '%{http_code}' -X POST \
@@ -3155,7 +3900,7 @@ run_worker() {
       process_job "$JOB_FILE" || true
     fi
     rm -f "$JOB_FILE"
-    sleep 5
+    sleep 1
   done
 }
 

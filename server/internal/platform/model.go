@@ -221,14 +221,26 @@ type WorkerJob struct {
 }
 
 type WorkerJobResult struct {
-	Success         bool            `json:"success"`
-	ExternalID      string          `json:"externalId"`
-	Message         string          `json:"message"`
-	ExitCode        *int            `json:"exitCode,omitempty"`
-	Output          string          `json:"output,omitempty"`
-	OutputTruncated bool            `json:"outputTruncated,omitempty"`
-	TimedOut        bool            `json:"timedOut,omitempty"`
-	Error           *WorkerJobError `json:"error,omitempty"`
+	Success         bool                    `json:"success"`
+	ExternalID      string                  `json:"externalId"`
+	Message         string                  `json:"message"`
+	ExitCode        *int                    `json:"exitCode,omitempty"`
+	Output          string                  `json:"output,omitempty"`
+	OutputTruncated bool                    `json:"outputTruncated,omitempty"`
+	TimedOut        bool                    `json:"timedOut,omitempty"`
+	Error           *WorkerJobError         `json:"error,omitempty"`
+	AgentTools      []SandboxAgentToolState `json:"agentTools,omitempty"`
+}
+
+type SandboxAgentToolState struct {
+	Tool            string    `json:"tool"`
+	CurrentVersion  string    `json:"currentVersion,omitempty"`
+	LatestVersion   string    `json:"latestVersion,omitempty"`
+	PreviousVersion string    `json:"previousVersion,omitempty"`
+	Status          string    `json:"status"`
+	Message         string    `json:"message,omitempty"`
+	Source          string    `json:"source,omitempty"`
+	CheckedAt       time.Time `json:"checkedAt,omitzero"`
 }
 
 type WorkerJobError struct {
