@@ -1,6 +1,7 @@
 package store
 
 import (
+	"cmp"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -14,12 +15,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1252,11 +1254,8 @@ func mergeCredentialModels(existing, remote []platform.CredentialModel) []platfo
 }
 
 func sortCredentialModels(models []platform.CredentialModel) {
-	sort.Slice(models, func(i, j int) bool {
-		if models[i].Group != models[j].Group {
-			return models[i].Group < models[j].Group
-		}
-		return models[i].ID < models[j].ID
+	slices.SortFunc(models, func(a, b platform.CredentialModel) int {
+		return cmp.Or(cmp.Compare(a.Group, b.Group), cmp.Compare(a.ID, b.ID))
 	})
 }
 
@@ -1478,17 +1477,7 @@ func parseCredentialModels(reader io.Reader) ([]platform.CredentialModel, error)
 	return models, nil
 }
 
-var (
-	providerHTTPClientOnce sync.Once
-	providerHTTPClient     *http.Client
-)
-
-func safeProviderHTTPClient() *http.Client {
-	providerHTTPClientOnce.Do(func() {
-		providerHTTPClient = newSafeProviderHTTPClient()
-	})
-	return providerHTTPClient
-}
+var safeProviderHTTPClient = sync.OnceValue(newSafeProviderHTTPClient)
 
 func newSafeProviderHTTPClient() *http.Client {
 	allowPrivate := strings.EqualFold(os.Getenv("AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS"), "true")
@@ -1596,10 +1585,11 @@ func encryptEnvironmentValue(key []byte, value string) (string, error) {
 }
 
 func decryptEnvironmentValue(key []byte, value string) (string, error) {
-	if !strings.HasPrefix(value, encryptedEnvironmentPrefix) {
+	encoded, ok := strings.CutPrefix(value, encryptedEnvironmentPrefix)
+	if !ok {
 		return value, nil
 	}
-	raw, err := base64.RawStdEncoding.DecodeString(strings.TrimPrefix(value, encryptedEnvironmentPrefix))
+	raw, err := base64.RawStdEncoding.DecodeString(encoded)
 	if err != nil {
 		return "", fmt.Errorf("decode encrypted environment variable: %w", err)
 	}
@@ -2101,12 +2091,7 @@ func (s *Store) ResolveRuntimeLLMTarget(
 }
 
 func stringListContains(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, target)
 }
 
 func advanceProvisioningProgress(current platform.ProvisioningProgress, input platform.WorkerJobProgressInput, now time.Time) platform.ProvisioningProgress {
@@ -2695,9 +2680,7 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 
 func effectiveSandboxSpec(runtimeSpec, sandboxSpec map[string]any) map[string]any {
 	result := make(map[string]any, len(runtimeSpec))
-	for key, value := range runtimeSpec {
-		result[key] = value
-	}
+	maps.Copy(result, runtimeSpec)
 	for _, key := range []string{
 		"serverId",
 		"driver",

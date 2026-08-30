@@ -226,8 +226,8 @@ type WorkerJobResult struct {
 	Message         string                  `json:"message"`
 	ExitCode        *int                    `json:"exitCode,omitempty"`
 	Output          string                  `json:"output,omitempty"`
-	OutputTruncated bool                    `json:"outputTruncated,omitempty"`
-	TimedOut        bool                    `json:"timedOut,omitempty"`
+	OutputTruncated bool                    `json:"outputTruncated,omitzero"`
+	TimedOut        bool                    `json:"timedOut,omitzero"`
 	Error           *WorkerJobError         `json:"error,omitempty"`
 	AgentTools      []SandboxAgentToolState `json:"agentTools,omitempty"`
 }
@@ -272,7 +272,7 @@ type ProvisioningAgentTool struct {
 	Message    string     `json:"message,omitempty"`
 	StartedAt  *time.Time `json:"startedAt,omitempty"`
 	FinishedAt *time.Time `json:"finishedAt,omitempty"`
-	DurationMS int64      `json:"durationMs,omitempty"`
+	DurationMS int64      `json:"durationMs,omitzero"`
 }
 
 type ProvisioningProgress struct {
@@ -285,7 +285,7 @@ type ProvisioningProgress struct {
 	StageStartedAt *time.Time                `json:"stageStartedAt,omitempty"`
 	UpdatedAt      *time.Time                `json:"updatedAt,omitempty"`
 	FinishedAt     *time.Time                `json:"finishedAt,omitempty"`
-	DurationMS     int64                     `json:"durationMs,omitempty"`
+	DurationMS     int64                     `json:"durationMs,omitzero"`
 	Timings        []ProvisioningStageTiming `json:"timings,omitempty"`
 	AgentTools     []ProvisioningAgentTool   `json:"agentTools,omitempty"`
 }

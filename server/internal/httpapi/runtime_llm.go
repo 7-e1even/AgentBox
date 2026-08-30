@@ -11,7 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -370,7 +370,7 @@ func runtimeLLMGeminiURL(target platform.RuntimeLLMTarget, requestPath string, q
 	parsed.RawPath = ""
 	forwardQuery := make(url.Values, len(query))
 	for key, values := range query {
-		forwardQuery[key] = append([]string(nil), values...)
+		forwardQuery[key] = slices.Clone(values)
 	}
 	forwardQuery.Set("key", target.Secret)
 	parsed.RawQuery = forwardQuery.Encode()
@@ -637,7 +637,7 @@ func (s *Server) setRuntimeLLMReportHeaders(
 		existing := strings.TrimSpace(header.Get("X-AgentBox-Conversion-Lost-Fields"))
 		if existing != "" {
 			fields = append(strings.Split(existing, ","), fields...)
-			sort.Strings(fields)
+			slices.Sort(fields)
 		}
 		header.Set("X-AgentBox-Conversion-Lost-Fields", strings.Join(fields, ","))
 	}
@@ -671,7 +671,7 @@ func runtimeLLMReportFields(report *adapter.Report) []string {
 	for field := range seen {
 		fields = append(fields, field)
 	}
-	sort.Strings(fields)
+	slices.Sort(fields)
 	return fields
 }
 

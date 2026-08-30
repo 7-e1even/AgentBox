@@ -1,13 +1,14 @@
 package main
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -115,11 +116,18 @@ func listGuestDirectory(target string, stdout io.Writer) error {
 			Name:       entry.Name(),
 		})
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Type != result[j].Type {
-			return result[i].Type == "directory"
+	slices.SortFunc(result, func(a, b guestFileEntry) int {
+		if a.Type != b.Type {
+			switch {
+			case a.Type == "directory":
+				return -1
+			case b.Type == "directory":
+				return 1
+			default:
+				return 0
+			}
 		}
-		return strings.ToLower(result[i].Name) < strings.ToLower(result[j].Name)
+		return cmp.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
 	})
 	return json.NewEncoder(stdout).Encode(result)
 }

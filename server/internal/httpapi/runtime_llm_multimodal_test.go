@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -41,7 +40,7 @@ func TestRuntimeLLMResponseMatrix(t *testing.T) {
 					t.Fatalf("convert request: %v", err)
 				}
 				converted, err := convertRuntimeLLMResponse(
-					context.Background(), upstream, client, "m",
+					t.Context(), upstream, client, "m",
 					[]byte(requests[client]), translatedRequest, []byte(responses[upstream]),
 				)
 				if err != nil {
@@ -118,7 +117,7 @@ func TestRuntimeLLMCLIProxyStreamMatrix(t *testing.T) {
 			}
 			var output strings.Builder
 			err = server.convertRuntimeLLMCLIProxyStream(
-				&output, context.Background(), strings.NewReader(streams[upstream]), "m",
+				&output, t.Context(), strings.NewReader(streams[upstream]), "m",
 				upstream, client, []byte(requests[client]), translatedRequest,
 			)
 			if err != nil {
@@ -134,11 +133,12 @@ func TestRuntimeLLMCLIProxyStreamMatrix(t *testing.T) {
 
 func assertRuntimeLLMSSEJSON(t *testing.T, body string) {
 	t.Helper()
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(line, "data:") {
+	for line := range strings.SplitSeq(body, "\n") {
+		data, ok := strings.CutPrefix(line, "data:")
+		if !ok {
 			continue
 		}
-		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		payload := strings.TrimSpace(data)
 		if payload == "" || payload == "[DONE]" {
 			continue
 		}
@@ -362,7 +362,7 @@ func TestRuntimeLLMAnthropicToolNamesArePortableAndReversible(t *testing.T) {
 	}
 
 	response, err := convertRuntimeLLMResponse(
-		context.Background(), runtimeLLMProtocolAnthropic, runtimeLLMProtocolResponses,
+		t.Context(), runtimeLLMProtocolAnthropic, runtimeLLMProtocolResponses,
 		"claude-target", original, translated,
 		[]byte(`{"id":"msg_1","type":"message","role":"assistant","model":"claude-target","content":[{"type":"tool_use","id":"call_1","name":"container_exec","input":{"command":"pwd"}}],"stop_reason":"tool_use","usage":{"input_tokens":1,"output_tokens":1}}`),
 	)

@@ -760,7 +760,7 @@ func (s *Store) verifyAutomationDelivery(stored storedAutomation, delivery platf
 		_, _ = mac.Write([]byte(deliveryID + "." + timestampValue + "."))
 		_, _ = mac.Write(delivery.Body)
 		expected := mac.Sum(nil)
-		for _, signature := range strings.Fields(automationHeader(delivery.Headers, "webhook-signature")) {
+		for signature := range strings.FieldsSeq(automationHeader(delivery.Headers, "webhook-signature")) {
 			version, encoded, found := strings.Cut(signature, ",")
 			if !found || version != "v1" {
 				continue

@@ -4,6 +4,7 @@ package sessionworker
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -17,7 +18,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -627,12 +628,12 @@ type streamDecoder struct {
 }
 
 func (d *streamDecoder) decode(chunk []byte, final bool) string {
-	data := append(append([]byte(nil), d.pending...), chunk...)
+	data := append(bytes.Clone(d.pending), chunk...)
 	d.pending = nil
 	var output strings.Builder
 	for len(data) > 0 {
 		if !utf8.FullRune(data) && !final {
-			d.pending = append([]byte(nil), data...)
+			d.pending = bytes.Clone(data)
 			break
 		}
 		runeValue, size := utf8.DecodeRune(data)
@@ -790,7 +791,7 @@ func rpcList(driver, target, containerPath string) ([]fileEntry, error) {
 		return nil, err
 	}
 	entries := make([]fileEntry, 0)
-	for _, line := range strings.Split(string(output), "\n") {
+	for line := range strings.SplitSeq(string(output), "\n") {
 		fields := strings.Split(line, "\t")
 		if len(fields) < 4 {
 			continue
@@ -804,11 +805,18 @@ func rpcList(driver, target, containerPath string) ([]fileEntry, error) {
 		}
 		entries = append(entries, fileEntry{Type: entryType, Size: size, ModifiedAt: modifiedAt, Path: entryPath, Name: path.Base(entryPath)})
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].Type != entries[j].Type {
-			return entries[i].Type == "directory"
+	slices.SortFunc(entries, func(a, b fileEntry) int {
+		if a.Type != b.Type {
+			switch {
+			case a.Type == "directory":
+				return -1
+			case b.Type == "directory":
+				return 1
+			default:
+				return 0
+			}
 		}
-		return strings.ToLower(entries[i].Name) < strings.ToLower(entries[j].Name)
+		return cmp.Compare(strings.ToLower(a.Name), strings.ToLower(b.Name))
 	})
 	return entries, nil
 }

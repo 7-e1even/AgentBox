@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
@@ -44,29 +45,20 @@ func main() {
 		logger.Error("DATABASE_URL is required")
 		os.Exit(1)
 	}
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8091"
-	}
-	bindHost := strings.TrimSpace(os.Getenv("AGENTBOX_BIND_HOST"))
-	if bindHost == "" {
-		bindHost = "127.0.0.1"
-	}
+	port := cmp.Or(os.Getenv("PORT"), "8091")
+	bindHost := cmp.Or(strings.TrimSpace(os.Getenv("AGENTBOX_BIND_HOST")), "127.0.0.1")
 	origins := strings.Split(os.Getenv("ALLOWED_ORIGINS"), ",")
 	disableAuth := strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_DISABLE_AUTH")), "true")
 	workerBinaryDir := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_BINARY_DIR"))
-	workerVersion := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_VERSION"))
-	if workerVersion == "" {
-		workerVersion = version
-	}
-	workerReleaseURL := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_RELEASE_BASE_URL"))
-	if workerReleaseURL == "" {
-		workerReleaseURL = "https://github.com/7-e1even/AgentBox/releases/download"
-	}
-	workerCacheDir := strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_CACHE_DIR"))
-	if workerCacheDir == "" {
-		workerCacheDir = "/var/lib/agentbox/worker-cache"
-	}
+	workerVersion := cmp.Or(strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_VERSION")), version)
+	workerReleaseURL := cmp.Or(
+		strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_RELEASE_BASE_URL")),
+		"https://github.com/7-e1even/AgentBox/releases/download",
+	)
+	workerCacheDir := cmp.Or(
+		strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_CACHE_DIR")),
+		"/var/lib/agentbox/worker-cache",
+	)
 	if disableAuth && !strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_ENV")), "development") {
 		logger.Error("AGENTBOX_DISABLE_AUTH is only allowed when AGENTBOX_ENV=development")
 		os.Exit(1)

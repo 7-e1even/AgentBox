@@ -26,10 +26,10 @@ type message struct {
 	Path       string `json:"path,omitempty"`
 	Content    string `json:"content,omitempty"`
 	UploadID   string `json:"uploadId,omitempty"`
-	Cols       int    `json:"cols,omitempty"`
-	Rows       int    `json:"rows,omitempty"`
-	OK         bool   `json:"ok,omitempty"`
-	Retryable  bool   `json:"retryable,omitempty"`
+	Cols       int    `json:"cols,omitzero"`
+	Rows       int    `json:"rows,omitzero"`
+	OK         bool   `json:"ok,omitzero"`
+	Retryable  bool   `json:"retryable,omitzero"`
 	Result     any    `json:"result,omitempty"`
 	Error      string `json:"error,omitempty"`
 }

@@ -19,7 +19,7 @@ func TestLiveSandboxSession(t *testing.T) {
 	if baseURL == "" || sandboxID == "" {
 		t.Skip("set AGENTBOX_LIVE_SESSION_URL and AGENTBOX_LIVE_SANDBOX_ID to run")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
 	defer cancel()
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/api/sandboxes/"+sandboxID+"/session-ticket", nil)

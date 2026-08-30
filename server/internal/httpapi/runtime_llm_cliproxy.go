@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -169,13 +170,13 @@ func normalizeGeminiContent(root map[string]any, to runtimeLLMProtocol, body []b
 			}
 			if to == runtimeLLMProtocolResponses || to == runtimeLLMProtocolChat {
 				if _, ok := part["inline_data"].(map[string]any); ok {
-					clearMap(part)
+					clear(part)
 					part["text"] = runtimeLLMMediaMarker(body, mediaIndex)
 					mediaIndex++
 					continue
 				}
 				if _, ok := part["file_data"].(map[string]any); ok {
-					clearMap(part)
+					clear(part)
 					part["text"] = runtimeLLMMediaMarker(body, mediaIndex)
 					mediaIndex++
 				}
@@ -546,7 +547,7 @@ func restoreGeminiMedia(original []byte, to runtimeLLMProtocol, converted map[st
 		if !ok {
 			return false
 		}
-		clearMap(part)
+		clear(part)
 		for key, value := range media[index] {
 			part[key] = value
 		}
@@ -654,7 +655,7 @@ func runtimeLLMMediaMarker(body []byte, index int) string {
 }
 
 func runtimeLLMMediaMarkerIndex(value string, body []byte, count int) (int, bool) {
-	for index := 0; index < count; index++ {
+	for index := range count {
 		if value == runtimeLLMMediaMarker(body, index) {
 			return index, true
 		}
@@ -669,12 +670,6 @@ func firstMap(values ...any) (map[string]any, bool) {
 		}
 	}
 	return nil, false
-}
-
-func clearMap(value map[string]any) {
-	for key := range value {
-		delete(value, key)
-	}
 }
 
 func restorePortableDocuments(to runtimeLLMProtocol, root map[string]any) {
@@ -1010,10 +1005,11 @@ func anthropicSourceURL(part map[string]any) string {
 }
 
 func parseDataURL(value string) (mediaType, data string, ok bool) {
-	if !strings.HasPrefix(value, "data:") {
+	value, ok = strings.CutPrefix(value, "data:")
+	if !ok {
 		return "", "", false
 	}
-	metadata, data, found := strings.Cut(strings.TrimPrefix(value, "data:"), ",")
+	metadata, data, found := strings.Cut(value, ",")
 	if !found || !strings.HasSuffix(strings.ToLower(metadata), ";base64") {
 		return "", "", false
 	}
@@ -1054,12 +1050,7 @@ func stringValue(value any) string {
 }
 
 func firstNonEmptyRuntimeLLM(values ...string) string {
-	for _, value := range values {
-		if value != "" {
-			return value
-		}
-	}
-	return ""
+	return cmp.Or(values...)
 }
 
 func convertRuntimeLLMResponse(
@@ -1231,8 +1222,8 @@ func restoreRuntimeLLMStreamToolNames(
 	if strings.HasPrefix(trimmed, "data:") || strings.HasPrefix(trimmed, "event:") {
 		lines := strings.Split(trimmed, "\n")
 		for index, line := range lines {
-			if strings.HasPrefix(line, "data:") {
-				payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			if data, ok := strings.CutPrefix(line, "data:"); ok {
+				payload := strings.TrimSpace(data)
 				if payload != "" && payload != "[DONE]" {
 					lines[index] = "data: " + restoreJSON(payload)
 				}

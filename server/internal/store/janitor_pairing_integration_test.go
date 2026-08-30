@@ -2,7 +2,6 @@ package store
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"errors"
 	"os"
@@ -23,7 +22,7 @@ func newIntegrationTestStore(t *testing.T) *Store {
 		t.Skip("AGENTBOX_TEST_DATABASE_URL is not set; skipping integration test")
 	}
 	t.Setenv("AGENTBOX_SECRET_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32)))
-	ctx := context.Background()
+	ctx := t.Context()
 	store, err := New(ctx, databaseURL, catalog.Catalog{})
 	if err != nil {
 		t.Fatalf("open store: %v", err)
@@ -38,7 +37,7 @@ func mustCreatePairingToken(t *testing.T, s *Store) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.pool.Exec(context.Background(), `INSERT INTO server_pairings
+	if _, err := s.pool.Exec(t.Context(), `INSERT INTO server_pairings
 	  (id, token_hash, expires_at, created_at)
 	  VALUES ($1, $2, NOW() + INTERVAL '10 minutes', NOW())`,
 		uuid.NewString(), hashToken(token)); err != nil {
@@ -60,7 +59,7 @@ func testServerRegistration(serverID, pairingToken string) platform.ServerRegist
 
 func TestRegisterServerReregistrationRequiresPreviousCredential(t *testing.T) {
 	s := newIntegrationTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	serverID := uuid.NewString()
 
 	_, credential, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s)))
@@ -103,7 +102,7 @@ func TestRegisterServerReregistrationRequiresPreviousCredential(t *testing.T) {
 
 func TestJanitorCleansExpiredRowsAndStuckSandboxes(t *testing.T) {
 	s := newIntegrationTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	serverID := uuid.NewString()
 	if _, _, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s))); err != nil {
 		t.Fatalf("register server: %v", err)

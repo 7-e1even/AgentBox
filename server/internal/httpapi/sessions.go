@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -52,10 +53,10 @@ type sessionMessage struct {
 	Path       string          `json:"path,omitempty"`
 	Content    string          `json:"content,omitempty"`
 	UploadID   string          `json:"uploadId,omitempty"`
-	Cols       int             `json:"cols,omitempty"`
-	Rows       int             `json:"rows,omitempty"`
-	OK         bool            `json:"ok,omitempty"`
-	Retryable  bool            `json:"retryable,omitempty"`
+	Cols       int             `json:"cols,omitzero"`
+	Rows       int             `json:"rows,omitzero"`
+	OK         bool            `json:"ok,omitzero"`
+	Retryable  bool            `json:"retryable,omitzero"`
 	Result     json.RawMessage `json:"result,omitempty"`
 	Error      string          `json:"error,omitempty"`
 }
@@ -123,7 +124,7 @@ func newSessionHub(origins []string, trustedProxy bool) *sessionHub {
 }
 
 func (h *sessionHub) acceptOptions(request *http.Request) *websocket.AcceptOptions {
-	patterns := append([]string(nil), h.originPatterns...)
+	patterns := slices.Clone(h.originPatterns)
 	// 仅在信任代理时才把 X-Forwarded-Host 并入 Origin 白名单，防止伪造头绕过校验。
 	if h.trustedProxy {
 		if forwardedHost := forwardedHostPattern(request.Header.Get("X-Forwarded-Host")); forwardedHost != "" {

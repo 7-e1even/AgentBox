@@ -2,7 +2,6 @@ package store
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -100,7 +99,7 @@ func TestMergeCredentialModelsPreservesManualModelsOnly(t *testing.T) {
 
 func TestKimiCodingConnectionUsesMessagesEndpoint(t *testing.T) {
 	request, err := providerCheckRequest(
-		context.Background(),
+		t.Context(),
 		"anthropic",
 		"anthropic",
 		"https://api.kimi.com/coding/",

@@ -405,8 +405,8 @@ func (s *runtimeResponsesStream) emit(event string, payload map[string]any) erro
 }
 
 func responsesID(messageID string) string {
-	if strings.HasPrefix(messageID, "msg_") {
-		return "resp_" + strings.TrimPrefix(messageID, "msg_")
+	if suffix, ok := strings.CutPrefix(messageID, "msg_"); ok {
+		return "resp_" + suffix
 	}
 	if strings.HasPrefix(messageID, "resp_") {
 		return messageID

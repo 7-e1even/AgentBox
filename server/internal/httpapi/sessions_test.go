@@ -97,7 +97,7 @@ func TestSessionAcceptOptionsRejectInvalidForwardedGatewayHost(t *testing.T) {
 
 func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 	server := newSessionTestServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
 	worker, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/servers/"+sessionTestServerID+"/sessions/connect"), &websocket.DialOptions{
@@ -226,7 +226,7 @@ func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 
 func TestSandboxSessionForwardsDesktopFrames(t *testing.T) {
 	server := newSessionTestServer(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
 	worker, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/servers/"+sessionTestServerID+"/sessions/connect"), &websocket.DialOptions{

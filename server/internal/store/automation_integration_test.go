@@ -12,7 +12,7 @@ import (
 
 func TestAutomationWebhookPersistsPollableIdempotentRun(t *testing.T) {
 	s := newIntegrationTestStore(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	secret := "integration-webhook-secret-" + uuid.NewString()
 	templateID := "runtime-" + strings.ReplaceAll(uuid.NewString(), "-", "")
 	credentialID := "credential-" + strings.ReplaceAll(uuid.NewString(), "-", "")

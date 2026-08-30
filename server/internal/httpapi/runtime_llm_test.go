@@ -473,11 +473,11 @@ func assertResponsesStreamLifecycle(t *testing.T, body string) {
 	completed := false
 	activeItems := make(map[int]bool)
 	activeParts := make(map[int]bool)
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(line, "data: ") {
+	for line := range strings.SplitSeq(body, "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
 			continue
 		}
-		data := strings.TrimPrefix(line, "data: ")
 		if data == "[DONE]" {
 			continue
 		}
@@ -539,8 +539,9 @@ func assertAnthropicStreamLifecycle(t *testing.T, body string, wantToolBlocks in
 	toolBlocks := 0
 	messageDelta := false
 	messageStop := false
-	for _, line := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(line, "data: ") {
+	for line := range strings.SplitSeq(body, "\n") {
+		data, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
 			continue
 		}
 		var event struct {
@@ -550,7 +551,7 @@ func assertAnthropicStreamLifecycle(t *testing.T, body string, wantToolBlocks in
 				Type string `json:"type"`
 			} `json:"content_block"`
 		}
-		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &event); err != nil {
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			t.Fatalf("invalid SSE JSON %q: %v", line, err)
 		}
 		if messageStop {

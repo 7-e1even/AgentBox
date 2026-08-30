@@ -8,7 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -195,7 +195,7 @@ func registerWorkerImageReference(path, reference string) error {
 		}
 	}
 	metadata.References = append(metadata.References, reference)
-	sort.Strings(metadata.References)
+	slices.Sort(metadata.References)
 	return writeWorkerImageMetadata(path, metadata)
 }
 
