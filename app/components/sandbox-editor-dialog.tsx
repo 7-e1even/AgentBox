@@ -112,7 +112,11 @@ export function SandboxEditorDialog({
           ? resource.spec.runtimeId
           : initialRuntimeId)
     ) ??
+    templates.find(
+      (item) => item.spec.driver === "docker" && isTemplateReady(item, servers)
+    ) ??
     templates.find((item) => isTemplateReady(item, servers)) ??
+    templates.find((item) => item.spec.driver === "docker") ??
     templates[0]
   const [input, setInput] = useState<ResourceDraft>(() =>
     resource
@@ -1088,14 +1092,14 @@ function runtimeDriverOptions(server?: ManagedServer) {
     {
       value: "docker",
       label: server.capabilities.includes("docker")
-        ? "Docker 容器"
+        ? "Docker 容器（推荐）"
         : "Docker 容器 · Worker 未就绪",
       disabled: !server.capabilities.includes("docker"),
     },
     {
       value: "boxlite",
       label: server.capabilities.includes("boxlite")
-        ? "BoxLite MicroVM（推荐）"
+        ? "BoxLite MicroVM"
         : "BoxLite MicroVM · SDK 自检未通过",
       disabled: !server.capabilities.includes("boxlite"),
     },

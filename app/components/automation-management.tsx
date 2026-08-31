@@ -645,7 +645,11 @@ function AutomationEditor({
         ),
       }
     }
-    return defaultAutomationInput(projectId, templates[0], credentials)
+    return defaultAutomationInput(
+      projectId,
+      templates.find((item) => item.spec.driver === "docker") ?? templates[0],
+      credentials
+    )
   })
   const [saving, setSaving] = useState(false)
   const [rotating, setRotating] = useState(false)

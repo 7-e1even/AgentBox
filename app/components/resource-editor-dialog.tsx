@@ -105,14 +105,14 @@ function runtimeDriverOptions(server?: ManagedServer): Option[] {
     {
       value: "docker",
       label: server.capabilities.includes("docker")
-        ? "Docker 容器"
+        ? "Docker 容器（推荐）"
         : "Docker 容器 · Worker 未就绪",
       disabled: !server.capabilities.includes("docker"),
     },
     {
       value: "boxlite",
       label: server.capabilities.includes("boxlite")
-        ? "BoxLite MicroVM（推荐）"
+        ? "BoxLite MicroVM"
         : "BoxLite MicroVM · SDK 自检未通过",
       disabled: !server.capabilities.includes("boxlite"),
     },

@@ -646,7 +646,7 @@ worker_capabilities() {
 worker_inventory() {
 	ARCH=$(worker_arch)
 	DOCKER_IMAGES='[]'
-  if command -v docker >/dev/null && timeout 10 docker info >/dev/null 2>&1; then
+  if printf '%s' "$1" | jq -e 'index("docker") != null' >/dev/null; then
     DOCKER_IMAGES=$(docker image ls --no-trunc --format '{{json .}}' 2>/dev/null | jq -s --arg arch "$ARCH" '
       map(select((.Repository | startswith("agentbox/runtime-")) | not) | {
         id: .ID,
@@ -2830,7 +2830,14 @@ configure_skills() {
         docker exec "$CONTAINER" chmod 755 "/opt/agentbox/skills/$ID/$SKILL_PATH" || exit 1
       fi
     done || exit 1
-    for SKILL_TARGET in \
+    docker exec "$CONTAINER" sh -c '
+      SKILL_SOURCE=$1
+      shift
+      for SKILL_TARGET do
+        rm -rf "$SKILL_TARGET" && mkdir -p "$SKILL_TARGET" &&
+          cp -R "$SKILL_SOURCE/." "$SKILL_TARGET/" || exit 1
+      done
+    ' agentbox "/opt/agentbox/skills/$ID" \
       "/root/.agents/skills/$ID" \
       "/root/.gemini/antigravity-cli/skills/$ID" \
       "/root/.codex/skills/$ID" \
@@ -2851,9 +2858,7 @@ configure_skills() {
       "/root/.traecli/skills/$ID" \
       "/root/.grok/skills/$ID" \
       "/root/.qwen/skills/$ID" \
-      "/root/.qwenpaw/skill_pool/$ID"; do
-      docker exec "$CONTAINER" sh -c 'rm -rf "$1" && mkdir -p "$1" && cp -R "$2/." "$1/"' agentbox "$SKILL_TARGET" "/opt/agentbox/skills/$ID" || exit 1
-    done
+      "/root/.qwenpaw/skill_pool/$ID" || exit 1
     ) || return 1
   done
 }
@@ -3529,22 +3534,48 @@ process_job() {
     *) complete_job_failure "$JOB_ID" worker_action_unsupported dispatch false \
          "Unsupported worker action: $ACTION" "$ACTION" ;;
   esac
+  case "$ACTION" in
+    create-sandbox|start-sandbox|restart-sandbox) mark_worker_inventory_dirty || true ;;
+  esac
+}
+
+mark_worker_inventory_dirty() {
+  INVENTORY_MARKER=$(mktemp "$STATE_DIR/inventory-generation.XXXXXX") || return 1
+  printf '%s\n' "$INVENTORY_MARKER" > "$INVENTORY_MARKER"
+  mv "$INVENTORY_MARKER" "$STATE_DIR/inventory-generation"
 }
 
 heartbeat_loop() {
+  INVENTORY_REPORTED_AT=0
+  INVENTORY_REPORTED_GENERATION=
   while :; do
     CAPS=$(worker_capabilities)
-    INVENTORY=$(worker_inventory)
+    HEARTBEAT_NOW=$(date +%s)
+    INVENTORY_GENERATION=$(cat "$STATE_DIR/inventory-generation" 2>/dev/null || true)
+    INVENTORY=null
+    if [ "$INVENTORY_REPORTED_AT" -eq 0 ] ||
+       [ "$((HEARTBEAT_NOW - INVENTORY_REPORTED_AT))" -ge 120 ] ||
+       [ "$INVENTORY_GENERATION" != "$INVENTORY_REPORTED_GENERATION" ]; then
+      INVENTORY=$(worker_inventory "$CAPS") || INVENTORY=null
+    fi
     HEARTBEAT=$(jq -n --argjson capabilities "$CAPS" --argjson inventory "$INVENTORY" \
       --arg workerVersion "$AGENTBOX_WORKER_VERSION" \
-      '{capabilities:$capabilities,inventory:$inventory,workerVersion:$workerVersion}')
+      '{capabilities:$capabilities,workerVersion:$workerVersion}
+       + (if $inventory == null then {} else {inventory:$inventory} end)')
+    HEARTBEAT_SENT=true
     if ! curl -fsS -X POST "$SERVER_URL/api/servers/$SERVER_ID/heartbeat" \
       -H "Authorization: Bearer $CREDENTIAL" \
       -H 'Content-Type: application/json' --data "$HEARTBEAT" >/dev/null 2>&1; then
       LEGACY_HEARTBEAT=$(printf '%s' "$HEARTBEAT" | jq 'del(.workerVersion)')
       curl -fsS -X POST "$SERVER_URL/api/servers/$SERVER_ID/heartbeat" \
         -H "Authorization: Bearer $CREDENTIAL" \
-        -H 'Content-Type: application/json' --data "$LEGACY_HEARTBEAT" >/dev/null 2>&1 || true
+        -H 'Content-Type: application/json' --data "$LEGACY_HEARTBEAT" >/dev/null 2>&1 || HEARTBEAT_SENT=false
+    fi
+    if [ "$HEARTBEAT_SENT" = true ] && [ "$INVENTORY" != null ]; then
+      INVENTORY_REPORTED_AT=$(date +%s)
+      # A job may finish during collection or reporting. Acknowledge only the
+      # generation read before collection, leaving newer invalidations pending.
+      INVENTORY_REPORTED_GENERATION=$INVENTORY_GENERATION
     fi
     sleep 15
   done
@@ -3613,6 +3644,7 @@ run_worker() {
     [ -s "$BOXLITE_IMAGES_FILE" ] || printf '[]\n' > "$BOXLITE_IMAGES_FILE"
     echo "warning: BoxLite image inventory is unavailable" >&2
   }
+  mark_worker_inventory_dirty || true
   while :; do
     finalize_worker_update || true
     ensure_session_worker

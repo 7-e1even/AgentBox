@@ -158,22 +158,6 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
     return (
       <LoadState label="沙箱" {...sandboxData} onRetry={sandboxData.refresh} />
     )
-  if (runtimeId && !runtimeData.data)
-    return (
-      <LoadState
-        label="沙箱模板"
-        {...runtimeData}
-        onRetry={runtimeData.refresh}
-      />
-    )
-  if (!serverData.data)
-    return (
-      <LoadState
-        label="运行服务器"
-        {...serverData}
-        onRetry={serverData.refresh}
-      />
-    )
   return (
     <>
       {Boolean(sandboxData.error) && (
@@ -201,7 +185,7 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
         sandboxId={sandboxId}
         sandbox={sandboxData.data}
         runtime={runtimeData.data}
-        server={serverData.data.find(
+        server={serverData.data?.find(
           (item) => item.id === sandboxData.data?.spec.serverId
         )}
       />
