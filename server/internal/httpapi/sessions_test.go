@@ -14,6 +14,7 @@ import (
 
 	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
+	"agentbox/internal/workerprotocol"
 	"github.com/coder/websocket"
 )
 
@@ -63,6 +64,65 @@ func TestSandboxSessionTicketIsSingleUse(t *testing.T) {
 	}
 	if _, ok := hub.consumeTicket(token, target.SandboxID, "terminal"); ok {
 		t.Fatal("session ticket could be consumed twice")
+	}
+}
+
+func TestSessionHubsDoNotShareWorkersOrTickets(t *testing.T) {
+	first := newSessionHub(nil, false)
+	second := newSessionHub(nil, false)
+	first.registerWorker(&workerSessionConnection{serverID: sessionTestServerID})
+	if !first.hasWorker(sessionTestServerID) || second.hasWorker(sessionTestServerID) {
+		t.Fatal("Worker connections must belong to exactly one process-local hub")
+	}
+	target := sandboxSessionTarget{SandboxID: "sandbox-one", ServerID: sessionTestServerID, ExternalID: "container", Driver: "docker"}
+	token, _, err := first.issueTicket(target, "terminal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := second.consumeTicket(token, target.SandboxID, "terminal"); ok {
+		t.Fatal("another instance or a restarted Server must not accept the ticket")
+	}
+	if _, ok := first.consumeTicket(token, target.SandboxID, "terminal"); !ok {
+		t.Fatal("the original hub must still own its fresh ticket")
+	}
+}
+
+func TestWorkerSessionProtocolHandshake(t *testing.T) {
+	for _, test := range []struct {
+		name, minimum, maximum string
+		status                 int
+	}{
+		{name: "current", minimum: "1", maximum: "1", status: http.StatusSwitchingProtocols},
+		{name: "n-1 Worker", status: http.StatusSwitchingProtocols},
+		{name: "incompatible", minimum: "2", maximum: "2", status: http.StatusUpgradeRequired},
+		{name: "malformed", minimum: "1", status: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := newSessionTestServer(t)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			header := http.Header{"Authorization": []string{"Bearer " + strings.Repeat("w", 32)}}
+			if test.minimum != "" {
+				header.Set(workerprotocol.HeaderMinimum, test.minimum)
+			}
+			if test.maximum != "" {
+				header.Set(workerprotocol.HeaderMaximum, test.maximum)
+			}
+			conn, response, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/servers/"+sessionTestServerID+"/sessions/connect"), &websocket.DialOptions{HTTPHeader: header})
+			if conn != nil {
+				defer conn.CloseNow()
+			}
+			if response == nil || response.StatusCode != test.status {
+				t.Fatalf("handshake response = %#v, error = %v; want %d", response, err, test.status)
+			}
+			if test.status == http.StatusSwitchingProtocols {
+				if err != nil || response.Header.Get(workerprotocol.HeaderSelected) != "1" {
+					t.Fatalf("handshake selection = %q, error = %v", response.Header.Get(workerprotocol.HeaderSelected), err)
+				}
+			} else if err == nil || conn != nil {
+				t.Fatal("invalid protocol must not upgrade to WebSocket")
+			}
+		})
 	}
 }
 

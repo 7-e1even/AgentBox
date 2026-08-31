@@ -21,6 +21,10 @@ import (
 )
 
 const (
+	// SessionTopology is intentionally not configurable: Worker/browser sockets
+	// and single-use tickets belong to one Server process, not the database.
+	SessionTopology = "single-instance"
+
 	sandboxSessionTicketLifetime = 30 * time.Second
 	sandboxSessionReadLimit      = 1024 * 1024
 	sandboxSessionWriteTimeout   = 10 * time.Second
@@ -99,6 +103,8 @@ type browserSessionConnection struct {
 }
 
 type sessionHub struct {
+	// All three maps are process-local. Server replicas and cross-instance
+	// ticket routing are unsupported; restarting requires fresh connections.
 	mu             sync.RWMutex
 	workers        map[string]*workerSessionConnection
 	sessions       map[string]*browserSessionConnection
@@ -320,6 +326,9 @@ func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID stri
 }
 
 func (s *Server) connectWorkerSessions(w http.ResponseWriter, request *http.Request) {
+	if !s.negotiateWorkerProtocol(w, request) {
+		return
+	}
 	serverID := request.PathValue("id")
 	credential := authBearer(request)
 	if err := s.store.HeartbeatServer(request.Context(), serverID, credential, nil, nil, ""); err != nil {

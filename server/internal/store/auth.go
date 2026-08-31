@@ -78,6 +78,13 @@ func (s *Store) SetupAdmin(ctx context.Context, input platform.UserInput, sessio
     VALUES ($1, $2, $3, $4)`, sessionHash, user.ID, expiresAt, now); err != nil {
 		return platform.User{}, fmt.Errorf("create setup session: %w", err)
 	}
+	ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: user.ID, Name: user.Name})
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "setup-admin",
+		ResourceKind: "user", ResourceID: user.ID, ResourceName: user.Name,
+	}); err != nil {
+		return platform.User{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.User{}, fmt.Errorf("commit user setup: %w", err)
 	}
@@ -126,6 +133,12 @@ func (s *Store) AuthenticateUser(ctx context.Context, username, password string,
     VALUES ($1, $2, $3, $4)`, sessionHash, user.ID, expiresAt, now); err != nil {
 		return platform.User{}, fmt.Errorf("create session: %w", err)
 	}
+	ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: user.ID, Name: user.Name})
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "login", ResourceKind: "user", ResourceID: user.ID,
+	}); err != nil {
+		return platform.User{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.User{}, fmt.Errorf("commit login: %w", err)
 	}
@@ -154,8 +167,26 @@ func (s *Store) UserBySession(ctx context.Context, sessionHash []byte) (platform
 }
 
 func (s *Store) DeleteSession(ctx context.Context, sessionHash []byte) error {
-	if _, err := s.pool.Exec(ctx, "DELETE FROM user_sessions WHERE token_hash = $1", sessionHash); err != nil {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin logout: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var userID string
+	err = tx.QueryRow(ctx, "DELETE FROM user_sessions WHERE token_hash = $1 RETURNING user_id", sessionHash).Scan(&userID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("delete session: %w", err)
+	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryAuth, Action: "logout", ResourceKind: "user", ResourceID: userID,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit logout: %w", err)
 	}
 	return nil
 }
@@ -187,13 +218,27 @@ func (s *Store) CreateUser(ctx context.Context, input platform.UserInput) (platf
 	if err != nil {
 		return platform.User{}, fmt.Errorf("hash password: %w", err)
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.User{}, fmt.Errorf("begin create user: %w", err)
+	}
+	defer tx.Rollback(ctx)
 	now := time.Now().UTC()
-	user, err := scanUser(s.pool.QueryRow(ctx, `INSERT INTO users
+	user, err := scanUser(tx.QueryRow(ctx, `INSERT INTO users
     (id, name, username, email, password_hash, role, status, created_at, updated_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
     RETURNING `+userColumns, uuid.NewString(), input.Name, input.Username, input.Email, passwordHash, input.Role, input.Status, now))
 	if err != nil {
 		return platform.User{}, mapUserError(err)
+	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryUser, Action: "create", ResourceKind: "user",
+		ResourceID: user.ID, ResourceName: user.Name, Detail: map[string]any{"role": string(user.Role)},
+	}); err != nil {
+		return platform.User{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.User{}, fmt.Errorf("commit create user: %w", err)
 	}
 	return user, nil
 }
@@ -240,16 +285,30 @@ func (s *Store) updateUser(ctx context.Context, id string, input platform.UserIn
 	if err != nil {
 		return platform.User{}, mapUserError(err)
 	}
+	var sessionsRevoked int64
 	if input.Password != "" || input.Status == platform.UserStatusDisabled {
 		if len(keepSessionHash) == 0 {
-			if _, err := tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", id); err != nil {
+			result, err := tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", id)
+			if err != nil {
 				return platform.User{}, fmt.Errorf("invalidate user sessions: %w", err)
 			}
+			sessionsRevoked = result.RowsAffected()
 		} else {
-			if _, err := tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1 AND token_hash <> $2", id, keepSessionHash); err != nil {
+			result, err := tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1 AND token_hash <> $2", id, keepSessionHash)
+			if err != nil {
 				return platform.User{}, fmt.Errorf("invalidate user sessions: %w", err)
 			}
+			sessionsRevoked = result.RowsAffected()
 		}
+	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryUser, Action: "update", ResourceKind: "user", ResourceID: user.ID,
+		ResourceName: user.Name, Detail: map[string]any{
+			"role": string(user.Role), "status": string(user.Status), "passwordChanged": input.Password != "",
+			"sessionsRevoked": sessionsRevoked, "sessionPreserved": len(keepSessionHash) > 0,
+		},
+	}); err != nil {
+		return platform.User{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.User{}, fmt.Errorf("commit update user: %w", err)
@@ -258,6 +317,8 @@ func (s *Store) updateUser(ctx context.Context, id string, input platform.UserIn
 }
 
 func (s *Store) UpdateUserPreferences(ctx context.Context, id string, input platform.UserPreferences) (platform.User, error) {
+	// Display preferences have no authorization/session effect and remain
+	// best-effort telemetry rather than expanding the transactional audit path.
 	if err := platform.ValidateUserPreferences(input); err != nil {
 		return platform.User{}, err
 	}
@@ -270,12 +331,23 @@ func (s *Store) UpdateUserPreferences(ctx context.Context, id string, input plat
 }
 
 func (s *Store) DeleteUser(ctx context.Context, id string) error {
-	result, err := s.pool.Exec(ctx, "DELETE FROM users WHERE id = $1", id)
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("delete user: %w", err)
+		return fmt.Errorf("begin delete user: %w", err)
 	}
-	if result.RowsAffected() == 0 {
-		return ErrNotFound
+	defer tx.Rollback(ctx)
+	user, err := scanUser(tx.QueryRow(ctx, "DELETE FROM users WHERE id = $1 RETURNING "+userColumns, id))
+	if err != nil {
+		return mapUserError(err)
+	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryUser, Action: "delete", ResourceKind: "user", ResourceID: id,
+		ResourceName: user.Name,
+	}); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete user: %w", err)
 	}
 	return nil
 }

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"syscall"
 
-	"agentbox/internal/httpapi"
+	"agentbox/internal/workerscript"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,7 +20,7 @@ func runWorkerShell(arguments []string) error {
 	}
 	file := os.NewFile(uintptr(descriptor), "agentbox-worker")
 	defer file.Close()
-	if _, err := io.WriteString(file, httpapi.WorkerDaemonScript()); err != nil {
+	if _, err := io.WriteString(file, workerscript.Daemon()); err != nil {
 		return fmt.Errorf("write Worker script memory file: %w", err)
 	}
 	if _, err := file.Seek(0, io.SeekStart); err != nil {

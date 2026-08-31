@@ -77,6 +77,37 @@ func TestWriteErrorUsesStructuredContract(t *testing.T) {
 
 type fakeStore struct{}
 
+func (s fakeStore) ListResourcesFiltered(ctx context.Context, filter platform.ResourceFilter) ([]platform.Resource, error) {
+	resources, err := s.ListResources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]platform.Resource, 0)
+	for _, resource := range resources {
+		if filter.Kind != "" && resource.Kind != filter.Kind {
+			continue
+		}
+		if filter.ProjectID != "" && (resource.ProjectID == nil || *resource.ProjectID != filter.ProjectID) {
+			continue
+		}
+		result = append(result, resource)
+	}
+	return result, nil
+}
+
+func (s fakeStore) GetResource(ctx context.Context, id string) (platform.Resource, error) {
+	resources, err := s.ListResources(ctx)
+	if err != nil {
+		return platform.Resource{}, err
+	}
+	for _, resource := range resources {
+		if resource.ID == id {
+			return resource, nil
+		}
+	}
+	return platform.Resource{}, store.ErrResourceNotFound
+}
+
 type emptyUsersStore struct{ fakeStore }
 
 func (emptyUsersStore) ListUsers(context.Context) ([]platform.User, error) {

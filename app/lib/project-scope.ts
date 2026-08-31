@@ -3,9 +3,12 @@ import type { Resource } from "@/lib/platform-schema"
 export const PROJECT_COOKIE_NAME = "agentbox-project"
 
 export function resolveProjectId(
-  resources: Resource[],
+  resources: Resource[] | undefined,
   preferredProjectId?: string | null
 ) {
+  // Keep the selection while navigation data is unavailable; validate it only
+  // after the project request succeeds.
+  if (resources === undefined) return preferredProjectId || "default"
   const projects = resources.filter((resource) => resource.kind === "project")
   return (
     projects.find((project) => project.id === preferredProjectId)?.id ??

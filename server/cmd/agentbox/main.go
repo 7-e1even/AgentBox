@@ -94,6 +94,8 @@ func main() {
 			logger.Warn("authentication disabled for development")
 		}
 		logger.Info("agentbox api listening", "address", server.Addr)
+		logger.Info("session plane requires one Server replica; tickets and WebSocket connections are process-local",
+			"session_topology", httpapi.SessionTopology)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("serve api", "error", err)
 			cancel()

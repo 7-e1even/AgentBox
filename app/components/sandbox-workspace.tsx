@@ -20,7 +20,6 @@ import {
   FileUpIcon,
   FolderIcon,
   FolderOpenIcon,
-  InfoIcon,
   MonitorIcon,
   PanelBottomIcon,
   PanelLeftIcon,
@@ -35,6 +34,13 @@ import {
 } from "lucide-react"
 import Link from "next/link"
 
+import { usePolling } from "@/hooks/use-polling"
+import { LoadState } from "@/components/load-state"
+import {
+  resourceResponseSchema,
+  type ResourceOfKind,
+} from "@/lib/platform-schema"
+import { serversResponseSchema, type ManagedServer } from "@/lib/server-schema"
 import { SandboxCodeEditor } from "@/components/sandbox-code-editor"
 import { SandboxDesktop } from "@/components/sandbox-desktop"
 import {
@@ -78,11 +84,6 @@ import { appToast as toast } from "@/lib/app-toast"
 import { errorMessage, requestJson } from "@/lib/api-client"
 import { writeClipboardText } from "@/lib/clipboard"
 import {
-  resourceSchema,
-  resourcesResponseSchema,
-  type Resource,
-} from "@/lib/platform-schema"
-import {
   sandboxFileEntriesSchema,
   type SandboxFileEntry,
 } from "@/lib/sandbox-file-schema"
@@ -116,6 +117,109 @@ type UploadProgress = {
 }
 
 export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
+  const sandboxData = usePolling({
+    queryKey: `workspace:${sandboxId}`,
+    interval: 15000,
+    load: async (signal) => {
+      const resource = resourceResponseSchema.parse(
+        await requestJson<unknown>(
+          `/api/resources/${encodeURIComponent(sandboxId)}`,
+          { signal }
+        )
+      ).resource
+      if (resource.kind !== "sandbox") throw new Error("该资源不是沙箱")
+      return resource
+    },
+  })
+  const runtimeId = sandboxData.data?.spec.runtimeId
+  const runtimeData = usePolling({
+    queryKey: `workspace-runtime:${runtimeId ?? ""}`,
+    enabled: typeof runtimeId === "string" && runtimeId !== "",
+    load: async (signal) => {
+      const resource = resourceResponseSchema.parse(
+        await requestJson<unknown>(
+          `/api/resources/${encodeURIComponent(String(runtimeId))}`,
+          { signal }
+        )
+      ).resource
+      if (resource.kind !== "runtime") throw new Error("该资源不是沙箱模板")
+      return resource
+    },
+  })
+  const serverData = usePolling({
+    queryKey: `workspace-servers:${sandboxId}`,
+    enabled: sandboxData.data !== undefined,
+    load: async (signal) =>
+      serversResponseSchema.parse(
+        await requestJson<unknown>("/api/servers", { signal })
+      ).servers,
+  })
+  if (!sandboxData.data)
+    return (
+      <LoadState label="沙箱" {...sandboxData} onRetry={sandboxData.refresh} />
+    )
+  if (runtimeId && !runtimeData.data)
+    return (
+      <LoadState
+        label="沙箱模板"
+        {...runtimeData}
+        onRetry={runtimeData.refresh}
+      />
+    )
+  if (!serverData.data)
+    return (
+      <LoadState
+        label="运行服务器"
+        {...serverData}
+        onRetry={serverData.refresh}
+      />
+    )
+  return (
+    <>
+      {Boolean(sandboxData.error) && (
+        <LoadState
+          label="沙箱"
+          {...sandboxData}
+          onRetry={sandboxData.refresh}
+        />
+      )}
+      {Boolean(runtimeData.error) && (
+        <LoadState
+          label="沙箱模板"
+          {...runtimeData}
+          onRetry={runtimeData.refresh}
+        />
+      )}
+      {Boolean(serverData.error) && (
+        <LoadState
+          label="运行服务器"
+          {...serverData}
+          onRetry={serverData.refresh}
+        />
+      )}
+      <SandboxWorkspaceContent
+        sandboxId={sandboxId}
+        sandbox={sandboxData.data}
+        runtime={runtimeData.data}
+        server={serverData.data.find(
+          (item) => item.id === sandboxData.data?.spec.serverId
+        )}
+      />
+    </>
+  )
+}
+
+function SandboxWorkspaceContent({
+  sandboxId,
+  sandbox,
+  runtime,
+  server,
+}: {
+  sandboxId: string
+  sandbox: ResourceOfKind<"sandbox">
+  runtime?: ResourceOfKind<"runtime">
+  server?: ManagedServer
+}) {
   const terminalRef = useRef<SandboxTerminalHandle>(null)
   const uploadInputRef = useRef<HTMLInputElement>(null)
   const uploadDirectoryRef = useRef("/")
@@ -123,10 +227,6 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
     () => new SandboxSessionClient(sandboxId),
     [sandboxId]
   )
-  const [sandbox, setSandbox] = useState<Resource | null>(null)
-  const [resources, setResources] = useState<Resource[]>([])
-  const [initializing, setInitializing] = useState(true)
-  const [loadError, setLoadError] = useState("")
   const [directoryEntries, setDirectoryEntries] = useState<
     Record<string, SandboxFileEntry[]>
   >({})
@@ -155,8 +255,6 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
   const [dragUploadTarget, setDragUploadTarget] = useState<string | null>(null)
 
   const isRunning = sandbox?.spec.status === "running"
-  const runtime = resources.find((item) => item.id === sandbox?.spec.runtimeId)
-  const server = resources.find((item) => item.id === sandbox?.spec.serverId)
   const inheritedAgents = runtime?.spec.agentTools
   const sandboxAgents = stringList(
     Array.isArray(sandbox?.spec.agentTools)
@@ -231,35 +329,6 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
       session.stop()
     }
   }, [isRunning, session])
-
-  useEffect(() => {
-    let cancelled = false
-    async function initialize() {
-      setInitializing(true)
-      setLoadError("")
-      try {
-        const nextResources = resourcesResponseSchema.parse(
-          await requestJson<unknown>("/api/resources")
-        ).resources
-        const nextSandbox = nextResources.find(
-          (resource) => resource.kind === "sandbox" && resource.id === sandboxId
-        )
-        if (!nextSandbox) throw new Error("沙箱不存在")
-        if (cancelled) return
-        setResources(nextResources)
-        setSandbox(resourceSchema.parse(nextSandbox))
-        setInitializing(false)
-      } catch (error) {
-        if (!cancelled) setLoadError(errorMessage(error))
-      } finally {
-        if (!cancelled) setInitializing(false)
-      }
-    }
-    void initialize()
-    return () => {
-      cancelled = true
-    }
-  }, [loadDirectory, sandboxId])
 
   useEffect(() => {
     if (
@@ -1209,22 +1278,7 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
         }
       />
 
-      {initializing ? (
-        <div className="flex min-h-0 flex-1 items-center justify-center gap-2 text-muted-foreground">
-          <Spinner />
-          正在连接沙箱…
-        </div>
-      ) : loadError || !sandbox ? (
-        <Empty className="min-h-0 flex-1 rounded-none border-0">
-          <EmptyHeader>
-            <EmptyMedia variant="icon">
-              <InfoIcon aria-hidden="true" />
-            </EmptyMedia>
-            <EmptyTitle>无法打开沙箱</EmptyTitle>
-            <EmptyDescription>{loadError || "沙箱不存在"}</EmptyDescription>
-          </EmptyHeader>
-        </Empty>
-      ) : !isRunning ? (
+      {!isRunning ? (
         <Empty className="min-h-0 flex-1 rounded-none border-0">
           <EmptyHeader>
             <EmptyMedia variant="icon">

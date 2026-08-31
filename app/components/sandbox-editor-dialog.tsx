@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useMemo, useState, type ReactNode } from "react"
 import {
   BoxIcon,
   CheckIcon,
@@ -23,8 +23,11 @@ import {
 import { reconcileModelBindings } from "@/lib/model-bindings"
 import {
   resourceInputSchema,
+  sandboxSpecForUpdate,
   type Resource,
+  type ResourceDraft,
   type ResourceInput,
+  type ResourceOfKind,
 } from "@/lib/platform-schema"
 import {
   normalizeRuntimeImageReference,
@@ -75,6 +78,8 @@ type SandboxEditorDialogProps = {
   credentials: ManagedCredential[]
   proxies: ManagedNetworkProxy[]
   initialRuntimeId?: string
+  dependenciesReady?: boolean
+  dependencyStatus?: ReactNode
   onOpenChange: (open: boolean) => void
   onSave: (input: ResourceInput) => Promise<void>
 }
@@ -87,26 +92,29 @@ export function SandboxEditorDialog({
   credentials,
   proxies,
   initialRuntimeId,
+  dependenciesReady = true,
+  dependencyStatus,
   onOpenChange,
   onSave,
 }: SandboxEditorDialogProps) {
   const templates = useMemo(
     () =>
-      resources.filter(
-        (item) =>
-          item.kind === "runtime" &&
-          item.projectId === projectId &&
-          item.enabled
-      ),
+      resources
+        .filter((item) => item.kind === "runtime")
+        .filter((item) => item.projectId === projectId && item.enabled),
     [projectId, resources]
   )
   const initialTemplate =
     templates.find(
-      (item) => item.id === (resource?.spec.runtimeId ?? initialRuntimeId)
+      (item) =>
+        item.id ===
+        (resource?.kind === "sandbox"
+          ? resource.spec.runtimeId
+          : initialRuntimeId)
     ) ??
     templates.find((item) => isTemplateReady(item, servers)) ??
     templates[0]
-  const [input, setInput] = useState<ResourceInput>(() =>
+  const [input, setInput] = useState<ResourceDraft>(() =>
     resource
       ? sandboxInputFromResource(resource, initialTemplate, credentials)
       : createSandboxInput(projectId, resources, initialTemplate, credentials)
@@ -139,13 +147,16 @@ export function SandboxEditorDialog({
     input.spec.imageReference
   )
   const lockedTools = useMemo(
-    () => (resource ? supportedAgentToolList(resource.spec.agentTools) : []),
+    () =>
+      resource?.kind === "sandbox"
+        ? supportedAgentToolList(resource.spec.agentTools)
+        : [],
     [resource]
   )
 
-  function update<K extends keyof ResourceInput>(
+  function update<K extends keyof ResourceDraft>(
     key: K,
-    value: ResourceInput[K]
+    value: ResourceDraft[K]
   ) {
     setInput((current) => ({ ...current, [key]: value }))
     setError("")
@@ -253,6 +264,7 @@ export function SandboxEditorDialog({
   }
 
   async function submit() {
+    if (saving || !dependenciesReady) return
     if (!template) {
       setError("请选择一个可用的沙箱模板")
       return
@@ -272,7 +284,7 @@ export function SandboxEditorDialog({
       setError(environmentError)
       return
     }
-    const next: ResourceInput = {
+    const next: ResourceDraft = {
       ...input,
       projectId,
       spec: {
@@ -282,6 +294,9 @@ export function SandboxEditorDialog({
         credentialIds,
         modelBindings,
       },
+    }
+    if (resource?.kind === "sandbox") {
+      next.spec = sandboxSpecForUpdate(next.spec, resource.spec)
     }
     const parsed = resourceInputSchema.safeParse(next)
     if (!parsed.success) {
@@ -360,6 +375,7 @@ export function SandboxEditorDialog({
 
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
           <FieldGroup className="gap-6">
+            {dependencyStatus}
             <FieldSet>
               <FieldLegend>基本信息</FieldLegend>
               <div className="grid gap-4 sm:grid-cols-2">
@@ -934,7 +950,9 @@ export function SandboxEditorDialog({
             取消
           </Button>
           <Button
-            disabled={saving || !template || !configurationReady}
+            disabled={
+              saving || !dependenciesReady || !template || !configurationReady
+            }
             onClick={() => void submit()}
           >
             {saving && <LoaderCircleIcon className="animate-spin" />}
@@ -988,9 +1006,9 @@ function CapabilitySelector({
 function createSandboxInput(
   projectId: string,
   resources: Resource[],
-  template: Resource | undefined,
+  template: ResourceOfKind<"runtime"> | undefined,
   credentials: ManagedCredential[]
-): ResourceInput {
+): ResourceDraft {
   return {
     id: uniqueSandboxId("sandbox", resources),
     kind: "sandbox",
@@ -1015,10 +1033,10 @@ function createSandboxInput(
 
 function sandboxInputFromResource(
   resource: Resource,
-  template: Resource | undefined,
+  template: ResourceOfKind<"runtime"> | undefined,
   credentials: ManagedCredential[]
-) {
-  const input = resourceInputSchema.parse(resource)
+): ResourceDraft {
+  const input: ResourceDraft = { ...resource, spec: { ...resource.spec } }
   return {
     ...input,
     spec: {
@@ -1040,7 +1058,7 @@ function sandboxInputFromResource(
   }
 }
 
-function templateDefaults(template?: Resource) {
+function templateDefaults(template?: ResourceOfKind<"runtime">) {
   return {
     serverId: stringValue(template?.spec.serverId),
     driver: stringValue(template?.spec.driver),
@@ -1050,7 +1068,7 @@ function templateDefaults(template?: Resource) {
     setup: stringValue(template?.spec.setup),
     cpu: stringValue(template?.spec.cpu) || "2",
     memory: stringValue(template?.spec.memory) || "4 GiB",
-    desktop: template?.spec.desktop === true,
+    desktop: template?.spec.desktop,
     network: stringValue(template?.spec.network) || "restricted",
     proxyId: stringValue(template?.spec.proxyId),
     agentTools: supportedAgentToolList(template?.spec.agentTools),
@@ -1183,7 +1201,10 @@ function driverLabel(driver: string) {
   return "未配置"
 }
 
-function isTemplateReady(template: Resource, servers: ManagedServer[]) {
+function isTemplateReady(
+  template: ResourceOfKind<"runtime">,
+  servers: ManagedServer[]
+) {
   const server = servers.find((item) => item.id === template.spec.serverId)
   const driver = stringValue(template.spec.driver)
   const requiredCapability = driver === "vm" ? "kvm" : driver

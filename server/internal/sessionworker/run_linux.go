@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -27,6 +26,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"agentbox/internal/workerprotocol"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/creack/pty"
@@ -56,6 +56,9 @@ func Run(ctx context.Context, configPath string, stderr io.Writer) error {
 		if err != nil && ctx.Err() == nil {
 			_, _ = fmt.Fprintf(stderr, "session connection: %v\n", err)
 		}
+		if errors.Is(err, workerprotocol.ErrIncompatible) {
+			delay = 30 * time.Second
+		}
 		if ctx.Err() != nil {
 			break
 		}
@@ -84,10 +87,7 @@ func runConnection(ctx context.Context, configPath string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	header := http.Header{}
-	header.Set("Authorization", "Bearer "+config.credential)
-	header.Set("User-Agent", "AgentBox-Session-Worker/3")
-	conn, _, err := websocket.Dial(ctx, config.websocketURL(), &websocket.DialOptions{HTTPHeader: header})
+	conn, err := dialConnection(ctx, config)
 	if err != nil {
 		return false, err
 	}

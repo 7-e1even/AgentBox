@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"log/slog"
+	"maps"
 	"net/http"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,11 @@ func newLogRecorder(store interface {
 
 // Record 投递一条日志；缓冲区满时丢弃并计数告警，绝不阻塞调用方。
 func (r *logRecorder) Record(entry platform.LogEntry) {
+	entry.Detail = maps.Clone(entry.Detail)
+	if entry.Detail == nil {
+		entry.Detail = make(map[string]any)
+	}
+	entry.Detail["delivery"] = "best-effort"
 	if entry.CreatedAt.IsZero() {
 		entry.CreatedAt = time.Now().UTC()
 	}
@@ -73,11 +79,16 @@ func (r *logRecorder) run() {
 	defer ticker.Stop()
 	batch := make([]platform.LogEntry, 0, logRecorderBatchSize)
 	flush := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if dispatcher, ok := r.store.(interface{ DispatchAuditEvents(context.Context) error }); ok {
+			if err := dispatcher.DispatchAuditEvents(ctx); err != nil {
+				r.logger.Warn("dispatch durable audit events failed; pending events retained", "error", err)
+			}
+		}
 		if len(batch) == 0 {
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		if err := r.store.InsertLogs(ctx, batch); err != nil {
 			r.logger.Warn("insert system logs failed", "count", len(batch), "error", err)
 		}

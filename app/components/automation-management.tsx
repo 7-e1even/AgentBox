@@ -1,14 +1,9 @@
 "use client"
 
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react"
+import { useCallback, useMemo, useRef, useState, type ReactNode } from "react"
 import Link from "next/link"
+import { usePolling } from "@/hooks/use-polling"
+import { LoadState } from "@/components/load-state"
 import {
   ActivityIcon,
   ArrowLeftIcon,
@@ -120,7 +115,7 @@ import { appToast as toast } from "@/lib/app-toast"
 import { errorMessage, requestJson } from "@/lib/api-client"
 import type { ManagedCredential } from "@/lib/credential-schema"
 import { reconcileModelBindings } from "@/lib/model-bindings"
-import type { Resource } from "@/lib/platform-schema"
+import type { Resource, ResourceOfKind } from "@/lib/platform-schema"
 import {
   provisioningCacheLabel,
   provisioningDuration,
@@ -128,31 +123,39 @@ import {
 } from "@/lib/provisioning"
 import { shellSingleQuote } from "@/lib/shell-quote"
 
+const noAutomations: Automation[] = []
+const noRuns: AutomationRun[] = []
+
+function activeRunsInterval(data: { runs: AutomationRun[] } | undefined) {
+  return data?.runs.some((run) =>
+    ["evaluating", "queued", "provisioning"].includes(run.status)
+  )
+    ? 5000
+    : false
+}
+
 export function AutomationManagement({
   projectId,
   resources,
   credentials,
   canMutate,
+  dependenciesReady = true,
 }: {
   projectId: string
   resources: Resource[]
   credentials: ManagedCredential[]
   canMutate: boolean
+  dependenciesReady?: boolean
 }) {
   const templates = useMemo(
     () =>
-      resources.filter(
-        (resource) =>
-          resource.kind === "runtime" &&
-          resource.projectId === projectId &&
-          resource.enabled
-      ),
+      resources
+        .filter((resource) => resource.kind === "runtime")
+        .filter(
+          (resource) => resource.projectId === projectId && resource.enabled
+        ),
     [projectId, resources]
   )
-  const [automations, setAutomations] = useState<Automation[]>([])
-  const [runs, setRuns] = useState<AutomationRun[]>([])
-  const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState("")
   const [search, setSearch] = useState("")
   const [editing, setEditing] = useState<Automation | "new" | null>(null)
   const [secret, setSecret] = useState("")
@@ -162,45 +165,51 @@ export function AutomationManagement({
   const [deleting, setDeleting] = useState<Automation | null>(null)
   const [testing, setTesting] = useState<Automation | null>(null)
 
-  const loadData = useCallback(async () => {
-    try {
+  const fetchData = useCallback(
+    async (signal: AbortSignal) => {
       const [automationBody, runBody] = await Promise.all([
         requestJson<unknown>(
-          `/api/automations?projectId=${encodeURIComponent(projectId)}`
+          `/api/automations?projectId=${encodeURIComponent(projectId)}`,
+          { signal }
         ),
         requestJson<unknown>(
-          `/api/automation-runs?projectId=${encodeURIComponent(projectId)}&limit=50`
+          `/api/automation-runs?projectId=${encodeURIComponent(projectId)}&limit=50`,
+          { signal }
         ),
       ])
-      setAutomations(
-        automationsResponseSchema.parse(automationBody).automations
-      )
-      setRuns(automationRunsResponseSchema.parse(runBody).runs)
-      setLoadError("")
-    } catch (error) {
-      setLoadError(errorMessage(error))
-    } finally {
-      setLoading(false)
-    }
-  }, [projectId])
-
-  useEffect(() => {
-    const initial = window.setTimeout(() => void loadData(), 0)
-    return () => window.clearTimeout(initial)
-  }, [loadData])
-
-  const hasActiveRuns = runs.some(
-    (run) =>
-      run.status === "evaluating" ||
-      run.status === "queued" ||
-      run.status === "provisioning"
+      return {
+        automations:
+          automationsResponseSchema.parse(automationBody).automations,
+        runs: automationRunsResponseSchema.parse(runBody).runs,
+      }
+    },
+    [projectId]
   )
 
-  useEffect(() => {
-    if (!hasActiveRuns) return
-    const timer = window.setInterval(() => void loadData(), 5000)
-    return () => window.clearInterval(timer)
-  }, [hasActiveRuns, loadData])
+  const dataPolling = usePolling({
+    queryKey: `automations:${projectId}`,
+    load: fetchData,
+    interval: activeRunsInterval,
+  })
+  const automations = dataPolling.data?.automations ?? noAutomations
+  const runs = dataPolling.data?.runs ?? noRuns
+  const loading = dataPolling.data === undefined && !dataPolling.error
+  const loadError = dataPolling.error ? errorMessage(dataPolling.error) : ""
+  function setAutomations(update: (current: Automation[]) => Automation[]) {
+    dataPolling.setData((current) => ({
+      automations: update(current?.automations ?? []),
+      runs: current?.runs ?? [],
+    }))
+  }
+  function setRuns(update: (current: AutomationRun[]) => AutomationRun[]) {
+    dataPolling.setData((current) => ({
+      automations: current?.automations ?? [],
+      runs: update(current?.runs ?? []),
+    }))
+  }
+  const loadData = async () => {
+    await dataPolling.refresh()
+  }
 
   const visibleAutomations = useMemo(() => {
     const normalized = search.trim().toLowerCase()
@@ -348,6 +357,7 @@ export function AutomationManagement({
             projectId={projectId}
             templates={templates}
             credentials={credentials}
+            dependenciesReady={dependenciesReady}
             automation={editing === "new" ? null : editing}
             secret={secret}
             secretLoading={secretLoading}
@@ -385,14 +395,22 @@ export function AutomationManagement({
           />
         ) : loading ? (
           <AutomationSkeleton />
-        ) : loadError ? (
-          <Alert variant="destructive">
-            <XCircleIcon />
-            <AlertTitle>自动化加载失败</AlertTitle>
-            <AlertDescription>{loadError}</AlertDescription>
-          </Alert>
+        ) : loadError && automations.length === 0 ? (
+          <LoadState
+            label="自动化"
+            error={new Error(loadError)}
+            onRetry={loadData}
+          />
         ) : (
           <>
+            {loadError && (
+              <LoadState
+                label="自动化"
+                error={new Error(loadError)}
+                stale
+                onRetry={loadData}
+              />
+            )}
             <CollectionToolbar>
               <CollectionSearch
                 value={search}
@@ -587,9 +605,10 @@ function AutomationEditor({
   onLoadSecret,
   onTest,
   onDelete,
+  dependenciesReady,
 }: {
   projectId: string
-  templates: Resource[]
+  templates: ResourceOfKind<"runtime">[]
   credentials: ManagedCredential[]
   automation: Automation | null
   secret: string
@@ -600,6 +619,7 @@ function AutomationEditor({
   onLoadSecret: (automation: Automation) => void
   onTest: (automation: Automation) => void
   onDelete: (automation: Automation) => void
+  dependenciesReady: boolean
 }) {
   const [input, setInput] = useState<AutomationInput>(() => {
     if (automation) {
@@ -644,6 +664,10 @@ function AutomationEditor({
     : ""
 
   async function save() {
+    if (!dependenciesReady) {
+      setFormError("模板或凭据尚未加载成功，请重试后保存；当前草稿会保留。")
+      return
+    }
     const parsed = automationInputSchema.safeParse(input)
     if (!parsed.success) {
       setFormError(parsed.error.issues[0]?.message ?? "请检查自动化配置")
@@ -738,7 +762,10 @@ function AutomationEditor({
               </Button>
             </>
           )}
-          <Button disabled={saving} onClick={() => void save()}>
+          <Button
+            disabled={saving || !dependenciesReady}
+            onClick={() => void save()}
+          >
             {saving && (
               <LoaderCircleIcon
                 className="animate-spin"
@@ -1194,66 +1221,45 @@ function CopyField({
 }
 
 export function AutomationRunHistory({ projectId }: { projectId: string }) {
-  const [runs, setRuns] = useState<AutomationRun[]>([])
-  const [loading, setLoading] = useState(true)
-  const [loadError, setLoadError] = useState("")
   const [search, setSearch] = useState("")
   const [statusFilter, setStatusFilter] = useState<AutomationRunStatus | "all">(
     "all"
   )
   const [cursorStack, setCursorStack] = useState([""])
-  const [nextCursor, setNextCursor] = useState("")
-  const [hasMore, setHasMore] = useState(false)
-  const runListRequestId = useRef(0)
   const pageSize = 20
   const currentCursor = cursorStack[cursorStack.length - 1]
   const page = cursorStack.length
 
-  const loadRuns = useCallback(async () => {
-    const requestId = runListRequestId.current + 1
-    runListRequestId.current = requestId
-    try {
-      const params = new URLSearchParams({
-        projectId,
-        limit: String(pageSize),
-      })
+  const fetchRuns = useCallback(
+    async (signal: AbortSignal) => {
+      const params = new URLSearchParams({ projectId, limit: String(pageSize) })
       if (statusFilter !== "all") params.set("status", statusFilter)
       if (search.trim()) params.set("search", search.trim())
       if (currentCursor) params.set("cursor", currentCursor)
-      const body = await requestJson<unknown>(
-        `/api/automation-runs?${params.toString()}`
+      return automationRunsResponseSchema.parse(
+        await requestJson<unknown>(
+          `/api/automation-runs?${params.toString()}`,
+          { signal }
+        )
       )
-      const response = automationRunsResponseSchema.parse(body)
-      if (runListRequestId.current !== requestId) return
-      setRuns(response.items)
-      setNextCursor(response.nextCursor)
-      setHasMore(response.hasMore)
-      setLoadError("")
-    } catch (error) {
-      if (runListRequestId.current !== requestId) return
-      setLoadError(errorMessage(error))
-    } finally {
-      if (runListRequestId.current === requestId) setLoading(false)
-    }
-  }, [currentCursor, projectId, search, statusFilter])
-
-  useEffect(() => {
-    const initial = window.setTimeout(
-      () => void loadRuns(),
-      search.trim() ? 250 : 0
-    )
-    return () => window.clearTimeout(initial)
-  }, [loadRuns, search])
-
-  const hasActiveRuns = runs.some((run) =>
-    ["evaluating", "queued", "provisioning"].includes(run.status)
+    },
+    [currentCursor, projectId, search, statusFilter]
   )
 
-  useEffect(() => {
-    if (!hasActiveRuns) return
-    const timer = window.setInterval(() => void loadRuns(), 5000)
-    return () => window.clearInterval(timer)
-  }, [hasActiveRuns, loadRuns])
+  const runsPolling = usePolling({
+    queryKey: `runs:${projectId}:${currentCursor}:${statusFilter}:${search}`,
+    load: fetchRuns,
+    interval: activeRunsInterval,
+    initialDelay: search.trim() ? 250 : 0,
+  })
+  const runs = runsPolling.data?.items ?? []
+  const nextCursor = runsPolling.data?.nextCursor ?? ""
+  const hasMore = runsPolling.data?.hasMore ?? false
+  const loading = runsPolling.data === undefined && !runsPolling.error
+  const loadError = runsPolling.error ? errorMessage(runsPolling.error) : ""
+  const loadRuns = async () => {
+    await runsPolling.refresh()
+  }
 
   const runPagination = (
     <CollectionCursorPagination
@@ -1262,15 +1268,11 @@ export function AutomationRunHistory({ projectId }: { projectId: string }) {
       hasPrevious={cursorStack.length > 1}
       hasNext={hasMore && nextCursor !== ""}
       onPrevious={() => {
-        runListRequestId.current += 1
         setCursorStack((current) => current.slice(0, -1))
-        setLoading(true)
       }}
       onNext={() => {
         if (!nextCursor) return
-        runListRequestId.current += 1
         setCursorStack((current) => [...current, nextCursor])
-        setLoading(true)
       }}
     />
   )
@@ -1295,24 +1297,16 @@ export function AutomationRunHistory({ projectId }: { projectId: string }) {
             value={search}
             placeholder="搜索自动化、模板或沙箱"
             onChange={(event) => {
-              runListRequestId.current += 1
               setSearch(event.target.value)
               setCursorStack([""])
-              setNextCursor("")
-              setHasMore(false)
-              setLoading(true)
             }}
           />
           <div className="flex items-center gap-2">
             <Select
               value={statusFilter}
               onValueChange={(value) => {
-                runListRequestId.current += 1
                 setStatusFilter(value as AutomationRunStatus | "all")
                 setCursorStack([""])
-                setNextCursor("")
-                setHasMore(false)
-                setLoading(true)
               }}
             >
               <SelectTrigger className="w-full sm:w-40" aria-label="按状态筛选">
@@ -1340,14 +1334,22 @@ export function AutomationRunHistory({ projectId }: { projectId: string }) {
           </div>
         </CollectionToolbar>
 
+        {loadError && runs.length > 0 && (
+          <LoadState
+            label="运行记录"
+            error={new Error(loadError)}
+            stale
+            onRetry={loadRuns}
+          />
+        )}
         {loading ? (
           <AutomationRunsSkeleton />
-        ) : loadError ? (
-          <Alert variant="destructive">
-            <XCircleIcon />
-            <AlertTitle>运行记录加载失败</AlertTitle>
-            <AlertDescription>{loadError}</AlertDescription>
-          </Alert>
+        ) : loadError && runs.length === 0 ? (
+          <LoadState
+            label="运行记录"
+            error={new Error(loadError)}
+            onRetry={loadRuns}
+          />
         ) : runs.length === 0 ? (
           <>
             <Empty className="min-h-72 flex-1 border-0">
@@ -1726,7 +1728,7 @@ function AutomationSkeleton() {
 
 function defaultAutomationInput(
   projectId: string,
-  template: Resource | undefined,
+  template: ResourceOfKind<"runtime"> | undefined,
   credentials: ManagedCredential[]
 ): AutomationInput {
   return {

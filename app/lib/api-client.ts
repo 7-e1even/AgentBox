@@ -32,7 +32,7 @@ export async function requestJson<T>(
   })
   if (response.status === 401) {
     window.location.assign("/login")
-    throw new Error("登录状态已过期")
+    throw new ApiError("登录状态已过期", { status: 401, code: "unauthorized" })
   }
   if (!response.ok) {
     const body = await response.json().catch(() => null)

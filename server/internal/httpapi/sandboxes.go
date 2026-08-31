@@ -35,9 +35,6 @@ func (s *Server) operateSandbox(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	entry.ResourceName = resource.Name
-	entry.Message = fmt.Sprintf("沙箱 %s 执行操作 %s", resource.Name, action)
-	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusAccepted, map[string]any{"resource": resource})
 }
 
@@ -65,13 +62,6 @@ func (s *Server) updateSandboxNetworkProxy(w http.ResponseWriter, request *http.
 		s.handleError(w, err)
 		return
 	}
-	entry.ResourceName = resource.Name
-	if input.ProxyID == "" {
-		entry.Message = fmt.Sprintf("沙箱 %s 切换为直连", resource.Name)
-	} else {
-		entry.Message = fmt.Sprintf("沙箱 %s 切换网络代理", resource.Name)
-	}
-	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusAccepted, map[string]any{"resource": resource})
 }
 
@@ -100,9 +90,5 @@ func (s *Server) operateSandboxAgentTools(w http.ResponseWriter, request *http.R
 		s.handleError(w, err)
 		return
 	}
-	entry.ResourceName = resource.Name
-	entry.Message = fmt.Sprintf("沙箱 %s 执行 Agent 工具操作 %s", resource.Name, action)
-	entry.Detail = map[string]any{"tools": input.Tools}
-	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusAccepted, map[string]any{"resource": resource})
 }

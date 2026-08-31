@@ -1,4 +1,4 @@
-package httpapi
+package workerscript
 
 import (
 	"os"
@@ -402,7 +402,7 @@ func TestWorkerClaimsJobsEverySecond(t *testing.T) {
 		t.Fatal("Worker run loop was not found")
 	}
 	body := workerDaemon[start:]
-	if !strings.Contains(body, "    sleep 1\n") {
+	if !strings.Contains(body, "    else\n      sleep 1\n") {
 		t.Fatal("Worker must claim queued Agent updates within one second")
 	}
 	if strings.Contains(body, "    sleep 5\n") {
@@ -551,7 +551,7 @@ func TestWorkerReportsProvisioningStagesWithoutBlockingJobs(t *testing.T) {
 	for _, expected := range []string{
 		`report_job_progress()`,
 		`/jobs/$JOB_ID/progress`,
-		`--data "$BODY" >/dev/null 2>&1 || true`,
+		`--data "$BODY" >/dev/null || true`,
 		`report_job_progress runtime-check "正在检查 $DRIVER 运行时"`,
 		`report_job_progress runtime-create "正在创建 Docker 沙箱实例"`,
 		`report_job_progress configuration "正在写入沙箱配置"`,

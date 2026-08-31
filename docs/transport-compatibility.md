@@ -2,6 +2,20 @@
 
 AgentBox 的浏览器、Worker 和沙箱共用一个公开入口。生产环境应只代理 `app` 的 3000 端口，由 Next.js 将 `/api/*` 转发到内部 Server；不要把 PostgreSQL 或 Server 的 8091 端口直接暴露到公网。
 
+## Session 单实例边界
+
+目前 Server 必须保持 **1 个副本**。Worker WebSocket、浏览器 WebSocket 和 30 秒单次会话票据都保存在同一 Server 进程内；PostgreSQL 不共享这些连接或票据。仅对浏览器配置粘性路由不足以解决 Worker 被路由到另一副本的问题。
+
+`/api/sandboxes/*/session-ticket`、`/desktop-ticket`、浏览器 `/session`、`/desktop` 和 Worker `/api/servers/*/sessions/connect` 必须由同一 Server 处理。当前不支持多副本或重叠滚动发布；升级时先停止旧 Server，再启动新 Server。重启会中断现有终端/桌面，Worker 会重连，浏览器必须重新申请票据。
+
+启动日志及 `/healthz` 的 `sessionTopology: "single-instance"` 声明这一部署约束，不代表系统会自动检测或阻止错误的多副本部署。
+
+## Worker 协议
+
+Worker 协议版本独立于发布版本。当前为 v1，覆盖现有任务和会话消息，包括第一批的 `leaseGeneration`。Worker 在任务认领、进度、完成及会话升级请求中发送 `X-AgentBox-Worker-Protocol-Min/Max`；Server 用 `X-AgentBox-Worker-Protocol` 返回双方支持的最高版本。
+
+相邻旧版本没有这些头，按既有 v1 消息兼容；这不会放宽租约代次校验。明确不兼容的请求返回 426 `worker_protocol_incompatible`，不会认领任务或建立会话。Worker 不处理超出其支持范围的成功响应，需安装与 Server 配套的 Worker。此兼容承诺不覆盖早于现有 v1 消息格式的历史版本。
+
 ## 传输矩阵
 
 | 链路 | 入口 | 传输 | 代理要求 |

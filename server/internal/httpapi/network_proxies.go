@@ -37,12 +37,6 @@ func (s *Server) createNetworkProxy(w http.ResponseWriter, request *http.Request
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryProxy, Action: "create",
-		Message:      "创建网络代理 " + proxy.Name,
-		ResourceKind: "proxy", ResourceID: proxy.ID, ResourceName: proxy.Name,
-		Detail: map[string]any{"scheme": proxy.Scheme, "host": proxy.Host},
-	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{"proxy": proxy})
 }
 
@@ -62,12 +56,6 @@ func (s *Server) updateNetworkProxy(w http.ResponseWriter, request *http.Request
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryProxy, Action: "update",
-		Message:      "更新网络代理 " + proxy.Name,
-		ResourceKind: "proxy", ResourceID: proxy.ID, ResourceName: proxy.Name,
-		Detail: map[string]any{"scheme": proxy.Scheme, "host": proxy.Host, "enabled": proxy.Enabled},
-	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"proxy": proxy})
 }
 
@@ -91,12 +79,6 @@ func (s *Server) checkNetworkProxy(w http.ResponseWriter, request *http.Request)
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryProxy, Action: "check",
-		Message:      "已请求 Worker 检测网络代理",
-		ResourceKind: "proxy", ResourceID: proxyID,
-		Detail: map[string]any{"serverId": result.ServerID, "checkId": result.ID},
-	})
 	s.writeJSON(w, http.StatusAccepted, map[string]any{"result": result})
 }
 
@@ -122,10 +104,5 @@ func (s *Server) deleteNetworkProxy(w http.ResponseWriter, request *http.Request
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryProxy, Action: "delete",
-		Message:      "删除网络代理 " + request.PathValue("id"),
-		ResourceKind: "proxy", ResourceID: request.PathValue("id"),
-	})
 	w.WriteHeader(http.StatusNoContent)
 }

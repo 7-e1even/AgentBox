@@ -23,6 +23,8 @@ services:
         max-file: "3"
 
   server:
+    # Session tickets and Worker/browser WebSockets are process-local.
+    # Keep exactly one Server replica; overlapping rolling updates are unsupported.
     image: ghcr.io/7-e1even/agentbox-server:${AGENTBOX_VERSION:-latest}
     build:
       context: ./server

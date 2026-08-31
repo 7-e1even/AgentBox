@@ -1,12 +1,13 @@
 "use client"
 
 import { Fragment, useCallback, useEffect, useState } from "react"
+import { usePolling } from "@/hooks/use-polling"
+import { LoadState } from "@/components/load-state"
 import {
   ChevronDownIcon,
   ChevronRightIcon,
   RefreshCwIcon,
   ScrollTextIcon,
-  XCircleIcon,
 } from "lucide-react"
 
 import { CollectionHeader } from "@/components/control-plane-view"
@@ -17,7 +18,6 @@ import {
   CollectionTable,
   CollectionToolbar,
 } from "@/components/collection-list"
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -141,8 +141,6 @@ function normalizeLogsResponse(body: unknown) {
 }
 
 export function LogsView() {
-  const [entries, setEntries] = useState<LogEntry[]>([])
-  const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [category, setCategory] = useState("all")
   const [level, setLevel] = useState("all")
@@ -150,9 +148,6 @@ export function LogsView() {
   const [search, setSearch] = useState("")
   const [query, setQuery] = useState("")
   const [autoRefresh, setAutoRefresh] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
-  const [loadError, setLoadError] = useState("")
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
   // 关键字输入防抖 300ms，回车立即生效。
@@ -164,46 +159,35 @@ export function LogsView() {
     return () => window.clearTimeout(timer)
   }, [search])
 
-  const loadLogs = useCallback(
-    async (background = false) => {
-      if (background) {
-        setRefreshing(true)
-      } else {
-        setLoading(true)
-      }
-      try {
-        const params = new URLSearchParams()
-        if (category !== "all") params.set("category", category)
-        if (level !== "all") params.set("level", level)
-        if (status !== "all") params.set("status", status)
-        if (query) params.set("q", query)
-        params.set("page", String(page))
-        params.set("pageSize", String(PAGE_SIZE))
-        const body = await requestJson<unknown>(`/api/logs?${params}`)
-        const result = normalizeLogsResponse(body)
-        setEntries(result.entries)
-        setTotal(result.total)
-        setLoadError("")
-      } catch (error) {
-        setLoadError(errorMessage(error))
-      } finally {
-        setLoading(false)
-        setRefreshing(false)
-      }
+  const fetchLogs = useCallback(
+    async (signal: AbortSignal) => {
+      const params = new URLSearchParams()
+      if (category !== "all") params.set("category", category)
+      if (level !== "all") params.set("level", level)
+      if (status !== "all") params.set("status", status)
+      if (query) params.set("q", query)
+      params.set("page", String(page))
+      params.set("pageSize", String(PAGE_SIZE))
+      const body = await requestJson<unknown>(`/api/logs?${params}`, { signal })
+      const result = normalizeLogsResponse(body)
+      return result
     },
     [category, level, status, query, page]
   )
 
-  useEffect(() => {
-    const initial = window.setTimeout(() => void loadLogs(), 0)
-    return () => window.clearTimeout(initial)
-  }, [loadLogs])
-
-  useEffect(() => {
-    if (!autoRefresh) return
-    const timer = window.setInterval(() => void loadLogs(true), 5000)
-    return () => window.clearInterval(timer)
-  }, [autoRefresh, loadLogs])
+  const logsPolling = usePolling({
+    queryKey: `logs:${category}:${level}:${status}:${query}:${page}`,
+    load: fetchLogs,
+    interval: autoRefresh ? 5000 : false,
+  })
+  const entries = logsPolling.data?.entries ?? []
+  const total = logsPolling.data?.total ?? 0
+  const loadError = logsPolling.error ? errorMessage(logsPolling.error) : ""
+  const loading = logsPolling.data === undefined && !logsPolling.error
+  const refreshing = logsPolling.loading
+  const loadLogs = async () => {
+    await logsPolling.refresh()
+  }
 
   const hasFilters =
     category !== "all" || level !== "all" || status !== "all" || query !== ""
@@ -230,7 +214,7 @@ export function LogsView() {
               variant="outline"
               size="sm"
               disabled={loading || refreshing}
-              onClick={() => void loadLogs(true)}
+              onClick={() => void loadLogs()}
             >
               <RefreshCwIcon
                 data-icon="inline-start"
@@ -311,11 +295,13 @@ export function LogsView() {
         </CollectionToolbar>
 
         {loadError && !loading && (
-          <Alert variant="destructive">
-            <XCircleIcon />
-            <AlertTitle>日志加载失败</AlertTitle>
-            <AlertDescription>{loadError}</AlertDescription>
-          </Alert>
+          <LoadState
+            label="日志"
+            error={new Error(loadError)}
+            stale={logsPolling.data !== undefined}
+            loading={refreshing}
+            onRetry={loadLogs}
+          />
         )}
 
         {loading ? (
@@ -372,9 +358,7 @@ export function LogsView() {
                     <TableRow
                       className="cursor-pointer"
                       aria-expanded={expanded}
-                      onClick={() =>
-                        setExpandedId(expanded ? null : entry.id)
-                      }
+                      onClick={() => setExpandedId(expanded ? null : entry.id)}
                     >
                       <TableCell className="pl-4 text-muted-foreground">
                         {expanded ? (
@@ -437,9 +421,7 @@ export function LogsView() {
                                   ? `${entry.durationMs} ms`
                                   : "—"}
                               </span>
-                              <span>
-                                来源地址：{entry.remoteAddr || "—"}
-                              </span>
+                              <span>来源地址：{entry.remoteAddr || "—"}</span>
                               {(entry.resourceName || entry.resourceKind) && (
                                 <span>
                                   资源：

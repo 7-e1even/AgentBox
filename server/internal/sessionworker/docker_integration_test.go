@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"agentbox/internal/workerprotocol"
 	"github.com/coder/websocket"
 	"github.com/coder/websocket/wsjson"
 	"github.com/google/uuid"
@@ -138,6 +139,12 @@ func connectDockerSessionWorker(t *testing.T, ctx context.Context) (*websocket.C
 			http.Error(response, "invalid user agent", http.StatusBadRequest)
 			return
 		}
+		if request.Header.Get(workerprotocol.HeaderMinimum) != "1" || request.Header.Get(workerprotocol.HeaderMaximum) != "1" {
+			connectionErrors <- fmt.Errorf("Worker did not offer the expected protocol range")
+			http.Error(response, "invalid protocol range", http.StatusBadRequest)
+			return
+		}
+		response.Header().Set(workerprotocol.HeaderSelected, "1")
 		connection, err := websocket.Accept(response, request, nil)
 		if err != nil {
 			connectionErrors <- fmt.Errorf("accept Worker WebSocket: %w", err)

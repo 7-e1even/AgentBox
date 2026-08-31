@@ -103,6 +103,9 @@ func (s *Store) GetAutomationSecret(ctx context.Context, id string) (platform.Au
 }
 
 func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationInput, userID string) (platform.Automation, string, error) {
+	if platform.AuditActorFromContext(ctx).Type == "" {
+		ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: userID})
+	}
 	platform.NormalizeAutomationInput(&input)
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, "", err
@@ -150,6 +153,13 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	if err != nil {
 		return platform.Automation{}, "", mapResourceError(err)
 	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "create", ActorID: userID,
+		ResourceKind: "automation", ResourceID: automation.ID, ResourceName: automation.Name,
+		Detail: map[string]any{"projectId": automation.ProjectID, "templateId": automation.TemplateID},
+	}); err != nil {
+		return platform.Automation{}, "", err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.Automation{}, "", mapResourceError(err)
 	}
@@ -157,6 +167,9 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 }
 
 func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.AutomationInput, userID string) (platform.Automation, error) {
+	if platform.AuditActorFromContext(ctx).Type == "" {
+		ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: userID})
+	}
 	platform.NormalizeAutomationInput(&input)
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, err
@@ -191,6 +204,13 @@ func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.
 	if err != nil {
 		return platform.Automation{}, mapResourceError(err)
 	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "update", ActorID: userID,
+		ResourceKind: "automation", ResourceID: automation.ID, ResourceName: automation.Name,
+		Detail: map[string]any{"projectId": automation.ProjectID, "templateId": automation.TemplateID, "enabled": automation.Enabled},
+	}); err != nil {
+		return platform.Automation{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.Automation{}, mapResourceError(err)
 	}
@@ -213,6 +233,11 @@ func (s *Store) DeleteAutomation(ctx context.Context, id string) error {
 	if command.RowsAffected() == 0 {
 		return ErrResourceNotFound
 	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "delete", ResourceKind: "automation", ResourceID: id,
+	}); err != nil {
+		return err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit delete automation: %w", err)
 	}
@@ -220,6 +245,9 @@ func (s *Store) DeleteAutomation(ctx context.Context, id string) error {
 }
 
 func (s *Store) RotateAutomationSecret(ctx context.Context, id, userID string) (platform.Automation, string, error) {
+	if platform.AuditActorFromContext(ctx).Type == "" {
+		ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: userID})
+	}
 	secret, err := newWebhookSecret()
 	if err != nil {
 		return platform.Automation{}, "", err
@@ -228,8 +256,16 @@ func (s *Store) RotateAutomationSecret(ctx context.Context, id, userID string) (
 	if err != nil {
 		return platform.Automation{}, "", err
 	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.Automation{}, "", fmt.Errorf("begin rotate automation secret: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockControlPlaneMutation(ctx, tx); err != nil {
+		return platform.Automation{}, "", err
+	}
 	now := time.Now().UTC()
-	automation, err := scanAutomation(s.pool.QueryRow(ctx, `UPDATE automations SET
+	automation, err := scanAutomation(tx.QueryRow(ctx, `UPDATE automations SET
     secret_hash = $1, secret_ciphertext = $2, secret_nonce = $3, secret_last_four = $4,
     updated_by = $5, secret_rotated_at = $6, updated_at = $6
 	    WHERE id = $7 AND action_type = 'create-sandbox' RETURNING `+automationColumns,
@@ -240,6 +276,15 @@ func (s *Store) RotateAutomationSecret(ctx context.Context, id, userID string) (
 	}
 	if err != nil {
 		return platform.Automation{}, "", fmt.Errorf("rotate automation secret: %w", err)
+	}
+	if err := s.appendAuditEvent(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: "rotate-secret", ActorID: userID,
+		ResourceKind: "automation", ResourceID: automation.ID, ResourceName: automation.Name,
+	}); err != nil {
+		return platform.Automation{}, "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.Automation{}, "", fmt.Errorf("commit rotate automation secret: %w", err)
 	}
 	return automation, secret, nil
 }
@@ -287,6 +332,9 @@ func (s *Store) triggerAutomation(
 		if err := s.verifyAutomationDelivery(stored, delivery); err != nil {
 			return platform.AutomationTriggerResult{}, err
 		}
+		ctx = platform.WithAuditActor(ctx, platform.AuditActor{
+			Type: "webhook", ID: stored.Automation.ID, Name: stored.Automation.Name,
+		})
 	}
 	if !stored.Automation.Enabled {
 		return platform.AutomationTriggerResult{}, ErrAutomationDisabled
@@ -367,8 +415,8 @@ func (s *Store) triggerAutomation(
 	}
 
 	resource, err := scanResource(tx.QueryRow(ctx, `INSERT INTO control_resources
-    (id, kind, project_id, name, description, enabled, spec, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8)
+    (id, kind, project_id, name, description, enabled, spec, created_at, updated_at, observed_generation)
+    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8, 0)
     RETURNING `+resourceColumns, sandboxInput.ID, sandboxInput.Kind, sandboxInput.ProjectID,
 		sandboxInput.Name, sandboxInput.Description, sandboxInput.Enabled, mustMapJSON(sandboxInput.Spec), receivedAt,
 	))
@@ -388,6 +436,10 @@ func (s *Store) triggerAutomation(
 		return platform.AutomationTriggerResult{}, fmt.Errorf("queue automation run: %w", err)
 	}
 	if err := updateAutomationLastTriggered(ctx, tx, stored.Automation.ID, receivedAt); err != nil {
+		return platform.AutomationTriggerResult{}, err
+	}
+	if err := s.appendAuditEvent(ctx, tx, automationRunAuditEntry(stored.Automation.ID, run,
+		platform.AutomationRunQueued, "", jobID)); err != nil {
 		return platform.AutomationTriggerResult{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -569,6 +621,9 @@ func (s *Store) finishAutomationRun(
 	if err := updateAutomationLastTriggered(ctx, tx, automationID, triggeredAt); err != nil {
 		return platform.AutomationTriggerResult{}, err
 	}
+	if err := s.appendAuditEvent(ctx, tx, automationRunAuditEntry(automationID, run, status, code, "")); err != nil {
+		return platform.AutomationTriggerResult{}, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return platform.AutomationTriggerResult{}, fmt.Errorf("commit finished automation run: %w", err)
 	}
@@ -577,6 +632,24 @@ func (s *Store) finishAutomationRun(
 	run.ErrorMessage = message
 	run.FinishedAt = &finishedAt
 	return s.automationTriggerResult(run, false), nil
+}
+
+func automationRunAuditEntry(automationID string, run platform.AutomationRun, status platform.AutomationRunStatus, code, jobID string) platform.LogEntry {
+	action := "webhook"
+	if run.TriggerSource == "manual-test" {
+		action = "test"
+	}
+	entry := platform.LogEntry{
+		Category: platform.LogCategoryAutomation, Action: action,
+		ResourceKind: "automation", ResourceID: automationID, ResourceName: run.AutomationName,
+		Detail: map[string]any{"runId": run.ID, "status": string(status), "triggerSource": run.TriggerSource,
+			"projectId": run.ProjectID, "templateId": run.TemplateID, "errorCode": code, "jobId": jobID},
+	}
+	if status == platform.AutomationRunFailed {
+		entry.Status = platform.LogStatusFailed
+		entry.Level = platform.LogLevelWarn
+	}
+	return entry
 }
 
 func updateAutomationLastTriggered(ctx context.Context, tx pgx.Tx, automationID string, triggeredAt time.Time) error {
@@ -653,18 +726,16 @@ func enqueueAutomationSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platfor
 	if err != nil {
 		return "", nil, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE control_resources
-		SET spec = spec || jsonb_build_object('driver', $1::text, 'imageReference', $2::text)
-		WHERE id = $3 AND kind = 'sandbox'`, driver, imageReference, sandbox.ID); err != nil {
-		return "", nil, fmt.Errorf("persist sandbox runtime snapshot: %w", err)
+	if err := persistSandboxCreationSpec(ctx, tx, sandbox, payload, driver, imageReference); err != nil {
+		return "", nil, err
 	}
 	payload["driver"] = driver
 	now := time.Now().UTC()
 	jobID := uuid.NewString()
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-		(id, server_id, resource_id, action, status, payload, automation_run_id, created_at, updated_at)
-		VALUES ($1, $2, $3, 'create-sandbox', 'pending', $4::jsonb, $5, $6, $6)`,
-		jobID, sandbox.Spec["serverId"], sandbox.ID, mustMapJSON(payload), runID, now); err != nil {
+		(id, server_id, resource_id, action, status, payload, automation_run_id, created_at, updated_at, resource_generation)
+		VALUES ($1, $2, $3, 'create-sandbox', 'pending', $4::jsonb, $5, $6, $6, $7)`,
+		jobID, sandbox.Spec["serverId"], sandbox.ID, mustMapJSON(payload), runID, now, sandbox.Generation); err != nil {
 		return "", nil, fmt.Errorf("enqueue automated sandbox creation: %w", err)
 	}
 	return jobID, payload, nil

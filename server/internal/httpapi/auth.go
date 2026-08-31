@@ -51,13 +51,6 @@ func (s *Server) setupAdmin(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryAuth, Action: "setup-admin",
-		Message:      "初始化管理员账号 " + user.Username,
-		ActorID:      user.ID,
-		ActorName:    user.Name,
-		ResourceKind: "user", ResourceID: user.ID, ResourceName: user.Name,
-	})
 	s.setSessionCookie(w, request, token, expiresAt)
 	s.writeJSON(w, http.StatusCreated, map[string]any{"user": user})
 }
@@ -104,12 +97,6 @@ func (s *Server) login(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryAuth, Action: "login",
-		Message:   "用户登录成功：" + user.Username,
-		ActorID:   user.ID,
-		ActorName: user.Name,
-	})
 	s.setSessionCookie(w, request, token, expiresAt)
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
@@ -145,7 +132,6 @@ func (s *Server) updateCurrentUser(w http.ResponseWriter, request *http.Request)
 				s.handleError(w, err)
 				return
 			}
-			s.recordLog(request, entry)
 			s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 			return
 		}
@@ -159,7 +145,6 @@ func (s *Server) updateCurrentUser(w http.ResponseWriter, request *http.Request)
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -195,10 +180,6 @@ func (s *Server) logout(w http.ResponseWriter, request *http.Request) {
 			return
 		}
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryAuth, Action: "logout",
-		Message: "用户登出：" + userFromContext(request.Context()).Username,
-	})
 	s.clearSessionCookie(w, request)
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -227,12 +208,6 @@ func (s *Server) createUser(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryUser, Action: "create",
-		Message:      "创建用户 " + user.Username,
-		ResourceKind: "user", ResourceID: user.ID, ResourceName: user.Name,
-		Detail: map[string]any{"role": string(user.Role)},
-	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{"user": user})
 }
 
@@ -257,12 +232,6 @@ func (s *Server) updateUser(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryUser, Action: "update",
-		Message:      "更新用户 " + user.Username,
-		ResourceKind: "user", ResourceID: user.ID, ResourceName: user.Name,
-		Detail: map[string]any{"role": string(user.Role), "status": string(user.Status)},
-	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -282,11 +251,6 @@ func (s *Server) deleteUser(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryUser, Action: "delete",
-		Message:      "删除用户 " + request.PathValue("id"),
-		ResourceKind: "user", ResourceID: request.PathValue("id"),
-	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -298,7 +262,7 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 				s.handleError(w, err)
 				return
 			}
-			next.ServeHTTP(w, request.WithContext(context.WithValue(request.Context(), userContextKey{}, user)))
+			next.ServeHTTP(w, request.WithContext(withUserAuditContext(request.Context(), user)))
 			return
 		}
 		tokenHash, ok := sessionHash(request)
@@ -316,8 +280,13 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 			s.handleError(w, err)
 			return
 		}
-		next.ServeHTTP(w, request.WithContext(context.WithValue(request.Context(), userContextKey{}, user)))
+		next.ServeHTTP(w, request.WithContext(withUserAuditContext(request.Context(), user)))
 	})
+}
+
+func withUserAuditContext(ctx context.Context, user platform.User) context.Context {
+	ctx = context.WithValue(ctx, userContextKey{}, user)
+	return platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: user.ID, Name: user.Name})
 }
 
 func (s *Server) debugUser(ctx context.Context) (platform.User, error) {

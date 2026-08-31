@@ -48,13 +48,16 @@ type Input struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
 	Enabled     bool           `json:"enabled"`
+	SpecVersion int            `json:"specVersion"`
 	Spec        map[string]any `json:"spec"`
 }
 
 type Resource struct {
 	Input
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Generation         int64     `json:"generation"`
+	ObservedGeneration int64     `json:"observedGeneration"`
+	CreatedAt          time.Time `json:"createdAt"`
+	UpdatedAt          time.Time `json:"updatedAt"`
 }
 
 type Snapshot struct {
@@ -214,13 +217,14 @@ type RuntimeLLMTarget struct {
 }
 
 type WorkerJob struct {
-	ID              string         `json:"id"`
-	ResourceID      string         `json:"resourceId"`
-	Action          string         `json:"action"`
-	Payload         map[string]any `json:"payload"`
-	LeaseGeneration int            `json:"leaseGeneration"`
-	LeaseExpiresAt  time.Time      `json:"leaseExpiresAt"`
-	MaxAttempts     int            `json:"maxAttempts"`
+	ID                 string         `json:"id"`
+	ResourceID         string         `json:"resourceId"`
+	ResourceGeneration int64          `json:"resourceGeneration"`
+	Action             string         `json:"action"`
+	Payload            map[string]any `json:"payload"`
+	LeaseGeneration    int            `json:"leaseGeneration"`
+	LeaseExpiresAt     time.Time      `json:"leaseExpiresAt"`
+	MaxAttempts        int            `json:"maxAttempts"`
 }
 
 type WorkerJobResult struct {
@@ -304,6 +308,9 @@ type ValidationError struct{ Message string }
 func (e *ValidationError) Error() string { return e.Message }
 
 func Normalize(input *Input) {
+	if input.SpecVersion == 0 {
+		input.SpecVersion = 1
+	}
 	input.ID = strings.ToLower(strings.TrimSpace(input.ID))
 	input.Name = strings.TrimSpace(input.Name)
 	input.Description = strings.TrimSpace(input.Description)
@@ -319,9 +326,12 @@ func Normalize(input *Input) {
 		input.Spec = map[string]any{}
 	}
 	if input.Kind == KindRuntime || input.Kind == KindSandbox {
-		input.Spec["environmentVariables"] = SandboxEnvironmentVariables(
-			input.Spec["environmentVariables"],
-		)
+		// Do not normalize malformed values into a valid empty list before validation.
+		if value := input.Spec["environmentVariables"]; value == nil {
+			input.Spec["environmentVariables"] = SandboxEnvironmentVariables(nil)
+		} else if _, ok := value.([]any); ok {
+			input.Spec["environmentVariables"] = SandboxEnvironmentVariables(value)
+		}
 	}
 }
 
@@ -557,6 +567,12 @@ func ValidateCredentialModel(input CredentialModelInput) error {
 }
 
 func Validate(input Input) error {
+	if input.SpecVersion != 0 && input.SpecVersion != 1 {
+		return &ValidationError{Message: "不支持的资源 specVersion"}
+	}
+	if _, err := DecodeResourceSpec(input); err != nil {
+		return err
+	}
 	if !isKind(input.Kind) {
 		return &ValidationError{Message: "资源类型无效"}
 	}

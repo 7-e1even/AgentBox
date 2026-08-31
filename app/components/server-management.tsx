@@ -1,6 +1,8 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
+import { usePolling } from "@/hooks/use-polling"
+import { LoadState } from "@/components/load-state"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   ArrowLeftIcon,
@@ -16,7 +18,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react"
 import { appToast as toast } from "@/lib/app-toast"
-import { errorMessage, requestJson } from "@/lib/api-client"
+import { ApiError, errorMessage, requestJson } from "@/lib/api-client"
 import { writeClipboardText } from "@/lib/clipboard"
 
 import {
@@ -74,7 +76,6 @@ import { Spinner } from "@/components/ui/spinner"
 import type { Resource } from "@/lib/platform-schema"
 import {
   serverPairingResponseSchema,
-  serversResponseSchema,
   type ManagedServer,
   type ServerPairing,
 } from "@/lib/server-schema"
@@ -88,6 +89,8 @@ export function ServerManagement({
   canMutate,
   canMutateRuntimes,
   onServersChange,
+  onRefresh: refreshServers,
+  targetWorkerVersion,
   onCreateRuntime,
   onEditRuntime,
 }: {
@@ -96,6 +99,8 @@ export function ServerManagement({
   canMutate: boolean
   canMutateRuntimes: boolean
   onServersChange: (servers: ManagedServer[]) => void
+  onRefresh: () => Promise<void>
+  targetWorkerVersion: string
   onCreateRuntime: (serverId: string) => void
   onEditRuntime: (runtime: Resource) => void
 }) {
@@ -105,9 +110,7 @@ export function ServerManagement({
   const [creating, setCreating] = useState(false)
   const [error, setError] = useState("")
   const [serverUrl, setServerUrl] = useState("")
-  const [addressStatus, setAddressStatus] =
-    useState<AddressStatus>("idle")
-  const [targetWorkerVersion, setTargetWorkerVersion] = useState("")
+  const [addressStatus, setAddressStatus] = useState<AddressStatus>("idle")
 
   const detectServerUrl = useCallback(async () => {
     setAddressStatus("detecting")
@@ -121,57 +124,31 @@ export function ServerManagement({
     }
   }, [])
 
-  const refreshServers = useCallback(async () => {
-    const body = serversResponseSchema.parse(
-      await requestJson<unknown>("/api/servers")
-    )
-    onServersChange(body.servers)
-    setTargetWorkerVersion(body.workerVersion)
-  }, [onServersChange])
-
-  useEffect(() => {
-    const initial = window.setTimeout(
-      () => void refreshServers().catch(() => undefined),
-      0
-    )
-    const timer = window.setInterval(
-      () => void refreshServers().catch(() => undefined),
-      15_000
-    )
-    return () => {
-      window.clearTimeout(initial)
-      window.clearInterval(timer)
-    }
-  }, [refreshServers])
-
-  useEffect(() => {
-    if (!open || !pairing || pairing.serverId) return
-    let stopped = false
-    let completed = false
-    const check = async () => {
-      try {
-        const body = serverPairingResponseSchema.parse(
-          await requestJson<unknown>(`/api/server-pairings/${pairing.id}`)
-        )
-        if (stopped) return
-        setPairing((current) =>
-          current ? { ...body.pairing, token: current.token } : current
-        )
-        if (body.pairing.serverId && !completed) {
-          completed = true
-          await refreshServers()
-          toast.success("服务器已接入")
-        }
-      } catch (cause) {
-        if (!stopped) setError(errorMessage(cause))
+  const pairingPolling = usePolling({
+    queryKey: `pairing:${pairing?.id ?? ""}`,
+    enabled: open && !!pairing && !pairing.serverId,
+    interval: 2000,
+    load: async (signal) => {
+      if (pairing && Date.parse(pairing.expiresAt) <= Date.now())
+        throw new ApiError("配对命令已过期，请取消后重新添加服务器", {
+          status: 410,
+        })
+      const body = serverPairingResponseSchema.parse(
+        await requestJson<unknown>(`/api/server-pairings/${pairing?.id}`, {
+          signal,
+        })
+      )
+      signal.throwIfAborted()
+      setPairing((current) =>
+        current ? { ...body.pairing, token: current.token } : current
+      )
+      if (body.pairing.serverId) {
+        void refreshServers().catch(() => undefined)
+        toast.success("服务器已接入")
       }
-    }
-    const timer = window.setInterval(() => void check(), 2_000)
-    return () => {
-      stopped = true
-      window.clearInterval(timer)
-    }
-  }, [open, pairing, refreshServers])
+      return body
+    },
+  })
 
   async function addServer() {
     void detectServerUrl()
@@ -195,9 +172,10 @@ export function ServerManagement({
   const installCommand = normalizedServerUrl
     ? `curl -fsSL ${normalizedServerUrl}/api/worker/install.sh | sudo sh -s -- ${normalizedServerUrl}`
     : ""
-  const setupCommand = pairing?.token && normalizedServerUrl
-    ? `sudo agentbox-worker setup --server ${normalizedServerUrl} --token ${pairing.token}`
-    : ""
+  const setupCommand =
+    pairing?.token && normalizedServerUrl
+      ? `sudo agentbox-worker setup --server ${normalizedServerUrl} --token ${pairing.token}`
+      : ""
   const invalidServerUrl = serverUrl.length > 0 && !normalizedServerUrl
 
   const selectedServer =
@@ -323,6 +301,13 @@ export function ServerManagement({
             ) : null}
           </Field>
 
+          {Boolean(pairingPolling.error) && (
+            <LoadState
+              label="服务器配对"
+              {...pairingPolling}
+              onRetry={pairingPolling.refresh}
+            />
+          )}
           {creating ? (
             <div className="flex items-center justify-center gap-2 py-8 text-muted-foreground">
               <Spinner /> 正在生成配对命令…
@@ -910,7 +895,7 @@ function WorkerOfflineAlert({ server }: { server: ManagedServer }) {
         />
         <p>
           等待 15–60 秒后页面会自动刷新。若仍未上线，请执行
-          <code className="mx-1 break-all font-mono text-xs">
+          <code className="mx-1 font-mono text-xs break-all">
             sudo systemctl status agentbox-worker.service --no-pager
           </code>
           查看错误；若提示找不到服务，请重新运行“添加服务器”中的 Worker

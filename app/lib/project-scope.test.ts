@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import type { Resource } from "./platform-schema"
+import { resourceSchema, type Resource } from "./platform-schema"
 import { resolveProjectId, resourcesForProject } from "./project-scope"
 
 const timestamp = "2026-08-13T12:00:00.000Z"
@@ -10,7 +10,7 @@ function resource(
   kind: Resource["kind"],
   projectId: string | null
 ): Resource {
-  return {
+  return resourceSchema.parse({
     id,
     kind,
     projectId,
@@ -20,7 +20,7 @@ function resource(
     spec: {},
     createdAt: timestamp,
     updatedAt: timestamp,
-  }
+  })
 }
 
 describe("project scope", () => {
@@ -42,5 +42,15 @@ describe("project scope", () => {
     expect(
       resourcesForProject(resources, "beta").map((item) => item.id)
     ).toEqual(["beta", "shared-image", "beta-runtime"])
+  })
+
+  it("preserves the selection during an outage and resolves deleted projects after recovery", () => {
+    expect(resolveProjectId(undefined, "deleted-project")).toBe(
+      "deleted-project"
+    )
+    expect(resolveProjectId(resources, "deleted-project")).toBe("alpha")
+    expect(resolveProjectId(undefined, "beta")).toBe("beta")
+    expect(resolveProjectId(resources, "beta")).toBe("beta")
+    expect(resolveProjectId([], "beta")).toBe("default")
   })
 })

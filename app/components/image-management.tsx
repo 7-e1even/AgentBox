@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 import type { ColumnDef } from "@tanstack/react-table"
 import {
   BoxIcon,
@@ -50,11 +50,7 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import {
-  serversResponseSchema,
-  type ManagedServer,
-  type ServerImage,
-} from "@/lib/server-schema"
+import { type ManagedServer, type ServerImage } from "@/lib/server-schema"
 import { runtimeInventoryImages } from "@/lib/runtime-images"
 
 type ImageRow = { image: ServerImage }
@@ -104,12 +100,12 @@ const runtimeDefinitions: Record<
 export function ImageManagement({
   servers,
   canMutate,
-  onServersChange,
+  onRefresh: refresh,
   onCreateRuntime,
 }: {
   servers: ManagedServer[]
   canMutate: boolean
-  onServersChange: (servers: ManagedServer[]) => void
+  onRefresh: () => Promise<void>
   onCreateRuntime: (
     serverId: string,
     imageReference: string,
@@ -124,21 +120,6 @@ export function ImageManagement({
   )
   const [scope, setScope] = useState<ImageScope>("container")
   const [refreshing, setRefreshing] = useState(false)
-
-  const refresh = useCallback(async () => {
-    const response = await fetch("/api/servers")
-    if (!response.ok) throw new Error("无法刷新服务器镜像")
-    const body = serversResponseSchema.parse(await response.json())
-    onServersChange(body.servers)
-  }, [onServersChange])
-
-  useEffect(() => {
-    const timer = window.setInterval(
-      () => void refresh().catch(() => undefined),
-      15_000
-    )
-    return () => window.clearInterval(timer)
-  }, [refresh])
 
   const selectedServerId = servers.some(
     (server) => server.id === requestedServerId

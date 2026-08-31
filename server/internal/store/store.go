@@ -56,14 +56,18 @@ const (
 	// references live in JSONB and therefore cannot be protected by foreign keys.
 	controlPlaneMutationLockKey int64 = 0x4147424d55544154
 	resourceUpdateSpecSQL             = `CASE WHEN kind = 'sandbox' THEN
-		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation') || jsonb_build_object(
+		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation' - 'agentToolVersions' - 'agentToolOperation' - 'automationId' - 'automationRunId') || jsonb_build_object(
 			'status', spec->'status',
 			'message', spec->'message',
 			'externalId', spec->'externalId',
 			'provisioning', spec->'provisioning',
 			'proxyId', COALESCE(spec->'proxyId', $5::jsonb->'proxyId', '""'::jsonb),
 			'appliedProxyId', spec->'appliedProxyId',
-			'proxyOperation', spec->'proxyOperation'
+			'proxyOperation', spec->'proxyOperation',
+			'agentToolVersions', spec->'agentToolVersions',
+			'agentToolOperation', spec->'agentToolOperation',
+			'automationId', spec->'automationId',
+			'automationRunId', spec->'automationRunId'
 		)
 	ELSE $5::jsonb END`
 )
@@ -263,6 +267,7 @@ var janitorStatements = []janitorStatement{
 	      'requested', 'pending', 'starting', 'stopping', 'restarting', 'deleting'
 	    )
 	    AND latest.resource_id = sandbox.id AND latest.status = 'failed'
+	    AND latest.resource_generation = sandbox.generation
 	    AND latest.result_error_code IN (
 	      'worker_unavailable', 'worker_lease_expired', 'worker_retry_exhausted'
 	    )
@@ -288,6 +293,7 @@ var janitorStatements = []janitorStatement{
 	        SELECT job.status, job.action, job.result_error_code
 	        FROM worker_jobs job
 	        WHERE job.resource_id = sandbox.id
+	          AND job.resource_generation = sandbox.generation
 	        ORDER BY job.created_at DESC
 	        LIMIT 1
 	      ) latest
@@ -314,6 +320,7 @@ var janitorStatements = []janitorStatement{
 	        SELECT job.status, job.action, job.result_error_code
 	        FROM worker_jobs job
 	        WHERE job.resource_id = sandbox.id
+	          AND job.resource_generation = sandbox.generation
 	        ORDER BY job.created_at DESC
 	        LIMIT 1
 	      ) latest
@@ -441,10 +448,20 @@ func (s *Store) CreateServerPairing(ctx context.Context) (platform.ServerPairing
 		Token:     token,
 		ExpiresAt: now.Add(15 * time.Minute),
 	}
-	if _, err := s.pool.Exec(ctx, `INSERT INTO server_pairings
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.ServerPairing{}, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `INSERT INTO server_pairings
     (id, token_hash, expires_at, created_at) VALUES ($1, $2, $3, $4)`,
 		pairing.ID, hashToken(token), pairing.ExpiresAt, now); err != nil {
 		return platform.ServerPairing{}, fmt.Errorf("create server pairing: %w", err)
+	}
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryServer, Action: "pair", ResourceKind: "server-pairing", ResourceID: pairing.ID,
+	}); err != nil {
+		return platform.ServerPairing{}, err
 	}
 	_, _ = s.pool.Exec(ctx, "DELETE FROM server_pairings WHERE expires_at < NOW() - INTERVAL '1 day'")
 	return pairing, nil
@@ -539,7 +556,10 @@ func (s *Store) RegisterServer(ctx context.Context, input platform.ServerRegistr
     SET server_id = $1, claimed_at = $2 WHERE id = $3`, serverID, now, pairingID); err != nil {
 		return platform.ManagedServer{}, "", fmt.Errorf("complete server pairing: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "worker", ID: input.ServerID, Name: input.Name})
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryServer, Action: "register", ResourceKind: "server", ResourceID: input.ServerID,
+	}); err != nil {
 		return platform.ManagedServer{}, "", fmt.Errorf("commit server registration: %w", err)
 	}
 	return server, credential, nil
@@ -641,7 +661,9 @@ func (s *Store) EnqueueWorkerUpdate(ctx context.Context, serverID, targetVersion
       worker_update_message = '', updated_at = $2 WHERE id = $3`, targetVersion, now, serverID); err != nil {
 		return fmt.Errorf("mark Worker update pending: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryServer, Action: "update-worker", ResourceKind: "server", ResourceID: serverID,
+	}); err != nil {
 		return fmt.Errorf("commit Worker update: %w", err)
 	}
 	return nil
@@ -679,7 +701,9 @@ func (s *Store) DeleteServer(ctx context.Context, id string) error {
 	if result.RowsAffected() != 1 {
 		return ErrResourceNotFound
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryServer, Action: "delete", ResourceKind: "server", ResourceID: id,
+	}); err != nil {
 		return fmt.Errorf("commit delete managed server: %w", err)
 	}
 	return nil
@@ -752,7 +776,12 @@ func (s *Store) CreateCredential(ctx context.Context, input platform.CredentialI
 		return platform.ManagedCredential{}, err
 	}
 	now := time.Now().UTC()
-	result, err := scanCredential(s.pool.QueryRow(ctx, `INSERT INTO provider_credentials
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.ManagedCredential{}, err
+	}
+	defer tx.Rollback(ctx)
+	result, err := scanCredential(tx.QueryRow(ctx, `INSERT INTO provider_credentials
     (id, name, provider_id, protocol, endpoint, model_id, secret_ciphertext,
      secret_nonce, secret_last_four, enabled, created_at, updated_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
@@ -762,6 +791,11 @@ func (s *Store) CreateCredential(ctx context.Context, input platform.CredentialI
 	))
 	if err != nil {
 		return platform.ManagedCredential{}, mapResourceError(err)
+	}
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "create", ResourceKind: "credential", ResourceID: input.ID,
+	}); err != nil {
+		return platform.ManagedCredential{}, err
 	}
 	return result, nil
 }
@@ -842,7 +876,9 @@ func (s *Store) UpdateCredential(ctx context.Context, id string, input platform.
 	if err != nil {
 		return platform.ManagedCredential{}, mapResourceError(err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "update", ResourceKind: "credential", ResourceID: id,
+	}); err != nil {
 		return platform.ManagedCredential{}, fmt.Errorf("commit update provider credential: %w", err)
 	}
 	return result, nil
@@ -872,7 +908,9 @@ func (s *Store) DeleteCredential(ctx context.Context, id string) error {
 	if result.RowsAffected() != 1 {
 		return ErrResourceNotFound
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "delete", ResourceKind: "credential", ResourceID: id,
+	}); err != nil {
 		return fmt.Errorf("commit delete provider credential: %w", err)
 	}
 	return nil
@@ -958,7 +996,12 @@ func (s *Store) CreateNetworkProxy(ctx context.Context, input platform.NetworkPr
 		return platform.ManagedNetworkProxy{}, fmt.Errorf("encode network proxy bypass list: %w", err)
 	}
 	now := time.Now().UTC()
-	result, err := scanNetworkProxy(s.pool.QueryRow(ctx, `INSERT INTO network_proxies
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.ManagedNetworkProxy{}, err
+	}
+	defer tx.Rollback(ctx)
+	result, err := scanNetworkProxy(tx.QueryRow(ctx, `INSERT INTO network_proxies
     (id, name, scheme, host, port, username, password_ciphertext,
      password_nonce, password_last_four, no_proxy, enabled, created_at, updated_at)
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
@@ -968,6 +1011,11 @@ func (s *Store) CreateNetworkProxy(ctx context.Context, input platform.NetworkPr
 	))
 	if err != nil {
 		return platform.ManagedNetworkProxy{}, mapResourceError(err)
+	}
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "create", ResourceKind: "proxy", ResourceID: input.ID,
+	}); err != nil {
+		return platform.ManagedNetworkProxy{}, err
 	}
 	return result, nil
 }
@@ -1038,7 +1086,9 @@ func (s *Store) UpdateNetworkProxy(ctx context.Context, id string, input platfor
 	if err != nil {
 		return platform.ManagedNetworkProxy{}, mapResourceError(err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "update", ResourceKind: "proxy", ResourceID: id,
+	}); err != nil {
 		return platform.ManagedNetworkProxy{}, fmt.Errorf("commit update network proxy: %w", err)
 	}
 	return result, nil
@@ -1111,7 +1161,9 @@ func (s *Store) CreateNetworkProxyCheck(
 		result.ID, serverID, payload, now); err != nil {
 		return platform.NetworkProxyCheck{}, fmt.Errorf("enqueue network proxy check: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "check", ResourceKind: "proxy", ResourceID: proxyID,
+	}); err != nil {
 		return platform.NetworkProxyCheck{}, fmt.Errorf("commit network proxy check: %w", err)
 	}
 	return result, nil
@@ -1240,7 +1292,9 @@ func (s *Store) DeleteNetworkProxy(ctx context.Context, id string) error {
 	if result.RowsAffected() != 1 {
 		return ErrResourceNotFound
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryProxy, Action: "delete", ResourceKind: "proxy", ResourceID: id,
+	}); err != nil {
 		return fmt.Errorf("commit delete network proxy: %w", err)
 	}
 	return nil
@@ -1388,7 +1442,9 @@ func (s *Store) DeleteCredentialModel(ctx context.Context, id, modelID string) (
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "model-delete", ResourceKind: "credential", ResourceID: id,
+	}); err != nil {
 		return nil, fmt.Errorf("commit delete provider model: %w", err)
 	}
 	return models, nil
@@ -1411,7 +1467,9 @@ func (s *Store) mutateCredentialModels(
 	if err != nil {
 		return nil, err
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryCredential, Action: "models-update", ResourceKind: "credential", ResourceID: id,
+	}); err != nil {
 		return nil, fmt.Errorf("commit provider model update: %w", err)
 	}
 	return models, nil
@@ -2184,7 +2242,7 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	var job platform.WorkerJob
 	var payloadJSON []byte
 	var resourceID pgtype.Text
-	err = tx.QueryRow(ctx, `SELECT id, resource_id, action, payload
+	err = tx.QueryRow(ctx, `SELECT id, resource_id, action, payload, resource_generation
     FROM worker_jobs
     WHERE server_id = $1
 	  AND (
@@ -2198,7 +2256,7 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
     FOR UPDATE SKIP LOCKED
 	LIMIT 1`, serverID, now, workerJobAutomaticRetryLimit,
 		automaticallyRetryableWorkerJobActions).Scan(
-		&job.ID, &resourceID, &job.Action, &payloadJSON,
+		&job.ID, &resourceID, &job.Action, &payloadJSON, &job.ResourceGeneration,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		if err := tx.Commit(ctx); err != nil {
@@ -2208,6 +2266,24 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	}
 	if err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("select worker job: %w", err)
+	}
+	if resourceID.Valid {
+		if err := ensureWorkerResourceGeneration(ctx, tx, resourceID.String, job.ResourceGeneration); err != nil {
+			if !errors.Is(err, ErrConflict) {
+				return platform.WorkerJob{}, err
+			}
+			if err := failStaleResourceJob(ctx, tx, job.ID); err != nil {
+				return platform.WorkerJob{}, err
+			}
+			ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "worker", ID: serverID})
+			if err := s.commitAudit(ctx, tx, platform.LogEntry{
+				Category: platform.LogCategoryJob, Action: "discard", ResourceKind: "job", ResourceID: job.ID,
+				Detail: map[string]any{"serverId": serverID, "generation": job.ResourceGeneration, "errorCode": "resource_generation_changed"},
+			}); err != nil {
+				return platform.WorkerJob{}, err
+			}
+			return platform.WorkerJob{}, ErrNoJob
+		}
 	}
 	if err := json.Unmarshal(payloadJSON, &job.Payload); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("decode worker job payload: %w", err)
@@ -2258,7 +2334,11 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 			return platform.WorkerJob{}, fmt.Errorf("mark Worker update active: %w", err)
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "worker", ID: serverID})
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryJob, Action: "claim", ResourceKind: "job", ResourceID: job.ID,
+		Detail: map[string]any{"serverId": serverID, "leaseGeneration": job.LeaseGeneration, "generation": job.ResourceGeneration},
+	}); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("commit worker job claim: %w", err)
 	}
 	return job, nil
@@ -2578,19 +2658,25 @@ func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credentia
 	var action string
 	var progressJSON []byte
 	var leaseGeneration int
+	var resourceGeneration int64
 	now := time.Now().UTC()
-	err = tx.QueryRow(ctx, `SELECT resource_id, action, progress, attempts FROM worker_jobs
+	err = tx.QueryRow(ctx, `SELECT resource_id, action, progress, attempts, resource_generation FROM worker_jobs
 	WHERE id = $1 AND server_id = $2 AND status = 'leased'
 	  AND lease_until >= $3
 	  AND (attempts = $4 OR ($4 = 0 AND attempts = 1))
 	FOR UPDATE`, jobID, serverID, now, input.LeaseGeneration).Scan(
-		&resourceID, &action, &progressJSON, &leaseGeneration,
+		&resourceID, &action, &progressJSON, &leaseGeneration, &resourceGeneration,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.ProvisioningProgress{}, ErrResourceNotFound
 	}
 	if err != nil {
 		return platform.ProvisioningProgress{}, fmt.Errorf("select worker job progress: %w", err)
+	}
+	if resourceID.Valid {
+		if err := ensureWorkerResourceGeneration(ctx, tx, resourceID.String, resourceGeneration); err != nil {
+			return platform.ProvisioningProgress{}, err
+		}
 	}
 	if err := touchWorkerJobActivity(ctx, tx, serverID, now); err != nil {
 		return platform.ProvisioningProgress{}, err
@@ -2687,6 +2773,7 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	var action string
 	var progressJSON []byte
 	var jobPayloadJSON []byte
+	var resourceGeneration int64
 	now := time.Now().UTC()
 	err = tx.QueryRow(ctx, `UPDATE worker_jobs SET
 		status = $1, lease_until = NULL, result_message = $2, external_id = $3,
@@ -2696,16 +2783,39 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		WHERE id = $13 AND server_id = $14 AND status = 'leased'
 		  AND lease_until >= $12
 		  AND (attempts = $15 OR ($15 = 0 AND attempts = 1))
-		RETURNING resource_id, action, progress, payload`, status, result.Message,
+		RETURNING resource_id, action, progress, payload, resource_generation`, status, result.Message,
 		result.ExternalID, result.ExitCode, result.Output, result.OutputTruncated, result.TimedOut,
 		workerError.Code, workerError.Stage, workerError.Retryable, errorDetailsJSON,
 		now, jobID, serverID, result.LeaseGeneration,
-	).Scan(&resourceID, &action, &progressJSON, &jobPayloadJSON)
+	).Scan(&resourceID, &action, &progressJSON, &jobPayloadJSON, &resourceGeneration)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrResourceNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("complete worker job: %w", err)
+	}
+	ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "worker", ID: serverID})
+	audit := platform.LogEntry{
+		Category: platform.LogCategoryJob, Action: "complete", ResourceKind: "job", ResourceID: jobID,
+		Status: platform.LogStatusFailed,
+		Detail: map[string]any{"serverId": serverID, "generation": resourceGeneration, "leaseGeneration": result.LeaseGeneration},
+	}
+	if result.Success {
+		audit.Status = platform.LogStatusSuccess
+	}
+	commitCompletion := func() error { return s.commitAudit(ctx, tx, audit) }
+	if resourceID.Valid {
+		if err := ensureWorkerResourceGeneration(ctx, tx, resourceID.String, resourceGeneration); err != nil {
+			if !errors.Is(err, ErrConflict) {
+				return err
+			}
+			audit.Status = platform.LogStatusFailed
+			audit.Detail["errorCode"] = "resource_generation_changed"
+			if err := failStaleResourceJob(ctx, tx, jobID); err != nil {
+				return err
+			}
+			return commitCompletion()
+		}
 	}
 	if err := touchWorkerJobActivity(ctx, tx, serverID, now); err != nil {
 		return err
@@ -2730,7 +2840,7 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
       WHERE id = $5`, result.Success, status, result.Message, now, serverID); err != nil {
 			return fmt.Errorf("finish Worker update: %w", err)
 		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := commitCompletion(); err != nil {
 			return fmt.Errorf("commit Worker update completion: %w", err)
 		}
 		return nil
@@ -2790,7 +2900,7 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 			progressJSON, now, len(result.AgentTools) > 0, agentToolsJSON, resourceIDValue); err != nil {
 			return fmt.Errorf("finish sandbox Agent tool operation: %w", err)
 		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := commitCompletion(); err != nil {
 			return fmt.Errorf("commit sandbox Agent tool completion: %w", err)
 		}
 		return nil
@@ -2825,12 +2935,14 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
           'message', $4::text, 'updatedAt', $5::timestamptz,
           'finishedAt', $5::timestamptz
         ), true
-      ), updated_at = $5
+      ), observed_generation = CASE
+        WHEN $1::boolean AND observed_generation = generation - 1 THEN generation
+        ELSE observed_generation END, updated_at = $5
       WHERE id = $6 AND kind = 'sandbox'`, result.Success, strings.TrimSpace(jobPayload.ProxyID),
 			operationStatus, message, now, resourceIDValue); err != nil {
 			return fmt.Errorf("finish sandbox proxy operation: %w", err)
 		}
-		if err := tx.Commit(ctx); err != nil {
+		if err := commitCompletion(); err != nil {
 			return fmt.Errorf("commit sandbox proxy completion: %w", err)
 		}
 		return nil
@@ -2840,15 +2952,15 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
       WHERE id = $1 AND kind = 'sandbox'`, resourceIDValue); err != nil {
 			return fmt.Errorf("delete completed sandbox: %w", err)
 		}
-		return tx.Commit(ctx)
+		return commitCompletion()
 	}
 	if strings.HasPrefix(action, "workspace-") {
-		return tx.Commit(ctx)
+		return commitCompletion()
 	}
 	switch action {
 	case "create-sandbox", "start-sandbox", "stop-sandbox", "restart-sandbox", "delete-sandbox":
 	default:
-		return tx.Commit(ctx)
+		return commitCompletion()
 	}
 	sandboxStatus := "error"
 	appliedProxyID := ""
@@ -2893,10 +3005,12 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	    )
 	  )
 	  ELSE '{}'::jsonb END,
+	observed_generation = CASE WHEN $11::boolean THEN generation ELSE observed_generation END,
 	updated_at = $9
 	WHERE id = $10 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
 		result.Message, hasProgress, progressJSON,
 		persistProxySnapshot, appliedProxyID, proxySnapshotMessage, now, resourceIDValue,
+		result.Success && (action == "create-sandbox" || action == "start-sandbox" || action == "restart-sandbox"),
 	); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
@@ -2919,7 +3033,7 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 			}
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := commitCompletion(); err != nil {
 		return fmt.Errorf("commit worker job completion: %w", err)
 	}
 	return nil
@@ -2970,7 +3084,8 @@ func scanResource(row pgx.Row) (platform.Resource, error) {
 	var project pgtype.Text
 	var specJSON []byte
 	if err := row.Scan(&result.ID, &result.Kind, &project, &result.Name, &result.Description,
-		&result.Enabled, &specJSON, &result.CreatedAt, &result.UpdatedAt); err != nil {
+		&result.Enabled, &specJSON, &result.CreatedAt, &result.UpdatedAt,
+		&result.SpecVersion, &result.Generation, &result.ObservedGeneration); err != nil {
 		return platform.Resource{}, err
 	}
 	if project.Valid {
@@ -2982,11 +3097,20 @@ func scanResource(row pgx.Row) (platform.Resource, error) {
 	return result, nil
 }
 
-const resourceColumns = `id, kind, project_id, name, description, enabled, spec, created_at, updated_at`
+const resourceColumns = `id, kind, project_id, name, description, enabled, spec, created_at, updated_at,
+  spec_version, generation, observed_generation`
 
 func (s *Store) ListResources(ctx context.Context) ([]platform.Resource, error) {
+	return s.ListResourcesFiltered(ctx, platform.ResourceFilter{})
+}
+
+func (s *Store) ListResourcesFiltered(ctx context.Context, filter platform.ResourceFilter) ([]platform.Resource, error) {
+	if err := filter.Validate(); err != nil {
+		return nil, err
+	}
 	rows, err := s.pool.Query(ctx, `SELECT `+resourceColumns+` FROM control_resources
-    ORDER BY kind, enabled DESC, updated_at DESC`)
+    WHERE ($1::text = '' OR kind = $1) AND ($2::text = '' OR project_id = $2)
+    ORDER BY kind, enabled DESC, updated_at DESC`, filter.Kind, filter.ProjectID)
 	if err != nil {
 		return nil, fmt.Errorf("list resources: %w", err)
 	}
@@ -3003,10 +3127,27 @@ func (s *Store) ListResources(ctx context.Context) ([]platform.Resource, error) 
 	return resources, rows.Err()
 }
 
+func (s *Store) GetResource(ctx context.Context, id string) (platform.Resource, error) {
+	resource, err := scanResource(s.pool.QueryRow(ctx,
+		`SELECT `+resourceColumns+` FROM control_resources WHERE id = $1`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.Resource{}, ErrResourceNotFound
+	}
+	if err != nil {
+		return platform.Resource{}, fmt.Errorf("get resource: %w", err)
+	}
+	maskResourceEnvironmentVariables(&resource)
+	return resource, nil
+}
+
 func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platform.Resource, error) {
+	input.Spec = platform.DesiredResourceSpec(input.Kind, input.Spec)
 	platform.Normalize(&input)
 	if err := platform.Validate(input); err != nil {
 		return platform.Resource{}, err
+	}
+	if input.Kind == platform.KindSandbox {
+		input.Spec["status"] = "requested"
 	}
 	if input.Kind == platform.KindRuntime || input.Kind == platform.KindSandbox {
 		if err := s.encryptSpecEnvironmentVariables(input.Spec); err != nil {
@@ -3029,8 +3170,8 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 	}
 	now := time.Now().UTC()
 	result, err := scanResource(tx.QueryRow(ctx, `INSERT INTO control_resources
-    (id, kind, project_id, name, description, enabled, spec, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8)
+    (id, kind, project_id, name, description, enabled, spec, created_at, updated_at, observed_generation)
+    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $8, CASE WHEN $2 = 'sandbox' THEN 0 ELSE 1 END)
     RETURNING `+resourceColumns, input.ID, input.Kind, input.ProjectID, input.Name,
 		input.Description, input.Enabled, mustMapJSON(input.Spec), now))
 	if err != nil {
@@ -3041,7 +3182,10 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 			return platform.Resource{}, err
 		}
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryResource, Action: "create", ResourceKind: string(input.Kind), ResourceID: input.ID,
+		Detail: map[string]any{"generation": result.Generation},
+	}); err != nil {
 		return platform.Resource{}, mapResourceError(err)
 	}
 	maskResourceEnvironmentVariables(&result)
@@ -3053,17 +3197,15 @@ func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource
 	if err != nil {
 		return "", err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE control_resources
-    SET spec = spec || jsonb_build_object('driver', $1::text, 'imageReference', $2::text)
-	    WHERE id = $3 AND kind = 'sandbox'`, driver, imageReference, sandbox.ID); err != nil {
-		return "", fmt.Errorf("persist sandbox runtime snapshot: %w", err)
+	if err := persistSandboxCreationSpec(ctx, tx, sandbox, payload, driver, imageReference); err != nil {
+		return "", err
 	}
 	now := time.Now().UTC()
 	jobID := uuid.NewString()
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-    (id, server_id, resource_id, action, status, payload, created_at, updated_at)
-    VALUES ($1, $2, $3, 'create-sandbox', 'pending', $4::jsonb, $5, $5)`,
-		jobID, sandbox.Spec["serverId"], sandbox.ID, mustMapJSON(payload), now,
+    (id, server_id, resource_id, action, status, payload, created_at, updated_at, resource_generation)
+    VALUES ($1, $2, $3, 'create-sandbox', 'pending', $4::jsonb, $5, $5, $6)`,
+		jobID, sandbox.Spec["serverId"], sandbox.ID, mustMapJSON(payload), now, sandbox.Generation,
 	); err != nil {
 		return "", fmt.Errorf("enqueue sandbox creation: %w", err)
 	}
@@ -3196,6 +3338,7 @@ func loadWorkerResourceDefinitions(
 }
 
 func (s *Store) UpdateResource(ctx context.Context, id string, input platform.Input) (platform.Resource, error) {
+	input.Spec = platform.DesiredResourceSpec(input.Kind, input.Spec)
 	platform.Normalize(&input)
 	if input.ID != id {
 		return platform.Resource{}, &platform.ValidationError{Message: "资源标识不能修改"}
@@ -3210,6 +3353,21 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	defer tx.Rollback(ctx)
 	if err := lockControlPlaneMutation(ctx, tx); err != nil {
 		return platform.Resource{}, err
+	}
+	if input.Kind == platform.KindSandbox {
+		// Configuration changes wait for an active operation to finish. We do not
+		// introduce cancellation/reconciliation of external Worker side effects.
+		var active bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM worker_jobs
+      WHERE resource_id = $1 AND status IN ('pending', 'leased'))`, id).Scan(&active); err != nil {
+			return platform.Resource{}, fmt.Errorf("check sandbox configuration operation: %w", err)
+		}
+		if active {
+			return platform.Resource{}, fmt.Errorf("%w: 请等待沙箱当前操作完成后再修改配置", ErrConflict)
+		}
+		if err := validateSandboxCreationSpec(ctx, tx, id, input.Spec); err != nil {
+			return platform.Resource{}, err
+		}
 	}
 	if err := s.ensureProject(ctx, tx, input); err != nil {
 		return platform.Resource{}, err
@@ -3228,6 +3386,8 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	result, err := scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
 		project_id = $1, name = $2, description = $3, enabled = $4,
 		spec = `+resourceUpdateSpecSQL+`,
+		generation = generation + 1,
+		observed_generation = CASE WHEN kind = 'sandbox' THEN observed_generation ELSE generation + 1 END,
 		updated_at = $6 WHERE id = $7 AND kind = $8 RETURNING `+resourceColumns,
 		input.ProjectID, input.Name, input.Description, input.Enabled, mustMapJSON(input.Spec),
 		time.Now().UTC(), id, input.Kind))
@@ -3237,7 +3397,10 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	if err != nil {
 		return platform.Resource{}, mapResourceError(err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryResource, Action: "update", ResourceKind: string(input.Kind), ResourceID: id,
+		Detail: map[string]any{"generation": result.Generation},
+	}); err != nil {
 		return platform.Resource{}, mapResourceError(err)
 	}
 	maskResourceEnvironmentVariables(&result)
@@ -3275,6 +3438,7 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
     WHERE id = $1 AND kind = 'sandbox' FOR UPDATE`, id).Scan(
 		&resource.ID, &resource.Kind, &project, &resource.Name, &resource.Description,
 		&resource.Enabled, &specJSON, &resource.CreatedAt, &resource.UpdatedAt,
+		&resource.SpecVersion, &resource.Generation, &resource.ObservedGeneration,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Resource{}, ErrResourceNotFound
@@ -3335,9 +3499,9 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	}
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-    (id, server_id, resource_id, action, status, payload, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, 'pending', $5::jsonb, $6, $6)`,
-		uuid.NewString(), serverID, id, workerAction, mustMapJSON(payload), now,
+    (id, server_id, resource_id, action, status, payload, created_at, updated_at, resource_generation)
+    VALUES ($1, $2, $3, $4, 'pending', $5::jsonb, $6, $6, $7)`,
+		uuid.NewString(), serverID, id, workerAction, mustMapJSON(payload), now, resource.Generation,
 	); err != nil {
 		return platform.Resource{}, fmt.Errorf("enqueue sandbox operation: %w", err)
 	}
@@ -3349,7 +3513,9 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	if err != nil {
 		return platform.Resource{}, fmt.Errorf("update sandbox operation status: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategorySandbox, Action: action, ResourceKind: "sandbox", ResourceID: id,
+	}); err != nil {
 		return platform.Resource{}, fmt.Errorf("commit sandbox operation: %w", err)
 	}
 	maskResourceEnvironmentVariables(&resource)
@@ -3374,6 +3540,7 @@ func (s *Store) UpdateSandboxNetworkProxy(ctx context.Context, id, proxyID strin
     WHERE id = $1 AND kind = 'sandbox' FOR UPDATE`, id).Scan(
 		&resource.ID, &resource.Kind, &project, &resource.Name, &resource.Description,
 		&resource.Enabled, &specJSON, &resource.CreatedAt, &resource.UpdatedAt,
+		&resource.SpecVersion, &resource.Generation, &resource.ObservedGeneration,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Resource{}, ErrResourceNotFound
@@ -3451,9 +3618,9 @@ func (s *Store) UpdateSandboxNetworkProxy(ctx context.Context, id, proxyID strin
 			"driver": driver, "proxyId": proxyID,
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-      (id, server_id, resource_id, action, status, payload, created_at, updated_at)
-      VALUES ($1, $2, $3, 'configure-sandbox-proxy', 'pending', $4::jsonb, $5, $5)`,
-			uuid.NewString(), serverID, id, mustMapJSON(payload), now,
+      (id, server_id, resource_id, action, status, payload, created_at, updated_at, resource_generation)
+      VALUES ($1, $2, $3, 'configure-sandbox-proxy', 'pending', $4::jsonb, $5, $5, $6)`,
+			uuid.NewString(), serverID, id, mustMapJSON(payload), now, resource.Generation+1,
 		); err != nil {
 			return platform.Resource{}, fmt.Errorf("enqueue sandbox proxy update: %w", err)
 		}
@@ -3465,12 +3632,14 @@ func (s *Store) UpdateSandboxNetworkProxy(ctx context.Context, id, proxyID strin
 		"appliedProxyId": appliedProxyID, "message": message, "updatedAt": now,
 	}
 	resource, err = scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
-    spec = $1::jsonb, updated_at = $2 WHERE id = $3 AND kind = 'sandbox'
+    spec = $1::jsonb, generation = generation + 1, updated_at = $2 WHERE id = $3 AND kind = 'sandbox'
     RETURNING `+resourceColumns, mustMapJSON(resource.Spec), now, id))
 	if err != nil {
 		return platform.Resource{}, fmt.Errorf("update sandbox proxy configuration: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategorySandbox, Action: "update-network-proxy", ResourceKind: "sandbox", ResourceID: id,
+	}); err != nil {
 		return platform.Resource{}, fmt.Errorf("commit sandbox proxy update: %w", err)
 	}
 	maskResourceEnvironmentVariables(&resource)
@@ -3507,6 +3676,7 @@ func (s *Store) OperateSandboxAgentTools(ctx context.Context, id, action string,
     WHERE id = $1 AND kind = 'sandbox' FOR UPDATE`, id).Scan(
 		&resource.ID, &resource.Kind, &project, &resource.Name, &resource.Description,
 		&resource.Enabled, &specJSON, &resource.CreatedAt, &resource.UpdatedAt,
+		&resource.SpecVersion, &resource.Generation, &resource.ObservedGeneration,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Resource{}, ErrResourceNotFound
@@ -3554,9 +3724,9 @@ func (s *Store) OperateSandboxAgentTools(ctx context.Context, id, action string,
 	payload["requestedAgentTools"] = tools
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
-    (id, server_id, resource_id, action, status, payload, created_at, updated_at)
-    VALUES ($1, $2, $3, $4, 'pending', $5::jsonb, $6, $6)`,
-		uuid.NewString(), serverID, id, workerAction, mustMapJSON(payload), now,
+    (id, server_id, resource_id, action, status, payload, created_at, updated_at, resource_generation)
+    VALUES ($1, $2, $3, $4, 'pending', $5::jsonb, $6, $6, $7)`,
+		uuid.NewString(), serverID, id, workerAction, mustMapJSON(payload), now, resource.Generation,
 	); err != nil {
 		return platform.Resource{}, fmt.Errorf("enqueue sandbox Agent tool operation: %w", err)
 	}
@@ -3572,7 +3742,9 @@ func (s *Store) OperateSandboxAgentTools(ctx context.Context, id, action string,
 	if err != nil {
 		return platform.Resource{}, fmt.Errorf("update sandbox Agent tool operation: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategorySandbox, Action: "agent-tools-" + action, ResourceKind: "sandbox", ResourceID: id,
+	}); err != nil {
 		return platform.Resource{}, fmt.Errorf("commit sandbox Agent tool operation: %w", err)
 	}
 	maskResourceEnvironmentVariables(&resource)
@@ -3631,7 +3803,9 @@ func (s *Store) DeleteResource(ctx context.Context, id string) error {
 	if _, err := tx.Exec(ctx, "DELETE FROM control_resources WHERE id = $1", id); err != nil {
 		return fmt.Errorf("delete resource: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategoryResource, Action: "delete", ResourceKind: "resource", ResourceID: id,
+	}); err != nil {
 		return fmt.Errorf("commit delete resource: %w", err)
 	}
 	return nil

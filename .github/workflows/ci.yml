@@ -40,6 +40,14 @@ jobs:
       - name: Vet
         working-directory: server
         run: go vet ./...
+      - name: Check Worker package boundary
+        working-directory: server
+        run: |
+          dependencies=$(go list -deps ./cmd/agentbox-worker)
+          if printf '%s\n' "$dependencies" | grep -Eq '^agentbox/internal/(httpapi|store)$'; then
+            echo 'Worker must not depend on the HTTP API or database store.'
+            exit 1
+          fi
       - name: Test
         working-directory: server
         run: go test -count=1 ./...

@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, type ReactNode } from "react"
 import { CheckIcon, SaveIcon } from "lucide-react"
 
 import { agentToolOptions, supportedAgentToolList } from "@/lib/agent-tools"
@@ -13,6 +13,7 @@ import {
 import {
   resourceInputSchema,
   type Resource,
+  type ResourceDraft,
   type ResourceInput,
   type ResourceKind,
 } from "@/lib/platform-schema"
@@ -637,9 +638,9 @@ function nextSpec(
     const runtime = resources.find(
       (item) => item.kind === "runtime" && item.id === value
     )
-    if (runtime) {
+    if (runtime?.kind === "runtime") {
       next.serverId = runtime.spec.serverId
-      next.desktop = runtime.spec.desktop === true
+      next.desktop = runtime.spec.desktop
       next.agentTools = supportedAgentToolList(runtime.spec.agentTools)
       next.credentialIds = stringArray(runtime.spec.credentialIds)
       next.environmentVariables = sandboxEnvironmentVariables(
@@ -691,7 +692,7 @@ function initialEditorSpec(
           item.enabled &&
           item.projectId === projectId
       )
-    if (runtime) {
+    if (runtime?.kind === "runtime") {
       spec.runtimeId = runtime.id
       spec.serverId = runtime.spec.serverId
       spec.agentTools = supportedAgentToolList(runtime.spec.agentTools)
@@ -725,7 +726,7 @@ function initialEditorSpec(
   const legacyImage = resources.find(
     (item) => item.kind === "image" && item.id === spec.imageId
   )
-  if (!spec.imageReference && legacyImage) {
+  if (!spec.imageReference && legacyImage?.kind === "image") {
     spec.imageReference = legacyImage.spec.reference
   }
   spec.imageReference = normalizeRuntimeImageReference(
@@ -736,14 +737,14 @@ function initialEditorSpec(
   return spec
 }
 
-function inputFromResource(resource: Resource): ResourceInput {
-  const input = resourceInputSchema.parse(resource)
-  if (resource.kind !== "runtime" && resource.kind !== "sandbox") return input
+function inputFromResource(resource: Resource): ResourceDraft {
+  if (resource.kind !== "runtime" && resource.kind !== "sandbox")
+    return { ...resource, spec: { ...resource.spec } }
   return {
-    ...input,
+    ...resource,
     spec: {
-      ...input.spec,
-      agentTools: supportedAgentToolList(input.spec.agentTools),
+      ...resource.spec,
+      agentTools: supportedAgentToolList(resource.spec.agentTools),
     },
   }
 }
@@ -774,6 +775,8 @@ export function ResourceEditorDialog({
   credentials,
   proxies,
   initialSpec,
+  dependenciesReady = true,
+  dependencyStatus,
   onOpenChange,
   onSave,
 }: {
@@ -785,10 +788,12 @@ export function ResourceEditorDialog({
   credentials: ManagedCredential[]
   proxies: ManagedNetworkProxy[]
   initialSpec?: Record<string, unknown>
+  dependenciesReady?: boolean
+  dependencyStatus?: ReactNode
   onOpenChange: (open: boolean) => void
   onSave: (input: ResourceInput) => Promise<void>
 }) {
-  const [input, setInput] = useState<ResourceInput>(() =>
+  const [input, setInput] = useState<ResourceDraft>(() =>
     resource
       ? inputFromResource(resource)
       : {
@@ -829,9 +834,9 @@ export function ResourceEditorDialog({
   const primarySpecFields = specFields.filter((field) => !field.advanced)
   const advancedSpecFields = specFields.filter((field) => field.advanced)
 
-  function update<K extends keyof ResourceInput>(
+  function update<K extends keyof ResourceDraft>(
     key: K,
-    value: ResourceInput[K]
+    value: ResourceDraft[K]
   ) {
     setInput((current) => ({ ...current, [key]: value }))
     setErrors((current) => ({ ...current, [key]: "" }))
@@ -855,6 +860,7 @@ export function ResourceEditorDialog({
   }
 
   async function submit() {
+    if (saving || !dependenciesReady) return
     const parsed = resourceInputSchema.safeParse(input)
     if (!parsed.success) {
       setErrors(
@@ -948,6 +954,7 @@ export function ResourceEditorDialog({
                     : "配置会保存在平台控制面，并由沙箱创建流程消费。"}
           </DialogDescription>
         </DialogHeader>
+        {dependencyStatus}
         <FieldGroup>
           {kind !== "project" &&
             kind !== "image" &&
@@ -1087,7 +1094,7 @@ export function ResourceEditorDialog({
           >
             取消
           </Button>
-          <Button onClick={submit} disabled={saving}>
+          <Button onClick={submit} disabled={saving || !dependenciesReady}>
             {saving ? (
               <Spinner data-icon="inline-start" />
             ) : (

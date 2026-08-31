@@ -12,6 +12,9 @@ import (
 )
 
 func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
+	if !s.negotiateWorkerProtocol(w, request) {
+		return
+	}
 	credential := authBearer(request)
 	job, err := s.store.ClaimWorkerJob(
 		request.Context(), request.PathValue("id"), credential,
@@ -27,12 +30,6 @@ func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
 	baseURL := workerRequestBaseURL(request, s.trustedProxy)
 	attachWorkerRuntimeEndpoints(job.Payload, baseURL)
 	attachWorkerProxyEndpoint(job.Payload, baseURL)
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryJob, Action: "claim",
-		Message:      "Worker 认领任务：" + job.Action,
-		ResourceKind: "server", ResourceID: request.PathValue("id"),
-		Detail: map[string]any{"jobId": job.ID, "jobAction": job.Action, "resourceId": job.ResourceID},
-	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
@@ -157,6 +154,9 @@ func removeLocalProxyHosts(values []string) []string {
 }
 
 func (s *Server) reportWorkerJobProgress(w http.ResponseWriter, request *http.Request) {
+	if !s.negotiateWorkerProtocol(w, request) {
+		return
+	}
 	var input platform.WorkerJobProgressInput
 	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {
 		return
@@ -191,6 +191,9 @@ func (s *Server) reportWorkerJobProgress(w http.ResponseWriter, request *http.Re
 }
 
 func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request) {
+	if !s.negotiateWorkerProtocol(w, request) {
+		return
+	}
 	var result platform.WorkerJobResult
 	if !s.decodeJSONWithLimit(w, request, &result, 8<<20) {
 		return
@@ -211,30 +214,6 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 		s.handleError(w, err)
 		return
 	}
-	message := result.Message
-	if len(message) > 500 {
-		message = message[:500]
-	}
-	entry := platform.LogEntry{
-		Category: platform.LogCategoryJob, Action: "complete",
-		Message:      "Worker 任务完成",
-		ResourceKind: "server", ResourceID: request.PathValue("id"),
-		Detail: map[string]any{"jobId": request.PathValue("jobId"), "externalId": result.ExternalID},
-	}
-	if message != "" {
-		entry.Detail["message"] = message
-	}
-	if !result.Success {
-		entry.Level = platform.LogLevelWarn
-		entry.Status = platform.LogStatusFailed
-		entry.Message = "Worker 任务失败"
-		if result.Error != nil {
-			entry.Detail["errorCode"] = result.Error.Code
-			entry.Detail["errorStage"] = result.Error.Stage
-			entry.Detail["retryable"] = result.Error.Retryable
-		}
-	}
-	s.recordLog(request, entry)
 	w.WriteHeader(http.StatusNoContent)
 }
 

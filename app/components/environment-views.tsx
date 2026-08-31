@@ -83,6 +83,7 @@ import {
   provisioningProgressSchema,
   type ProvisioningProgress,
   type Resource,
+  type ResourceOfKind,
 } from "@/lib/platform-schema"
 import {
   provisioningAgentToolStatusLabel,
@@ -588,9 +589,9 @@ export function SandboxesView({
       {selected && (
         <SandboxDetailsDialog
           sandbox={selected}
-          environment={resources.find(
-            (item) => item.id === selected.spec.runtimeId
-          )}
+          environment={resources
+            .filter((item) => item.kind === "runtime")
+            .find((item) => item.id === selected.spec.runtimeId)}
           server={servers.find((item) => item.id === selected.spec.serverId)}
           resources={resources}
           canOpenWorkspace={canOpenWorkspace}
@@ -622,8 +623,8 @@ function environmentColumns({
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
   onLaunch: (resource: Resource) => void
-}): ColumnDef<Resource>[] {
-  const columns: ColumnDef<Resource>[] = [
+}): ColumnDef<ResourceOfKind<"runtime">>[] {
+  const columns: ColumnDef<ResourceOfKind<"runtime">>[] = [
     {
       id: "name",
       accessorFn: (environment) => environment.name,
@@ -788,7 +789,7 @@ function sandboxColumns({
   ) => Promise<void>
   onEdit: (resource: Resource) => void
   onDelete: (resource: Resource) => void
-}): ColumnDef<Resource>[] {
+}): ColumnDef<ResourceOfKind<"sandbox">>[] {
   return [
     {
       id: "name",
@@ -850,9 +851,10 @@ function sandboxColumns({
     {
       id: "tools",
       accessorFn: (sandbox) => {
-        const inherited = resources.find(
-          (resource) => resource.id === sandbox.spec.runtimeId
-        )?.spec.agentTools
+        const inherited = resources
+          .filter((item) => item.kind === "runtime")
+          .find((resource) => resource.id === sandbox.spec.runtimeId)
+          ?.spec.agentTools
         const tools = Array.isArray(sandbox.spec.agentTools)
           ? sandbox.spec.agentTools
           : inherited
@@ -1030,7 +1032,7 @@ function sandboxColumns({
   ]
 }
 
-function sandboxFilterStatus(sandbox: Resource) {
+function sandboxFilterStatus(sandbox: ResourceOfKind<"sandbox">) {
   const status = String(sandbox.spec.status ?? "")
   return [
     "requested",
@@ -1050,15 +1052,15 @@ function SandboxAgentToolsDialog({
   onRefresh,
   onOpenChange,
 }: {
-  sandbox: Resource
+  sandbox: ResourceOfKind<"sandbox">
   resources: Resource[]
   onResourceChange: (resource: Resource) => void
   onRefresh: () => Promise<void>
   onOpenChange: (open: boolean) => void
 }) {
-  const runtime = resources.find(
-    (resource) => resource.id === sandbox.spec.runtimeId
-  )
+  const runtime = resources
+    .filter((item) => item.kind === "runtime")
+    .find((resource) => resource.id === sandbox.spec.runtimeId)
   const toolIds = supportedAgentToolList(
     Array.isArray(sandbox.spec.agentTools)
       ? sandbox.spec.agentTools
@@ -1101,8 +1103,8 @@ function SandboxDetailsDialog({
   canOpenWorkspace,
   onOpenChange,
 }: {
-  sandbox: Resource
-  environment?: Resource
+  sandbox: ResourceOfKind<"sandbox">
+  environment?: ResourceOfKind<"runtime">
   server?: ManagedServer
   resources: Resource[]
   canOpenWorkspace: boolean
@@ -1481,7 +1483,7 @@ function EnvironmentBadges({
   resource,
   detailed = false,
 }: {
-  resource: Resource
+  resource: ResourceOfKind<"runtime" | "sandbox">
   detailed?: boolean
 }) {
   const tools = stringList(resource.spec.agentTools)
@@ -1525,7 +1527,7 @@ function EnvironmentBadges({
 }
 
 function environmentSummary(
-  environment: Resource,
+  environment: ResourceOfKind<"runtime">,
   resources: Resource[],
   servers: ManagedServer[]
 ) {
@@ -1534,7 +1536,10 @@ function environmentSummary(
   return `${driver} · ${environmentImage(environment, resources)} · ${server?.name ?? "未绑定服务器"}`
 }
 
-function environmentImage(environment: Resource, resources: Resource[]) {
+function environmentImage(
+  environment: ResourceOfKind<"runtime" | "sandbox">,
+  resources: Resource[]
+) {
   const reference = specString(environment.spec, "imageReference")
   if (reference) return reference
   return (
@@ -1562,11 +1567,11 @@ function stringList(value: unknown) {
     : []
 }
 
-function isRunningSandbox(resource: Resource) {
+function isRunningSandbox(resource: ResourceOfKind<"sandbox">) {
   return resource.spec.status === "running"
 }
 
-function sandboxStatus(resource: Resource) {
+function sandboxStatus(resource: ResourceOfKind<"sandbox">) {
   switch (resource.spec.status) {
     case "running":
       return "运行中"

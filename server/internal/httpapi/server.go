@@ -21,6 +21,8 @@ import (
 
 type PlatformStore interface {
 	ListResources(context.Context) ([]platform.Resource, error)
+	ListResourcesFiltered(context.Context, platform.ResourceFilter) ([]platform.Resource, error)
+	GetResource(context.Context, string) (platform.Resource, error)
 	CreateResource(context.Context, platform.Input) (platform.Resource, error)
 	UpdateResource(context.Context, string, platform.Input) (platform.Resource, error)
 	DeleteResource(context.Context, string) error
@@ -162,6 +164,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	admin("GET /api/logs", server.listLogs)
 	authenticated("GET /api/catalog", server.getCatalog)
 	authenticated("GET /api/resources", server.listResources)
+	authenticated("GET /api/resources/{id}", server.getResource)
 	operator("POST /api/resources", server.createResource)
 	operator("PATCH /api/resources/{id}", server.updateResource)
 	operator("DELETE /api/resources/{id}", server.deleteResource)
@@ -237,7 +240,7 @@ func (s *Server) health(w http.ResponseWriter, request *http.Request) {
 		s.writeError(w, http.StatusServiceUnavailable, "数据库暂时不可用")
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "sessionTopology": SessionTopology})
 }
 
 func (s *Server) getCatalog(w http.ResponseWriter, _ *http.Request) {
@@ -245,12 +248,28 @@ func (s *Server) getCatalog(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) listResources(w http.ResponseWriter, request *http.Request) {
-	resources, err := s.store.ListResources(request.Context())
+	filter := platform.ResourceFilter{
+		Kind: platform.Kind(request.URL.Query().Get("kind")), ProjectID: request.URL.Query().Get("projectId"),
+	}
+	if err := filter.Validate(); err != nil {
+		s.handleError(w, err)
+		return
+	}
+	resources, err := s.store.ListResourcesFiltered(request.Context(), filter)
 	if err != nil {
 		s.handleError(w, err)
 		return
 	}
 	s.writeJSON(w, http.StatusOK, platform.Snapshot{Resources: resources})
+}
+
+func (s *Server) getResource(w http.ResponseWriter, request *http.Request) {
+	resource, err := s.store.GetResource(request.Context(), request.PathValue("id"))
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"resource": resource})
 }
 
 func (s *Server) createResource(w http.ResponseWriter, request *http.Request) {
@@ -274,8 +293,6 @@ func (s *Server) createResource(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	entry.Message = fmt.Sprintf("创建资源 %s（%s）", resource.Name, resource.Kind)
-	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusCreated, map[string]any{"resource": resource})
 }
 
@@ -301,9 +318,6 @@ func (s *Server) updateResource(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	entry.ResourceName = resource.Name
-	entry.Message = fmt.Sprintf("更新资源 %s（%s）", resource.Name, resource.Kind)
-	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusOK, map[string]any{"resource": resource})
 }
 
@@ -318,10 +332,6 @@ func (s *Server) deleteResource(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryResource, Action: "delete",
-		Message: fmt.Sprintf("删除资源 %s", id), ResourceID: id,
-	})
 	w.WriteHeader(http.StatusNoContent)
 }
 

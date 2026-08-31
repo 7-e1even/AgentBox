@@ -49,7 +49,6 @@ export function SandboxAgentToolsPanel({
   toolIds,
   running,
   onResourceChange,
-  onRefresh,
 }: SandboxAgentToolsPanelProps) {
   const autoCheckAttempted = useRef(false)
   const [submitting, setSubmitting] = useState<"check" | "update" | null>(null)
@@ -119,24 +118,6 @@ export function SandboxAgentToolsPanel({
     autoCheckAttempted.current = true
     void runAction("check", toolIds)
   }, [active, runAction, running, states.length, toolIds])
-
-  useEffect(() => {
-    if (!active) return
-    let cancelled = false
-    let timer = 0
-    const poll = async () => {
-      try {
-        await onRefresh()
-      } finally {
-        if (!cancelled) timer = window.setTimeout(poll, 750)
-      }
-    }
-    timer = window.setTimeout(poll, 500)
-    return () => {
-      cancelled = true
-      window.clearTimeout(timer)
-    }
-  }, [active, onRefresh])
 
   if (toolIds.length === 0) {
     return (

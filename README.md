@@ -24,6 +24,8 @@ docker compose ps
 
 长期或生产部署请先将 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`；需要固定版本、端口或公开地址时也在该文件中覆盖。
 
+Server 当前必须保持 **1 个副本**：会话票据、Worker 和浏览器 WebSocket 均属于同一进程，不支持多副本或重叠滚动发布。重启后 Worker 会重连，浏览器需要重新打开终端/桌面。部署约束与 Worker v1 协议兼容规则见[传输兼容矩阵](docs/transport-compatibility.md)。
+
 生产环境建议由反向代理（如 Nginx、Caddy）终结 TLS，以 HTTPS 对外提供访问。位于反向代理之后时，在 `.env` 中设置 `AGENTBOX_TRUSTED_PROXY=true`，Server 才会信任代理传入的 `X-Forwarded-*` 头；直接暴露端口或可信内网保持默认即可。代理还必须关闭流式响应缓冲、保留 WebSocket Upgrade，并把读写超时设为长于最长 Agent 会话，完整配置见[传输兼容矩阵](docs/transport-compatibility.md)。
 
 打开 `http://<服务器地址>:3000` 创建首个管理员，再到“服务器”页面复制命令安装并配对 Linux Worker。安装脚本会经由 AgentBox Server 下载当前 Release 中对应 `amd64` / `arm64` 的单个 Go Worker 二进制并校验 SHA-256；目标机不需要 Python，也不需要直接访问 GitHub。

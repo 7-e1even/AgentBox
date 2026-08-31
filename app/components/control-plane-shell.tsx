@@ -7,19 +7,26 @@ import {
   useEffect,
   useState,
   type ReactNode,
+  type SetStateAction,
 } from "react"
 import dynamic from "next/dynamic"
 import { ShieldXIcon, Trash2Icon } from "lucide-react"
-import { useRouter } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 
 import { AppSidebar } from "@/components/app-sidebar"
 import { ResourceEditorDialog } from "@/components/resource-editor-dialog"
 import { SandboxEditorDialog } from "@/components/sandbox-editor-dialog"
 import { SettingsView } from "@/components/settings-view"
 import { SiteHeaderProvider } from "@/components/site-header"
-import type { Provider } from "@/lib/catalog"
+import { catalogSchema } from "@/lib/catalog"
+import { observePollingVisibility, usePolling } from "@/hooks/use-polling"
+import { PollingController } from "@/lib/polling-controller"
+import { LoadState } from "@/components/load-state"
+import { Button } from "@/components/ui/button"
+import { domainsForEditor, domainsForSection } from "@/lib/console-domains"
 import {
   credentialModelsResponseSchema,
+  credentialsResponseSchema,
   credentialResponseSchema,
   type CredentialInput,
   type CredentialModel,
@@ -32,10 +39,15 @@ import {
   type ResourceInput,
   type ResourceKind,
 } from "@/lib/platform-schema"
-import { PROJECT_COOKIE_NAME, resourcesForProject } from "@/lib/project-scope"
-import type { ManagedServer } from "@/lib/server-schema"
+import {
+  PROJECT_COOKIE_NAME,
+  resolveProjectId,
+  resourcesForProject,
+} from "@/lib/project-scope"
+import { serversResponseSchema, type ManagedServer } from "@/lib/server-schema"
 import {
   networkProxyCheckResponseSchema,
+  networkProxiesResponseSchema,
   networkProxyResponseSchema,
   type ManagedNetworkProxy,
   type NetworkProxyCheckResult,
@@ -44,6 +56,7 @@ import {
 import { appToast as toast } from "@/lib/app-toast"
 import {
   userResponseSchema,
+  usersResponseSchema,
   type ManagedUser,
   type UserInput,
   type UserPreferences,
@@ -67,8 +80,12 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty"
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar"
-import { errorMessage, requestJson } from "@/lib/api-client"
-import { appSectionPath, type AppSection } from "@/lib/app-section"
+import { ApiError, errorMessage, requestJson } from "@/lib/api-client"
+import {
+  APP_SECTION_PATHS,
+  appSectionPath,
+  type AppSection,
+} from "@/lib/app-section"
 
 // 各管理视图按需加载，避免所有 section 的代码打进首屏 chunk。
 const AccessManagement = dynamic(() =>
@@ -124,13 +141,52 @@ const sectionKinds: Partial<
   variables: "variable",
 }
 
-type Catalog = {
-  providers: Provider[]
-}
-
 type SectionRenderer = (section: AppSection) => ReactNode
 
 const SectionRendererContext = createContext<SectionRenderer | null>(null)
+
+function useListPolling<T>(options: Parameters<typeof usePolling<T[]>>[0]) {
+  const state = usePolling(options)
+  const setData = state.setData
+  const setItems = useCallback(
+    (update: SetStateAction<T[]>) => {
+      setData((current) =>
+        typeof update === "function" ? update(current ?? []) : update
+      )
+    },
+    [setData]
+  )
+  return { ...state, items: state.data ?? [], setItems }
+}
+
+function resourcesPollingInterval(
+  resources: Resource[] | undefined
+): number | false {
+  return resources?.some(
+    (item) =>
+      item.kind === "sandbox" &&
+      (["requested", "starting", "stopping", "restarting", "deleting"].includes(
+        String(item.spec.status)
+      ) ||
+        ["queued", "running"].includes(
+          String(item.spec.proxyOperation?.status)
+        ) ||
+        ["queued", "running"].includes(
+          String(item.spec.agentToolOperation?.status)
+        ))
+  )
+    ? 1000
+    : false
+}
+
+const domainLabels = {
+  resources: "项目资源",
+  servers: "服务器",
+  credentials: "模型服务",
+  proxies: "网络代理",
+  users: "用户",
+  catalog: "模型服务目录",
+}
 
 export function ControlPlaneSection({ section }: { section: AppSection }) {
   const renderSection = useContext(SectionRendererContext)
@@ -143,34 +199,20 @@ export function ControlPlaneSection({ section }: { section: AppSection }) {
 }
 
 export function ControlPlaneShell({
-  initialResources,
-  initialServers,
-  initialCredentials,
-  initialProxies,
+  initialProjects,
   currentUser,
-  initialUsers,
   initialProjectId,
-  catalog,
   children,
 }: {
-  initialResources: Resource[]
-  initialServers: ManagedServer[]
-  initialCredentials: ManagedCredential[]
-  initialProxies: ManagedNetworkProxy[]
+  initialProjects?: Resource[]
   currentUser: ManagedUser
-  initialUsers: ManagedUser[]
   initialProjectId: string
-  catalog: Catalog
   children: ReactNode
 }) {
   const router = useRouter()
-  const [resources, setResources] = useState(initialResources)
-  const [servers, setServers] = useState(initialServers)
-  const [credentials, setCredentials] = useState(initialCredentials)
-  const [proxies, setProxies] = useState(initialProxies)
-  const [users, setUsers] = useState(initialUsers)
+  const pathname = usePathname()
   const [sessionUser, setSessionUser] = useState(currentUser)
-  const [projectId, setProjectId] = useState(initialProjectId)
+  const [selectedProjectId, setProjectId] = useState(initialProjectId)
   const [resourceEditor, setResourceEditor] = useState<{
     kind: ResourceKind
     resource: Resource | null
@@ -186,13 +228,148 @@ export function ControlPlaneShell({
   const [sandboxBusyId, setSandboxBusyId] = useState<string | null>(null)
   const [userBusyId, setUserBusyId] = useState<string | null>(null)
 
-  const projectResources = resources.filter((item) => item.kind === "project")
-  const currentProject = projectResources.find((item) => item.id === projectId)
-  const scopedResources = resourcesForProject(resources, projectId)
   const isViewer = sessionUser.role === "viewer"
   const isAdmin = sessionUser.role === "admin"
   // viewer 只读；operator 可变更沙箱/模板/自动化/镜像/项目，不能变更服务器/凭据/代理/用户
   const canMutateResources = !isViewer
+
+  const section = (Object.keys(APP_SECTION_PATHS) as AppSection[]).find(
+    (key) => APP_SECTION_PATHS[key] === pathname
+  )
+  const sectionNeeds = domainsForSection(section, isAdmin)
+  const editorNeeds = domainsForEditor(
+    sandboxEditor ? "sandbox" : resourceEditor?.kind
+  )
+  const needs = new Set([...sectionNeeds, ...editorNeeds])
+  const projectsDomain = useListPolling({
+    queryKey: "projects",
+    initialData: initialProjects,
+    load: async (signal) =>
+      resourcesResponseSchema.parse(
+        await requestJson<unknown>("/api/resources?kind=project", { signal })
+      ).resources,
+  })
+  const projectResources = projectsDomain.items
+  const projectId = resolveProjectId(projectsDomain.data, selectedProjectId)
+  const allProjects = section === "projects" || section === "servers"
+  const resourcesDomain = useListPolling({
+    queryKey: `resources:${allProjects ? "all" : projectId}`,
+    enabled: needs.has("resources"),
+    interval: resourcesPollingInterval,
+    load: async (signal) => {
+      if (allProjects)
+        return resourcesResponseSchema.parse(
+          await requestJson<unknown>("/api/resources", { signal })
+        ).resources
+      const [scoped, images] = await Promise.all([
+        requestJson<unknown>(
+          `/api/resources?projectId=${encodeURIComponent(projectId)}`,
+          { signal }
+        ),
+        requestJson<unknown>("/api/resources?kind=image", { signal }),
+      ])
+      return [
+        ...resourcesResponseSchema.parse(scoped).resources,
+        ...resourcesResponseSchema.parse(images).resources,
+      ]
+    },
+  })
+  const serversDomain = usePolling({
+    queryKey: "servers",
+    enabled: needs.has("servers"),
+    interval: 15000,
+    load: async (signal) =>
+      serversResponseSchema.parse(
+        await requestJson<unknown>("/api/servers", { signal })
+      ),
+  })
+  const credentialsDomain = useListPolling({
+    queryKey: "credentials",
+    enabled: needs.has("credentials"),
+    load: async (signal) =>
+      credentialsResponseSchema.parse(
+        await requestJson<unknown>("/api/credentials", { signal })
+      ).credentials,
+  })
+  const proxiesDomain = useListPolling({
+    queryKey: "proxies",
+    enabled: needs.has("proxies"),
+    load: async (signal) =>
+      networkProxiesResponseSchema.parse(
+        await requestJson<unknown>("/api/network-proxies", { signal })
+      ).proxies,
+  })
+  const usersDomain = useListPolling({
+    queryKey: "users",
+    enabled: isAdmin && needs.has("users"),
+    load: async (signal) =>
+      usersResponseSchema.parse(
+        await requestJson<unknown>("/api/users", { signal })
+      ).users,
+  })
+  const catalogDomain = usePolling({
+    queryKey: "catalog",
+    enabled: needs.has("catalog"),
+    load: async (signal) =>
+      catalogSchema.parse(
+        await requestJson<unknown>("/api/catalog", { signal })
+      ),
+  })
+  const domains = {
+    resources: resourcesDomain,
+    servers: serversDomain,
+    credentials: credentialsDomain,
+    proxies: proxiesDomain,
+    users: usersDomain,
+    catalog: catalogDomain,
+  }
+  const resources = [
+    ...projectResources,
+    ...resourcesDomain.items.filter((item) => item.kind !== "project"),
+  ]
+  const setResources = resourcesDomain.setItems
+  const servers = serversDomain.data?.servers ?? []
+  const setServerData = serversDomain.setData
+  const setServers = useCallback(
+    (update: SetStateAction<ManagedServer[]>) =>
+      setServerData((current) => ({
+        workerVersion: current?.workerVersion ?? "",
+        servers:
+          typeof update === "function"
+            ? update(current?.servers ?? [])
+            : update,
+      })),
+    [setServerData]
+  )
+  const refreshServerData = serversDomain.refresh
+  const refreshServers = useCallback(async () => {
+    if (!(await refreshServerData()))
+      throw new Error("服务器信息未能刷新，请重试")
+  }, [refreshServerData])
+  const credentials = credentialsDomain.items
+  const setCredentials = credentialsDomain.setItems
+  const proxies = proxiesDomain.items
+  const setProxies = proxiesDomain.setItems
+  const users = usersDomain.items
+  const setUsers = usersDomain.setItems
+  const currentProject = projectResources.find((item) => item.id === projectId)
+  const scopedResources = resourcesForProject(resources, projectId)
+  const editorReady = editorNeeds.every(
+    (key) => domains[key].data !== undefined && !domains[key].error
+  )
+  const editorIssue = editorNeeds.find(
+    (key) => domains[key].data === undefined || domains[key].error
+  )
+  const editorWaiting = editorNeeds.some(
+    (key) => domains[key].data === undefined
+  )
+  const editorDependencyStatus = editorIssue ? (
+    <LoadState
+      label={domainLabels[editorIssue]}
+      {...domains[editorIssue]}
+      onRetry={domains[editorIssue].refresh}
+    />
+  ) : undefined
 
   useEffect(() => {
     const secure = window.location.protocol === "https:" ? "; Secure" : ""
@@ -219,6 +396,7 @@ export function ControlPlaneShell({
     input: ResourceInput,
     editing: Resource | null = resourceEditor?.resource ?? null
   ) {
+    if (!editorReady) throw new Error("相关配置尚未加载完成，请先重试后再保存")
     const result = resourceResponseSchema.parse(
       await requestJson<unknown>(
         editing ? `/api/resources/${editing.id}` : "/api/resources",
@@ -235,6 +413,15 @@ export function ControlPlaneShell({
           )
         : [...current, result.resource]
     )
+    if (result.resource.kind === "project") {
+      projectsDomain.setItems((current) =>
+        editing
+          ? current.map((item) =>
+              item.id === result.resource.id ? result.resource : item
+            )
+          : [...current, result.resource]
+      )
+    }
     setResourceEditor(null)
     if (input.kind === "project" && !editing) {
       setProjectId(result.resource.id)
@@ -331,24 +518,63 @@ export function ControlPlaneShell({
 
   async function checkNetworkProxy(
     proxy: ManagedNetworkProxy,
-    serverId: string
+    serverId: string,
+    signal: AbortSignal
   ): Promise<NetworkProxyCheckResult> {
-    let result = networkProxyCheckResponseSchema.parse(
+    const result = networkProxyCheckResponseSchema.parse(
       await requestJson<unknown>(`/api/network-proxies/${proxy.id}/check`, {
         method: "POST",
         body: JSON.stringify({ serverId }),
+        signal,
       })
     ).result
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (result.status === "completed") return result
-      await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 750))
-      result = networkProxyCheckResponseSchema.parse(
-        await requestJson<unknown>(
-          `/api/network-proxies/${proxy.id}/checks/${result.checkId}`
+    signal.throwIfAborted()
+    if (result.status === "completed") return result
+    const polling = new PollingController(result)
+    polling.configure(
+      async (requestSignal) =>
+        networkProxyCheckResponseSchema.parse(
+          await requestJson<unknown>(
+            `/api/network-proxies/${proxy.id}/checks/${result.checkId}`,
+            { signal: requestSignal }
+          )
+        ).result,
+      750
+    )
+    const stopObserving = observePollingVisibility(polling)
+    try {
+      return await new Promise<NetworkProxyCheckResult>((resolve, reject) => {
+        const finish = (error?: unknown, value?: NetworkProxyCheckResult) => {
+          clearTimeout(timeout)
+          unsubscribe()
+          signal.removeEventListener("abort", abort)
+          polling.stop()
+          if (error) reject(error)
+          else resolve(value!)
+        }
+        const abort = () =>
+          finish(signal.reason || new DOMException("已取消检测", "AbortError"))
+        const timeout = setTimeout(
+          () => finish(new Error("Worker 检测超时，请确认 Worker 在线状态")),
+          30000
         )
-      ).result
+        const unsubscribe = polling.subscribe(() => {
+          const state = polling.getSnapshot()
+          if (state.data?.status === "completed") finish(undefined, state.data)
+          else if (
+            state.error &&
+            !(state.error instanceof TypeError) &&
+            !(state.error instanceof ApiError && state.error.retryable)
+          )
+            finish(state.error)
+        })
+        signal.addEventListener("abort", abort, { once: true })
+        polling.start()
+      })
+    } finally {
+      stopObserving()
+      polling.stop()
     }
-    throw new Error("Worker 检测超时，请确认 Worker 在线状态")
   }
 
   async function checkCredential(credential: ManagedCredential) {
@@ -428,32 +654,19 @@ export function ControlPlaneShell({
     return result.models
   }
 
+  const resourceRefresh = resourcesDomain.refresh
   const refreshResources = useCallback(async () => {
-    const result = resourcesResponseSchema.parse(
-      await requestJson<unknown>("/api/resources")
-    )
-    setResources(result.resources)
-  }, [])
+    await resourceRefresh()
+  }, [resourceRefresh])
 
-  const handleSandboxResourceChange = useCallback((resource: Resource) => {
-    setResources((current) =>
-      current.map((item) => (item.id === resource.id ? resource : item))
-    )
-  }, [])
-
-  const hasPendingSandboxes = resources.some(
-    (item) =>
-      item.kind === "sandbox" &&
-      ["requested", "starting", "stopping", "restarting", "deleting"].includes(
-        String(item.spec.status ?? "")
+  const handleSandboxResourceChange = useCallback(
+    (resource: Resource) => {
+      setResources((current) =>
+        current.map((item) => (item.id === resource.id ? resource : item))
       )
+    },
+    [setResources]
   )
-
-  useEffect(() => {
-    if (!hasPendingSandboxes) return
-    const timer = window.setInterval(() => void refreshResources(), 5000)
-    return () => window.clearInterval(timer)
-  }, [hasPendingSandboxes, refreshResources])
 
   async function operateSandbox(
     sandbox: Resource,
@@ -502,6 +715,10 @@ export function ControlPlaneShell({
         method: "DELETE",
       })
       setResources((current) => current.filter((item) => item.id !== target.id))
+      if (target.kind === "project")
+        projectsDomain.setItems((current) =>
+          current.filter((item) => item.id !== target.id)
+        )
       if (target.kind === "project" && target.id === projectId) {
         const next = resources.find(
           (item) => item.kind === "project" && item.id !== target.id
@@ -608,6 +825,17 @@ export function ControlPlaneShell({
 
   function renderSection(section: AppSection) {
     const kind = sectionKinds[section]
+    const missing = domainsForSection(section, isAdmin).find(
+      (key) => domains[key].data === undefined
+    )
+    if (missing)
+      return (
+        <LoadState
+          label={domainLabels[missing]}
+          {...domains[missing]}
+          onRetry={domains[missing].refresh}
+        />
+      )
 
     return section === "overview" ? (
       <DashboardView
@@ -631,6 +859,7 @@ export function ControlPlaneShell({
         resources={resources}
         credentials={credentials}
         canMutate={canMutateResources}
+        dependenciesReady={!resourcesDomain.error && !credentialsDomain.error}
       />
     ) : section === "automationRuns" ? (
       <AutomationRunHistory key={projectId} projectId={projectId} />
@@ -672,6 +901,8 @@ export function ControlPlaneShell({
         canMutate={isAdmin}
         canMutateRuntimes={canMutateResources}
         onServersChange={setServers}
+        onRefresh={refreshServers}
+        targetWorkerVersion={serversDomain.data?.workerVersion ?? ""}
         onCreateRuntime={(serverId) =>
           setResourceEditor({
             kind: "runtime",
@@ -687,7 +918,7 @@ export function ControlPlaneShell({
       <ImageManagement
         servers={servers}
         canMutate={canMutateResources}
-        onServersChange={setServers}
+        onRefresh={refreshServers}
         onCreateRuntime={(serverId, imageReference, driver) =>
           setResourceEditor({
             kind: "runtime",
@@ -699,7 +930,7 @@ export function ControlPlaneShell({
     ) : section === "access" ? (
       <AccessManagement
         credentials={credentials}
-        providers={catalog.providers}
+        providers={catalogDomain.data?.providers ?? []}
         canMutate={isAdmin}
         onSave={saveCredential}
         onCheck={checkCredential}
@@ -830,44 +1061,83 @@ export function ControlPlaneShell({
             className="min-w-0 overflow-hidden focus:outline-none"
           >
             <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+              {(projectsDomain.data === undefined ||
+                Boolean(projectsDomain.error)) && (
+                <LoadState
+                  label="项目"
+                  {...projectsDomain}
+                  onRetry={projectsDomain.refresh}
+                />
+              )}
+              {sectionNeeds
+                .filter((key) => domains[key].stale)
+                .map((key) => (
+                  <LoadState
+                    key={key}
+                    label={domainLabels[key]}
+                    {...domains[key]}
+                    onRetry={domains[key].refresh}
+                  />
+                ))}
+              {editorWaiting && (
+                <div className="px-4">
+                  {editorDependencyStatus}
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      setResourceEditor(null)
+                      setSandboxEditor(null)
+                    }}
+                  >
+                    取消编辑
+                  </Button>
+                </div>
+              )}
               {children}
             </div>
           </SidebarInset>
 
-          {resourceEditor && (
-            <ResourceEditorDialog
-              key={resourceEditor.resource?.id ?? resourceEditor.kind}
-              kind={resourceEditor.kind}
-              resource={resourceEditor.resource}
-              projectId={projectId}
-              resources={resources}
-              servers={servers}
-              credentials={credentials}
-              proxies={proxies}
-              initialSpec={resourceEditor.initialSpec}
-              onOpenChange={(open) => !open && setResourceEditor(null)}
-              onSave={saveResource}
-            />
-          )}
+          {resourceEditor &&
+            editorNeeds.every((key) => domains[key].data !== undefined) && (
+              <ResourceEditorDialog
+                key={resourceEditor.resource?.id ?? resourceEditor.kind}
+                kind={resourceEditor.kind}
+                resource={resourceEditor.resource}
+                projectId={projectId}
+                resources={resources}
+                servers={servers}
+                credentials={credentials}
+                proxies={proxies}
+                initialSpec={resourceEditor.initialSpec}
+                onOpenChange={(open) => !open && setResourceEditor(null)}
+                onSave={saveResource}
+                dependenciesReady={editorReady}
+                dependencyStatus={editorDependencyStatus}
+              />
+            )}
 
-          {sandboxEditor && (
-            <SandboxEditorDialog
-              key={
-                sandboxEditor.resource?.id ??
-                sandboxEditor.initialRuntimeId ??
-                "new"
-              }
-              resource={sandboxEditor.resource}
-              projectId={projectId}
-              resources={resources}
-              servers={servers}
-              credentials={credentials}
-              proxies={proxies}
-              initialRuntimeId={sandboxEditor.initialRuntimeId}
-              onOpenChange={(open) => !open && setSandboxEditor(null)}
-              onSave={saveSandbox}
-            />
-          )}
+          {sandboxEditor &&
+            editorNeeds.every((key) => domains[key].data !== undefined) && (
+              <SandboxEditorDialog
+                key={
+                  sandboxEditor.resource?.id ??
+                  sandboxEditor.initialRuntimeId ??
+                  "new"
+                }
+                resource={sandboxEditor.resource}
+                projectId={projectId}
+                resources={resources}
+                servers={servers}
+                credentials={credentials}
+                proxies={proxies}
+                initialRuntimeId={sandboxEditor.initialRuntimeId}
+                onOpenChange={(open) => !open && setSandboxEditor(null)}
+                onSave={saveSandbox}
+                dependenciesReady={editorReady}
+                dependencyStatus={editorDependencyStatus}
+              />
+            )}
 
           <AlertDialog
             open={Boolean(deletingResource)}

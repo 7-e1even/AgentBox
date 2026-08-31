@@ -1,6 +1,6 @@
 "use client"
 
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import {
   CircleCheckIcon,
   CircleXIcon,
@@ -92,7 +92,8 @@ type NetworkProxyManagementProps = {
   ) => Promise<ManagedNetworkProxy>
   onCheck: (
     proxy: ManagedNetworkProxy,
-    serverId: string
+    serverId: string,
+    signal: AbortSignal
   ) => Promise<NetworkProxyCheckResult>
   onDelete: (proxy: ManagedNetworkProxy) => Promise<void>
 }
@@ -110,6 +111,11 @@ export function NetworkProxyManagement({
   onCheck,
   onDelete,
 }: NetworkProxyManagementProps) {
+  const checkController = useRef<AbortController | null>(null)
+  useEffect(() => {
+    checkController.current = new AbortController()
+    return () => checkController.current?.abort()
+  }, [])
   const [selection, setSelection] = useState<string | null>(
     proxies[0]?.id ?? null
   )
@@ -178,12 +184,16 @@ export function NetworkProxyManagement({
       [proxy.id]: { status: "checking", serverName: checkServer.name },
     }))
     try {
-      const result = await onCheck(proxy, checkServer.id)
+      const signal = checkController.current?.signal
+      if (!signal || signal.aborted) return
+      const result = await onCheck(proxy, checkServer.id, signal)
+      signal.throwIfAborted()
       setChecks((current) => ({
         ...current,
         [proxy.id]: { status: "complete", result },
       }))
     } catch (cause) {
+      if (checkController.current?.signal.aborted) return
       setChecks((current) => ({
         ...current,
         [proxy.id]: {
@@ -199,6 +209,7 @@ export function NetworkProxyManagement({
     setCheckingAll(true)
     try {
       for (const proxy of proxies) {
+        if (checkController.current?.signal.aborted) break
         await runCheck(proxy)
       }
     } finally {

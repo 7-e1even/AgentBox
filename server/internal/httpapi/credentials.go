@@ -31,12 +31,6 @@ func (s *Server) createCredential(w http.ResponseWriter, request *http.Request) 
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryCredential, Action: "create",
-		Message:      "创建模型凭据 " + credential.Name,
-		ResourceKind: "credential", ResourceID: credential.ID, ResourceName: credential.Name,
-		Detail: map[string]any{"provider": credential.ProviderID},
-	})
 	s.writeJSON(w, http.StatusCreated, map[string]any{"credential": credential})
 }
 
@@ -58,12 +52,6 @@ func (s *Server) updateCredential(w http.ResponseWriter, request *http.Request) 
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryCredential, Action: "update",
-		Message:      "更新模型凭据 " + credential.Name,
-		ResourceKind: "credential", ResourceID: credential.ID, ResourceName: credential.Name,
-		Detail: map[string]any{"provider": credential.ProviderID, "enabled": credential.Enabled},
-	})
 	s.writeJSON(w, http.StatusOK, map[string]any{"credential": credential})
 }
 
@@ -78,11 +66,6 @@ func (s *Server) deleteCredential(w http.ResponseWriter, request *http.Request) 
 		s.handleError(w, err)
 		return
 	}
-	s.recordLog(request, platform.LogEntry{
-		Category: platform.LogCategoryCredential, Action: "delete",
-		Message:      "删除模型凭据 " + request.PathValue("id"),
-		ResourceKind: "credential", ResourceID: request.PathValue("id"),
-	})
 	w.WriteHeader(http.StatusNoContent)
 }
 
