@@ -188,14 +188,23 @@ func (s *Server) listAutomationRuns(w http.ResponseWriter, request *http.Request
 		return
 	}
 	limit, _ := strconv.Atoi(request.URL.Query().Get("limit"))
-	runs, err := s.store.ListAutomationRuns(
-		request.Context(), projectID, strings.TrimSpace(request.URL.Query().Get("automationId")), limit,
-	)
+	filter := platform.AutomationRunFilter{
+		ProjectID:    projectID,
+		AutomationID: strings.TrimSpace(request.URL.Query().Get("automationId")),
+		Status:       platform.AutomationRunStatus(strings.TrimSpace(request.URL.Query().Get("status"))),
+		Search:       strings.TrimSpace(request.URL.Query().Get("search")),
+		Cursor:       strings.TrimSpace(request.URL.Query().Get("cursor")),
+		Limit:        limit,
+	}
+	page, err := s.store.ListAutomationRunsPage(request.Context(), filter)
 	if err != nil {
 		s.handleError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]any{"runs": runs})
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"items": page.Items, "runs": page.Items,
+		"nextCursor": page.NextCursor, "hasMore": page.HasMore,
+	})
 }
 
 func (s *Server) getAutomationRun(w http.ResponseWriter, request *http.Request) {
@@ -345,7 +354,5 @@ func (s *Server) handleAutomationTriggerError(w http.ResponseWriter, err error) 
 }
 
 func (s *Server) writeAutomationWebhookError(w http.ResponseWriter, status int, code, message string, retryable bool) {
-	s.writeJSON(w, status, map[string]any{"error": map[string]any{
-		"code": code, "message": message, "retryable": retryable,
-	}})
+	s.writeAPIError(w, status, code, message, retryable)
 }

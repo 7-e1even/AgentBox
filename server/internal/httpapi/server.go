@@ -25,6 +25,7 @@ type PlatformStore interface {
 	UpdateResource(context.Context, string, platform.Input) (platform.Resource, error)
 	DeleteResource(context.Context, string) error
 	OperateSandbox(context.Context, string, string) (platform.Resource, error)
+	UpdateSandboxNetworkProxy(context.Context, string, string) (platform.Resource, error)
 	OperateSandboxAgentTools(context.Context, string, string, []string) (platform.Resource, error)
 	ListAutomations(context.Context, string) ([]platform.Automation, error)
 	GetAutomation(context.Context, string) (platform.Automation, error)
@@ -35,7 +36,7 @@ type PlatformStore interface {
 	RotateAutomationSecret(context.Context, string, string) (platform.Automation, string, error)
 	TriggerAutomation(context.Context, platform.AutomationDelivery) (platform.AutomationTriggerResult, error)
 	TestAutomation(context.Context, string, []byte) (platform.AutomationTriggerResult, error)
-	ListAutomationRuns(context.Context, string, string, int) ([]platform.AutomationRun, error)
+	ListAutomationRunsPage(context.Context, platform.AutomationRunFilter) (platform.AutomationRunPage, error)
 	GetAutomationRun(context.Context, string) (platform.AutomationRun, error)
 	GetPublicAutomationRun(context.Context, string, string, string) (platform.AutomationRun, error)
 	ListCredentials(context.Context) ([]platform.ManagedCredential, error)
@@ -165,6 +166,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	operator("PATCH /api/resources/{id}", server.updateResource)
 	operator("DELETE /api/resources/{id}", server.deleteResource)
 	operator("POST /api/sandboxes/{id}/actions/{action}", server.operateSandbox)
+	operator("PATCH /api/sandboxes/{id}/network-proxy", server.updateSandboxNetworkProxy)
 	operator("POST /api/sandboxes/{id}/agent-tools/actions/{action}", server.operateSandboxAgentTools)
 	operator("POST /api/sandboxes/{id}/session-ticket", server.createSandboxSessionTicket)
 	operator("POST /api/sandboxes/{id}/desktop-ticket", server.createSandboxDesktopTicket)
@@ -371,7 +373,44 @@ func (s *Server) handleError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) writeError(w http.ResponseWriter, status int, message string) {
-	s.writeJSON(w, status, map[string]string{"error": message})
+	s.writeAPIError(w, status, apiErrorCode(status), message, apiErrorRetryable(status))
+}
+
+func (s *Server) writeAPIError(w http.ResponseWriter, status int, code, message string, retryable bool) {
+	s.writeJSON(w, status, map[string]any{"error": map[string]any{
+		"code": code, "message": message, "retryable": retryable,
+	}})
+}
+
+func apiErrorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "invalid_request"
+	case http.StatusUnauthorized:
+		return "unauthorized"
+	case http.StatusForbidden:
+		return "forbidden"
+	case http.StatusNotFound:
+		return "not_found"
+	case http.StatusConflict:
+		return "conflict"
+	case http.StatusRequestEntityTooLarge:
+		return "payload_too_large"
+	case http.StatusTooManyRequests:
+		return "rate_limited"
+	case http.StatusBadGateway:
+		return "upstream_unavailable"
+	case http.StatusServiceUnavailable:
+		return "service_unavailable"
+	case http.StatusInternalServerError:
+		return "internal_error"
+	default:
+		return "request_failed"
+	}
+}
+
+func apiErrorRetryable(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
 }
 
 func (s *Server) writeJSON(w http.ResponseWriter, status int, value any) {

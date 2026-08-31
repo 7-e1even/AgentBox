@@ -172,7 +172,7 @@ func (s *Server) reportWorkerJobProgress(w http.ResponseWriter, request *http.Re
 	case "", "running", "installed", "verifying", "succeeded", "failed", "cached":
 		validAgentToolStatus = true
 	}
-	if input.Stage == "" || len(input.Stage) > 64 || len(input.Message) > 500 ||
+	if input.LeaseGeneration < 0 || input.Stage == "" || len(input.Stage) > 64 || len(input.Message) > 500 ||
 		len(input.CacheStatus) > 32 || len(input.CacheReason) > 200 ||
 		len(input.AgentTool) > 64 || !validAgentToolStatus ||
 		(input.AgentTool == "") != (input.AgentToolStatus == "") {
@@ -239,6 +239,9 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 }
 
 func normalizeWorkerJobResult(result *platform.WorkerJobResult) bool {
+	if result.LeaseGeneration < 0 {
+		return false
+	}
 	if !normalizeWorkerAgentTools(result.AgentTools) {
 		return false
 	}

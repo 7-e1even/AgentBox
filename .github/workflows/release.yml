@@ -12,6 +12,21 @@ jobs:
   worker:
     name: Test and publish Worker binaries
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: agentbox_test
+          POSTGRES_PASSWORD: agentbox
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agentbox_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      AGENTBOX_TEST_DATABASE_URL: postgres://postgres:agentbox@127.0.0.1:5432/agentbox_test?sslmode=disable
     permissions:
       contents: write
     steps:
@@ -30,7 +45,16 @@ jobs:
           cache-dependency-path: app/pnpm-lock.yaml
       - name: Test Go services
         working-directory: server
-        run: go test ./...
+        run: go test -count=1 ./...
+      - name: Exercise Docker lifecycle and real Session Worker RPC
+        working-directory: server
+        env:
+          AGENTBOX_DOCKER_E2E: "1"
+        run: |
+          set -o pipefail
+          output_path="${RUNNER_TEMP}/agentbox-docker-e2e.log"
+          go test -v -count=1 ./internal/sessionworker -run '^TestDockerSessionWorkerDataPlaneE2E$' | tee "${output_path}"
+          grep -q -- '--- PASS: TestDockerSessionWorkerDataPlaneE2E' "${output_path}"
       - name: Test Web app
         working-directory: app
         run: |

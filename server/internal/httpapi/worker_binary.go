@@ -23,7 +23,7 @@ var workerVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$
 func (s *Server) workerBinary(w http.ResponseWriter, request *http.Request) {
 	arch := request.URL.Query().Get("arch")
 	if arch != "amd64" && arch != "arm64" {
-		http.Error(w, "unsupported Worker architecture", http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "unsupported Worker architecture")
 		return
 	}
 	version := strings.TrimSpace(request.URL.Query().Get("version"))
@@ -31,11 +31,11 @@ func (s *Server) workerBinary(w http.ResponseWriter, request *http.Request) {
 		version = s.workerVersion
 	}
 	if !workerVersionPattern.MatchString(version) {
-		http.Error(w, "invalid Worker version", http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "invalid Worker version")
 		return
 	}
 	if version != s.workerVersion {
-		http.Error(w, "unsupported Worker version", http.StatusBadRequest)
+		s.writeError(w, http.StatusBadRequest, "unsupported Worker version")
 		return
 	}
 	path, err := s.resolveWorkerBinary(request.Context(), version, arch)
@@ -43,18 +43,18 @@ func (s *Server) workerBinary(w http.ResponseWriter, request *http.Request) {
 		if s.logger != nil {
 			s.logger.Error("resolve Worker binary", "version", version, "arch", arch, "error", err)
 		}
-		http.Error(w, "Worker binary is unavailable", http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Worker binary is unavailable")
 		return
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		http.Error(w, "Worker binary is unavailable", http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Worker binary is unavailable")
 		return
 	}
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		http.Error(w, "Worker binary is unavailable", http.StatusServiceUnavailable)
+		s.writeError(w, http.StatusServiceUnavailable, "Worker binary is unavailable")
 		return
 	}
 	// Expose the SHA-256 of the exact bytes served so installers can verify the

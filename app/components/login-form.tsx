@@ -22,6 +22,7 @@ import {
 } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
+import { apiErrorMessage } from "@/lib/api-client"
 
 export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
   const [busy, setBusy] = useState(false)
@@ -59,10 +60,8 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
         }
       )
       if (!response.ok) {
-        const body = (await response.json().catch(() => null)) as {
-          error?: string
-        } | null
-        throw new Error(body?.error || "登录失败，请稍后重试")
+        const body = await response.json().catch(() => null)
+        throw new Error(apiErrorMessage(body, "登录失败，请稍后重试"))
       }
       window.location.assign("/")
     } catch (cause) {

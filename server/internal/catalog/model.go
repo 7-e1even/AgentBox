@@ -15,27 +15,6 @@ type Provider struct {
 	Models      []ProviderModel `json:"models"`
 }
 
-type Skill struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Version     string `json:"version"`
-	Category    string `json:"category"`
-}
-
-type MCPServer struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Transport   string `json:"transport"`
-	ToolCount   int    `json:"toolCount"`
-	Status      string `json:"status"`
-}
-
 type Catalog struct {
 	Providers []Provider `json:"providers"`
-	// Skills and MCPServers only seed builtin control_resources at startup;
-	// they are no longer part of the /api/catalog response consumed by clients.
-	Skills     []Skill     `json:"-"`
-	MCPServers []MCPServer `json:"-"`
 }

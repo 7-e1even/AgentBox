@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"testing"
+	"time"
 )
 
 func TestSecretKeyFilePathPrefersExplicitEnv(t *testing.T) {
@@ -92,6 +93,98 @@ func TestLoadSecretKeyPersistsAndReloads(t *testing.T) {
 	}
 	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("key file mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestCreateOrReadSecretKeyUsesConcurrentWinner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "secret-key")
+	winnerFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatalf("reserve key file as winning process: %v", err)
+	}
+	winnerKey := bytes.Repeat([]byte{7}, 32)
+	loserKey := bytes.Repeat([]byte{8}, 32)
+	result := make(chan struct {
+		key []byte
+		err error
+	}, 1)
+	go func() {
+		key, err := createOrReadSecretKey(path, loserKey)
+		result <- struct {
+			key []byte
+			err error
+		}{key: key, err: err}
+	}()
+
+	// Keep the winning file empty briefly to exercise the loser's bounded
+	// retry instead of relying on filesystem scheduling to produce the race.
+	time.Sleep(30 * time.Millisecond)
+	encoded := base64.RawStdEncoding.EncodeToString(winnerKey) + "\n"
+	if _, err := winnerFile.WriteString(encoded); err != nil {
+		winnerFile.Close()
+		t.Fatalf("write winning key: %v", err)
+	}
+	if err := winnerFile.Close(); err != nil {
+		t.Fatalf("close winning key: %v", err)
+	}
+
+	select {
+	case loaded := <-result:
+		if loaded.err != nil {
+			t.Fatalf("load concurrently created key: %v", loaded.err)
+		}
+		if !bytes.Equal(loaded.key, winnerKey) {
+			t.Fatal("losing process returned its generated key instead of the authoritative file key")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("losing process did not observe the concurrently created key")
+	}
+}
+
+func TestLoadSecretKeyWaitsForConcurrentInitialWrite(t *testing.T) {
+	t.Setenv("AGENTBOX_SECRET_KEY", "")
+	path := filepath.Join(t.TempDir(), "secret-key")
+	t.Setenv("AGENTBOX_SECRET_KEY_FILE", path)
+	winnerFile, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatalf("reserve key file as winning process: %v", err)
+	}
+	winnerKey := bytes.Repeat([]byte{10}, 32)
+	result := make(chan struct {
+		key []byte
+		err error
+	}, 1)
+	go func() {
+		key, err := loadSecretKey()
+		result <- struct {
+			key []byte
+			err error
+		}{key: key, err: err}
+	}()
+
+	// loadSecretKey can observe the O_EXCL-created file before the winner has
+	// written its contents. Keep that window open long enough to prove the
+	// initial-read path retries the incomplete file.
+	time.Sleep(30 * time.Millisecond)
+	encoded := base64.RawStdEncoding.EncodeToString(winnerKey) + "\n"
+	if _, err := winnerFile.WriteString(encoded); err != nil {
+		winnerFile.Close()
+		t.Fatalf("write winning key: %v", err)
+	}
+	if err := winnerFile.Close(); err != nil {
+		t.Fatalf("close winning key: %v", err)
+	}
+
+	select {
+	case loaded := <-result:
+		if loaded.err != nil {
+			t.Fatalf("load key during concurrent initial write: %v", loaded.err)
+		}
+		if !bytes.Equal(loaded.key, winnerKey) {
+			t.Fatal("initial reader did not return the authoritative file key")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial reader did not observe the completed key file")
 	}
 }
 

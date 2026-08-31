@@ -27,7 +27,10 @@ class MockWebSocket {
 
   close(code = 1000) {
     if (code !== 1000 && (code < 3000 || code > 4999)) {
-      throw new DOMException("invalid WebSocket close code", "InvalidAccessError")
+      throw new DOMException(
+        "invalid WebSocket close code",
+        "InvalidAccessError"
+      )
     }
     this.closeCode = code
     this.readyState = 3
@@ -51,11 +54,12 @@ class MockWebSocket {
 }
 
 function stubFetchTicket(ticket = "ticket-1") {
-  return vi.fn(async () =>
-    new Response(JSON.stringify({ ticket }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    })
+  return vi.fn(
+    async () =>
+      new Response(JSON.stringify({ ticket }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
   )
 }
 
@@ -142,11 +146,12 @@ describe("SandboxSessionClient", () => {
     })
 
     it("会话服务暂时不可用时保持连接中并退避重试", async () => {
-      const fetchTicket = vi.fn(async () =>
-        new Response(JSON.stringify({ error: "沙箱会话服务尚未连接" }), {
-          status: 503,
-          headers: { "Content-Type": "application/json" },
-        })
+      const fetchTicket = vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: "沙箱会话服务尚未连接" }), {
+            status: 503,
+            headers: { "Content-Type": "application/json" },
+          })
       )
       vi.stubGlobal("fetch", fetchTicket)
       const client = new SandboxSessionClient("sandbox-1")
@@ -159,6 +164,42 @@ describe("SandboxSessionClient", () => {
       expect(fetchTicket).toHaveBeenCalledTimes(1)
       await vi.advanceTimersByTimeAsync(1)
       expect(fetchTicket).toHaveBeenCalledTimes(2)
+      client.stop()
+    })
+
+    it("结构化授权错误保留服务端消息且不重试", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                error: {
+                  code: "forbidden",
+                  message: "没有权限创建沙箱会话",
+                  retryable: false,
+                },
+              }),
+              {
+                status: 403,
+                headers: { "Content-Type": "application/json" },
+              }
+            )
+        )
+      )
+      const client = new SandboxSessionClient("sandbox-1")
+      const states: Array<{ state: string; detail?: string }> = []
+      client.onState((state, detail) => states.push({ state, detail }))
+
+      client.start()
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(client.getState()).toBe("error")
+      expect(states.at(-1)).toEqual({
+        state: "error",
+        detail: "没有权限创建沙箱会话",
+      })
+      expect(fetch).toHaveBeenCalledTimes(1)
       client.stop()
     })
 
@@ -184,7 +225,8 @@ describe("SandboxSessionClient", () => {
 
       socket.receive({
         type: "error",
-        error: "portal error: gRPC/tonic status: Unavailable, Connection refused",
+        error:
+          "portal error: gRPC/tonic status: Unavailable, Connection refused",
       })
       expect(client.getState()).toBe("connecting")
       await vi.advanceTimersByTimeAsync(1000)

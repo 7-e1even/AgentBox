@@ -100,6 +100,21 @@ type AutomationRun struct {
 	Provisioning           ProvisioningProgress `json:"provisioning"`
 }
 
+type AutomationRunFilter struct {
+	ProjectID    string
+	AutomationID string
+	Status       AutomationRunStatus
+	Search       string
+	Cursor       string
+	Limit        int
+}
+
+type AutomationRunPage struct {
+	Items      []AutomationRun `json:"items"`
+	NextCursor string          `json:"nextCursor"`
+	HasMore    bool            `json:"hasMore"`
+}
+
 type AutomationDelivery struct {
 	EndpointID     string
 	Authorization  string

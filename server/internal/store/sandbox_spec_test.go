@@ -125,11 +125,14 @@ func TestGrokBuildUsesResponsesFacade(t *testing.T) {
 
 func TestSandboxUpdatesPreserveWorkerManagedLifecycleFields(t *testing.T) {
 	for _, expected := range []string{
-		`($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning')`,
+		`- 'proxyId' - 'appliedProxyId' - 'proxyOperation'`,
 		`'status', spec->'status'`,
 		`'message', spec->'message'`,
 		`'externalId', spec->'externalId'`,
 		`'provisioning', spec->'provisioning'`,
+		`'proxyId', COALESCE(spec->'proxyId'`,
+		`'appliedProxyId', spec->'appliedProxyId'`,
+		`'proxyOperation', spec->'proxyOperation'`,
 	} {
 		if !strings.Contains(resourceUpdateSpecSQL, expected) {
 			t.Fatalf("sandbox update does not preserve Worker-managed field %q", expected)

@@ -13,6 +13,10 @@ type sandboxAgentToolActionInput struct {
 	Tools []string `json:"tools"`
 }
 
+type sandboxNetworkProxyInput struct {
+	ProxyID string `json:"proxyId"`
+}
+
 func (s *Server) operateSandbox(w http.ResponseWriter, request *http.Request) {
 	id, action := request.PathValue("id"), request.PathValue("action")
 	started := time.Now()
@@ -33,6 +37,40 @@ func (s *Server) operateSandbox(w http.ResponseWriter, request *http.Request) {
 	}
 	entry.ResourceName = resource.Name
 	entry.Message = fmt.Sprintf("沙箱 %s 执行操作 %s", resource.Name, action)
+	s.recordLog(request, entry)
+	s.writeJSON(w, http.StatusAccepted, map[string]any{"resource": resource})
+}
+
+func (s *Server) updateSandboxNetworkProxy(w http.ResponseWriter, request *http.Request) {
+	var input sandboxNetworkProxyInput
+	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {
+		return
+	}
+	input.ProxyID = strings.TrimSpace(input.ProxyID)
+	id := request.PathValue("id")
+	started := time.Now()
+	resource, err := s.store.UpdateSandboxNetworkProxy(request.Context(), id, input.ProxyID)
+	entry := platform.LogEntry{
+		Category: platform.LogCategorySandbox, Action: "network-proxy-update",
+		ResourceKind: string(platform.KindSandbox), ResourceID: id,
+		DurationMS: time.Since(started).Milliseconds(),
+		Detail:     map[string]any{"proxyId": input.ProxyID},
+	}
+	if err != nil {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Message = fmt.Sprintf("沙箱 %s 更新网络出口失败", id)
+		entry.Detail["error"] = err.Error()
+		s.recordLog(request, entry)
+		s.handleError(w, err)
+		return
+	}
+	entry.ResourceName = resource.Name
+	if input.ProxyID == "" {
+		entry.Message = fmt.Sprintf("沙箱 %s 切换为直连", resource.Name)
+	} else {
+		entry.Message = fmt.Sprintf("沙箱 %s 切换网络代理", resource.Name)
+	}
 	s.recordLog(request, entry)
 	s.writeJSON(w, http.StatusAccepted, map[string]any{"resource": resource})
 }

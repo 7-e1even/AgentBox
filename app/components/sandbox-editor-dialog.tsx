@@ -638,7 +638,7 @@ export function SandboxEditorDialog({
                         : driver === "boxlite" &&
                             input.spec.network === "restricted"
                           ? "只放行代理、直连地址和控制面。"
-                          : "向环境内程序注入标准 HTTP(S) 代理变量。"}
+                          : "向环境内程序注入标准 HTTP(S) 与 ALL_PROXY 变量。"}
                     </FieldDescription>
                   </Field>
                   <Field>

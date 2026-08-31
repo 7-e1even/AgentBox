@@ -8,15 +8,19 @@ import {
   useState,
   type ReactNode,
 } from "react"
+import Link from "next/link"
 import {
   ActivityIcon,
+  ArrowLeftIcon,
   CheckCircle2Icon,
   ChevronDownIcon,
   ClipboardIcon,
+  HistoryIcon,
   KeyRoundIcon,
   LoaderCircleIcon,
   PlayIcon,
   PlusIcon,
+  RefreshCwIcon,
   Trash2Icon,
   WebhookIcon,
   WorkflowIcon,
@@ -26,7 +30,9 @@ import {
 import { CollectionHeader } from "@/components/control-plane-view"
 import {
   CollectionContent,
+  CollectionCursorPagination,
   CollectionSearch,
+  CollectionTable,
   CollectionToolbar,
 } from "@/components/collection-list"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -82,6 +88,7 @@ import {
 import {
   Sheet,
   SheetContent,
+  SheetDescription,
   SheetHeader,
   SheetTitle,
 } from "@/components/ui/sheet"
@@ -309,18 +316,29 @@ export function AutomationManagement({
             >
               返回列表
             </Button>
-          ) : canMutate ? (
-            <Button
-              disabled={templates.length === 0}
-              onClick={() => {
-                setEditing("new")
-                resetSecret()
-              }}
-            >
-              <PlusIcon data-icon="inline-start" />
-              新建自动化
-            </Button>
-          ) : undefined
+          ) : (
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" asChild>
+                <Link href="/automations/runs">
+                  <HistoryIcon data-icon="inline-start" />
+                  <span className="sr-only sm:not-sr-only">运行记录</span>
+                </Link>
+              </Button>
+              {canMutate && (
+                <Button
+                  size="sm"
+                  disabled={templates.length === 0}
+                  onClick={() => {
+                    setEditing("new")
+                    resetSecret()
+                  }}
+                >
+                  <PlusIcon data-icon="inline-start" />
+                  <span className="sr-only sm:not-sr-only">新建自动化</span>
+                </Button>
+              )}
+            </div>
+          )
         }
       />
       <CollectionContent className="gap-6">
@@ -334,11 +352,6 @@ export function AutomationManagement({
             secret={secret}
             secretLoading={secretLoading}
             secretError={secretError}
-            runs={
-              editing === "new"
-                ? []
-                : runs.filter((run) => run.automationId === editing.id)
-            }
             onSaved={(automation, nextSecret) => {
               setAutomations((current) => {
                 const exists = current.some((item) => item.id === automation.id)
@@ -424,101 +437,104 @@ export function AutomationManagement({
                 )}
               </Empty>
             ) : (
-              <Card className="py-0">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead className="pl-4">自动化</TableHead>
-                      <TableHead>Webhook 来源</TableHead>
-                      <TableHead>沙箱模板</TableHead>
-                      <TableHead>最近运行</TableHead>
-                      <TableHead>状态</TableHead>
-                      <TableHead className="pr-4 text-right">操作</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {visibleAutomations.map((automation) => {
-                      const latestRun = latestRunByAutomation.get(automation.id)
-                      const template = templates.find(
-                        (item) => item.id === automation.templateId
-                      )
-                      return (
-                        <TableRow key={automation.id}>
-                          <TableCell className="max-w-72 pl-4">
-                            <button
-                              type="button"
-                              className="flex min-w-0 items-center gap-3 text-left"
-                              onClick={
-                                canMutate
-                                  ? () => editAutomation(automation)
-                                  : undefined
-                              }
-                            >
-                              <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                                <WorkflowIcon className="size-4" />
-                              </span>
-                              <span className="min-w-0">
-                                <span className="block truncate font-medium">
-                                  {automation.name}
-                                </span>
-                                <span className="block truncate text-xs text-muted-foreground">
-                                  {automation.description || "Webhook 创建沙箱"}
-                                </span>
-                              </span>
-                            </button>
-                          </TableCell>
-                          <TableCell>
-                            <span className="flex items-center gap-2">
-                              <WebhookIcon className="size-4 text-muted-foreground" />
-                              {authModeLabel(automation.trigger.authMode)}
+              <CollectionTable>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="pl-4">自动化</TableHead>
+                    <TableHead className="hidden lg:table-cell">
+                      Webhook 来源
+                    </TableHead>
+                    <TableHead className="hidden xl:table-cell">
+                      沙箱模板
+                    </TableHead>
+                    <TableHead>最近运行</TableHead>
+                    <TableHead className="hidden md:table-cell">状态</TableHead>
+                    <TableHead className="pr-4 text-right">操作</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {visibleAutomations.map((automation) => {
+                    const latestRun = latestRunByAutomation.get(automation.id)
+                    const template = templates.find(
+                      (item) => item.id === automation.templateId
+                    )
+                    return (
+                      <TableRow key={automation.id}>
+                        <TableCell className="max-w-72 pl-4">
+                          <button
+                            type="button"
+                            className="flex min-w-0 items-center gap-3 text-left"
+                            onClick={
+                              canMutate
+                                ? () => editAutomation(automation)
+                                : undefined
+                            }
+                          >
+                            <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted text-muted-foreground">
+                              <WorkflowIcon className="size-4" />
                             </span>
-                          </TableCell>
-                          <TableCell>
-                            {template?.name ?? automation.templateId}
-                          </TableCell>
-                          <TableCell>
-                            {latestRun ? (
-                              <div className="flex flex-col gap-0.5">
-                                <RunStatusBadge status={latestRun.status} />
-                                <span className="text-xs text-muted-foreground">
-                                  {formatRelativeTime(latestRun.receivedAt)}
-                                </span>
-                              </div>
-                            ) : (
-                              <span className="text-muted-foreground">
-                                尚未运行
+                            <span className="min-w-0">
+                              <span className="block truncate font-medium">
+                                {automation.name}
                               </span>
-                            )}
-                          </TableCell>
-                          <TableCell>
-                            <Badge
-                              variant={
-                                automation.enabled ? "default" : "secondary"
-                              }
+                              <span className="block truncate text-xs text-muted-foreground">
+                                {automation.description || "Webhook 创建沙箱"}
+                              </span>
+                            </span>
+                          </button>
+                        </TableCell>
+                        <TableCell className="hidden lg:table-cell">
+                          <span className="flex items-center gap-2">
+                            <WebhookIcon className="size-4 text-muted-foreground" />
+                            {authModeLabel(automation.trigger.authMode)}
+                          </span>
+                        </TableCell>
+                        <TableCell className="hidden xl:table-cell">
+                          {template?.name ?? automation.templateId}
+                        </TableCell>
+                        <TableCell>
+                          {latestRun ? (
+                            <Link
+                              href="/automations/runs"
+                              className="flex flex-col items-start gap-0.5"
                             >
-                              {automation.enabled ? "已启用" : "已停用"}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="pr-4 text-right">
-                            {canMutate && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => editAutomation(automation)}
-                              >
-                                编辑
-                              </Button>
-                            )}
-                          </TableCell>
-                        </TableRow>
-                      )
-                    })}
-                  </TableBody>
-                </Table>
-              </Card>
+                              <RunStatusBadge status={latestRun.status} />
+                              <span className="text-xs text-muted-foreground">
+                                {formatRelativeTime(latestRun.receivedAt)}
+                              </span>
+                            </Link>
+                          ) : (
+                            <span className="text-muted-foreground">
+                              尚未运行
+                            </span>
+                          )}
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell">
+                          <Badge
+                            variant={
+                              automation.enabled ? "default" : "secondary"
+                            }
+                          >
+                            {automation.enabled ? "已启用" : "已停用"}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="pr-4 text-right">
+                          {canMutate && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => editAutomation(automation)}
+                            >
+                              编辑
+                            </Button>
+                          )}
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </CollectionTable>
             )}
-
-            <RunHistory runs={runs.slice(0, 12)} />
           </>
         )}
       </CollectionContent>
@@ -566,7 +582,6 @@ function AutomationEditor({
   secret,
   secretLoading,
   secretError,
-  runs,
   onSaved,
   onRotate,
   onLoadSecret,
@@ -580,7 +595,6 @@ function AutomationEditor({
   secret: string
   secretLoading: boolean
   secretError: string
-  runs: AutomationRun[]
   onSaved: (automation: Automation, secret: string) => void
   onRotate: (automation: Automation, secret: string) => void
   onLoadSecret: (automation: Automation) => void
@@ -1021,8 +1035,6 @@ function AutomationEditor({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
-
-      {automation && <RunHistory runs={runs} title="这条自动化的运行记录" />}
     </div>
   )
 }
@@ -1181,103 +1193,293 @@ function CopyField({
   )
 }
 
-function RunHistory({
+export function AutomationRunHistory({ projectId }: { projectId: string }) {
+  const [runs, setRuns] = useState<AutomationRun[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState("")
+  const [search, setSearch] = useState("")
+  const [statusFilter, setStatusFilter] = useState<AutomationRunStatus | "all">(
+    "all"
+  )
+  const [cursorStack, setCursorStack] = useState([""])
+  const [nextCursor, setNextCursor] = useState("")
+  const [hasMore, setHasMore] = useState(false)
+  const runListRequestId = useRef(0)
+  const pageSize = 20
+  const currentCursor = cursorStack[cursorStack.length - 1]
+  const page = cursorStack.length
+
+  const loadRuns = useCallback(async () => {
+    const requestId = runListRequestId.current + 1
+    runListRequestId.current = requestId
+    try {
+      const params = new URLSearchParams({
+        projectId,
+        limit: String(pageSize),
+      })
+      if (statusFilter !== "all") params.set("status", statusFilter)
+      if (search.trim()) params.set("search", search.trim())
+      if (currentCursor) params.set("cursor", currentCursor)
+      const body = await requestJson<unknown>(
+        `/api/automation-runs?${params.toString()}`
+      )
+      const response = automationRunsResponseSchema.parse(body)
+      if (runListRequestId.current !== requestId) return
+      setRuns(response.items)
+      setNextCursor(response.nextCursor)
+      setHasMore(response.hasMore)
+      setLoadError("")
+    } catch (error) {
+      if (runListRequestId.current !== requestId) return
+      setLoadError(errorMessage(error))
+    } finally {
+      if (runListRequestId.current === requestId) setLoading(false)
+    }
+  }, [currentCursor, projectId, search, statusFilter])
+
+  useEffect(() => {
+    const initial = window.setTimeout(
+      () => void loadRuns(),
+      search.trim() ? 250 : 0
+    )
+    return () => window.clearTimeout(initial)
+  }, [loadRuns, search])
+
+  const hasActiveRuns = runs.some((run) =>
+    ["evaluating", "queued", "provisioning"].includes(run.status)
+  )
+
+  useEffect(() => {
+    if (!hasActiveRuns) return
+    const timer = window.setInterval(() => void loadRuns(), 5000)
+    return () => window.clearInterval(timer)
+  }, [hasActiveRuns, loadRuns])
+
+  const runPagination = (
+    <CollectionCursorPagination
+      currentPage={page}
+      itemCount={runs.length}
+      hasPrevious={cursorStack.length > 1}
+      hasNext={hasMore && nextCursor !== ""}
+      onPrevious={() => {
+        runListRequestId.current += 1
+        setCursorStack((current) => current.slice(0, -1))
+        setLoading(true)
+      }}
+      onNext={() => {
+        if (!nextCursor) return
+        runListRequestId.current += 1
+        setCursorStack((current) => [...current, nextCursor])
+        setLoading(true)
+      }}
+    />
+  )
+
+  return (
+    <section className="flex min-h-0 flex-1 flex-col">
+      <CollectionHeader
+        title="运行记录"
+        count={runs.length}
+        action={
+          <Button variant="outline" size="sm" asChild>
+            <Link href="/automations">
+              <ArrowLeftIcon data-icon="inline-start" />
+              <span className="sr-only sm:not-sr-only">返回自动化</span>
+            </Link>
+          </Button>
+        }
+      />
+      <CollectionContent>
+        <CollectionToolbar>
+          <CollectionSearch
+            value={search}
+            placeholder="搜索自动化、模板或沙箱"
+            onChange={(event) => {
+              runListRequestId.current += 1
+              setSearch(event.target.value)
+              setCursorStack([""])
+              setNextCursor("")
+              setHasMore(false)
+              setLoading(true)
+            }}
+          />
+          <div className="flex items-center gap-2">
+            <Select
+              value={statusFilter}
+              onValueChange={(value) => {
+                runListRequestId.current += 1
+                setStatusFilter(value as AutomationRunStatus | "all")
+                setCursorStack([""])
+                setNextCursor("")
+                setHasMore(false)
+                setLoading(true)
+              }}
+            >
+              <SelectTrigger className="w-full sm:w-40" aria-label="按状态筛选">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectGroup>
+                  <SelectItem value="all">全部状态</SelectItem>
+                  <SelectItem value="evaluating">正在校验</SelectItem>
+                  <SelectItem value="queued">等待 Worker</SelectItem>
+                  <SelectItem value="provisioning">正在预配</SelectItem>
+                  <SelectItem value="succeeded">成功</SelectItem>
+                  <SelectItem value="failed">失败</SelectItem>
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+            <Button
+              variant="outline"
+              size="icon"
+              aria-label="刷新运行记录"
+              onClick={() => void loadRuns()}
+            >
+              <RefreshCwIcon />
+            </Button>
+          </div>
+        </CollectionToolbar>
+
+        {loading ? (
+          <AutomationRunsSkeleton />
+        ) : loadError ? (
+          <Alert variant="destructive">
+            <XCircleIcon />
+            <AlertTitle>运行记录加载失败</AlertTitle>
+            <AlertDescription>{loadError}</AlertDescription>
+          </Alert>
+        ) : runs.length === 0 ? (
+          <>
+            <Empty className="min-h-72 flex-1 border-0">
+              <EmptyHeader>
+                <EmptyMedia variant="icon">
+                  <HistoryIcon />
+                </EmptyMedia>
+                <EmptyTitle>
+                  {search.trim() || statusFilter !== "all"
+                    ? "没有匹配的运行记录"
+                    : "还没有运行记录"}
+                </EmptyTitle>
+                <EmptyDescription>
+                  {search.trim() || statusFilter !== "all"
+                    ? "调整搜索词或状态筛选后再试。"
+                    : "Webhook 或控制台测试触发后，结果会出现在这里。"}
+                </EmptyDescription>
+              </EmptyHeader>
+            </Empty>
+            {runPagination}
+          </>
+        ) : (
+          <AutomationRunsTable runs={runs} pagination={runPagination} />
+        )}
+      </CollectionContent>
+    </section>
+  )
+}
+
+function AutomationRunsTable({
   runs,
-  title = "最近运行",
+  pagination,
 }: {
   runs: AutomationRun[]
-  title?: string
+  pagination?: ReactNode
 }) {
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
   const selectedRun = runs.find((run) => run.id === selectedRunId) ?? null
   return (
     <>
-      <Card>
-        <CardHeader>
-          <CardTitle>{title}</CardTitle>
-          <CardDescription>Webhook 接收与沙箱创建结果。</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {runs.length === 0 ? (
-            <div className="flex min-h-32 items-center justify-center rounded-lg border border-dashed text-sm text-muted-foreground">
-              尚无运行记录
-            </div>
-          ) : (
-            <div className="overflow-hidden rounded-lg border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>状态</TableHead>
-                    <TableHead>自动化</TableHead>
-                    <TableHead>模板</TableHead>
-                    <TableHead>关联沙箱</TableHead>
-                    <TableHead>接收时间</TableHead>
-                    <TableHead className="text-right">详情</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {runs.map((run) => (
-                    <TableRow key={run.id}>
-                      <TableCell>
-                        <div className="flex max-w-44 flex-col items-start gap-1">
-                          <RunStatusBadge status={run.status} />
-                          {run.provisioning.message &&
-                            ["queued", "provisioning"].includes(run.status) && (
-                              <span className="line-clamp-2 text-xs text-muted-foreground">
-                                {run.provisioning.message}
-                              </span>
-                            )}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        <div className="flex max-w-64 flex-col gap-0.5">
-                          <span className="truncate font-medium">
-                            {run.automationName}
-                          </span>
-                          {run.errorMessage && (
-                            <span className="truncate text-xs text-destructive">
-                              {run.errorMessage}
-                            </span>
-                          )}
-                        </div>
-                      </TableCell>
-                      <TableCell>
-                        {run.templateName || run.templateId}
-                      </TableCell>
-                      <TableCell className="font-mono text-xs">
-                        {run.sandboxId ?? "—"}
-                      </TableCell>
-                      <TableCell>{formatDateTime(run.receivedAt)}</TableCell>
-                      <TableCell className="text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setSelectedRunId(run.id)}
-                        >
-                          查看
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
-          )}
-        </CardContent>
-      </Card>
+      <CollectionTable pagination={pagination}>
+        <TableHeader>
+          <TableRow>
+            <TableHead className="pl-4">状态</TableHead>
+            <TableHead>自动化</TableHead>
+            <TableHead className="hidden lg:table-cell">模板</TableHead>
+            <TableHead className="hidden xl:table-cell">关联沙箱</TableHead>
+            <TableHead className="hidden md:table-cell">来源</TableHead>
+            <TableHead className="hidden sm:table-cell">接收时间</TableHead>
+            <TableHead className="hidden pr-4 text-right sm:table-cell">
+              详情
+            </TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {runs.map((run) => (
+            <TableRow key={run.id}>
+              <TableCell className="pl-4">
+                <div className="flex max-w-44 flex-col items-start gap-1">
+                  <RunStatusBadge status={run.status} />
+                  {run.provisioning.message &&
+                    ["queued", "provisioning"].includes(run.status) && (
+                      <span className="line-clamp-2 text-xs text-muted-foreground">
+                        {run.provisioning.message}
+                      </span>
+                    )}
+                </div>
+              </TableCell>
+              <TableCell className="max-w-0 sm:max-w-80">
+                <button
+                  type="button"
+                  className="flex w-full min-w-0 flex-col gap-0.5 text-left"
+                  aria-label={`查看 ${run.automationName} 运行详情`}
+                  onClick={() => setSelectedRunId(run.id)}
+                >
+                  <span className="truncate font-medium">
+                    {run.automationName}
+                  </span>
+                  {run.errorMessage && (
+                    <span
+                      className="truncate text-xs text-destructive"
+                      title={run.errorMessage}
+                    >
+                      {run.errorMessage}
+                    </span>
+                  )}
+                  <span className="text-xs text-muted-foreground sm:hidden">
+                    {formatDateTime(run.receivedAt)}
+                  </span>
+                </button>
+              </TableCell>
+              <TableCell className="hidden lg:table-cell">
+                {run.templateName || run.templateId}
+              </TableCell>
+              <TableCell className="hidden max-w-56 truncate font-mono text-xs xl:table-cell">
+                {run.sandboxId ?? "—"}
+              </TableCell>
+              <TableCell className="hidden text-muted-foreground md:table-cell">
+                {run.triggerSource === "manual-test" ? "控制台测试" : "Webhook"}
+              </TableCell>
+              <TableCell className="hidden sm:table-cell">
+                {formatDateTime(run.receivedAt)}
+              </TableCell>
+              <TableCell className="hidden pr-4 text-right sm:table-cell">
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setSelectedRunId(run.id)}
+                >
+                  查看
+                </Button>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </CollectionTable>
       <Sheet
         open={Boolean(selectedRun)}
         onOpenChange={(open) => !open && setSelectedRunId(null)}
       >
-        <SheetContent className="overflow-y-auto data-[side=right]:sm:max-w-xl">
+        <SheetContent className="overflow-x-hidden overflow-y-auto data-[side=right]:w-full data-[side=right]:sm:max-w-xl">
           <SheetHeader>
             <SheetTitle className="flex items-center gap-2">
               {selectedRun && <RunStatusBadge status={selectedRun.status} />}
-              Run 详情
+              运行详情
             </SheetTitle>
+            <SheetDescription>
+              Webhook 接收、沙箱创建与预配阶段的完整结果。
+            </SheetDescription>
           </SheetHeader>
           {selectedRun && (
-            <div className="flex flex-col gap-5 px-4 pb-6">
+            <div className="flex min-w-0 flex-col gap-5 overflow-x-hidden px-4 pb-6">
               <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm">
                 <dt className="text-muted-foreground">Run ID</dt>
                 <dd className="font-mono text-xs break-all">
@@ -1317,9 +1519,11 @@ function RunHistory({
                 <Alert variant="destructive">
                   <XCircleIcon />
                   <AlertTitle>{selectedRun.errorCode || "创建失败"}</AlertTitle>
-                  <AlertDescription>
-                    <div className="flex flex-col gap-2">
-                      <p className="break-words">{selectedRun.errorMessage}</p>
+                  <AlertDescription className="min-w-0">
+                    <div className="flex min-w-0 flex-col gap-2">
+                      <p className="break-all whitespace-pre-wrap">
+                        {selectedRun.errorMessage}
+                      </p>
                       {(selectedRun.errorStage ||
                         selectedRun.errorRetryable) && (
                         <div className="flex flex-wrap gap-2">
@@ -1346,6 +1550,18 @@ function RunHistory({
   )
 }
 
+function AutomationRunsSkeleton() {
+  return (
+    <div className="overflow-hidden rounded-lg border">
+      <div className="flex flex-col gap-3 p-4">
+        {Array.from({ length: 8 }, (_, index) => (
+          <Skeleton key={index} className="h-9 w-full" />
+        ))}
+      </div>
+    </div>
+  )
+}
+
 function ProvisioningDetails({ run }: { run: AutomationRun }) {
   const progress = run.provisioning
   return (
@@ -1367,9 +1583,11 @@ function ProvisioningDetails({ run }: { run: AutomationRun }) {
           )}
         />
         {progress.message && (
-          <div className="sm:col-span-3">
+          <div className="min-w-0 sm:col-span-3">
             <p className="text-xs text-muted-foreground">阶段说明</p>
-            <p className="mt-1 text-sm break-words">{progress.message}</p>
+            <p className="mt-1 text-sm break-all whitespace-pre-wrap">
+              {progress.message}
+            </p>
           </div>
         )}
       </div>

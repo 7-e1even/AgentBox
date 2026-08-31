@@ -1,3 +1,5 @@
+import { apiErrorMessage } from "./api-client"
+
 export type SandboxSessionState =
   "disconnected" | "connecting" | "ready" | "error"
 
@@ -197,13 +199,19 @@ export class SandboxSessionClient {
         `/api/sandboxes/${encodeURIComponent(this.sandboxId)}/session-ticket`,
         { method: "POST", credentials: "include" }
       )
-      const payload = (await response.json().catch(() => null)) as {
-        ticket?: string
-        error?: string
-      } | null
-      if (!response.ok || !payload?.ticket) {
-        const detail =
-          payload?.error || `无法创建沙箱会话（HTTP ${response.status}）`
+      const payload = await response.json().catch(() => null)
+      const ticket =
+        payload &&
+        typeof payload === "object" &&
+        "ticket" in payload &&
+        typeof payload.ticket === "string"
+          ? payload.ticket
+          : ""
+      if (!response.ok || !ticket) {
+        const detail = apiErrorMessage(
+          payload,
+          `无法创建沙箱会话（HTTP ${response.status}）`
+        )
         if (response.status === 401 || response.status === 403) {
           this.setState("error", detail)
           return
@@ -212,7 +220,7 @@ export class SandboxSessionClient {
       }
       if (this.stopped || generation !== this.connectionGeneration) return
 
-      const socket = new WebSocket(sessionURL(this.sandboxId, payload.ticket))
+      const socket = new WebSocket(sessionURL(this.sandboxId, ticket))
       this.socket = socket
       socket.addEventListener("message", (event) =>
         this.handleMessage(event.data)

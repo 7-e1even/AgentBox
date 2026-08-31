@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   automationInputSchema,
   automationRunSchema,
+  automationRunsResponseSchema,
   automationSchema,
 } from "./automation-schema"
 
@@ -109,5 +110,34 @@ describe("automation schemas", () => {
     expect(run.errorStage).toBe("")
     expect(run.errorRetryable).toBe(false)
     expect(run.errorDetails).toEqual({})
+  })
+
+  it("normalizes legacy and cursor-paginated run lists", () => {
+    expect(automationRunsResponseSchema.parse({ runs: [] })).toMatchObject({
+      items: [],
+      runs: [],
+      nextCursor: "",
+      hasMore: false,
+    })
+    expect(
+      automationRunsResponseSchema.parse({
+        items: [],
+        nextCursor: "next-page",
+        hasMore: true,
+      })
+    ).toMatchObject({
+      items: [],
+      runs: [],
+      nextCursor: "next-page",
+      hasMore: true,
+    })
+  })
+
+  it("rejects malformed cursor-paginated run lists", () => {
+    expect(automationRunsResponseSchema.safeParse({}).success).toBe(false)
+    expect(
+      automationRunsResponseSchema.safeParse({ items: [], hasMore: true })
+        .success
+    ).toBe(false)
   })
 })

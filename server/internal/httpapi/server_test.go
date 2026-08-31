@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -37,6 +38,43 @@ func TestStatusRecorderUnwrapsForStreamingWriteDeadline(t *testing.T) {
 	}
 }
 
+func TestWriteErrorUsesStructuredContract(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    int
+		code      string
+		retryable bool
+	}{
+		{name: "client error", status: http.StatusBadRequest, code: "invalid_request"},
+		{name: "temporary server error", status: http.StatusServiceUnavailable, code: "service_unavailable", retryable: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := &Server{}
+			response := httptest.NewRecorder()
+			server.writeError(response, test.status, "请求失败原因")
+
+			if response.Code != test.status {
+				t.Fatalf("status = %d, want %d", response.Code, test.status)
+			}
+			var body struct {
+				Error struct {
+					Code      string `json:"code"`
+					Message   string `json:"message"`
+					Retryable bool   `json:"retryable"`
+				} `json:"error"`
+			}
+			if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if body.Error.Code != test.code || body.Error.Message != "请求失败原因" || body.Error.Retryable != test.retryable {
+				t.Fatalf("error = %#v", body.Error)
+			}
+		})
+	}
+}
+
 type fakeStore struct{}
 
 type emptyUsersStore struct{ fakeStore }
@@ -62,6 +100,12 @@ func (fakeStore) OperateSandbox(_ context.Context, id, action string) (platform.
 		return platform.Resource{}, &platform.ValidationError{Message: "不支持的沙箱操作"}
 	}
 	return platform.Resource{Input: platform.Input{ID: id, Kind: platform.KindSandbox, Name: action}}, nil
+}
+func (fakeStore) UpdateSandboxNetworkProxy(_ context.Context, id, proxyID string) (platform.Resource, error) {
+	return platform.Resource{Input: platform.Input{
+		ID: id, Kind: platform.KindSandbox, Name: "proxy",
+		Spec: map[string]any{"proxyId": proxyID},
+	}}, nil
 }
 func (fakeStore) OperateSandboxAgentTools(_ context.Context, id, action string, tools []string) (platform.Resource, error) {
 	switch action {
@@ -116,8 +160,8 @@ func (fakeStore) TestAutomation(context.Context, string, []byte) (platform.Autom
 		ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunQueued,
 	}}, nil
 }
-func (fakeStore) ListAutomationRuns(context.Context, string, string, int) ([]platform.AutomationRun, error) {
-	return []platform.AutomationRun{}, nil
+func (fakeStore) ListAutomationRunsPage(context.Context, platform.AutomationRunFilter) (platform.AutomationRunPage, error) {
+	return platform.AutomationRunPage{Items: []platform.AutomationRun{}}, nil
 }
 func (fakeStore) GetAutomationRun(context.Context, string) (platform.AutomationRun, error) {
 	return platform.AutomationRun{ID: "96b47a49-96d4-492d-85e6-8c14f0315ae8", Status: platform.AutomationRunSucceeded}, nil
@@ -513,6 +557,27 @@ func TestSandboxAgentToolActionAcceptsSelectedTools(t *testing.T) {
 	if response.Code != http.StatusAccepted ||
 		!strings.Contains(response.Body.String(), `"requestedAgentTools":["codex","claude-code"]`) {
 		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+	}
+}
+
+func TestSandboxNetworkProxyUpdateAcceptsDirectAndNamedProxy(t *testing.T) {
+	for name, body := range map[string]string{
+		"direct": `{"proxyId":""}`,
+		"proxy":  `{"proxyId":"office-proxy"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(
+				http.MethodPatch,
+				"/api/sandboxes/sandbox-one/network-proxy",
+				strings.NewReader(body),
+			)
+			response := httptest.NewRecorder()
+			testHandler().ServeHTTP(response, request)
+			if response.Code != http.StatusAccepted ||
+				!strings.Contains(response.Body.String(), strings.TrimSuffix(strings.TrimPrefix(body, "{"), "}")) {
+				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
+			}
+		})
 	}
 }
 

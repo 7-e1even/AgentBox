@@ -10,7 +10,7 @@ const proxyIdSchema = z
 const networkProxyBaseSchema = z.object({
   id: proxyIdSchema,
   name: z.string().trim().min(2, "名称至少需要 2 个字符").max(80),
-  scheme: z.enum(["http", "https"]),
+  scheme: z.enum(["http", "https", "socks5", "socks5h"]),
   host: z
     .string()
     .trim()
@@ -103,8 +103,26 @@ export const networkProxyCheckResponseSchema = z.object({
   result: networkProxyCheckResultSchema,
 })
 
+export const sandboxProxyOperationSchema = z
+  .object({
+    status: z.enum([
+      "pending-start",
+      "queued",
+      "running",
+      "succeeded",
+      "failed",
+    ]),
+    desiredProxyId: z.string(),
+    appliedProxyId: z.string(),
+    message: z.string(),
+    updatedAt: z.string().datetime({ offset: true }),
+    finishedAt: z.string().datetime({ offset: true }).optional(),
+  })
+  .strict()
+
 export type NetworkProxyInput = z.infer<typeof networkProxyInputSchema>
 export type ManagedNetworkProxy = z.infer<typeof managedNetworkProxySchema>
 export type NetworkProxyCheckResult = z.infer<
   typeof networkProxyCheckResultSchema
 >
+export type SandboxProxyOperation = z.infer<typeof sandboxProxyOperationSchema>

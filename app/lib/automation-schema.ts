@@ -121,9 +121,26 @@ export const automationSecretResponseSchema = automationResponseSchema.extend({
   webhookPath: z.string(),
 })
 
-export const automationRunsResponseSchema = z.object({
-  runs: z.array(automationRunSchema),
-})
+export const automationRunsResponseSchema = z
+  .object({
+    items: z.array(automationRunSchema).optional(),
+    runs: z.array(automationRunSchema).optional(),
+    nextCursor: z.string().default(""),
+    hasMore: z.boolean().default(false),
+  })
+  .refine(
+    (response) => response.items !== undefined || response.runs !== undefined,
+    {
+      message: "运行记录响应缺少 items 或 runs",
+    }
+  )
+  .refine((response) => !response.hasMore || response.nextCursor !== "", {
+    message: "存在下一页时必须返回 nextCursor",
+  })
+  .transform((response) => {
+    const items = response.items ?? response.runs ?? []
+    return { ...response, items, runs: response.runs ?? items }
+  })
 
 export const automationTriggerResponseSchema = z.object({
   run: automationRunSchema,

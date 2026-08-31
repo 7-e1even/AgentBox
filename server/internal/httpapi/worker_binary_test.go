@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -93,6 +94,19 @@ func TestWorkerBinaryRejectsUnknownArchitecture(t *testing.T) {
 	server.workerBinary(response, request)
 	if response.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+	var body struct {
+		Error struct {
+			Code      string `json:"code"`
+			Message   string `json:"message"`
+			Retryable bool   `json:"retryable"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error envelope: %v", err)
+	}
+	if body.Error.Code != "invalid_request" || body.Error.Message != "unsupported Worker architecture" || body.Error.Retryable {
+		t.Fatalf("error = %+v", body.Error)
 	}
 }
 

@@ -79,6 +79,11 @@ const AutomationManagement = dynamic(() =>
     (mod) => mod.AutomationManagement
   )
 )
+const AutomationRunHistory = dynamic(() =>
+  import("@/components/automation-management").then(
+    (mod) => mod.AutomationRunHistory
+  )
+)
 const ImageManagement = dynamic(() =>
   import("@/components/image-management").then((mod) => mod.ImageManagement)
 )
@@ -627,6 +632,8 @@ export function ControlPlaneShell({
         credentials={credentials}
         canMutate={canMutateResources}
       />
+    ) : section === "automationRuns" ? (
+      <AutomationRunHistory key={projectId} projectId={projectId} />
     ) : section === "runtimes" ? (
       <EnvironmentTemplatesView
         key={projectId}

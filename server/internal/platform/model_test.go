@@ -279,6 +279,17 @@ func TestValidateNetworkProxyAndNetworkBinding(t *testing.T) {
 	if err := ValidateNetworkProxy(proxy); err != nil {
 		t.Fatalf("ValidateNetworkProxy() returned error: %v", err)
 	}
+	for _, scheme := range []string{"https", "socks5", "socks5h"} {
+		proxy.Scheme = scheme
+		if err := ValidateNetworkProxy(proxy); err != nil {
+			t.Errorf("ValidateNetworkProxy() rejected %s: %v", scheme, err)
+		}
+	}
+	proxy.Scheme = "ftp"
+	if err := ValidateNetworkProxy(proxy); !IsValidationError(err) {
+		t.Fatalf("ValidateNetworkProxy() error = %v, want unsupported scheme rejection", err)
+	}
+	proxy.Scheme = "http"
 	proxy.NoProxy = []string{"*"}
 	if err := ValidateNetworkProxy(proxy); !IsValidationError(err) {
 		t.Fatalf("ValidateNetworkProxy() error = %v, want global bypass rejection", err)

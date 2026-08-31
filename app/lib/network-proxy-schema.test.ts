@@ -1,6 +1,49 @@
 import { describe, expect, it } from "vitest"
 
-import { networkProxyCheckResponseSchema } from "./network-proxy-schema"
+import {
+  networkProxyCheckResponseSchema,
+  networkProxyInputSchema,
+  sandboxProxyOperationSchema,
+} from "./network-proxy-schema"
+
+describe("network proxy input", () => {
+  it.each(["http", "https", "socks5", "socks5h"] as const)(
+    "accepts the %s protocol",
+    (scheme) => {
+      expect(
+        networkProxyInputSchema.parse({
+          id: "office-proxy",
+          name: "Office proxy",
+          scheme,
+          host: "proxy.internal",
+          port: 1080,
+          username: "",
+          password: "",
+          noProxy: [],
+          enabled: true,
+        }).scheme
+      ).toBe(scheme)
+    }
+  )
+})
+
+describe("sandbox proxy operation", () => {
+  it("keeps desired and applied proxy state separate while a Worker job is queued", () => {
+    expect(
+      sandboxProxyOperationSchema.parse({
+        status: "queued",
+        desiredProxyId: "backup-proxy",
+        appliedProxyId: "office-proxy",
+        message: "正在排队应用网络出口",
+        updatedAt: "2026-08-30T08:00:00Z",
+      })
+    ).toMatchObject({
+      status: "queued",
+      desiredProxyId: "backup-proxy",
+      appliedProxyId: "office-proxy",
+    })
+  })
+})
 
 describe("network proxy check response", () => {
   it("accepts a successful latency result", () => {

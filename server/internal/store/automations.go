@@ -107,11 +107,19 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, "", err
 	}
-	templateResource, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.Automation{}, "", fmt.Errorf("begin create automation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockControlPlaneMutation(ctx, tx); err != nil {
+		return platform.Automation{}, "", err
+	}
+	templateResource, err := loadAutomationTemplate(ctx, tx, input.ProjectID, input.TemplateID)
 	if err != nil {
 		return platform.Automation{}, "", err
 	}
-	if err := validateAutomationModelBindings(ctx, s.pool, templateResource.Spec, input.ModelBindings); err != nil {
+	if err := validateAutomationModelBindings(ctx, tx, templateResource.Spec, input.ModelBindings); err != nil {
 		return platform.Automation{}, "", err
 	}
 	secret := input.Secret
@@ -127,7 +135,7 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 		return platform.Automation{}, "", err
 	}
 	now := time.Now().UTC()
-	automation, err := scanAutomation(s.pool.QueryRow(ctx, `INSERT INTO automations
+	automation, err := scanAutomation(tx.QueryRow(ctx, `INSERT INTO automations
     (id, project_id, name, description, enabled, trigger_type, action_type, auth_mode,
      endpoint_id, secret_hash, secret_ciphertext, secret_nonce, secret_last_four,
      template_id, model_bindings, input_template,
@@ -142,6 +150,9 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	if err != nil {
 		return platform.Automation{}, "", mapResourceError(err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.Automation{}, "", mapResourceError(err)
+	}
 	return automation, secret, nil
 }
 
@@ -150,14 +161,22 @@ func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.
 	if err := platform.ValidateAutomationInput(input); err != nil {
 		return platform.Automation{}, err
 	}
-	templateResource, err := loadAutomationTemplate(ctx, s.pool, input.ProjectID, input.TemplateID)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.Automation{}, fmt.Errorf("begin update automation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockControlPlaneMutation(ctx, tx); err != nil {
+		return platform.Automation{}, err
+	}
+	templateResource, err := loadAutomationTemplate(ctx, tx, input.ProjectID, input.TemplateID)
 	if err != nil {
 		return platform.Automation{}, err
 	}
-	if err := validateAutomationModelBindings(ctx, s.pool, templateResource.Spec, input.ModelBindings); err != nil {
+	if err := validateAutomationModelBindings(ctx, tx, templateResource.Spec, input.ModelBindings); err != nil {
 		return platform.Automation{}, err
 	}
-	automation, err := scanAutomation(s.pool.QueryRow(ctx, `UPDATE automations SET
+	automation, err := scanAutomation(tx.QueryRow(ctx, `UPDATE automations SET
 	project_id = $1, name = $2, description = $3, enabled = $4,
 	action_type = 'create-sandbox', auth_mode = $5, template_id = $6,
 	model_bindings = $7, updated_by = $8, updated_at = $9
@@ -172,16 +191,30 @@ func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.
 	if err != nil {
 		return platform.Automation{}, mapResourceError(err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.Automation{}, mapResourceError(err)
+	}
 	return automation, nil
 }
 
 func (s *Store) DeleteAutomation(ctx context.Context, id string) error {
-	command, err := s.pool.Exec(ctx, "DELETE FROM automations WHERE id = $1 AND action_type = 'create-sandbox'", id)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin delete automation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockControlPlaneMutation(ctx, tx); err != nil {
+		return err
+	}
+	command, err := tx.Exec(ctx, "DELETE FROM automations WHERE id = $1 AND action_type = 'create-sandbox'", id)
 	if err != nil {
 		return fmt.Errorf("delete automation: %w", err)
 	}
 	if command.RowsAffected() == 0 {
 		return ErrResourceNotFound
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete automation: %w", err)
 	}
 	return nil
 }
@@ -234,6 +267,9 @@ func (s *Store) triggerAutomation(
 		return platform.AutomationTriggerResult{}, fmt.Errorf("begin automation trigger: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	if err := lockControlPlaneReferences(ctx, tx); err != nil {
+		return platform.AutomationTriggerResult{}, err
+	}
 	where := "id = $1"
 	if byEndpoint {
 		where = "endpoint_id = $1"
@@ -366,33 +402,106 @@ func (s *Store) triggerAutomation(
 }
 
 func (s *Store) ListAutomationRuns(ctx context.Context, projectID, automationID string, limit int) ([]platform.AutomationRun, error) {
+	page, err := s.ListAutomationRunsPage(ctx, platform.AutomationRunFilter{
+		ProjectID: projectID, AutomationID: automationID, Limit: limit,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+func (s *Store) ListAutomationRunsPage(ctx context.Context, filter platform.AutomationRunFilter) (platform.AutomationRunPage, error) {
+	limit := filter.Limit
 	if limit <= 0 || limit > 100 {
 		limit = 50
+	}
+	automationID := strings.TrimSpace(filter.AutomationID)
+	if automationID != "" {
+		if _, err := uuid.Parse(automationID); err != nil {
+			return platform.AutomationRunPage{}, &platform.ValidationError{Message: "自动化筛选无效"}
+		}
 	}
 	query := `SELECT ` + automationRunColumns + ` FROM automation_runs
 		WHERE project_id = $1 AND action_type = 'create-sandbox'
 		  AND status IN ('evaluating', 'queued', 'provisioning', 'succeeded', 'failed')`
-	args := []any{strings.TrimSpace(projectID)}
-	if strings.TrimSpace(automationID) != "" {
+	args := []any{strings.TrimSpace(filter.ProjectID)}
+	if automationID != "" {
 		query += ` AND automation_id = $2`
 		args = append(args, automationID)
 	}
+	if filter.Status != "" {
+		switch filter.Status {
+		case platform.AutomationRunEvaluating, platform.AutomationRunQueued,
+			platform.AutomationRunProvisioning, platform.AutomationRunSucceeded, platform.AutomationRunFailed:
+		default:
+			return platform.AutomationRunPage{}, &platform.ValidationError{Message: "运行状态筛选无效"}
+		}
+		query += fmt.Sprintf(` AND status = $%d`, len(args)+1)
+		args = append(args, filter.Status)
+	}
+	if search := strings.TrimSpace(filter.Search); search != "" {
+		query += fmt.Sprintf(` AND concat_ws(' ', automation_name, template_name, template_id,
+			COALESCE(sandbox_id, ''), error_message) ILIKE $%d`, len(args)+1)
+		args = append(args, "%"+search+"%")
+	}
+	if strings.TrimSpace(filter.Cursor) != "" {
+		receivedAt, id, err := decodeAutomationRunCursor(filter.Cursor)
+		if err != nil {
+			return platform.AutomationRunPage{}, &platform.ValidationError{Message: "运行记录游标无效"}
+		}
+		query += fmt.Sprintf(` AND (received_at, id) < ($%d, $%d::uuid)`, len(args)+1, len(args)+2)
+		args = append(args, receivedAt, id)
+	}
 	query += fmt.Sprintf(` ORDER BY received_at DESC, id DESC LIMIT $%d`, len(args)+1)
-	args = append(args, limit)
+	args = append(args, limit+1)
 	rows, err := s.pool.Query(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list automation runs: %w", err)
+		return platform.AutomationRunPage{}, fmt.Errorf("list automation runs: %w", err)
 	}
 	defer rows.Close()
-	runs := make([]platform.AutomationRun, 0)
+	runs := make([]platform.AutomationRun, 0, limit+1)
 	for rows.Next() {
 		run, err := scanAutomationRun(rows)
 		if err != nil {
-			return nil, fmt.Errorf("scan automation run: %w", err)
+			return platform.AutomationRunPage{}, fmt.Errorf("scan automation run: %w", err)
 		}
 		runs = append(runs, run)
 	}
-	return runs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return platform.AutomationRunPage{}, err
+	}
+	page := platform.AutomationRunPage{Items: runs}
+	if len(runs) > limit {
+		page.Items = runs[:limit]
+		page.HasMore = true
+		page.NextCursor = encodeAutomationRunCursor(page.Items[len(page.Items)-1])
+	}
+	return page, nil
+}
+
+func encodeAutomationRunCursor(run platform.AutomationRun) string {
+	value := run.ReceivedAt.UTC().Format(time.RFC3339Nano) + "\n" + run.ID
+	return base64.RawURLEncoding.EncodeToString([]byte(value))
+}
+
+func decodeAutomationRunCursor(cursor string) (time.Time, string, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(cursor))
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	receivedAt, id, ok := strings.Cut(string(raw), "\n")
+	if !ok {
+		return time.Time{}, "", errors.New("automation run cursor has no separator")
+	}
+	parsedTime, err := time.Parse(time.RFC3339Nano, receivedAt)
+	if err != nil {
+		return time.Time{}, "", err
+	}
+	if _, err := uuid.Parse(id); err != nil {
+		return time.Time{}, "", err
+	}
+	return parsedTime, id, nil
 }
 
 func (s *Store) GetAutomationRun(ctx context.Context, id string) (platform.AutomationRun, error) {

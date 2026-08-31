@@ -281,6 +281,67 @@ function CollectionPagination({
   )
 }
 
+function CollectionCursorPagination({
+  currentPage,
+  itemCount,
+  hasPrevious,
+  hasNext,
+  onPrevious,
+  onNext,
+}: {
+  currentPage: number
+  itemCount: number
+  hasPrevious: boolean
+  hasNext: boolean
+  onPrevious: () => void
+  onNext: () => void
+}) {
+  if (itemCount === 0 && !hasPrevious) return null
+
+  return (
+    <>
+      <Separator />
+      <div className="flex min-h-14 flex-col gap-2 bg-muted/20 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+        <p className="text-center text-xs text-muted-foreground sm:text-left">
+          第 {currentPage} 页 · 本页 {itemCount} 条
+        </p>
+        <Pagination className="mx-0 w-auto justify-end">
+          <PaginationContent>
+            <PaginationItem>
+              <PaginationPrevious
+                href="#"
+                text="上一页"
+                aria-label="上一页"
+                aria-disabled={!hasPrevious}
+                tabIndex={hasPrevious ? undefined : -1}
+                className={cn(!hasPrevious && "pointer-events-none opacity-50")}
+                onClick={(event) => {
+                  event.preventDefault()
+                  if (hasPrevious) onPrevious()
+                }}
+              />
+            </PaginationItem>
+            <PaginationItem>
+              <PaginationNext
+                href="#"
+                text="下一页"
+                aria-label="下一页"
+                aria-disabled={!hasNext}
+                tabIndex={hasNext ? undefined : -1}
+                className={cn(!hasNext && "pointer-events-none opacity-50")}
+                onClick={(event) => {
+                  event.preventDefault()
+                  if (hasNext) onNext()
+                }}
+              />
+            </PaginationItem>
+          </PaginationContent>
+        </Pagination>
+      </div>
+    </>
+  )
+}
+
 function paginationItems(currentPage: number, totalPages: number) {
   if (totalPages <= 5) {
     return Array.from({ length: totalPages }, (_, index) => index + 1)
@@ -300,6 +361,7 @@ function paginationItems(currentPage: number, totalPages: number) {
 
 export {
   CollectionContent,
+  CollectionCursorPagination,
   CollectionList,
   CollectionListItem,
   CollectionPagination,

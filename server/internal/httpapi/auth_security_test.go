@@ -37,6 +37,9 @@ func TestLoginRateLimitReturns429(t *testing.T) {
 	if response.Code != http.StatusTooManyRequests {
 		t.Fatalf("attempt %d: status = %d, want %d", loginRateLimitAttempts+1, response.Code, http.StatusTooManyRequests)
 	}
+	if got := response.Header().Get("Retry-After"); got != "60" {
+		t.Fatalf("Retry-After = %q, want 60", got)
+	}
 }
 
 func TestLoginRateLimitCannotBeBypassedWithRotatingUsernames(t *testing.T) {

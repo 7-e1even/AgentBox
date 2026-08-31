@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
-	"os"
 	"testing"
 
 	"agentbox/internal/catalog"
@@ -17,10 +16,7 @@ import (
 // database to run them.
 func newIntegrationTestStore(t *testing.T) *Store {
 	t.Helper()
-	databaseURL := os.Getenv("AGENTBOX_TEST_DATABASE_URL")
-	if databaseURL == "" {
-		t.Skip("AGENTBOX_TEST_DATABASE_URL is not set; skipping integration test")
-	}
+	databaseURL := newIntegrationDatabaseURL(t)
 	t.Setenv("AGENTBOX_SECRET_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32)))
 	ctx := t.Context()
 	store, err := New(ctx, databaseURL, catalog.Catalog{})
@@ -107,6 +103,10 @@ func TestJanitorCleansExpiredRowsAndStuckSandboxes(t *testing.T) {
 	if _, _, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s))); err != nil {
 		t.Fatalf("register server: %v", err)
 	}
+	busyServerID := uuid.NewString()
+	if _, _, err := s.RegisterServer(ctx, testServerRegistration(busyServerID, mustCreatePairingToken(t, s))); err != nil {
+		t.Fatalf("register busy server: %v", err)
+	}
 
 	// Finished worker jobs: one older than the 7-day retention, one fresh.
 	oldJobID, freshJobID := uuid.NewString(), uuid.NewString()
@@ -163,16 +163,18 @@ func TestJanitorCleansExpiredRowsAndStuckSandboxes(t *testing.T) {
 		t.Fatalf("insert fresh session: %v", err)
 	}
 
-	// A sandbox stuck in 'requested' whose creation job was never claimed, and a
-	// freshly requested sandbox that must be left alone.
+	// A sandbox assigned to a long-offline Worker may become terminal. A fresh
+	// sandbox and an old queued sandbox whose Worker is still online must remain.
 	stuckSandboxID := "janitor-stuck-" + uuid.NewString()
 	freshSandboxID := "janitor-fresh-" + uuid.NewString()
+	busySandboxID := "janitor-busy-" + uuid.NewString()
 	for _, sandbox := range []struct {
 		id     string
 		ageSQL string
 	}{
 		{stuckSandboxID, "NOW() - INTERVAL '20 minutes'"},
 		{freshSandboxID, "NOW()"},
+		{busySandboxID, "NOW() - INTERVAL '20 minutes'"},
 	} {
 		if _, err := s.pool.Exec(ctx, `INSERT INTO control_resources
 		  (id, kind, project_id, name, description, enabled, spec, created_at, updated_at)
@@ -188,6 +190,19 @@ func TestJanitorCleansExpiredRowsAndStuckSandboxes(t *testing.T) {
 	          NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '20 minutes')`,
 		uuid.NewString(), serverID, stuckSandboxID); err != nil {
 		t.Fatalf("insert stuck sandbox job: %v", err)
+	}
+	busyJobID := uuid.NewString()
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_jobs
+	  (id, server_id, resource_id, action, status, payload, created_at, updated_at)
+	  VALUES ($1, $2, $3, 'create-sandbox', 'pending', '{}'::jsonb,
+	          NOW() - INTERVAL '20 minutes', NOW() - INTERVAL '20 minutes')`,
+		busyJobID, busyServerID, busySandboxID); err != nil {
+		t.Fatalf("insert queued sandbox job for online Worker: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE managed_servers SET
+	  last_seen_at = NOW(), last_job_activity_at = NOW() - INTERVAL '20 minutes'
+	  WHERE id = $1`, serverID); err != nil {
+		t.Fatalf("mark Worker job loop inactive: %v", err)
 	}
 
 	// Two passes must converge to the same state (idempotency).
@@ -216,7 +231,7 @@ func TestJanitorCleansExpiredRowsAndStuckSandboxes(t *testing.T) {
 	  FROM control_resources WHERE id = $1`, stuckSandboxID).Scan(&status, &message); err != nil {
 		t.Fatalf("load stuck sandbox: %v", err)
 	}
-	if status != "error" || message != "Worker 离线或任务超时未被认领" {
+	if status != "error" || message != "Worker 任务循环长时间无活动，任务未被认领" {
 		t.Fatalf("stuck sandbox status = %q message = %q, want error state", status, message)
 	}
 	if err := s.pool.QueryRow(ctx, `SELECT spec->>'status'
@@ -225,5 +240,19 @@ func TestJanitorCleansExpiredRowsAndStuckSandboxes(t *testing.T) {
 	}
 	if status != "requested" {
 		t.Fatalf("fresh sandbox status = %q, want requested", status)
+	}
+	var busyJobStatus string
+	if err := s.pool.QueryRow(ctx, `SELECT status FROM worker_jobs WHERE id = $1`, busyJobID).Scan(&busyJobStatus); err != nil {
+		t.Fatalf("load queued job for online Worker: %v", err)
+	}
+	if busyJobStatus != "pending" {
+		t.Fatalf("queued job for online Worker status = %q, want pending", busyJobStatus)
+	}
+	if err := s.pool.QueryRow(ctx, `SELECT spec->>'status'
+	  FROM control_resources WHERE id = $1`, busySandboxID).Scan(&status); err != nil {
+		t.Fatalf("load queued sandbox for online Worker: %v", err)
+	}
+	if status != "requested" {
+		t.Fatalf("queued sandbox for online Worker status = %q, want requested", status)
 	}
 }

@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -33,6 +34,32 @@ func TestNormalizeWorkerJobResultRejectsUnsafeErrorMetadata(t *testing.T) {
 		if normalizeWorkerJobResult(&result) {
 			t.Fatalf("unsafe Worker error was accepted: %#v", workerError)
 		}
+	}
+}
+
+func TestWorkerJobEndpointsRejectNegativeLeaseGeneration(t *testing.T) {
+	for name, test := range map[string]struct {
+		path string
+		body string
+	}{
+		"progress": {
+			path: "/api/servers/7b20f83b-6418-4a9f-8477-3dc7c35d6310/jobs/754f76dd-2297-44e9-8204-a688be9be4a5/progress",
+			body: `{"leaseGeneration":-1,"stage":"runtime","message":"running"}`,
+		},
+		"complete": {
+			path: "/api/servers/7b20f83b-6418-4a9f-8477-3dc7c35d6310/jobs/754f76dd-2297-44e9-8204-a688be9be4a5/complete",
+			body: `{"leaseGeneration":-1,"success":true,"message":"done"}`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			testHandler().ServeHTTP(response, request)
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d (body = %s)", response.Code, http.StatusBadRequest, response.Body.String())
+			}
+		})
 	}
 }
 

@@ -562,7 +562,7 @@ function ProxyEditor({
         <ShieldCheckIcon />
         <AlertTitle>作用于环境内的安装和运行流量</AlertTitle>
         <AlertDescription>
-          AgentBox 会注入标准大小写代理变量。BoxLite
+          AgentBox 会注入标准大小写 HTTP(S) 与 ALL_PROXY 变量。BoxLite
           受限网络可仅放行代理和直连地址；Docker
           仍依赖应用遵守代理变量。宿主机拉取镜像和 AgentBox LLM
           网关发出的模型请求不走这里的代理。
@@ -603,13 +603,13 @@ function ProxyEditor({
           </Field>
         </div>
 
-        <div className="grid gap-4 sm:grid-cols-[9rem_minmax(0,1fr)_9rem]">
+        <div className="grid gap-4 sm:grid-cols-[12rem_minmax(0,1fr)_9rem]">
           <Field data-invalid={Boolean(errors.scheme)}>
             <FieldLabel htmlFor="proxy-scheme">协议</FieldLabel>
             <Select
               value={input.scheme}
               onValueChange={(value) =>
-                update("scheme", value as "http" | "https")
+                update("scheme", value as NetworkProxyInput["scheme"])
               }
             >
               <SelectTrigger id="proxy-scheme" className="w-full">
@@ -620,9 +620,16 @@ function ProxyEditor({
                   <SelectLabel>代理协议</SelectLabel>
                   <SelectItem value="http">HTTP</SelectItem>
                   <SelectItem value="https">HTTPS</SelectItem>
+                  <SelectItem value="socks5">SOCKS5</SelectItem>
+                  <SelectItem value="socks5h">
+                    SOCKS5H · 远端解析 DNS
+                  </SelectItem>
                 </SelectGroup>
               </SelectContent>
             </Select>
+            <FieldDescription>
+              SOCKS5H 会让兼容程序通过代理解析域名，减少本地 DNS 泄漏。
+            </FieldDescription>
             <FieldError>{errors.scheme}</FieldError>
           </Field>
           <Field data-invalid={Boolean(errors.host)}>

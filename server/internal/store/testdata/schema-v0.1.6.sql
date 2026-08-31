@@ -15,11 +15,6 @@ CREATE TABLE IF NOT EXISTS control_resources (
   updated_at TIMESTAMPTZ NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS schema_migrations (
-  id TEXT PRIMARY KEY,
-  applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
 CREATE INDEX IF NOT EXISTS idx_control_resources_kind_project
   ON control_resources(kind, project_id, updated_at DESC);
 
@@ -116,7 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_provider_credentials_provider
 CREATE TABLE IF NOT EXISTS network_proxies (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
-  scheme TEXT NOT NULL CHECK (scheme IN ('http', 'https', 'socks5', 'socks5h')),
+  scheme TEXT NOT NULL CHECK (scheme IN ('http', 'https')),
   host TEXT NOT NULL,
   port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
   username TEXT NOT NULL DEFAULT '',
@@ -128,10 +123,6 @@ CREATE TABLE IF NOT EXISTS network_proxies (
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
 );
-
-ALTER TABLE network_proxies DROP CONSTRAINT IF EXISTS network_proxies_scheme_check;
-ALTER TABLE network_proxies ADD CONSTRAINT network_proxies_scheme_check
-  CHECK (scheme IN ('http', 'https', 'socks5', 'socks5h'));
 
 CREATE INDEX IF NOT EXISTS idx_network_proxies_enabled
   ON network_proxies(enabled, updated_at DESC);
@@ -152,10 +143,6 @@ CREATE TABLE IF NOT EXISTS worker_jobs (
   result_output TEXT NOT NULL DEFAULT '',
   result_truncated BOOLEAN NOT NULL DEFAULT FALSE,
   result_timed_out BOOLEAN NOT NULL DEFAULT FALSE,
-  result_error_code TEXT NOT NULL DEFAULT '',
-  result_error_stage TEXT NOT NULL DEFAULT '',
-  result_error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
-  result_error_details JSONB NOT NULL DEFAULT '{}'::jsonb,
   automation_run_id UUID,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
@@ -166,10 +153,6 @@ ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_exit_code INTEGER;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_output TEXT NOT NULL DEFAULT '';
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_truncated BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_timed_out BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_code TEXT NOT NULL DEFAULT '';
-ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_stage TEXT NOT NULL DEFAULT '';
-ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_retryable BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS result_error_details JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS automation_run_id UUID;
 ALTER TABLE worker_jobs ADD COLUMN IF NOT EXISTS progress JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE worker_jobs DROP CONSTRAINT IF EXISTS worker_jobs_status_check;
@@ -350,6 +333,8 @@ SET
   description = '预装 Codex、Git 与常用 Agent 能力的标准 Linux 环境',
   spec = spec || jsonb_build_object(
     'agentTools', '["codex"]'::jsonb,
+    'skillIds', '["code-review", "task-planner"]'::jsonb,
+    'mcpServerIds', '["filesystem"]'::jsonb,
     'variableIds', '[]'::jsonb
   )
 WHERE id = 'docker-agent'
@@ -379,6 +364,33 @@ SET spec = jsonb_set(spec, '{url}', to_jsonb('runtime://' || id), TRUE)
 WHERE kind = 'mcp' AND spec->>'transport' = 'http' AND COALESCE(spec->>'url', '') = '';
 
 UPDATE control_resources
+SET spec = spec || jsonb_build_object(
+  'transport', 'stdio',
+  'command', 'npx',
+  'args', '-y @modelcontextprotocol/server-filesystem /workspace'
+)
+WHERE id = 'filesystem' AND kind = 'mcp'
+  AND COALESCE(spec->>'command', '') IN ('', 'filesystem');
+
+UPDATE control_resources
+SET spec = spec || jsonb_build_object(
+  'transport', 'stdio',
+  'command', 'npx',
+  'args', '-y @playwright/mcp@latest --headless'
+)
+WHERE id = 'browser' AND kind = 'mcp'
+  AND COALESCE(spec->>'url', '') IN ('', 'runtime://browser');
+
+UPDATE control_resources
+SET enabled = FALSE,
+    spec = spec || jsonb_build_object(
+      'transport', 'http',
+      'url', 'https://api.githubcopilot.com/mcp/'
+    )
+WHERE id = 'github' AND kind = 'mcp'
+  AND COALESCE(spec->>'url', '') IN ('', 'runtime://github');
+
+UPDATE control_resources
 SET spec = jsonb_set(
   spec,
   '{variableIds}',
@@ -393,91 +405,19 @@ SET spec = jsonb_set(
   TRUE
 )
 WHERE kind IN ('runtime', 'sandbox')
-  AND spec->'variableIds' ? 'github-token'
-  AND NOT EXISTS (
-    SELECT 1 FROM schema_migrations WHERE id = 'remove-builtin-skills-and-mcp-v1'
-  );
+  AND spec->'variableIds' ? 'github-token';
 
 UPDATE control_resources
 SET spec = spec - 'headers'
 WHERE id = 'github'
   AND kind = 'mcp'
-  AND spec->>'headers' = 'Authorization=env://GITHUB_TOKEN'
-  AND NOT EXISTS (
-    SELECT 1 FROM schema_migrations WHERE id = 'remove-builtin-skills-and-mcp-v1'
-  );
+  AND spec->>'headers' = 'Authorization=env://GITHUB_TOKEN';
 
 DELETE FROM control_resources
 WHERE id = 'github-token'
   AND kind = 'variable'
   AND name = 'GITHUB_TOKEN'
-  AND spec->>'reference' = 'env://GITHUB_TOKEN'
-  AND NOT EXISTS (
-    SELECT 1 FROM schema_migrations WHERE id = 'remove-builtin-skills-and-mcp-v1'
-  );
-
-UPDATE control_resources
-SET spec = jsonb_set(
-  jsonb_set(
-    spec,
-    '{skillIds}',
-    COALESCE(
-      (
-        SELECT jsonb_agg(skill_id ORDER BY position)
-        FROM jsonb_array_elements_text(COALESCE(spec->'skillIds', '[]'::jsonb))
-          WITH ORDINALITY AS selected_skills(skill_id, position)
-        WHERE skill_id <> ALL (ARRAY[
-          'web-research', 'code-review', 'document-writer',
-          'data-analysis', 'task-planner', 'support-tone'
-        ]::text[])
-      ),
-      '[]'::jsonb
-    ),
-    TRUE
-  ),
-  '{mcpServerIds}',
-  COALESCE(
-    (
-      SELECT jsonb_agg(mcp_id ORDER BY position)
-      FROM jsonb_array_elements_text(COALESCE(spec->'mcpServerIds', '[]'::jsonb))
-        WITH ORDINALITY AS selected_mcp(mcp_id, position)
-      WHERE mcp_id <> ALL (ARRAY['filesystem', 'github', 'browser', 'postgres']::text[])
-    ),
-    '[]'::jsonb
-  ),
-  TRUE
-)
-WHERE kind IN ('runtime', 'sandbox')
-  AND NOT EXISTS (
-    SELECT 1 FROM schema_migrations WHERE id = 'remove-builtin-skills-and-mcp-v1'
-  )
-  AND (
-    COALESCE(spec->'skillIds', '[]'::jsonb) ?| ARRAY[
-      'web-research', 'code-review', 'document-writer',
-      'data-analysis', 'task-planner', 'support-tone'
-    ]
-    OR COALESCE(spec->'mcpServerIds', '[]'::jsonb) ?| ARRAY[
-      'filesystem', 'github', 'browser', 'postgres'
-    ]
-  );
-
-DELETE FROM control_resources
-WHERE NOT EXISTS (
-  SELECT 1 FROM schema_migrations WHERE id = 'remove-builtin-skills-and-mcp-v1'
-)
-AND (
-  (kind = 'skill' AND id = ANY (ARRAY[
-    'web-research', 'code-review', 'document-writer',
-    'data-analysis', 'task-planner', 'support-tone'
-  ]::text[]))
-  OR (kind = 'mcp' AND id = ANY (ARRAY[
-    'filesystem', 'github', 'browser', 'postgres'
-  ]::text[]))
-);
-
-INSERT INTO schema_migrations (id)
-VALUES ('remove-builtin-skills-and-mcp-v1')
-ON CONFLICT (id) DO NOTHING;
+  AND spec->>'reference' = 'env://GITHUB_TOKEN';
 
 UPDATE control_resources
 SET spec = '{}'::jsonb
@@ -550,9 +490,6 @@ CREATE TABLE IF NOT EXISTS automation_runs (
   worker_job_id UUID REFERENCES worker_jobs(id) ON DELETE SET NULL,
   error_code TEXT NOT NULL DEFAULT '',
   error_message TEXT NOT NULL DEFAULT '',
-  error_stage TEXT NOT NULL DEFAULT '',
-  error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
-  error_details JSONB NOT NULL DEFAULT '{}'::jsonb,
   received_at TIMESTAMPTZ NOT NULL,
   queued_at TIMESTAMPTZ,
   started_at TIMESTAMPTZ,
@@ -567,9 +504,6 @@ ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_type TEXT NOT NULL DE
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_source TEXT NOT NULL DEFAULT 'generic';
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS event_time TIMESTAMPTZ;
 ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS provisioning JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS error_stage TEXT NOT NULL DEFAULT '';
-ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS error_retryable BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE automation_runs ADD COLUMN IF NOT EXISTS error_details JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE automation_runs DROP CONSTRAINT IF EXISTS automation_runs_action_type_check;
 ALTER TABLE automation_runs ADD CONSTRAINT automation_runs_action_type_check
 	CHECK (action_type = 'create-sandbox') NOT VALID;

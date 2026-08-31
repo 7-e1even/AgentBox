@@ -80,6 +80,7 @@ func (s *Server) login(w http.ResponseWriter, request *http.Request) {
 			Message: "登录尝试过于频繁", Status: platform.LogStatusFailed,
 			Detail: map[string]any{"username": input.Username, "reason": "rate-limited"},
 		})
+		w.Header().Set("Retry-After", "60")
 		s.writeError(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 		return
 	}

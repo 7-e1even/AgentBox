@@ -410,6 +410,20 @@ func TestWorkerClaimsJobsEverySecond(t *testing.T) {
 	}
 }
 
+func TestWorkerEchoesLeaseGenerationOnProgressCompletionAndSelfUpdate(t *testing.T) {
+	for _, expected := range []string{
+		`.job.leaseGeneration // 0`,
+		`{leaseGeneration:$leaseGeneration,stage:$stage,message:$message`,
+		`{leaseGeneration:$leaseGeneration,success:$success,externalId:$externalId`,
+		`.leaseGeneration // 0`,
+		`{jobId:$jobId,leaseGeneration:$leaseGeneration`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker lease fencing is missing %q", expected)
+		}
+	}
+}
+
 func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 	for _, expected := range []string{
 		`if [ "$MODE" = ensure ] && [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc '`,
@@ -1128,6 +1142,8 @@ func TestWorkerInjectsProxyBeforeAgentInstallationWithoutPersistingSecret(t *tes
 		`[ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env`,
 		`append_env "$PROXY_ENV" NODE_USE_ENV_PROXY 1`,
 		`append_env "$PROXY_ENV" CLAUDE_CODE_PROXY_RESOLVES_HOSTS 1`,
+		`HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy`,
+		`"$(sandbox_control_plane_host "$DRIVER")" host.boxlite.internal`,
 		`del(.credentials, .proxy)`,
 		`.job.payload.controlPlane.allowNet[]?, .job.payload.proxy.allowNet[]?`,
 		`--allow-net "$ALLOWED_HOST"`,
@@ -1164,6 +1180,21 @@ func TestWorkerInjectsProxyBeforeAgentInstallationWithoutPersistingSecret(t *tes
 	clearExportIndex := strings.Index(configureBody, `'  set +a'`)
 	if setExportIndex < 0 || sourceIndex <= setExportIndex || clearExportIndex <= sourceIndex {
 		t.Fatal("Worker must export proxy variables while loading the proxy environment")
+	}
+}
+
+func TestWorkerAppliesSandboxProxyWithoutRecreatingSandbox(t *testing.T) {
+	for _, expected := range []string{
+		`apply_sandbox_proxy()`,
+		`configure-sandbox-proxy)`,
+		`configure_proxy "$TARGET" "$JOB_FILE"`,
+		`docker exec "$TARGET" test -s /opt/agentbox/secrets/proxy.env`,
+		`docker exec "$TARGET" test -e /opt/agentbox/secrets/proxy.env`,
+		`sandbox_proxy_apply_failed proxy-config true`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker live proxy update is missing %q", expected)
+		}
 	}
 }
 

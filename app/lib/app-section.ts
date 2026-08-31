@@ -3,6 +3,7 @@ export const APP_SECTION_PATHS = {
   projects: "/projects",
   sandboxes: "/sandboxes",
   automations: "/automations",
+  automationRuns: "/automations/runs",
   servers: "/servers",
   runtimes: "/environment-templates",
   images: "/images",

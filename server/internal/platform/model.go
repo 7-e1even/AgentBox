@@ -214,13 +214,19 @@ type RuntimeLLMTarget struct {
 }
 
 type WorkerJob struct {
-	ID         string         `json:"id"`
-	ResourceID string         `json:"resourceId"`
-	Action     string         `json:"action"`
-	Payload    map[string]any `json:"payload"`
+	ID              string         `json:"id"`
+	ResourceID      string         `json:"resourceId"`
+	Action          string         `json:"action"`
+	Payload         map[string]any `json:"payload"`
+	LeaseGeneration int            `json:"leaseGeneration"`
+	LeaseExpiresAt  time.Time      `json:"leaseExpiresAt"`
+	MaxAttempts     int            `json:"maxAttempts"`
 }
 
 type WorkerJobResult struct {
+	// LeaseGeneration fences stale executors. Zero is accepted only for a
+	// first-generation lease as a controlled bridge for older Workers.
+	LeaseGeneration int                     `json:"leaseGeneration"`
 	Success         bool                    `json:"success"`
 	ExternalID      string                  `json:"externalId"`
 	Message         string                  `json:"message"`
@@ -251,6 +257,9 @@ type WorkerJobError struct {
 }
 
 type WorkerJobProgressInput struct {
+	// LeaseGeneration follows the same first-generation compatibility rule as
+	// WorkerJobResult. A reclaimed lease always requires its exact generation.
+	LeaseGeneration int    `json:"leaseGeneration"`
 	Stage           string `json:"stage"`
 	Message         string `json:"message"`
 	CacheStatus     string `json:"cacheStatus,omitempty"`
@@ -493,8 +502,9 @@ func ValidateNetworkProxy(input NetworkProxyInput) error {
 	if n := utf8.RuneCountInString(input.Name); n < 2 || n > 80 {
 		return &ValidationError{Message: "代理名称需要 2 到 80 个字符"}
 	}
-	if input.Scheme != "http" && input.Scheme != "https" {
-		return &ValidationError{Message: "第一版代理协议只支持 HTTP 或 HTTPS"}
+	if input.Scheme != "http" && input.Scheme != "https" &&
+		input.Scheme != "socks5" && input.Scheme != "socks5h" {
+		return &ValidationError{Message: "代理协议只支持 HTTP、HTTPS、SOCKS5 或 SOCKS5H"}
 	}
 	if input.Port < 1 || input.Port > 65535 {
 		return &ValidationError{Message: "代理端口需要在 1 到 65535 之间"}

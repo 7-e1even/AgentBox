@@ -1099,7 +1099,9 @@ complete_job() {
   ERROR_DETAILS=${12:-}
   [ -n "$ERROR_DETAILS" ] || ERROR_DETAILS='{}'
   AGENT_TOOLS_FILE=${13:-/dev/null}
+  LEASE_GENERATION=${LEASE_GENERATION:-0}
   BODY=$(jq -n \
+	--argjson leaseGeneration "$LEASE_GENERATION" \
     --argjson success "$SUCCESS" \
     --arg externalId "$EXTERNAL_ID" \
     --arg message "$MESSAGE" \
@@ -1112,7 +1114,7 @@ complete_job() {
     --argjson errorRetryable "$ERROR_RETRYABLE" \
     --argjson errorDetails "$ERROR_DETAILS" \
     --slurpfile agentTools "$AGENT_TOOLS_FILE" \
-    '{success:$success,externalId:$externalId,message:$message,
+	'{leaseGeneration:$leaseGeneration,success:$success,externalId:$externalId,message:$message,
       exitCode:(if $exitCode == "" then null else ($exitCode | tonumber) end),
       output:$output,outputTruncated:$outputTruncated,timedOut:$timedOut,
       agentTools:($agentTools[0] // []),
@@ -1170,10 +1172,12 @@ report_job_progress() {
   CACHE_REASON=${4:-}
   AGENT_TOOL=${5:-}
   AGENT_TOOL_STATUS=${6:-}
-  BODY=$(jq -n --arg stage "$STAGE" --arg message "$MESSAGE" \
+  LEASE_GENERATION=${LEASE_GENERATION:-0}
+  BODY=$(jq -n --argjson leaseGeneration "$LEASE_GENERATION" \
+	--arg stage "$STAGE" --arg message "$MESSAGE" \
     --arg cacheStatus "$CACHE_STATUS" --arg cacheReason "$CACHE_REASON" \
     --arg agentTool "$AGENT_TOOL" --arg agentToolStatus "$AGENT_TOOL_STATUS" \
-    '{stage:$stage,message:$message,
+	'{leaseGeneration:$leaseGeneration,stage:$stage,message:$message,
       cacheStatus:(if $cacheStatus == "" then null else $cacheStatus end),
       cacheReason:(if $cacheReason == "" then null else $cacheReason end),
       agentTool:(if $agentTool == "" then null else $agentTool end),
@@ -1196,6 +1200,7 @@ finalize_worker_update() {
   MARKER="$STATE_DIR/worker-update.json"
   [ -s "$MARKER" ] || return 0
   JOB_ID=$(jq -r '.jobId // empty' "$MARKER")
+  LEASE_GENERATION=$(jq -r '.leaseGeneration // 0' "$MARKER")
   TARGET_VERSION=$(jq -r '.targetVersion // empty' "$MARKER")
   ROLLBACK_SCRIPT=$(jq -r '.rollbackScript // empty' "$MARKER")
   [ -n "$JOB_ID" ] && [ -n "$TARGET_VERSION" ] || return 0
@@ -1280,6 +1285,7 @@ EOF
 update_worker() {
   JOB_FILE=$1
   JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
+  LEASE_GENERATION=$(jq -r '.job.leaseGeneration // 0' "$JOB_FILE")
   TARGET_VERSION=$(jq -r '.job.payload.version // empty' "$JOB_FILE")
   case "$TARGET_VERSION" in
     v[0-9A-Za-z]*) ;;
@@ -1345,9 +1351,11 @@ update_worker() {
   MARKER="$STATE_DIR/worker-update.json"
   ROLLBACK_SCRIPT="$STATE_DIR/worker-update-rollback-$JOB_ID.sh"
   MARKER_TMP="$STATE_DIR/.worker-update.json"
-  jq -n --arg jobId "$JOB_ID" --arg targetVersion "$TARGET_VERSION" \
+  jq -n --arg jobId "$JOB_ID" --argjson leaseGeneration "$LEASE_GENERATION" \
+	--arg targetVersion "$TARGET_VERSION" \
     --arg rollbackScript "$ROLLBACK_SCRIPT" \
-    '{jobId:$jobId,targetVersion:$targetVersion,rollbackScript:$rollbackScript}' > "$MARKER_TMP" || {
+	'{jobId:$jobId,leaseGeneration:$leaseGeneration,
+	  targetVersion:$targetVersion,rollbackScript:$rollbackScript}' > "$MARKER_TMP" || {
       restore_worker_binary "$PREVIOUS"
       rm -f "$WORKER_TMP"
       return 1
@@ -2713,10 +2721,19 @@ configure_proxy() {
   PROXY_URL_B64=$(jq -r '.job.payload.proxy.url | @base64' "$JOB_FILE")
   PROXY_URL=$(printf '%s' "$PROXY_URL_B64" | base64 -d)
   NO_PROXY=$(jq -r '.job.payload.proxy.noProxy // [] | join(",")' "$JOB_FILE")
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  for ENTRY in localhost 127.0.0.1 ::1 "$(server_url_host)" \
+    "$(sandbox_control_plane_host "$DRIVER")" host.boxlite.internal; do
+    [ -n "$ENTRY" ] || continue
+    case ",$NO_PROXY," in
+      *,$ENTRY,*) ;;
+      *) NO_PROXY=${NO_PROXY:+$NO_PROXY,}$ENTRY ;;
+    esac
+  done
   PROXY_ENV=$(mktemp)
   PROXY_LOADER=$(mktemp)
   chmod 600 "$PROXY_ENV"
-  for NAME in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+  for NAME in HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; do
     append_env "$PROXY_ENV" "$NAME" "$PROXY_URL"
   done
   append_env "$PROXY_ENV" NO_PROXY "$NO_PROXY"
@@ -3604,6 +3621,30 @@ restart_sandbox() {
   start_sandbox "$JOB_FILE"
 }
 
+apply_sandbox_proxy() {
+  JOB_FILE=$1
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  TARGET=$(sandbox_container_name "$JOB_FILE")
+  AGENTBOX_RUNTIME_DRIVER=$DRIVER
+  export AGENTBOX_RUNTIME_DRIVER
+  report_job_progress proxy-config "正在应用沙箱网络出口"
+  if [ "$DRIVER" = docker ]; then
+    docker inspect "$TARGET" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
+  else
+    runtime_call "$DRIVER" inspect "$TARGET" >/dev/null 2>&1 || { echo "sandbox runtime not found" >&2; return 1; }
+  fi
+  configure_proxy "$TARGET" "$JOB_FILE" || return 1
+  if jq -e '.job.payload.proxy? and (.job.payload.proxy.url // "") != ""' "$JOB_FILE" >/dev/null; then
+    docker exec "$TARGET" test -s /opt/agentbox/secrets/proxy.env || return 1
+  else
+    if docker exec "$TARGET" test -e /opt/agentbox/secrets/proxy.env; then
+      echo "sandbox proxy configuration was not removed" >&2
+      return 1
+    fi
+  fi
+  printf '%s' "$TARGET"
+}
+
 stop_sandbox() {
   JOB_FILE=$1
   DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
@@ -3688,6 +3729,7 @@ check_network_proxy() {
 process_job() {
   JOB_FILE=$1
   JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
+  LEASE_GENERATION=$(jq -r '.job.leaseGeneration // 0' "$JOB_FILE")
   ACTION=$(jq -r '.job.action' "$JOB_FILE")
   case "$ACTION" in
     check-network-proxy)
@@ -3766,6 +3808,22 @@ process_job() {
       if ! update_worker "$JOB_FILE" 2>"$LOG_FILE"; then
         MESSAGE=$(tail -c 3500 "$LOG_FILE")
         complete_job_failure "$JOB_ID" worker_update_failed worker-update true "$MESSAGE" "$ACTION"
+      fi
+      rm -f "$LOG_FILE"
+      ;;
+    configure-sandbox-proxy)
+      LOG_FILE=$(mktemp)
+      if EXTERNAL_ID=$(apply_sandbox_proxy "$JOB_FILE" 2>"$LOG_FILE"); then
+        if jq -e '.job.payload.proxy? and (.job.payload.proxy.url // "") != ""' "$JOB_FILE" >/dev/null; then
+          MESSAGE="沙箱网络代理已应用；新的 Agent 和终端进程将使用该代理"
+        else
+          MESSAGE="沙箱已切换为直连；新的 Agent 和终端进程将不再使用代理"
+        fi
+        complete_job "$JOB_ID" true "$EXTERNAL_ID" "$MESSAGE"
+      else
+        MESSAGE=$(tail -c 3500 "$LOG_FILE")
+        [ -n "$MESSAGE" ] || MESSAGE="沙箱网络出口应用失败"
+        complete_job_failure "$JOB_ID" sandbox_proxy_apply_failed proxy-config true "$MESSAGE" "$ACTION"
       fi
       rm -f "$LOG_FILE"
       ;;

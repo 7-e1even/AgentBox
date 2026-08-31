@@ -331,9 +331,9 @@ function fields(
         {
           key: "source",
           label: "来源",
-          options: values("inline", "git", "local", "builtin"),
+          options: values("inline", "git", "local"),
         },
-        { key: "path", label: "来源路径", placeholder: "skills/code-review" },
+        { key: "path", label: "来源路径", placeholder: "skills/my-skill" },
         {
           key: "instructions",
           label: "SKILL.md 指令",

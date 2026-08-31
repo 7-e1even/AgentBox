@@ -58,6 +58,7 @@ func TestViewerWriteRequestsAreForbidden(t *testing.T) {
 		{http.MethodPatch, "/api/resources/sandbox-one", `{"kind":"sandbox","name":"x","spec":{}}`},
 		{http.MethodDelete, "/api/resources/sandbox-one", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/actions/start", ""},
+		{http.MethodPatch, "/api/sandboxes/sandbox-one/network-proxy", `{"proxyId":"proxy-one"}`},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/agent-tools/actions/update", `{"tools":["codex"]}`},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/session-ticket", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/desktop-ticket", ""},
@@ -112,6 +113,12 @@ func TestOperatorSandboxOperationsAreAllowed(t *testing.T) {
 	response := rbacRequest(t, handler, http.MethodPost, "/api/sandboxes/sandbox-one/actions/start", "")
 	if response.Code != http.StatusAccepted {
 		t.Errorf("sandbox action: status = %d, want %d (body = %s)", response.Code, http.StatusAccepted, response.Body.String())
+	}
+
+	response = rbacRequest(t, handler, http.MethodPatch,
+		"/api/sandboxes/sandbox-one/network-proxy", `{"proxyId":"proxy-one"}`)
+	if response.Code != http.StatusAccepted {
+		t.Errorf("sandbox network proxy: status = %d, want %d (body = %s)", response.Code, http.StatusAccepted, response.Body.String())
 	}
 
 	response = rbacRequest(t, handler, http.MethodPost,

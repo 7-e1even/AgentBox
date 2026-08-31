@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -101,6 +102,19 @@ func (s *Store) AuthenticateUser(ctx context.Context, username, password string,
 		return platform.User{}, fmt.Errorf("begin login: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	var lockedPasswordHash []byte
+	lockedUser, err := scanUserWithPassword(tx.QueryRow(ctx, `SELECT `+userColumns+`, password_hash
+    FROM users WHERE id = $1 AND LOWER(username) = $2 FOR UPDATE`, user.ID, username), &lockedPasswordHash)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return platform.User{}, ErrUnauthorized
+		}
+		return platform.User{}, fmt.Errorf("lock login user: %w", err)
+	}
+	if lockedUser.Status != platform.UserStatusActive || !bytes.Equal(lockedPasswordHash, passwordHash) {
+		return platform.User{}, ErrUnauthorized
+	}
+	user = lockedUser
 	now := time.Now().UTC()
 	if _, err := tx.Exec(ctx, `UPDATE users SET last_login_at = $2, updated_at = updated_at WHERE id = $1`, user.ID, now); err != nil {
 		return platform.User{}, fmt.Errorf("record login: %w", err)
@@ -199,17 +213,27 @@ func (s *Store) updateUser(ctx context.Context, id string, input platform.UserIn
 	if err := platform.ValidateUserInput(input, false); err != nil {
 		return platform.User{}, err
 	}
-	now := time.Now().UTC()
-	var row pgx.Row
-	if input.Password == "" {
-		row = s.pool.QueryRow(ctx, `UPDATE users SET name = $2, username = $3, email = $4, role = $5, status = $6, updated_at = $7
-      WHERE id = $1 RETURNING `+userColumns, id, input.Name, input.Username, input.Email, input.Role, input.Status, now)
-	} else {
-		passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	var passwordHash []byte
+	if input.Password != "" {
+		var err error
+		passwordHash, err = bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
 		if err != nil {
 			return platform.User{}, fmt.Errorf("hash password: %w", err)
 		}
-		row = s.pool.QueryRow(ctx, `UPDATE users SET name = $2, username = $3, email = $4, password_hash = $5, role = $6, status = $7, updated_at = $8
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.User{}, fmt.Errorf("begin update user: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	now := time.Now().UTC()
+	var row pgx.Row
+	if input.Password == "" {
+		row = tx.QueryRow(ctx, `UPDATE users SET name = $2, username = $3, email = $4, role = $5, status = $6, updated_at = $7
+      WHERE id = $1 RETURNING `+userColumns, id, input.Name, input.Username, input.Email, input.Role, input.Status, now)
+	} else {
+		row = tx.QueryRow(ctx, `UPDATE users SET name = $2, username = $3, email = $4, password_hash = $5, role = $6, status = $7, updated_at = $8
       WHERE id = $1 RETURNING `+userColumns, id, input.Name, input.Username, input.Email, passwordHash, input.Role, input.Status, now)
 	}
 	user, err := scanUser(row)
@@ -218,14 +242,17 @@ func (s *Store) updateUser(ctx context.Context, id string, input platform.UserIn
 	}
 	if input.Password != "" || input.Status == platform.UserStatusDisabled {
 		if len(keepSessionHash) == 0 {
-			if _, err := s.pool.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", id); err != nil {
+			if _, err := tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1", id); err != nil {
 				return platform.User{}, fmt.Errorf("invalidate user sessions: %w", err)
 			}
 		} else {
-			if _, err := s.pool.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1 AND token_hash <> $2", id, keepSessionHash); err != nil {
+			if _, err := tx.Exec(ctx, "DELETE FROM user_sessions WHERE user_id = $1 AND token_hash <> $2", id, keepSessionHash); err != nil {
 				return platform.User{}, fmt.Errorf("invalidate user sessions: %w", err)
 			}
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return platform.User{}, fmt.Errorf("commit update user: %w", err)
 	}
 	return user, nil
 }

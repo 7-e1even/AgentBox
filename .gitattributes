@@ -1,1 +1,3 @@
 server/internal/store/schema.sql text eol=lf
+server/internal/store/migrations/*.sql text eol=lf
+server/internal/store/testdata/*.sql text eol=lf
