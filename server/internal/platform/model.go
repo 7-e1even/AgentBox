@@ -570,7 +570,8 @@ func Validate(input Input) error {
 	if input.SpecVersion != 0 && input.SpecVersion != 1 {
 		return &ValidationError{Message: "不支持的资源 specVersion"}
 	}
-	if _, err := DecodeResourceSpec(input); err != nil {
+	decodedSpec, err := DecodeResourceSpec(input)
+	if err != nil {
 		return err
 	}
 	if !isKind(input.Kind) {
@@ -587,6 +588,9 @@ func Validate(input Input) error {
 	}
 	if input.Kind != KindProject && input.Kind != KindImage && input.ProjectID == nil {
 		return &ValidationError{Message: "请选择所属项目"}
+	}
+	if input.Kind == KindSkill {
+		return ValidateSkillSpec(*decodedSpec.(*SkillSpec))
 	}
 	if input.Kind == KindImage {
 		if err := require(input.Spec, "reference", "请填写镜像引用"); err != nil {

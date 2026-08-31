@@ -168,6 +168,8 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	operator("POST /api/resources", server.createResource)
 	operator("PATCH /api/resources/{id}", server.updateResource)
 	operator("DELETE /api/resources/{id}", server.deleteResource)
+	operator("POST /api/skills/import-preview", server.previewSkillImport)
+	operator("GET /api/skills/search", server.searchSkills)
 	operator("POST /api/sandboxes/{id}/actions/{action}", server.operateSandbox)
 	operator("PATCH /api/sandboxes/{id}/network-proxy", server.updateSandboxNetworkProxy)
 	operator("POST /api/sandboxes/{id}/agent-tools/actions/{action}", server.operateSandboxAgentTools)
@@ -274,7 +276,7 @@ func (s *Server) getResource(w http.ResponseWriter, request *http.Request) {
 
 func (s *Server) createResource(w http.ResponseWriter, request *http.Request) {
 	var input platform.Input
-	if !s.decodeJSON(w, request, &input) {
+	if !s.decodeJSONWithLimit(w, request, &input, 8<<20) {
 		return
 	}
 	started := time.Now()
@@ -298,7 +300,7 @@ func (s *Server) createResource(w http.ResponseWriter, request *http.Request) {
 
 func (s *Server) updateResource(w http.ResponseWriter, request *http.Request) {
 	var input platform.Input
-	if !s.decodeJSON(w, request, &input) {
+	if !s.decodeJSONWithLimit(w, request, &input, 8<<20) {
 		return
 	}
 	id := request.PathValue("id")

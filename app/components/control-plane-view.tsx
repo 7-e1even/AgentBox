@@ -5,6 +5,7 @@ import type { ColumnDef } from "@tanstack/react-table"
 import {
   ContainerIcon,
   Disc3Icon,
+  ExternalLinkIcon,
   FolderKanbanIcon,
   KeyRoundIcon,
   MoreHorizontalIcon,
@@ -79,7 +80,8 @@ const meta = {
     title: "Skills",
     singular: "Skill",
     empty: "还没有 Skill",
-    description: "安装到 Agent 沙箱中的指令、脚本和资源。",
+    description:
+      "从 skills.sh、公开链接、本地 SKILL.md 或 ZIP 导入指令、脚本和资源，也可以手动编写。",
     icon: SparklesIcon,
   },
   mcp: {
@@ -176,10 +178,26 @@ export function ResourceView({
         count={total}
         action={
           canMutate ? (
-            <Button size="sm" onClick={onCreate}>
-              <PlusIcon data-icon="inline-start" />
-              新建{config.singular}
-            </Button>
+            <div className="flex items-center gap-2">
+              {kind === "skill" && (
+                <Button variant="outline" size="sm" asChild>
+                  <a
+                    href="https://skills.sh/"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label="浏览 skills.sh"
+                    title="浏览 skills.sh"
+                  >
+                    <ExternalLinkIcon data-icon="inline-start" />
+                    <span className="hidden sm:inline">浏览 skills.sh</span>
+                  </a>
+                </Button>
+              )}
+              <Button size="sm" onClick={onCreate}>
+                <PlusIcon data-icon="inline-start" />
+                {kind === "skill" ? "添加 Skill" : `新建${config.singular}`}
+              </Button>
+            </div>
           ) : undefined
         }
       />
@@ -190,7 +208,13 @@ export function ResourceView({
             icon={Icon}
             title={config.empty}
             description={config.description}
-            actionLabel={canMutate ? `创建第一个${config.singular}` : undefined}
+            actionLabel={
+              canMutate
+                ? kind === "skill"
+                  ? "导入第一个 Skill"
+                  : `创建第一个${config.singular}`
+                : undefined
+            }
             onAction={canMutate ? onCreate : undefined}
           />
         ) : (

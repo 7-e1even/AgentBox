@@ -91,12 +91,21 @@ const executionSpecSchema = z.object({
   modelBindings: z.record(z.string(), z.string()).optional(),
   workspace: z.string().optional(),
 })
-const skillSpecSchema = z.object({
+export const skillSpecSchema = z.object({
   version: z.string().optional(),
   category: z.string().optional(),
   source: z.string().optional(),
   path: z.string().optional(),
   instructions: z.string().optional(),
+  files: z
+    .array(
+      z.object({
+        path: z.string(),
+        content: z.string(),
+        executable: z.boolean().optional(),
+      })
+    )
+    .optional(),
 })
 const mcpSpecSchema = z.object({
   transport: z.string(),

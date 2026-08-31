@@ -772,8 +772,8 @@ func TestWorkerInjectsSandboxEnvironmentVariables(t *testing.T) {
 func TestWorkerSkillInstallDoesNotReuseRuntimeTargetVariable(t *testing.T) {
 	for _, expected := range []string{
 		`for SKILL_TARGET in`,
-		`mkdir -p "$SKILL_TARGET"`,
-		`sh -c 'cat > "$1"' agentbox "$SKILL_TARGET/SKILL.md"`,
+		`cp -R "$2/." "$1/"`,
+		`agentbox "$SKILL_TARGET" "/opt/agentbox/skills/$ID"`,
 		`sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/SKILL.md"`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {

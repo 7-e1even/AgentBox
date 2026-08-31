@@ -1,7 +1,15 @@
 "use client"
 
-import { useState, type ReactNode } from "react"
-import { CheckIcon, SaveIcon } from "lucide-react"
+import { useRef, useState, type ReactNode } from "react"
+import {
+  ArrowLeftIcon,
+  CheckIcon,
+  LinkIcon,
+  PencilIcon,
+  SaveIcon,
+  SearchIcon,
+  UploadIcon,
+} from "lucide-react"
 
 import { agentToolOptions, supportedAgentToolList } from "@/lib/agent-tools"
 import type { ManagedCredential } from "@/lib/credential-schema"
@@ -23,8 +31,13 @@ import {
   type RuntimeImageChoices,
 } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
+import type { ImportedSkill } from "@/lib/skill-import"
+import { cn } from "@/lib/utils"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
 import { RuntimeImageCombobox } from "@/components/runtime-image-combobox"
+import { SkillImportPanel } from "@/components/skill-import-panel"
+import { SkillSearchPanel } from "@/components/skill-search-panel"
+import { Badge } from "@/components/ui/badge"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Button } from "@/components/ui/button"
 import {
@@ -327,19 +340,30 @@ function fields(
       ]
     case "skill":
       return [
-        { key: "version", label: "版本", placeholder: "1.0.0" },
-        { key: "category", label: "分类", placeholder: "开发" },
+        { key: "version", label: "版本", placeholder: "1.0.0", advanced: true },
+        { key: "category", label: "分类", placeholder: "开发", advanced: true },
         {
           key: "source",
           label: "来源",
-          options: values("inline", "git", "local"),
+          options: [
+            { value: "inline", label: "手动编写" },
+            { value: "url", label: "链接导入" },
+            { value: "skills.sh", label: "skills.sh" },
+            { value: "upload", label: "本地上传" },
+            { value: "git", label: "Git（历史记录）" },
+            { value: "local", label: "本地（历史记录）" },
+          ],
+          disabled: true,
+          advanced: true,
         },
-        { key: "path", label: "来源路径", placeholder: "skills/my-skill" },
+        { key: "path", label: "来源路径", disabled: true, advanced: true },
         {
           key: "instructions",
           label: "SKILL.md 指令",
           textarea: true,
           placeholder: "说明何时使用以及执行步骤。",
+          description:
+            "保留完整 SKILL.md，也可以编辑正文。保存当前内容，不会自动同步来源。",
         },
       ]
     case "mcp":
@@ -597,7 +621,10 @@ function SpecFieldEditor({
       ) : field.textarea ? (
         <Textarea
           id={`spec-${field.key}`}
-          className="min-h-28 font-mono text-sm"
+          className={cn(
+            "min-h-28 font-mono text-sm",
+            kind === "skill" && "max-h-80 overflow-y-auto"
+          )}
           value={String(spec[field.key] ?? "")}
           placeholder={field.placeholder}
           onChange={(event) => onChange(field.key, event.target.value)}
@@ -605,6 +632,7 @@ function SpecFieldEditor({
       ) : (
         <Input
           id={`spec-${field.key}`}
+          disabled={field.disabled}
           value={String(spec[field.key] ?? "")}
           placeholder={field.placeholder}
           onChange={(event) => onChange(field.key, event.target.value)}
@@ -816,6 +844,14 @@ export function ResourceEditorDialog({
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [advancedOpen, setAdvancedOpen] = useState(false)
+  const [skillMode, setSkillMode] = useState("search")
+  const [skillImported, setSkillImported] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const skillBodyRef = useRef<HTMLDivElement>(null)
+  const skillNameRef = useRef<HTMLInputElement>(null)
+  const creatingSkill = kind === "skill" && !resource
+  const showDetails = !creatingSkill || skillMode === "manual" || skillImported
+  const skillFiles = Array.isArray(input.spec.files) ? input.spec.files : []
   const projects = resources.filter((item) => item.kind === "project")
   const projectResources = resources.filter(
     (item) =>
@@ -860,7 +896,7 @@ export function ResourceEditorDialog({
   }
 
   async function submit() {
-    if (saving || !dependenciesReady) return
+    if (saving || importing || !showDetails || !dependenciesReady) return
     const parsed = resourceInputSchema.safeParse(input)
     if (!parsed.success) {
       setErrors(
@@ -871,6 +907,11 @@ export function ResourceEditorDialog({
           ])
         )
       )
+      return
+    }
+    if (creatingSkill && resources.some((item) => item.id === parsed.data.id)) {
+      setErrors({ id: "该标识已存在，请修改唯一标识后再导入" })
+      document.getElementById("resource-id")?.focus()
       return
     }
     if (kind === "image" && stringArray(input.spec.modes).length === 0) {
@@ -923,12 +964,36 @@ export function ResourceEditorDialog({
     }
   }
 
+  function importSkill(skill: ImportedSkill) {
+    setInput((current) => ({
+      ...current,
+      name: skill.name,
+      id: createSlug(skill.name),
+      description: skill.description,
+      spec: { ...defaults("skill"), ...skill.spec },
+    }))
+    setSlugEdited(false)
+    setErrors({})
+    setSkillImported(true)
+    setAdvancedOpen(false)
+    requestAnimationFrame(() => {
+      skillBodyRef.current?.scrollTo({ top: 0 })
+      skillNameRef.current?.focus({ preventScroll: true })
+    })
+  }
+
   return (
     <Dialog open onOpenChange={(open) => !saving && onOpenChange(open)}>
       <DialogContent
-        className={`max-h-[92svh] overflow-y-auto ${
-          kind === "sandbox" ? "sm:max-w-xl" : "sm:max-w-4xl"
-        }`}
+        className={cn(
+          "max-h-[92svh] overflow-y-auto",
+          kind === "sandbox" ? "sm:max-w-xl" : "sm:max-w-4xl",
+          creatingSkill &&
+            "flex flex-col gap-0 overflow-hidden p-0 sm:max-w-3xl",
+          creatingSkill &&
+            (skillMode === "search" || showDetails) &&
+            "h-[min(42rem,92dvh)]"
+        )}
         onEscapeKeyDown={(event) => {
           if (
             document.querySelector('[data-slot="combobox-content"][data-open]')
@@ -937,9 +1002,19 @@ export function ResourceEditorDialog({
           }
         }}
       >
-        <DialogHeader>
+        <DialogHeader
+          className={cn(creatingSkill && "shrink-0 border-b px-5 py-4 pr-12")}
+        >
           <DialogTitle>
-            {resource ? "编辑 " : "创建 "}
+            {resource
+              ? "编辑 "
+              : creatingSkill
+                ? skillImported
+                  ? "确认导入 "
+                  : skillMode === "manual"
+                    ? "编写 "
+                    : "添加 "
+                : "创建 "}
             {labels[kind]}
           </DialogTitle>
           <DialogDescription>
@@ -951,157 +1026,329 @@ export function ResourceEditorDialog({
                   ? "把服务器、镜像、Agent 工具与模型凭据保存成可复用沙箱模板。"
                   : kind === "sandbox"
                     ? "从沙箱模板继承默认配置，并为这个沙箱选择一个或多个 Agent。"
-                    : "配置会保存在平台控制面，并由沙箱创建流程消费。"}
+                    : kind === "skill"
+                      ? creatingSkill
+                        ? skillImported
+                          ? "检查内容和所属项目，确认后保存到 Skills。"
+                          : "从 skills.sh 发现能力，也可以导入自己的文件。"
+                        : "管理 Skill 的指令、附件与项目归属。"
+                      : "配置会保存在平台控制面，并由沙箱创建流程消费。"}
           </DialogDescription>
         </DialogHeader>
-        {dependencyStatus}
-        <FieldGroup>
-          {kind !== "project" &&
-            kind !== "image" &&
-            kind !== "runtime" &&
-            kind !== "sandbox" && (
+        <div
+          ref={creatingSkill ? skillBodyRef : undefined}
+          className={
+            creatingSkill
+              ? "flex min-h-0 flex-1 flex-col gap-5 overflow-y-auto px-5 py-4"
+              : "contents"
+          }
+        >
+          {dependencyStatus}
+          {creatingSkill && (
+            <div
+              className={cn("flex flex-col gap-5", skillImported && "hidden")}
+            >
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                size="sm"
+                value={skillMode}
+                disabled={saving || importing}
+                aria-label="添加 Skill 的方式"
+                className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-fit"
+                onValueChange={(value) => {
+                  if (!value || value === skillMode) return
+                  setSkillMode(value)
+                  setSkillImported(false)
+                  setErrors({})
+                  setAdvancedOpen(false)
+                  setSlugEdited(false)
+                  setInput((current) => ({
+                    ...current,
+                    id: "",
+                    name: "",
+                    description: "",
+                    spec: defaults("skill"),
+                  }))
+                }}
+              >
+                <ToggleGroupItem value="search">
+                  <SearchIcon data-icon="inline-start" />
+                  搜索 skills.sh
+                </ToggleGroupItem>
+                <ToggleGroupItem value="url">
+                  <LinkIcon data-icon="inline-start" />
+                  链接导入
+                </ToggleGroupItem>
+                <ToggleGroupItem value="upload">
+                  <UploadIcon data-icon="inline-start" />
+                  本地上传
+                </ToggleGroupItem>
+                <ToggleGroupItem value="manual">
+                  <PencilIcon data-icon="inline-start" />
+                  手动编写
+                </ToggleGroupItem>
+              </ToggleGroup>
+              {skillMode === "search" && (
+                <SkillSearchPanel
+                  disabled={saving}
+                  resources={projectResources}
+                  onBusyChange={setImporting}
+                  onImported={importSkill}
+                />
+              )}
+              {(skillMode === "url" || skillMode === "upload") && (
+                <SkillImportPanel
+                  key={skillMode}
+                  mode={skillMode}
+                  disabled={saving}
+                  onBusyChange={setImporting}
+                  onImported={importSkill}
+                  onInvalidate={() => setSkillImported(false)}
+                />
+              )}
+            </div>
+          )}
+          {creatingSkill && skillImported && (
+            <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+              <Badge variant="secondary">
+                {input.spec.source === "skills.sh"
+                  ? "skills.sh"
+                  : input.spec.source === "upload"
+                    ? "本地文件"
+                    : "公开链接"}
+              </Badge>
+              <span
+                className="min-w-0 flex-1 truncate"
+                title={String(input.spec.path ?? "")}
+              >
+                {String(input.spec.path ?? "")}
+              </span>
+              <span className="shrink-0">{skillFiles.length + 1} 个文件</span>
+            </div>
+          )}
+          <FieldGroup className={cn(!showDetails && "hidden")}>
+            {kind !== "project" &&
+              kind !== "image" &&
+              kind !== "runtime" &&
+              kind !== "sandbox" && (
+                <Field>
+                  <FieldLabel>所属项目</FieldLabel>
+                  <Select
+                    value={input.projectId ?? ""}
+                    onValueChange={changeProject}
+                  >
+                    <SelectTrigger className="w-full">
+                      <SelectValue placeholder="选择项目" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectGroup>
+                        <SelectLabel>Projects</SelectLabel>
+                        {projects.map((item) => (
+                          <SelectItem key={item.id} value={item.id}>
+                            {item.name}
+                          </SelectItem>
+                        ))}
+                      </SelectGroup>
+                    </SelectContent>
+                  </Select>
+                </Field>
+              )}
+            <div className="grid gap-4 sm:grid-cols-2">
+              <Field data-invalid={Boolean(errors.name)}>
+                <FieldLabel htmlFor="resource-name">名称</FieldLabel>
+                <Input
+                  id="resource-name"
+                  ref={creatingSkill ? skillNameRef : undefined}
+                  autoFocus={!creatingSkill || skillMode === "manual"}
+                  value={input.name}
+                  aria-invalid={Boolean(errors.name)}
+                  onChange={(event) => {
+                    update("name", event.target.value)
+                    if (!slugEdited)
+                      update("id", createSlug(event.target.value))
+                  }}
+                />
+                <FieldError>{errors.name}</FieldError>
+              </Field>
+              <Field data-invalid={Boolean(errors.id)}>
+                <FieldLabel htmlFor="resource-id">唯一标识</FieldLabel>
+                <Input
+                  id="resource-id"
+                  value={input.id}
+                  disabled={Boolean(resource)}
+                  aria-invalid={Boolean(errors.id)}
+                  onChange={(event) => {
+                    setSlugEdited(true)
+                    update("id", event.target.value.toLowerCase())
+                  }}
+                />
+                <FieldError>{errors.id}</FieldError>
+              </Field>
+            </div>
+            {kind !== "sandbox" && (
               <Field>
-                <FieldLabel>所属项目</FieldLabel>
-                <Select
-                  value={input.projectId ?? ""}
-                  onValueChange={changeProject}
-                >
-                  <SelectTrigger className="w-full">
-                    <SelectValue placeholder="选择项目" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectGroup>
-                      <SelectLabel>Projects</SelectLabel>
-                      {projects.map((item) => (
-                        <SelectItem key={item.id} value={item.id}>
-                          {item.name}
-                        </SelectItem>
-                      ))}
-                    </SelectGroup>
-                  </SelectContent>
-                </Select>
+                <FieldLabel htmlFor="resource-description">简介</FieldLabel>
+                <Textarea
+                  id="resource-description"
+                  value={input.description}
+                  className={cn(
+                    "min-h-20",
+                    kind === "skill" && "max-h-24 overflow-y-auto"
+                  )}
+                  onChange={(event) =>
+                    update("description", event.target.value)
+                  }
+                />
               </Field>
             )}
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field data-invalid={Boolean(errors.name)}>
-              <FieldLabel htmlFor="resource-name">名称</FieldLabel>
-              <Input
-                id="resource-name"
-                autoFocus
-                value={input.name}
-                aria-invalid={Boolean(errors.name)}
-                onChange={(event) => {
-                  update("name", event.target.value)
-                  if (!slugEdited) update("id", createSlug(event.target.value))
-                }}
-              />
-              <FieldError>{errors.name}</FieldError>
-            </Field>
-            <Field data-invalid={Boolean(errors.id)}>
-              <FieldLabel htmlFor="resource-id">唯一标识</FieldLabel>
-              <Input
-                id="resource-id"
-                value={input.id}
-                disabled={Boolean(resource)}
-                aria-invalid={Boolean(errors.id)}
-                onChange={(event) => {
-                  setSlugEdited(true)
-                  update("id", event.target.value.toLowerCase())
-                }}
-              />
-              <FieldError>{errors.id}</FieldError>
-            </Field>
-          </div>
-          {kind !== "sandbox" && (
-            <Field>
-              <FieldLabel htmlFor="resource-description">简介</FieldLabel>
-              <Textarea
-                id="resource-description"
-                value={input.description}
-                className="min-h-20"
-                onChange={(event) => update("description", event.target.value)}
-              />
-            </Field>
-          )}
-          <div className="grid gap-4 sm:grid-cols-2">
-            {primarySpecFields.map((field) => (
-              <SpecFieldEditor
-                key={field.key}
-                field={field}
-                kind={kind}
-                spec={input.spec}
-                invalid={Boolean(errors.spec)}
-                onChange={updateSpec}
-              />
-            ))}
-          </div>
-          {advancedSpecFields.length > 0 && (
-            <details
-              className="group rounded-xl border"
-              open={advancedOpen}
-              onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
-            >
-              <summary className="cursor-pointer list-none px-4 py-3 text-sm font-medium">
-                高级配置
-                <span className="ml-2 font-normal text-muted-foreground">
-                  工作目录、资源、网络与扩展能力
-                </span>
-              </summary>
-              {advancedOpen ? (
-                <div className="grid gap-4 border-t p-4 sm:grid-cols-2">
-                  {advancedSpecFields.map((field) => (
-                    <SpecFieldEditor
-                      key={field.key}
-                      field={field}
-                      kind={kind}
-                      spec={input.spec}
-                      invalid={Boolean(errors.spec)}
-                      onChange={updateSpec}
-                    />
-                  ))}
-                </div>
-              ) : null}
-            </details>
-          )}
-          {kind !== "project" && kind !== "sandbox" && (
-            <Field orientation="horizontal" className="rounded-lg border p-3">
-              <Checkbox
-                id="resource-enabled"
-                checked={input.enabled}
-                onCheckedChange={(checked) =>
-                  update("enabled", checked === true)
-                }
-              />
-              <div>
-                <FieldLabel htmlFor="resource-enabled">启用配置</FieldLabel>
-                <FieldDescription>
-                  {kind === "image"
-                    ? "停用后不能用于创建或更新沙箱模板。"
-                    : "禁用后保留声明，但不会用于新建沙箱。"}
-                </FieldDescription>
-              </div>
-            </Field>
-          )}
-          {(errors.form || errors.spec) && (
-            <FieldError>{errors.form || errors.spec}</FieldError>
-          )}
-        </FieldGroup>
-        <DialogFooter>
-          <Button
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            disabled={saving}
-          >
-            取消
-          </Button>
-          <Button onClick={submit} disabled={saving || !dependenciesReady}>
-            {saving ? (
-              <Spinner data-icon="inline-start" />
-            ) : (
-              <SaveIcon data-icon="inline-start" />
+            <div className="grid gap-4 sm:grid-cols-2">
+              {primarySpecFields.map((field) => (
+                <SpecFieldEditor
+                  key={field.key}
+                  field={field}
+                  kind={kind}
+                  spec={input.spec}
+                  invalid={Boolean(errors.spec)}
+                  onChange={updateSpec}
+                />
+              ))}
+            </div>
+            {advancedSpecFields.length > 0 && (
+              <details
+                className="group rounded-xl border"
+                open={advancedOpen}
+                onToggle={(event) => setAdvancedOpen(event.currentTarget.open)}
+              >
+                <summary className="cursor-pointer list-none px-4 py-3 text-sm font-medium">
+                  高级配置
+                  <span className="ml-2 font-normal text-muted-foreground">
+                    {kind === "skill"
+                      ? "版本、分类与来源记录"
+                      : "工作目录、资源、网络与扩展能力"}
+                  </span>
+                </summary>
+                {advancedOpen ? (
+                  <div className="grid gap-4 border-t p-4 sm:grid-cols-2">
+                    {advancedSpecFields.map((field) => (
+                      <SpecFieldEditor
+                        key={field.key}
+                        field={field}
+                        kind={kind}
+                        spec={input.spec}
+                        invalid={Boolean(errors.spec)}
+                        onChange={updateSpec}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+              </details>
             )}
-            保存
-          </Button>
+            {kind === "skill" && skillFiles.length > 0 && (
+              <Field>
+                <FieldLabel>附带文件</FieldLabel>
+                <details className="rounded-lg border p-3">
+                  <summary className="cursor-pointer text-sm">
+                    {skillFiles.length} 个文件，将随 SKILL.md 一起安装
+                  </summary>
+                  <ul className="mt-3 flex max-h-40 flex-col gap-1 overflow-y-auto text-sm">
+                    {skillFiles.map((file: { path: string }) => (
+                      <li key={file.path} className="font-mono break-all">
+                        {file.path}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              </Field>
+            )}
+            {kind !== "project" && kind !== "sandbox" && (
+              <Field orientation="horizontal" className="rounded-lg border p-3">
+                <Checkbox
+                  id="resource-enabled"
+                  checked={input.enabled}
+                  onCheckedChange={(checked) =>
+                    update("enabled", checked === true)
+                  }
+                />
+                <div>
+                  <FieldLabel htmlFor="resource-enabled">启用配置</FieldLabel>
+                  <FieldDescription>
+                    {kind === "image"
+                      ? "停用后不能用于创建或更新沙箱模板。"
+                      : "禁用后保留声明，但不会用于新建沙箱。"}
+                  </FieldDescription>
+                </div>
+              </Field>
+            )}
+            {(errors.form || errors.spec) && (
+              <FieldError>{errors.form || errors.spec}</FieldError>
+            )}
+          </FieldGroup>
+        </div>
+        <DialogFooter
+          className={cn(
+            creatingSkill &&
+              "mx-0 mb-0 shrink-0 flex-row items-center justify-between px-5 py-3"
+          )}
+        >
+          {creatingSkill && skillImported && (
+            <Button
+              variant="ghost"
+              disabled={saving || importing}
+              onClick={() => {
+                setSkillImported(false)
+                setErrors({})
+                requestAnimationFrame(() => {
+                  skillBodyRef.current?.scrollTo({ top: 0 })
+                  document
+                    .getElementById(
+                      skillMode === "search"
+                        ? "skill-search"
+                        : skillMode === "url"
+                          ? "skill-import-source"
+                          : "skill-file-picker"
+                    )
+                    ?.focus()
+                })
+              }}
+            >
+              <ArrowLeftIcon data-icon="inline-start" />
+              返回{skillMode === "search" ? "结果" : "来源"}
+            </Button>
+          )}
+          {creatingSkill && !skillImported && (
+            <p className="mr-auto text-xs text-muted-foreground">
+              仅导入你信任的内容
+            </p>
+          )}
+          <div
+            className={
+              creatingSkill ? "ml-auto flex items-center gap-2" : "contents"
+            }
+          >
+            <Button
+              variant="outline"
+              onClick={() => onOpenChange(false)}
+              disabled={saving}
+            >
+              取消
+            </Button>
+            {showDetails && (
+              <Button
+                onClick={submit}
+                disabled={
+                  saving || importing || !showDetails || !dependenciesReady
+                }
+              >
+                {saving ? (
+                  <Spinner data-icon="inline-start" />
+                ) : (
+                  <SaveIcon data-icon="inline-start" />
+                )}
+                {creatingSkill && skillMode !== "manual" ? "确认导入" : "保存"}
+              </Button>
+            )}
+          </div>
         </DialogFooter>
       </DialogContent>
     </Dialog>

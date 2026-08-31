@@ -92,11 +92,20 @@ sudo systemctl restart agentbox-worker
 
 ### Skills
 
-进入“配置 → Skills”。内置 Skill 可以直接启用；自定义 Skill 点击“新建 Skill”。
+进入“配置 → Skills”，点击“添加 Skill”添加项目需要的能力。AgentBox 不预置 Skill，只有主动创建并绑定到沙箱模板的 Skill 才会安装到沙箱。
 
 ![Skills 列表](images/user-guide/06-skills.png)
 
-填写名称、唯一标识、版本和 `SKILL.md` 指令。来源为 `inline` 时，指令直接保存在控制面；如果使用来源路径，确保 Worker 创建沙箱时能取得对应内容。
+点击“添加 Skill”，默认进入 skills.sh 搜索，也可以选择“链接导入”“本地上传”或“手动编写”：
+
+- 搜索输入 2–100 个字符的关键词，按回车或点击“搜索”。展示 skills.sh 返回的 GitHub 来源、名称和安装量，每次最多 20 条；当前项目已导入的来源会标记“已导入”。点击“选择”读取正文和附件，再进入确认页面；“返回结果”会保留本次搜索。其他来源类型暂不展示，搜索故障会明确提示重试，不会显示成空目录。
+
+- 链接导入支持 skills.sh 的 GitHub 来源详情链接，例如 `https://skills.sh/vercel-labs/skills/find-skills`。点击“浏览 skills.sh”选择 Skill，再复制详情链接；AgentBox 会按名称定位公开仓库中的 Skill 目录，保留全部附件，无需执行安装命令或配置目录 API 凭据。仓库归档下载上限为 32 MiB，选定 Skill 仍受下述文件数量和大小限制。非 GitHub 来源请使用文件直链或本地上传。
+- 也支持公开的 HTTPS `SKILL.md` 直链、GitHub 文件页面（`/blob/.../SKILL.md`）及 ZIP 直链；单文件链接只导入该文件。需要完整目录时，请使用 skills.sh 链接或 ZIP。不支持内网地址、私有仓库认证或自动同步。
+- 本地上传支持 `.md` 和包含单个 Skill 的 ZIP。`SKILL.md` 需包含 YAML 元数据 `name`、`description` 和指令正文；ZIP 内可保留 `scripts/`、`references/`、`assets/` 等附件。上传文件与解压后的总大小各不超过 4 MiB，最多 128 个文件，单文件不超过 1 MiB；拒绝符号链接、重复路径和目录穿越。
+- 手动编写保留名称、唯一标识、版本和指令编辑能力。
+
+链接和本地文件先点击“读取并预览”。确认页面可以检查名称、唯一标识、所属项目、完整 `SKILL.md` 和附带文件；版本、分类和来源记录收在“高级配置”中。最后点击“确认导入”。读取不会保存或执行内容；已有标识不会被覆盖。导入后保存的是当前内容，Worker 不再依赖原链接，而是将正文和附件一并安装到沙箱中。请只导入信任的内容，脚本在后续由 Agent 使用时可能执行。
 
 ![创建 Skill](images/user-guide/07-create-skill.png)
 

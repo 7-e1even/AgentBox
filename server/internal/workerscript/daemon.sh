@@ -2800,17 +2800,36 @@ configure_skills() {
   SKILL_COUNT=$(jq '.job.payload.skills | length' "$JOB_FILE")
   [ "$SKILL_COUNT" -gt 0 ] || return 0
 
-  docker exec "$CONTAINER" mkdir -p /opt/agentbox/skills
+  docker exec "$CONTAINER" mkdir -p /opt/agentbox/skills || return 1
   jq -c '.job.payload.skills[]' "$JOB_FILE" | while IFS= read -r SKILL; do
+    (
     ID=$(printf '%s' "$SKILL" | jq -r '.id')
+    case "$ID" in ''|*[!a-z0-9-]*) exit 1 ;; esac
     NAME=$(printf '%s' "$SKILL" | jq -r '.name | @json')
     DESCRIPTION=$(printf '%s' "$SKILL" | jq -r '.description | @json')
     INSTRUCTIONS=$(printf '%s' "$SKILL" | jq -r '.spec.instructions // empty')
     [ -n "$INSTRUCTIONS" ] || INSTRUCTIONS=$(printf '%s' "$SKILL" | jq -r '.description')
-    SKILL_FILE=$(mktemp)
-    printf '%s\n' '---' "name: $NAME" "description: $DESCRIPTION" '---' '' "$INSTRUCTIONS" > "$SKILL_FILE"
-    docker exec "$CONTAINER" mkdir -p "/opt/agentbox/skills/$ID"
-    docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/SKILL.md" < "$SKILL_FILE"
+    SKILL_FILE=$(mktemp) || exit 1
+    trap 'rm -f "$SKILL_FILE"' EXIT
+    if printf '%s' "$SKILL" | jq -e '(.spec.instructions // "") | test("^---\\r?\\n")' >/dev/null; then
+      printf '%s' "$SKILL" | jq -j '.spec.instructions' > "$SKILL_FILE" || exit 1
+    else
+      printf '%s\n' '---' "name: $NAME" "description: $DESCRIPTION" '---' '' "$INSTRUCTIONS" > "$SKILL_FILE"
+    fi
+    # Replace only this Skill's directory, so removed attachments cannot survive a restart.
+    docker exec "$CONTAINER" sh -c 'rm -rf "$1" && mkdir -p "$1"' agentbox "/opt/agentbox/skills/$ID" || exit 1
+    docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/SKILL.md" < "$SKILL_FILE" || exit 1
+    printf '%s' "$SKILL" | jq -c '.spec.files[]?' | while IFS= read -r SKILL_ATTACHMENT; do
+      SKILL_PATH=$(printf '%s' "$SKILL_ATTACHMENT" | jq -r '.path')
+      case "$SKILL_PATH" in ''|.|..|/*|*/../*|../*|*/..|*\\*|*:*|SKILL.md) exit 1 ;; esac
+      SKILL_PARENT=$(dirname -- "$SKILL_PATH")
+      docker exec "$CONTAINER" mkdir -p "/opt/agentbox/skills/$ID/$SKILL_PARENT" || exit 1
+      printf '%s' "$SKILL_ATTACHMENT" | jq -r '.content' | base64 -d > "$SKILL_FILE" || exit 1
+      docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/$SKILL_PATH" < "$SKILL_FILE" || exit 1
+      if printf '%s' "$SKILL_ATTACHMENT" | jq -e '.executable == true' >/dev/null; then
+        docker exec "$CONTAINER" chmod 755 "/opt/agentbox/skills/$ID/$SKILL_PATH" || exit 1
+      fi
+    done || exit 1
     for SKILL_TARGET in \
       "/root/.agents/skills/$ID" \
       "/root/.gemini/antigravity-cli/skills/$ID" \
@@ -2833,10 +2852,9 @@ configure_skills() {
       "/root/.grok/skills/$ID" \
       "/root/.qwen/skills/$ID" \
       "/root/.qwenpaw/skill_pool/$ID"; do
-      docker exec "$CONTAINER" mkdir -p "$SKILL_TARGET"
-      docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "$SKILL_TARGET/SKILL.md" < "$SKILL_FILE"
+      docker exec "$CONTAINER" sh -c 'rm -rf "$1" && mkdir -p "$1" && cp -R "$2/." "$1/"' agentbox "$SKILL_TARGET" "/opt/agentbox/skills/$ID" || exit 1
     done
-    rm -f "$SKILL_FILE"
+    ) || return 1
   done
 }
 

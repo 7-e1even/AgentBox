@@ -55,11 +55,18 @@ type SandboxSpec struct {
 }
 
 type SkillSpec struct {
-	Version      string `json:"version,omitempty"`
-	Category     string `json:"category,omitempty"`
-	Source       string `json:"source,omitempty"`
-	Path         string `json:"path,omitempty"`
-	Instructions string `json:"instructions,omitempty"`
+	Version      string      `json:"version,omitempty"`
+	Category     string      `json:"category,omitempty"`
+	Source       string      `json:"source,omitempty"`
+	Path         string      `json:"path,omitempty"`
+	Instructions string      `json:"instructions,omitempty"`
+	Files        []SkillFile `json:"files,omitempty"`
+}
+
+type SkillFile struct {
+	Path       string `json:"path"`
+	Content    string `json:"content"` // Base64 preserves scripts and binary assets.
+	Executable bool   `json:"executable,omitzero"`
 }
 
 type MCPSpec struct {
