@@ -23,6 +23,7 @@ import {
   Sidebar,
   SidebarContent,
   SidebarHeader,
+  SidebarResizeHandle,
 } from "@/components/ui/sidebar"
 import type { Resource } from "@/lib/platform-schema"
 import type { ManagedUser } from "@/lib/user-schema"
@@ -89,7 +90,12 @@ export function AppSidebar({
   ]
 
   return (
-    <Sidebar collapsible="offcanvas" variant="inset" {...props}>
+    <Sidebar
+      collapsible="offcanvas"
+      variant="inset"
+      {...props}
+      id="app-sidebar"
+    >
       <SidebarHeader>
         <TeamSwitcher
           projects={projects}
@@ -100,6 +106,7 @@ export function AppSidebar({
       <SidebarContent>
         <NavMain groups={groups} />
       </SidebarContent>
+      <SidebarResizeHandle aria-controls="app-sidebar" />
     </Sidebar>
   )
 }

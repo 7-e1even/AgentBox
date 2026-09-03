@@ -26,7 +26,9 @@ import { PanelLeftIcon } from "lucide-react"
 
 const SIDEBAR_COOKIE_NAME = "sidebar_state"
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7
-const SIDEBAR_WIDTH = "16rem"
+const SIDEBAR_DEFAULT_WIDTH = 256
+const SIDEBAR_MIN_WIDTH = 224
+const SIDEBAR_MAX_WIDTH = 384
 const SIDEBAR_WIDTH_MOBILE = "18rem"
 const SIDEBAR_WIDTH_ICON = "3rem"
 const SIDEBAR_KEYBOARD_SHORTCUT = "b"
@@ -41,12 +43,32 @@ type SidebarContextProps = {
   toggleSidebar: () => void
 }
 
+type SidebarResizeContextProps = {
+  sidebarWidth: number
+  minSidebarWidth: number
+  maxSidebarWidth: number
+  setSidebarWidth: React.Dispatch<React.SetStateAction<number>>
+  isResizing: boolean
+  setIsResizing: (isResizing: boolean) => void
+}
+
 const SidebarContext = React.createContext<SidebarContextProps | null>(null)
+const SidebarResizeContext =
+  React.createContext<SidebarResizeContextProps | null>(null)
 
 function useSidebar() {
   const context = React.useContext(SidebarContext)
   if (!context) {
     throw new Error("useSidebar must be used within a SidebarProvider.")
+  }
+
+  return context
+}
+
+function useSidebarResize() {
+  const context = React.useContext(SidebarResizeContext)
+  if (!context) {
+    throw new Error("useSidebarResize must be used within a SidebarProvider.")
   }
 
   return context
@@ -67,6 +89,10 @@ function SidebarProvider({
 }) {
   const isMobile = useIsMobile()
   const [openMobile, setOpenMobile] = React.useState(false)
+  const [_sidebarWidth, _setSidebarWidth] = React.useState(
+    SIDEBAR_DEFAULT_WIDTH
+  )
+  const [isResizing, setIsResizing] = React.useState(false)
 
   // This is the internal state of the sidebar.
   // We use openProp and setOpenProp for control from outside the component.
@@ -80,6 +106,7 @@ function SidebarProvider({
       } else {
         _setOpen(openState)
       }
+      if (!openState) setIsResizing(false)
 
       // This sets the cookie to keep the sidebar state.
       document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`
@@ -91,6 +118,16 @@ function SidebarProvider({
   const toggleSidebar = React.useCallback(() => {
     return isMobile ? setOpenMobile((open) => !open) : setOpen((open) => !open)
   }, [isMobile, setOpen, setOpenMobile])
+
+  const setSidebarWidth = React.useCallback<
+    React.Dispatch<React.SetStateAction<number>>
+  >((value) => {
+    _setSidebarWidth((currentWidth) => {
+      const nextWidth =
+        typeof value === "function" ? value(currentWidth) : value
+      return Math.min(SIDEBAR_MAX_WIDTH, Math.max(SIDEBAR_MIN_WIDTH, nextWidth))
+    })
+  }, [])
 
   // Adds a keyboard shortcut to toggle the sidebar.
   React.useEffect(() => {
@@ -125,25 +162,39 @@ function SidebarProvider({
     [state, open, setOpen, isMobile, openMobile, setOpenMobile, toggleSidebar]
   )
 
+  const resizeContextValue = React.useMemo<SidebarResizeContextProps>(
+    () => ({
+      sidebarWidth: _sidebarWidth,
+      minSidebarWidth: SIDEBAR_MIN_WIDTH,
+      maxSidebarWidth: SIDEBAR_MAX_WIDTH,
+      setSidebarWidth,
+      isResizing,
+      setIsResizing,
+    }),
+    [_sidebarWidth, setSidebarWidth, isResizing]
+  )
+
   return (
     <SidebarContext.Provider value={contextValue}>
-      <div
-        data-slot="sidebar-wrapper"
-        style={
-          {
-            "--sidebar-width": SIDEBAR_WIDTH,
-            "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
-            ...style,
-          } as React.CSSProperties
-        }
-        className={cn(
-          "group/sidebar-wrapper flex min-h-svh w-full has-data-[variant=inset]:bg-sidebar",
-          className
-        )}
-        {...props}
-      >
-        {children}
-      </div>
+      <SidebarResizeContext.Provider value={resizeContextValue}>
+        <div
+          data-slot="sidebar-wrapper"
+          style={
+            {
+              "--sidebar-width": `${_sidebarWidth}px`,
+              "--sidebar-width-icon": SIDEBAR_WIDTH_ICON,
+              ...style,
+            } as React.CSSProperties
+          }
+          className={cn(
+            "group/sidebar-wrapper flex min-h-svh w-full has-data-[variant=inset]:bg-sidebar",
+            className
+          )}
+          {...props}
+        >
+          {children}
+        </div>
+      </SidebarResizeContext.Provider>
     </SidebarContext.Provider>
   )
 }
@@ -162,6 +213,7 @@ function Sidebar({
   collapsible?: "offcanvas" | "icon" | "none"
 }) {
   const { isMobile, state, openMobile, setOpenMobile } = useSidebar()
+  const { isResizing } = useSidebarResize()
 
   if (collapsible === "none") {
     return (
@@ -222,7 +274,8 @@ function Sidebar({
           "group-data-[side=right]:rotate-180",
           variant === "floating" || variant === "inset"
             ? "group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4)))]"
-            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon)"
+            : "group-data-[collapsible=icon]:w-(--sidebar-width-icon)",
+          isResizing && "transition-none"
         )}
       />
       <div
@@ -234,6 +287,7 @@ function Sidebar({
           variant === "floating" || variant === "inset"
             ? "p-2 group-data-[collapsible=icon]:w-[calc(var(--sidebar-width-icon)+(--spacing(4))+2px)]"
             : "group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[side=left]:border-r group-data-[side=right]:border-l",
+          isResizing && "transition-none",
           className
         )}
         {...props}
@@ -297,6 +351,127 @@ function SidebarRail({ className, ...props }: React.ComponentProps<"button">) {
         className
       )}
       {...props}
+    />
+  )
+}
+
+type SidebarResizeDrag = {
+  pointerId: number
+  startX: number
+  startWidth: number
+  direction: 1 | -1
+}
+
+function SidebarResizeHandle({
+  className,
+  ...props
+}: React.ComponentProps<"button">) {
+  const {
+    sidebarWidth,
+    minSidebarWidth,
+    maxSidebarWidth,
+    setSidebarWidth,
+    isResizing,
+    setIsResizing,
+  } = useSidebarResize()
+  const { isMobile, state } = useSidebar()
+  const drag = React.useRef<SidebarResizeDrag | null>(null)
+
+  React.useEffect(() => {
+    if (!isMobile && state === "expanded") return
+
+    drag.current = null
+    window.requestAnimationFrame(() => setIsResizing(false))
+  }, [isMobile, setIsResizing, state])
+
+  if (isMobile || state !== "expanded") {
+    return null
+  }
+
+  const stopResizing = (event: React.PointerEvent<HTMLButtonElement>) => {
+    if (drag.current?.pointerId !== event.pointerId) return
+
+    drag.current = null
+    setIsResizing(false)
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+  }
+
+  return (
+    <button
+      {...props}
+      type="button"
+      role="separator"
+      aria-label="调整侧栏宽度"
+      aria-orientation="vertical"
+      aria-valuemin={minSidebarWidth}
+      aria-valuemax={maxSidebarWidth}
+      aria-valuenow={sidebarWidth}
+      aria-valuetext={`${sidebarWidth} 像素`}
+      data-sidebar="resize-handle"
+      data-slot="sidebar-resize-handle"
+      data-resizing={isResizing}
+      title="拖动或使用方向键调整侧栏宽度"
+      className={cn(
+        "absolute inset-y-0 z-20 hidden w-4 cursor-col-resize touch-none transition-colors select-none group-data-[side=left]:-right-4 group-data-[side=right]:left-0 after:absolute after:inset-y-0 after:start-1/2 after:w-px after:bg-transparent hover:after:bg-sidebar-border focus-visible:outline-none focus-visible:after:bg-sidebar-ring data-[resizing=true]:after:bg-sidebar-ring sm:flex ltr:-translate-x-1/2 rtl:-translate-x-1/2",
+        className
+      )}
+      onPointerDown={(event) => {
+        if (event.button !== 0) return
+
+        event.preventDefault()
+        event.currentTarget.focus()
+        event.currentTarget.setPointerCapture(event.pointerId)
+        drag.current = {
+          pointerId: event.pointerId,
+          startX: event.clientX,
+          startWidth: sidebarWidth,
+          direction: event.currentTarget.closest('[data-side="right"]')
+            ? -1
+            : 1,
+        }
+        setIsResizing(true)
+      }}
+      onPointerMove={(event) => {
+        if (drag.current?.pointerId !== event.pointerId) return
+        if ((event.buttons & 1) === 0) {
+          drag.current = null
+          setIsResizing(false)
+          return
+        }
+
+        const nextWidth =
+          drag.current.startWidth +
+          (event.clientX - drag.current.startX) * drag.current.direction
+        setSidebarWidth(nextWidth)
+      }}
+      onPointerUp={stopResizing}
+      onPointerCancel={stopResizing}
+      onLostPointerCapture={() => {
+        drag.current = null
+        setIsResizing(false)
+      }}
+      onKeyDown={(event) => {
+        const direction = event.currentTarget.closest('[data-side="right"]')
+          ? -1
+          : 1
+        let nextWidth: number | null = null
+
+        if (event.key === "ArrowLeft") {
+          nextWidth = sidebarWidth - 16 * direction
+        } else if (event.key === "ArrowRight") {
+          nextWidth = sidebarWidth + 16 * direction
+        } else if (event.key === "Home") {
+          nextWidth = minSidebarWidth
+        } else if (event.key === "End") {
+          nextWidth = maxSidebarWidth
+        }
+
+        if (nextWidth === null) return
+        event.preventDefault()
+        setSidebarWidth(nextWidth)
+      }}
     />
   )
 }
@@ -696,6 +871,7 @@ export {
   SidebarMenuSubItem,
   SidebarProvider,
   SidebarRail,
+  SidebarResizeHandle,
   SidebarSeparator,
   SidebarTrigger,
   useSidebar,

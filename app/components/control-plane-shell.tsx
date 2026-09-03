@@ -1256,7 +1256,6 @@ export function ControlPlaneShell({
           className="h-svh min-h-0 overflow-hidden"
           style={
             {
-              "--sidebar-width": "calc(var(--spacing) * 72)",
               "--header-height": "calc(var(--spacing) * 12)",
             } as CSSProperties
           }
