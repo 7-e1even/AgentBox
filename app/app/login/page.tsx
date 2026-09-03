@@ -25,8 +25,11 @@ export default async function LoginPage() {
   if (!statusResponse) return <BackendUnavailable variant="unreachable" />
   if (!statusResponse.ok) return <BackendUnavailable variant="error" />
 
-  const needsSetup = authStatusSchema.parse(
-    await statusResponse.json()
-  ).needsSetup
-  return <LoginForm needsSetup={needsSetup} />
+  const authStatus = authStatusSchema.parse(await statusResponse.json())
+  return (
+    <LoginForm
+      needsSetup={authStatus.needsSetup}
+      setupCodeRequired={authStatus.setupCodeRequired}
+    />
+  )
 }

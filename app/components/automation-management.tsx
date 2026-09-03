@@ -1138,8 +1138,7 @@ function WebhookConnectionCard({
           <Field>
             <FieldLabel>Webhook 密钥</FieldLabel>
             <FieldDescription>
-              当前密钥末四位 {automation.secretLastFour}
-              。仅在配置调用方时显示完整值。
+              当前密钥已配置（{automation.secretLastFour}）。仅在配置调用方时显示完整值。
             </FieldDescription>
             <Button
               variant="outline"

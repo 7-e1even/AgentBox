@@ -57,13 +57,13 @@ func TestParseCreateCommand(t *testing.T) {
 	}
 }
 
-func TestParseCreateCommandDefaultsToEgress(t *testing.T) {
+func TestParseCreateCommandDefaultsToNone(t *testing.T) {
 	parsed, err := parseCommand([]string{"create", "agentbox-test", "ubuntu:24.04"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.network != "egress" {
-		t.Fatalf("default network = %q, want egress", parsed.network)
+	if parsed.network != "none" {
+		t.Fatalf("default network = %q, want none", parsed.network)
 	}
 }
 

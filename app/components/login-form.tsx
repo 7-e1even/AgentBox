@@ -24,7 +24,13 @@ import { Input } from "@/components/ui/input"
 import { Spinner } from "@/components/ui/spinner"
 import { apiErrorMessage } from "@/lib/api-client"
 
-export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
+export function LoginForm({
+  needsSetup,
+  setupCodeRequired,
+}: {
+  needsSetup: boolean
+  setupCodeRequired: boolean
+}) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
 
@@ -45,6 +51,7 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
           username: String(form.get("username") ?? ""),
           email: String(form.get("email") ?? ""),
           password,
+          setupCode: String(form.get("setupCode") ?? ""),
         }
       : {
           username: String(form.get("username") ?? ""),
@@ -63,7 +70,7 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
         const body = await response.json().catch(() => null)
         throw new Error(apiErrorMessage(body, "登录失败，请稍后重试"))
       }
-      window.location.assign("/")
+      window.location.replace("/")
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "登录失败，请稍后重试")
       setBusy(false)
@@ -102,13 +109,30 @@ export function LoginForm({ needsSetup }: { needsSetup: boolean }) {
             <CardTitle>{needsSetup ? "创建管理员" : "登录 AgentBox"}</CardTitle>
             <CardDescription>
               {needsSetup
-                ? "首次启动需要创建管理员账号。完成后将直接进入控制台。"
+                ? "首次启动需要创建管理员账号。初始化码仅显示在本地服务日志中。"
                 : "使用管理员为你创建的账号进入控制台。"}
             </CardDescription>
           </CardHeader>
           <CardContent>
             <form id="login-form" onSubmit={submit}>
               <FieldGroup>
+                {needsSetup && setupCodeRequired && (
+                  <Field>
+                    <FieldLabel htmlFor="setupCode">首次启动初始化码</FieldLabel>
+                    <Input
+                      id="setupCode"
+                      name="setupCode"
+                      type="password"
+                      autoComplete="off"
+                      autoCapitalize="none"
+                      spellCheck={false}
+                      required
+                    />
+                    <FieldDescription>
+                      请从 <code>docker compose logs server</code> 的启动日志中获取。
+                    </FieldDescription>
+                  </Field>
+                )}
                 {needsSetup && (
                   <Field>
                     <FieldLabel htmlFor="name">名称</FieldLabel>

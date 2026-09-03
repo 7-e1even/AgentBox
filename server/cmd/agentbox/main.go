@@ -15,6 +15,7 @@ import (
 
 	"agentbox/internal/catalog"
 	"agentbox/internal/httpapi"
+	"agentbox/internal/platform"
 	"agentbox/internal/store"
 	"github.com/joho/godotenv"
 )
@@ -59,9 +60,25 @@ func main() {
 		strings.TrimSpace(os.Getenv("AGENTBOX_WORKER_CACHE_DIR")),
 		"/var/lib/agentbox/worker-cache",
 	)
+	if err := platform.ValidateWorkerDownloadURL(workerReleaseURL); err != nil {
+		logger.Error("invalid AGENTBOX_WORKER_RELEASE_BASE_URL", "error", err)
+		os.Exit(1)
+	}
 	if disableAuth && !strings.EqualFold(strings.TrimSpace(os.Getenv("AGENTBOX_ENV")), "development") {
 		logger.Error("AGENTBOX_DISABLE_AUTH is only allowed when AGENTBOX_ENV=development")
 		os.Exit(1)
+	}
+	if err := httpapi.ValidateTrustedProxyEnvironment(); err != nil {
+		logger.Error("invalid trusted proxy configuration", "error", err)
+		os.Exit(1)
+	}
+	setupCode := strings.TrimSpace(os.Getenv("AGENTBOX_SETUP_CODE"))
+	setupCodeConfigured := setupCode != ""
+	if setupCodeConfigured {
+		if err := httpapi.ValidateSetupCode(setupCode); err != nil {
+			logger.Error("invalid AGENTBOX_SETUP_CODE", "error", err)
+			os.Exit(1)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -72,9 +89,30 @@ func main() {
 		os.Exit(1)
 	}
 	defer repository.Close()
+	needsSetup, err := repository.NeedsUserSetup(ctx)
+	if err != nil {
+		logger.Error("check first-run setup", "error", err)
+		os.Exit(1)
+	}
+	if needsSetup {
+		if setupCode == "" {
+			setupCode, err = httpapi.GenerateSetupCode()
+			if err != nil {
+				logger.Error("generate first-run setup code", "error", err)
+				os.Exit(1)
+			}
+			logger.Warn("first-run setup requires this generated one-time code; read it only from local server logs", "setup_code", setupCode)
+		} else {
+			logger.Warn("first-run setup requires the one-time code configured in AGENTBOX_SETUP_CODE")
+		}
+	} else if setupCodeConfigured {
+		logger.Warn("AGENTBOX_SETUP_CODE is ignored because initial setup is already complete")
+		setupCode = ""
+	}
 
 	handler := httpapi.New(repository, catalog.BuiltinCatalog, logger, origins, httpapi.Config{
 		DisableAuth:      disableAuth,
+		SetupCode:        setupCode,
 		WorkerBinaryDir:  workerBinaryDir,
 		WorkerVersion:    workerVersion,
 		WorkerReleaseURL: workerReleaseURL,

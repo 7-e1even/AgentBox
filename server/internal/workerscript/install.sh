@@ -1,21 +1,66 @@
 #!/bin/sh
 set -eu
 
-SERVER_URL=${1:-}
-case "$SERVER_URL" in
-  http://*|https://*) ;;
-  *) echo "usage: install.sh <agentbox-url>" >&2; exit 2 ;;
-esac
-case "$SERVER_URL" in
-  https://*|http://localhost*|http://127.0.0.1*|http://\[::1\]*) ;;
-  http://*)
-    echo "============================================================================" >&2
-    echo "WARNING: $SERVER_URL uses plain HTTP." >&2
-    echo "The Worker binary, server credentials, and sandbox secrets will cross the" >&2
-    echo "network unencrypted. Use HTTPS (or an SSH tunnel) for any real deployment." >&2
-    echo "============================================================================" >&2
-    ;;
-esac
+normalize_worker_origin() {
+  WORKER_ORIGIN=${1:-}
+  while [ "${WORKER_ORIGIN%/}" != "$WORKER_ORIGIN" ]; do WORKER_ORIGIN=${WORKER_ORIGIN%/}; done
+  case "$WORKER_ORIGIN" in
+    *[[:space:]]*|*\?*|*\#*|*@*)
+      echo "Worker URL must be an HTTP(S) origin without credentials, path, query, or fragment" >&2
+      return 1
+      ;;
+    https://*) WORKER_AUTHORITY=${WORKER_ORIGIN#https://}; WORKER_PLAIN_HTTP=false ;;
+    http://*) WORKER_AUTHORITY=${WORKER_ORIGIN#http://}; WORKER_PLAIN_HTTP=true ;;
+    *) echo "Worker URL must use HTTPS, or HTTP on an exact loopback host" >&2; return 1 ;;
+  esac
+  case "$WORKER_AUTHORITY" in ''|*/*) echo "Worker URL must contain only an origin" >&2; return 1 ;; esac
+  WORKER_HOST=$WORKER_AUTHORITY
+  case "$WORKER_AUTHORITY" in
+    \[*\]:*)
+      WORKER_HOST=${WORKER_AUTHORITY%%]*}
+      WORKER_HOST=${WORKER_HOST#\[}
+      WORKER_PORT=${WORKER_AUTHORITY#*]:}
+      case "$WORKER_PORT" in ''|*[!0-9]*) echo "Worker URL port is invalid" >&2; return 1 ;; esac
+      ;;
+    \[*\]) WORKER_HOST=${WORKER_AUTHORITY#\[}; WORKER_HOST=${WORKER_HOST%\]} ;;
+    *:*)
+      WORKER_HOST=${WORKER_AUTHORITY%:*}
+      WORKER_PORT=${WORKER_AUTHORITY##*:}
+      case "$WORKER_HOST" in ''|*:*) echo "Worker URL authority is invalid" >&2; return 1 ;; esac
+      case "$WORKER_PORT" in ''|*[!0-9]*) echo "Worker URL port is invalid" >&2; return 1 ;; esac
+      ;;
+  esac
+  [ -n "$WORKER_HOST" ] || { echo "Worker URL host is required" >&2; return 1; }
+  if [ "$WORKER_PLAIN_HTTP" = true ]; then
+    case "$WORKER_HOST" in
+      localhost|::1) ;;
+      127.*)
+        printf '%s\n' "$WORKER_HOST" | grep -Eq '^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || {
+          echo "Plain HTTP is allowed only for an exact localhost or loopback IP" >&2
+          return 1
+        }
+        OLD_IFS=$IFS; IFS=.; set -- $WORKER_HOST; IFS=$OLD_IFS
+        for WORKER_OCTET in "$@"; do
+          [ "$WORKER_OCTET" -le 255 ] || {
+            echo "Plain HTTP is allowed only for an exact localhost or loopback IP" >&2
+            return 1
+          }
+        done
+        ;;
+      *) echo "Plain HTTP is allowed only for an exact localhost or loopback IP" >&2; return 1 ;;
+    esac
+  fi
+  printf '%s' "$WORKER_ORIGIN"
+}
+
+SERVER_URL=$(normalize_worker_origin "${1:-}") || { echo "usage: install.sh <agentbox-url>" >&2; exit 2; }
+
+worker_origin_curl() {
+  case "$SERVER_URL" in
+    https://*) curl --proto '=https' --proto-redir '=https' -L "$@" ;;
+    http://*) curl --proto '=http' "$@" ;;
+  esac
+}
 
 verify_worker_checksum() {
   BINARY=$1
@@ -23,8 +68,8 @@ verify_worker_checksum() {
   EXPECTED_SHA256=$(tr -d '\r' < "$HEADERS" |
     sed -n 's/^[Xx]-[Cc]hecksum-[Ss]ha256:[[:space:]]*\([0-9A-Fa-f]\{1,\}\).*/\1/p' | head -n 1)
   if [ -z "$EXPECTED_SHA256" ]; then
-    echo "warning: the server did not provide a Worker checksum; skipping integrity verification" >&2
-    return 0
+    echo "the server did not provide a Worker checksum; refusing to install" >&2
+    exit 1
   fi
   if ! command -v sha256sum >/dev/null; then
     echo "sha256sum is required to verify the downloaded Worker binary" >&2
@@ -48,9 +93,9 @@ case "$(uname -m)" in
   aarch64|arm64) ARCH=arm64; BOXLITE_ARCH=aarch64 ;;
   *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
-curl -fsSL -D "$worker_headers_tmp" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"
+worker_origin_curl -fsS -D "$worker_headers_tmp" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"
 verify_worker_checksum "$worker_tmp" "$worker_headers_tmp"
-curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$microsandbox_source_tmp"
+worker_origin_curl -fsS "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$microsandbox_source_tmp"
 
 install_host_dependencies() {
   if command -v jq >/dev/null && command -v flock >/dev/null && command -v sync >/dev/null &&
@@ -123,8 +168,8 @@ install_boxlite_cli() {
   BOXLITE_URL="https://github.com/boxlite-ai/boxlite/releases/download/v${BOXLITE_VERSION}/${BOXLITE_ASSET}"
   if ! (
     set -eu
-    curl -fsSL "$BOXLITE_URL" -o "$boxlite_tmp/$BOXLITE_ASSET"
-    curl -fsSL "$BOXLITE_URL.sha256" -o "$boxlite_tmp/$BOXLITE_ASSET.sha256"
+    curl -fsSL --proto '=https' --proto-redir '=https' "$BOXLITE_URL" -o "$boxlite_tmp/$BOXLITE_ASSET"
+    curl -fsSL --proto '=https' --proto-redir '=https' "$BOXLITE_URL.sha256" -o "$boxlite_tmp/$BOXLITE_ASSET.sha256"
     cd "$boxlite_tmp"
     sha256sum -c "$BOXLITE_ASSET.sha256"
     tar -xzf "$BOXLITE_ASSET"

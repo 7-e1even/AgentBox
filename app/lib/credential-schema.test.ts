@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 
-import { managedCredentialSchema } from "./credential-schema"
+import {
+  credentialInputSchema,
+  managedCredentialSchema,
+} from "./credential-schema"
 
 const credential = {
   id: "openai-primary",
@@ -17,7 +20,7 @@ const credential = {
       source: "remote" as const,
     },
   ],
-  maskedSecret: "••••1234",
+  maskedSecret: "••••••••",
   enabled: true,
   lastCheckAt: null,
   lastCheckOk: null,
@@ -35,6 +38,35 @@ describe("managedCredentialSchema", () => {
     expect(
       managedCredentialSchema.safeParse({ ...credential, secret: "sk-secret" })
         .success
+    ).toBe(false)
+  })
+})
+
+describe("credentialInputSchema", () => {
+  const input = {
+    id: "openai-primary",
+    name: "OpenAI API Key",
+    providerId: "openai",
+    protocol: "openai-responses" as const,
+    endpoint: "https://api.openai.com/v1",
+    modelId: "",
+    secret: "sk-secret",
+    enabled: true,
+  }
+
+  it("accepts HTTPS and an empty default endpoint", () => {
+    expect(credentialInputSchema.safeParse(input).success).toBe(true)
+    expect(
+      credentialInputSchema.safeParse({ ...input, endpoint: "" }).success
+    ).toBe(true)
+  })
+
+  it("rejects a cleartext HTTP endpoint", () => {
+    expect(
+      credentialInputSchema.safeParse({
+        ...input,
+        endpoint: "http://api.openai.com/v1",
+      }).success
     ).toBe(false)
   })
 })

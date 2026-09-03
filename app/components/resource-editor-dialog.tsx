@@ -481,7 +481,7 @@ function defaults(kind: ResourceKind) {
       workdir: "/workspace",
       cpu: "2",
       memory: "4 GiB",
-      network: "egress",
+      network: "none",
       proxyId: "",
       skillIds: [],
       mcpServerIds: [],
@@ -698,6 +698,7 @@ function nextSpec(
     return next
   }
 
+  const previousDriver = String(spec.driver ?? "")
   const server = servers.find((item) => item.id === next.serverId)
   const availableDrivers = runtimeDriverOptions(server)
     .filter((option) => !option.disabled)
@@ -705,8 +706,10 @@ function nextSpec(
   if (!availableDrivers.includes(String(next.driver ?? ""))) {
     next.driver = availableDrivers[0] ?? ""
   }
-  if (next.driver !== "boxlite" && next.network === "restricted") {
-    next.network = "egress"
+  if (String(next.driver ?? "") !== previousDriver) {
+    next.network = next.driver === "boxlite" ? "restricted" : "none"
+  } else if (next.driver !== "boxlite" && next.network === "restricted") {
+    next.network = "none"
   }
 
   next.imageReference = normalizeRuntimeImageReference(
@@ -771,8 +774,10 @@ function initialEditorSpec(
       runtimeDriverOptions(server).find((option) => !option.disabled)?.value ??
       ""
   }
-  if (spec.driver !== "boxlite" && spec.network === "restricted") {
-    spec.network = "egress"
+  if (initialSpec?.network === undefined) {
+    spec.network = spec.driver === "boxlite" ? "restricted" : "none"
+  } else if (spec.driver !== "boxlite" && spec.network === "restricted") {
+    spec.network = "none"
   }
   const legacyImage = resources.find(
     (item) => item.kind === "image" && item.id === spec.imageId
@@ -800,7 +805,7 @@ function inputFromResource(resource: Resource): ResourceDraft {
     spec.driver !== "boxlite" &&
     spec.network === "restricted"
   ) {
-    spec.network = "egress"
+    spec.network = "none"
   }
   return {
     ...resource,

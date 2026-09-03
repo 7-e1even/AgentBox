@@ -2,11 +2,13 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"maps"
 	"net/http"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"agentbox/internal/platform"
 )
@@ -16,6 +18,8 @@ const (
 	logRecorderBatchSize  = 50
 	logRecorderFlushEvery = 500 * time.Millisecond
 	logMessageMaxLen      = 1024
+	logFieldMaxLen        = 512
+	logDetailMaxBytes     = 8 << 10
 )
 
 // logRecorder 异步批量写入系统日志：Record 非阻塞，
@@ -61,9 +65,7 @@ func (r *logRecorder) Record(entry platform.LogEntry) {
 	if entry.Status == "" {
 		entry.Status = platform.LogStatusSuccess
 	}
-	if len(entry.Message) > logMessageMaxLen {
-		entry.Message = entry.Message[:logMessageMaxLen]
-	}
+	boundLogEntry(&entry)
 	select {
 	case r.entries <- entry:
 	default:
@@ -73,23 +75,56 @@ func (r *logRecorder) Record(entry platform.LogEntry) {
 	}
 }
 
+func boundLogEntry(entry *platform.LogEntry) {
+	entry.Level = truncateLogString(entry.Level, logFieldMaxLen)
+	entry.Category = truncateLogString(entry.Category, logFieldMaxLen)
+	entry.Action = truncateLogString(entry.Action, logFieldMaxLen)
+	entry.Message = truncateLogString(entry.Message, logMessageMaxLen)
+	entry.ActorID = truncateLogString(entry.ActorID, logFieldMaxLen)
+	entry.ActorName = truncateLogString(entry.ActorName, logFieldMaxLen)
+	entry.ResourceKind = truncateLogString(entry.ResourceKind, logFieldMaxLen)
+	entry.ResourceID = truncateLogString(entry.ResourceID, logFieldMaxLen)
+	entry.ResourceName = truncateLogString(entry.ResourceName, logFieldMaxLen)
+	entry.Status = truncateLogString(entry.Status, logFieldMaxLen)
+	entry.RemoteAddr = truncateLogString(entry.RemoteAddr, logFieldMaxLen)
+	encoded, err := json.Marshal(entry.Detail)
+	if err != nil || len(encoded) > logDetailMaxBytes {
+		entry.Detail = map[string]any{"delivery": "best-effort", "truncated": true}
+	}
+}
+
+func truncateLogString(value string, maxBytes int) string {
+	if len(value) <= maxBytes {
+		return value
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(value[end]) {
+		end--
+	}
+	return value[:end]
+}
+
 func (r *logRecorder) run() {
 	defer close(r.done)
 	ticker := time.NewTicker(logRecorderFlushEvery)
 	defer ticker.Stop()
 	batch := make([]platform.LogEntry, 0, logRecorderBatchSize)
 	flush := func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
 		if dispatcher, ok := r.store.(interface{ DispatchAuditEvents(context.Context) error }); ok {
-			if err := dispatcher.DispatchAuditEvents(ctx); err != nil {
+			dispatchCtx, cancelDispatch := context.WithTimeout(context.Background(), 5*time.Second)
+			err := dispatcher.DispatchAuditEvents(dispatchCtx)
+			cancelDispatch()
+			if err != nil {
 				r.logger.Warn("dispatch durable audit events failed; pending events retained", "error", err)
 			}
 		}
 		if len(batch) == 0 {
 			return
 		}
-		if err := r.store.InsertLogs(ctx, batch); err != nil {
+		insertCtx, cancelInsert := context.WithTimeout(context.Background(), 5*time.Second)
+		err := r.store.InsertLogs(insertCtx, batch)
+		cancelInsert()
+		if err != nil {
 			r.logger.Warn("insert system logs failed", "count", len(batch), "error", err)
 		}
 		batch = batch[:0]

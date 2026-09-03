@@ -96,7 +96,8 @@ func TestWorkerRequestBaseURLUsesForwardedPublicAddress(t *testing.T) {
 	request := httptest.NewRequest("POST", "http://127.0.0.1:8091/api/servers/id/jobs/claim", nil)
 	request.Header.Set("X-Forwarded-Proto", "https")
 	request.Header.Set("X-Forwarded-Host", "agentbox.example:3000")
-	if got := workerRequestBaseURL(request, true); got != "https://agentbox.example:3000" {
+	server := &Server{trustedProxy: testTrustedProxySettings("192.0.2.0/24")}
+	if got := server.workerRequestBaseURL(request); got != "https://agentbox.example:3000" {
 		t.Fatalf("workerRequestBaseURL() = %q", got)
 	}
 }

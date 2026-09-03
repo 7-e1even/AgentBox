@@ -27,24 +27,24 @@ func (s *Server) claimWorkerJob(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	baseURL := workerRequestBaseURL(request, s.trustedProxy)
+	baseURL := s.workerRequestBaseURL(request)
 	attachWorkerRuntimeEndpoints(job.Payload, baseURL)
 	attachWorkerProxyEndpoint(job.Payload, baseURL)
 	s.writeJSON(w, http.StatusOK, map[string]any{"job": job})
 }
 
-func workerRequestBaseURL(request *http.Request, trustedProxy bool) string {
+func (s *Server) workerRequestBaseURL(request *http.Request) string {
 	scheme := "http"
 	if request.TLS != nil {
 		scheme = "https"
 	}
 	host := request.Host
-	if trustedProxy {
+	if s.trustsForwardedHeaders(request) {
 		// 仅在信任代理时才采纳 X-Forwarded-Proto/Host，防止伪造头污染 Worker 回连地址。
-		if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Proto")); forwarded == "http" || forwarded == "https" {
+		if forwarded := strings.ToLower(s.trustedForwardedValue(request, "X-Forwarded-Proto")); forwarded == "http" || forwarded == "https" {
 			scheme = forwarded
 		}
-		if forwarded := firstForwardedValue(request.Header.Get("X-Forwarded-Host")); forwarded != "" {
+		if forwarded := s.trustedForwardedValue(request, "X-Forwarded-Host"); forwardedHostPattern(forwarded) != "" {
 			host = forwarded
 		}
 	}
@@ -53,11 +53,6 @@ func workerRequestBaseURL(request *http.Request, trustedProxy bool) string {
 		return ""
 	}
 	return strings.TrimRight(parsed.String(), "/")
-}
-
-func firstForwardedValue(value string) string {
-	first, _, _ := strings.Cut(value, ",")
-	return strings.TrimSpace(first)
 }
 
 func attachWorkerRuntimeEndpoints(payload map[string]any, baseURL string) {

@@ -1,6 +1,7 @@
 package workerscript
 
 import (
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ func TestSandboxLifecyclePropagatesFailuresInsideWorkerConditional(t *testing.T)
 		{"start success", "docker", "start", ""},
 		{"restart success", "docker", "restart", ""},
 		{"docker start", "docker", "start", "docker-start"},
+		{"docker network policy", "docker", "start", "docker-network"},
 		{"boxlite start", "boxlite", "start", "boxlite-start"},
 		{"boxlite guest", "boxlite", "start", "boxlite-guest"},
 		{"microsandbox workdir", "microsandbox", "start", "microsandbox-fs-mkdir"},
@@ -52,8 +54,10 @@ jq() {
   esac
 }
 sandbox_container_name() { printf example-container; }
+validate_sandbox_network_policy_value() { return 0; }
 validate_sandbox_network_policy() { return 0; }
 effective_sandbox_network_policy() { printf egress; }
+enforce_docker_network_policy() { check_step docker-network; }
 docker() { case "$1" in start|stop) check_step "docker-$1" ;; *) return 0 ;; esac; }
 runtime_call() { check_step "$1-$2"; }
 install_boxlite_guest() { check_step boxlite-guest; }
@@ -89,12 +93,74 @@ fi
 	}
 }
 
+func TestDockerSandboxReuseEnforcesNetworkMode(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available on this test host")
+	}
+	_, guard, found := strings.Cut(workerDaemon, "\nenforce_docker_network_policy() {")
+	if !found {
+		t.Fatal("Worker Docker network policy guard is missing")
+	}
+	guard, _, found = strings.Cut(guard, "\ncreate_sandbox() {")
+	if !found {
+		t.Fatal("Worker Docker network policy guard boundary is missing")
+	}
+	guard = "enforce_docker_network_policy() {" + guard
+	mock := `docker() {
+  case "$1:${2:-}" in
+    inspect:-f)
+      [ "$ACTUAL_NETWORK" != inspect-error ] || return 1
+      printf '%s|%s' "$ACTUAL_NETWORK" "$ACTUAL_NETWORKS"
+      ;;
+    stop:--time) STOPPED=true ;;
+    *) return 2 ;;
+  esac
+}
+STOPPED=false
+`
+	for _, test := range []struct {
+		name, actual, networks, expected, wantResult string
+	}{
+		{name: "none matches none", actual: "none", networks: "none,", expected: "none", wantResult: "allowed:false"},
+		{name: "empty attachments match none", actual: "none", expected: "none", wantResult: "allowed:false"},
+		{name: "attached bridge cannot bypass none", actual: "none", networks: "bridge,none,", expected: "none", wantResult: "denied:true"},
+		{name: "default bridge matches egress", actual: "default", networks: "bridge,", expected: "egress", wantResult: "allowed:false"},
+		{name: "named bridge mode is rejected", actual: "private", networks: "private,", expected: "egress", wantResult: "denied:true"},
+		{name: "extra network cannot bypass egress", actual: "default", networks: "bridge,private,", expected: "egress", wantResult: "denied:true"},
+		{name: "legacy bridge cannot satisfy none", actual: "bridge", networks: "bridge,", expected: "none", wantResult: "denied:true"},
+		{name: "none is safe while restricted is rejected later", actual: "none", networks: "none,", expected: "restricted", wantResult: "allowed:false"},
+		{name: "legacy bridge cannot satisfy restricted", actual: "bridge", networks: "bridge,", expected: "restricted", wantResult: "denied:true"},
+		{name: "uninspectable container is stopped", actual: "inspect-error", expected: "none", wantResult: "denied:true"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.CommandContext(t.Context(), sh, "-s")
+			command.Env = append(command.Environ(), "ACTUAL_NETWORK="+test.actual, "ACTUAL_NETWORKS="+test.networks, "EXPECTED_NETWORK="+test.expected)
+			command.Stdin = strings.NewReader("set -eu\n" + mock + guard + `
+if enforce_docker_network_policy example-container "$EXPECTED_NETWORK"; then
+  RESULT=allowed
+else
+  RESULT=denied
+fi
+printf '%s:%s' "$RESULT" "$STOPPED"
+`)
+			output, err := command.CombinedOutput()
+			if err != nil || !strings.HasSuffix(string(output), test.wantResult) {
+				t.Fatalf("network mode %s for %s = (%q, %v), want suffix %q", test.actual, test.expected, output, err, test.wantResult)
+			}
+			if strings.HasPrefix(test.wantResult, "denied") && !strings.Contains(string(output), "stage network-policy failed") {
+				t.Fatalf("network mismatch omitted failure reason: %q", output)
+			}
+		})
+	}
+}
+
 func TestSandboxCreationRejectsRestrictedNetworkOutsideBoxLite(t *testing.T) {
 	sh, err := exec.LookPath("sh")
 	if err != nil {
 		t.Skip("POSIX shell is not available on this test host")
 	}
-	_, create, found := strings.Cut(workerDaemon, "\nvalidate_sandbox_network_policy() {")
+	_, create, found := strings.Cut(workerDaemon, "\nvalidate_sandbox_network_policy_value() {")
 	if !found {
 		t.Fatal("Worker network policy guard is missing")
 	}
@@ -102,7 +168,7 @@ func TestSandboxCreationRejectsRestrictedNetworkOutsideBoxLite(t *testing.T) {
 	if !found {
 		t.Fatal("Worker guarded lifecycle boundary is missing")
 	}
-	create = "validate_sandbox_network_policy() {" + create
+	create = "validate_sandbox_network_policy_value() {" + create
 	mock := `jq() {
   case "$*" in
     *payload.extensions*) return 1 ;;
@@ -112,19 +178,87 @@ func TestSandboxCreationRejectsRestrictedNetworkOutsideBoxLite(t *testing.T) {
     *) printf '' ;;
   esac
 }
+report_job_progress() { :; }
+timeout() { shift; "$@"; }
+docker() {
+  printf '%s\n' "$*" >> "$DOCKER_CALLS"
+  case "$*" in
+    info) return 0 ;;
+    'inspect agentbox-sandbox-one') return 0 ;;
+    *'.Config.Labels'* ) printf sandbox-one ;;
+    *'.HostConfig.NetworkMode'* ) printf 'bridge|bridge,' ;;
+    'stop agentbox-sandbox-one') return 0 ;;
+    'stop --time 10 agentbox-sandbox-one') return 0 ;;
+    *) return 2 ;;
+  esac
+}
 `
 	for _, driver := range []string{"docker", "microsandbox"} {
 		for _, operation := range []string{"create", "start", "restart"} {
 			t.Run(driver+" "+operation, func(t *testing.T) {
+				dockerCalls := t.TempDir() + "/docker-calls"
 				command := exec.CommandContext(t.Context(), sh, "-s")
-				command.Env = append(command.Environ(), "TEST_DRIVER="+driver, "TEST_OPERATION="+operation)
+				command.Env = append(command.Environ(), "TEST_DRIVER="+driver, "TEST_OPERATION="+operation, "DOCKER_CALLS="+dockerCalls)
 				command.Stdin = strings.NewReader("set -eu\n" + mock + create + "\n${TEST_OPERATION}_sandbox ignored\n")
 				output, err := command.CombinedOutput()
 				if err == nil || !strings.Contains(string(output), "restricted network is only supported by BoxLite") {
 					t.Fatalf("restricted %s network was not rejected for %s: (%q, %v)", driver, operation, output, err)
 				}
+				calls, readErr := os.ReadFile(dockerCalls)
+				if readErr != nil && !os.IsNotExist(readErr) {
+					t.Fatalf("read Docker calls: %v", readErr)
+				}
+				if driver == "docker" && !strings.Contains(string(calls), "stop --time 10 agentbox-sandbox-one") {
+					t.Fatalf("restricted %s did not stop the legacy Docker container; calls = %q", operation, calls)
+				}
 			})
 		}
+	}
+}
+
+func TestInvalidDockerNetworkPolicyDoesNotStopSandbox(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available on this test host")
+	}
+	_, lifecycle, found := strings.Cut(workerDaemon, "\nvalidate_sandbox_network_policy_value() {")
+	if !found {
+		t.Fatal("Worker network policy value guard is missing")
+	}
+	lifecycle, _, found = strings.Cut(lifecycle, "\ndelete_sandbox() {")
+	if !found {
+		t.Fatal("Worker guarded lifecycle boundary is missing")
+	}
+	lifecycle = "validate_sandbox_network_policy_value() {" + lifecycle
+	mock := `jq() {
+  case "$*" in
+    *payload.extensions*) return 1 ;;
+    *payload.sandboxId*) printf sandbox-one ;;
+    *payload.driver*) printf docker ;;
+    *payload.network*) printf corrupt-policy ;;
+    *) printf '' ;;
+  esac
+}
+docker() { printf '%s\n' "$*" >> "$DOCKER_CALLS"; return 0; }
+`
+	for _, operation := range []string{"create", "start", "restart"} {
+		t.Run(operation, func(t *testing.T) {
+			dockerCalls := t.TempDir() + "/docker-calls"
+			command := exec.CommandContext(t.Context(), sh, "-s")
+			command.Env = append(command.Environ(), "TEST_OPERATION="+operation, "DOCKER_CALLS="+dockerCalls)
+			command.Stdin = strings.NewReader("set -eu\n" + mock + lifecycle + "\n${TEST_OPERATION}_sandbox ignored\n")
+			output, err := command.CombinedOutput()
+			if err == nil || !strings.Contains(string(output), "unsupported network policy: corrupt-policy") {
+				t.Fatalf("invalid policy was not rejected for %s: (%q, %v)", operation, output, err)
+			}
+			calls, readErr := os.ReadFile(dockerCalls)
+			if readErr != nil && !os.IsNotExist(readErr) {
+				t.Fatalf("read Docker calls: %v", readErr)
+			}
+			if len(calls) != 0 {
+				t.Fatalf("invalid %s policy touched Docker: %q", operation, calls)
+			}
+		})
 	}
 }
 

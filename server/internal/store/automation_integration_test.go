@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"agentbox/internal/platform"
 	"github.com/google/uuid"
@@ -64,6 +65,29 @@ func TestAutomationWebhookPersistsPollableIdempotentRun(t *testing.T) {
 	revealed, revealedSecret, err := s.GetAutomationSecret(ctx, automation.ID)
 	if err != nil || revealed.ID != automation.ID || revealedSecret != secret {
 		t.Fatalf("revealed automation = %#v secret matches = %v, %v", revealed, revealedSecret == secret, err)
+	}
+
+	lockConnection, err := s.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lockConnection.Release()
+	if _, err := lockConnection.Exec(ctx, `SELECT pg_advisory_lock($1)`, controlPlaneMutationLockKey); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = lockConnection.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, controlPlaneMutationLockKey)
+	}()
+	invalidContext, cancelInvalid := context.WithTimeout(ctx, time.Second)
+	_, invalidErr := s.TriggerAutomation(invalidContext, platform.AutomationDelivery{
+		EndpointID: automation.EndpointID, Authorization: "Bearer invalid-secret", Body: []byte(`{}`),
+	})
+	cancelInvalid()
+	if !errors.Is(invalidErr, ErrWebhookUnauthorized) {
+		t.Fatalf("invalid webhook reached the control-plane lock: %v", invalidErr)
+	}
+	if _, err := lockConnection.Exec(ctx, `SELECT pg_advisory_unlock($1)`, controlPlaneMutationLockKey); err != nil {
+		t.Fatal(err)
 	}
 
 	delivery := platform.AutomationDelivery{

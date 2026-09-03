@@ -31,7 +31,7 @@ export async function requestJson<T>(
     headers: { "Content-Type": "application/json", ...options?.headers },
   })
   if (response.status === 401) {
-    window.location.assign("/login")
+    window.location.replace("/login")
     throw new ApiError("登录状态已过期", { status: 401, code: "unauthorized" })
   }
   if (!response.ok) {

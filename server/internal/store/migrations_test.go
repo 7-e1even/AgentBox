@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"net/url"
 	"os"
 	"strings"
@@ -34,6 +35,198 @@ func TestDatabaseMigrationsAreOrderedAndChecksummed(t *testing.T) {
 		if i > 0 && migrations[i-1].id >= migration.id {
 			t.Fatalf("migrations are not strictly ordered: %q before %q", migrations[i-1].id, migration.id)
 		}
+	}
+}
+
+func TestSystemLogRetentionMigrationDefersIndexBuilds(t *testing.T) {
+	migrations, err := loadDatabaseMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, migration := range migrations {
+		if migration.id != "0009_system_log_retention" {
+			continue
+		}
+		if strings.Contains(strings.ToUpper(migration.contents), "CREATE INDEX") {
+			t.Fatal("system log retention migration would build an index inside the migration transaction")
+		}
+		if len(systemLogRetentionIndexes) != 2 {
+			t.Fatalf("online system log index count = %d, want 2", len(systemLogRetentionIndexes))
+		}
+		return
+	}
+	t.Fatal("system log retention migration is missing")
+}
+
+func TestIndexPredicateNormalizationPreservesLiteralSemantics(t *testing.T) {
+	raw := `COALESCE(detail->>'delivery', 'best-effort') <> 'transactional'`
+	deparsed := `(COALESCE((detail ->> 'delivery'::text), 'best-effort'::text) <> 'transactional'::text)`
+	if normalizeIndexPredicate(raw) != normalizeIndexPredicate(deparsed) {
+		t.Fatal("PostgreSQL deparser formatting changed the expected predicate")
+	}
+	for _, wrong := range []string{
+		`COALESCE(detail->>'Delivery', 'best-effort') <> 'transactional'`,
+		`COALESCE(detail->>'delivery', 'best-effort') <> 'TRANSACTIONAL'`,
+		`(COALESCE(detail->>'delivery', 'best-effort') <> 'transactional') AND action = 'never'`,
+	} {
+		if normalizeIndexPredicate(raw) == normalizeIndexPredicate(wrong) {
+			t.Fatalf("normalization accepted semantically different predicate %q", wrong)
+		}
+	}
+}
+
+func TestSystemLogRetentionOnlineIndexesRecoverInvalidBuild(t *testing.T) {
+	store := newMigrationIntegrationStore(t)
+	ctx := t.Context()
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("initial migration: %v", err)
+	}
+	var schemaName string
+	if err := store.pool.QueryRow(ctx, "SELECT current_schema()").Scan(&schemaName); err != nil {
+		t.Fatal(err)
+	}
+	for _, spec := range systemLogRetentionIndexes {
+		state, found, err := loadConcurrentIndexState(ctx, store.pool, schemaName, spec.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !found || !state.valid || state.tableName != spec.table {
+			t.Fatalf("online index %s state = %#v found=%v", spec.name, state, found)
+		}
+	}
+
+	spec := systemLogRetentionIndexes[0]
+	indexIdentifier := pgx.Identifier{schemaName, spec.name}.Sanitize()
+	if _, err := store.pool.Exec(ctx, "DROP INDEX CONCURRENTLY "+indexIdentifier); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO system_logs
+		(level, category, action, message) VALUES
+		('info', 'system', 'invalid-index-one', 'test'),
+		('info', 'system', 'invalid-index-two', 'test')`); err != nil {
+		t.Fatal(err)
+	}
+	invalidQuery := "CREATE UNIQUE INDEX CONCURRENTLY " + pgx.Identifier{spec.name}.Sanitize() +
+		" ON " + pgx.Identifier{schemaName, spec.table}.Sanitize() + " ((1))"
+	if _, err := store.pool.Exec(ctx, invalidQuery); err == nil {
+		t.Fatal("invalid concurrent index build unexpectedly succeeded")
+	}
+	state, found, err := loadConcurrentIndexState(ctx, store.pool, schemaName, spec.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || state.valid {
+		t.Fatalf("failed concurrent build state = %#v found=%v, want invalid index", state, found)
+	}
+
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("recover invalid concurrent index: %v", err)
+	}
+	state, found, err = loadConcurrentIndexState(ctx, store.pool, schemaName, spec.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !state.valid || !state.ready || !state.live || state.accessMethod != "btree" || state.unique ||
+		state.hasExpressions || state.keyCount != len(spec.keys) || state.attributeCount != len(spec.keys) ||
+		len(state.keyDefinitions) != len(spec.keys) || len(state.keyDescending) != len(spec.keys) ||
+		len(state.keyNullsFirst) != len(spec.keys) ||
+		normalizeIndexPredicate(state.predicate) != normalizeIndexPredicate(spec.predicate) {
+		t.Fatalf("recovered concurrent index state = %#v found=%v", state, found)
+	}
+	for index, expected := range spec.keys {
+		if normalizeIndexSQL(state.keyDefinitions[index]) != normalizeIndexSQL(expected.definition) ||
+			state.keyDescending[index] != expected.descending || state.keyNullsFirst[index] != expected.nullsFirst {
+			t.Fatalf("recovered concurrent index key %d state = %#v want = %#v", index, state, expected)
+		}
+	}
+}
+
+func TestSystemLogRetentionOnlineIndexesRecoverMissingBuildAfterMarker(t *testing.T) {
+	store := newMigrationIntegrationStore(t)
+	ctx := t.Context()
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("initial migration: %v", err)
+	}
+	var schemaName string
+	if err := store.pool.QueryRow(ctx, "SELECT current_schema()").Scan(&schemaName); err != nil {
+		t.Fatal(err)
+	}
+	spec := systemLogRetentionIndexes[0]
+	indexIdentifier := pgx.Identifier{schemaName, spec.name}.Sanitize()
+	if _, err := store.pool.Exec(ctx, "DROP INDEX CONCURRENTLY "+indexIdentifier); err != nil {
+		t.Fatal(err)
+	}
+	var markerRecorded bool
+	if err := store.pool.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM schema_migrations WHERE id = '0009_system_log_retention'
+	)`).Scan(&markerRecorded); err != nil {
+		t.Fatal(err)
+	}
+	if !markerRecorded {
+		t.Fatal("system log retention marker was not committed before the simulated crash")
+	}
+
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("recover missing concurrent index after marker: %v", err)
+	}
+	state, found, err := loadConcurrentIndexState(ctx, store.pool, schemaName, spec.name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !state.valid || !state.ready || !state.live {
+		t.Fatalf("recovered missing concurrent index state = %#v found=%v", state, found)
+	}
+}
+
+func TestSystemLogRetentionOnlineIndexesRejectValidWrongDefinition(t *testing.T) {
+	store := newMigrationIntegrationStore(t)
+	ctx := t.Context()
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("initial migration: %v", err)
+	}
+	var schemaName string
+	if err := store.pool.QueryRow(ctx, "SELECT current_schema()").Scan(&schemaName); err != nil {
+		t.Fatal(err)
+	}
+	spec := systemLogRetentionIndexes[0]
+	indexIdentifier := pgx.Identifier{schemaName, spec.name}.Sanitize()
+	if _, err := store.pool.Exec(ctx, "DROP INDEX CONCURRENTLY "+indexIdentifier); err != nil {
+		t.Fatal(err)
+	}
+	wrongIndex := "CREATE INDEX CONCURRENTLY " + pgx.Identifier{spec.name}.Sanitize() +
+		" ON " + pgx.Identifier{schemaName, spec.table}.Sanitize() +
+		"(created_at DESC, id DESC) WHERE (" + spec.predicate + ") AND action = 'never'"
+	if _, err := store.pool.Exec(ctx, wrongIndex); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrate(ctx); err == nil || !strings.Contains(err.Error(), "unexpected predicate") {
+		t.Fatalf("migration accepted a valid index with the wrong predicate: %v", err)
+	}
+}
+
+func TestSystemLogRetentionOnlineIndexesRejectValidWrongOrdering(t *testing.T) {
+	store := newMigrationIntegrationStore(t)
+	ctx := t.Context()
+	if err := store.migrate(ctx); err != nil {
+		t.Fatalf("initial migration: %v", err)
+	}
+	var schemaName string
+	if err := store.pool.QueryRow(ctx, "SELECT current_schema()").Scan(&schemaName); err != nil {
+		t.Fatal(err)
+	}
+	spec := systemLogRetentionIndexes[0]
+	indexIdentifier := pgx.Identifier{schemaName, spec.name}.Sanitize()
+	if _, err := store.pool.Exec(ctx, "DROP INDEX CONCURRENTLY "+indexIdentifier); err != nil {
+		t.Fatal(err)
+	}
+	wrongIndex := "CREATE INDEX CONCURRENTLY " + pgx.Identifier{spec.name}.Sanitize() +
+		" ON " + pgx.Identifier{schemaName, spec.table}.Sanitize() +
+		"(created_at ASC NULLS LAST, id DESC NULLS FIRST) WHERE " + spec.predicate
+	if _, err := store.pool.Exec(ctx, wrongIndex); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.migrate(ctx); err == nil || !strings.Contains(err.Error(), "unexpected key ordering") {
+		t.Fatalf("migration accepted a valid index with the wrong ordering: %v", err)
 	}
 }
 
@@ -240,6 +433,77 @@ func TestDatabaseMigrationsSerializeConcurrentFirstStart(t *testing.T) {
 		}
 	}
 	assertDatabaseMigrationsRecorded(t, store)
+}
+
+func TestDatabaseMigrationLockWaitDoesNotLeaveAnOpenTransaction(t *testing.T) {
+	store := newMigrationIntegrationStore(t)
+	ctx := t.Context()
+	holder, err := store.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holderLocked := true
+	defer func() {
+		if holderLocked {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_, _ = holder.Exec(cleanupCtx, "SELECT pg_advisory_unlock($1)", databaseMigrationLockKey)
+			cancel()
+		}
+		holder.Release()
+	}()
+	if _, err := holder.Exec(ctx, "SELECT pg_advisory_lock($1)", databaseMigrationLockKey); err != nil {
+		t.Fatal(err)
+	}
+
+	waiter, err := store.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waiterReleased := false
+	defer func() {
+		if !waiterReleased {
+			waiter.Release()
+		}
+	}()
+	var waiterPID int
+	if err := waiter.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&waiterPID); err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancelWait := context.WithTimeout(ctx, 250*time.Millisecond)
+	err = waitForDatabaseMigrationLock(waitCtx, waiter)
+	cancelWait()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("migration lock wait error = %v, want deadline exceeded", err)
+	}
+	var state string
+	var noOpenTransaction, notWaitingOnLock bool
+	if err := store.pool.QueryRow(ctx, `SELECT state, xact_start IS NULL,
+		COALESCE(wait_event, '') <> 'AdvisoryLock'
+		FROM pg_stat_activity WHERE pid = $1`, waiterPID).Scan(
+		&state, &noOpenTransaction, &notWaitingOnLock,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if state != "idle" || !noOpenTransaction || !notWaitingOnLock {
+		t.Fatalf("waiting migration connection state=%q noOpenTransaction=%v notWaitingOnLock=%v",
+			state, noOpenTransaction, notWaitingOnLock)
+	}
+	var unlocked bool
+	if err := holder.QueryRow(ctx, "SELECT pg_advisory_unlock($1)", databaseMigrationLockKey).Scan(&unlocked); err != nil {
+		t.Fatal(err)
+	}
+	if !unlocked {
+		t.Fatal("migration holder lock was not released")
+	}
+	holderLocked = false
+	if err := waitForDatabaseMigrationLock(ctx, waiter); err != nil {
+		t.Fatalf("acquire migration lock after release: %v", err)
+	}
+	err = releaseDatabaseMigrationLock(waiter)
+	waiterReleased = true
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 func assertDatabaseMigrationsRecorded(t *testing.T, store *Store) {

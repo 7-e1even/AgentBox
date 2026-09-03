@@ -30,6 +30,7 @@ const (
 	// runtimeLLMNonStreamingTimeout 限制非流式请求的整体耗时（连接+读完整响应体），
 	// 流式请求不受此限制，由连接保活与客户端断开控制。
 	runtimeLLMNonStreamingTimeout = 2 * time.Minute
+	runtimeLLMStreamingTimeout    = 3 * time.Minute
 )
 
 var runtimeLLMConverter = adapter.NewConverter(
@@ -51,10 +52,11 @@ func (s *Server) runtimeLLMChat(w http.ResponseWriter, request *http.Request) {
 }
 
 func (s *Server) runtimeLLMGemini(w http.ResponseWriter, request *http.Request) {
-	target, ok := s.resolveRuntimeLLMTarget(w, request, runtimeLLMProtocolGemini)
+	target, release, ok := s.resolveRuntimeLLMTarget(w, request, runtimeLLMProtocolGemini)
 	if !ok {
 		return
 	}
+	defer release()
 	upstreamProtocol, err := runtimeLLMProtocolForCredential(target.Protocol)
 	if err != nil {
 		s.writeRuntimeLLMError(w, runtimeLLMProtocolGemini, http.StatusBadRequest, err.Error())
@@ -92,6 +94,9 @@ func (s *Server) forwardNativeRuntimeLLMGemini(
 	w http.ResponseWriter, request *http.Request, target platform.RuntimeLLMTarget,
 ) {
 	started := time.Now()
+	streaming := runtimeLLMGeminiStreaming(request.PathValue("path"), request.URL.Query())
+	ctx, cancel := context.WithTimeout(request.Context(), runtimeLLMTimeout(streaming))
+	defer cancel()
 	var upstreamStatus int
 	failure := ""
 	defer func() {
@@ -120,7 +125,7 @@ func (s *Server) forwardNativeRuntimeLLMGemini(
 		return
 	}
 	request.Body = http.MaxBytesReader(w, request.Body, runtimeLLMMaxBodyBytes)
-	upstreamRequest, err := http.NewRequestWithContext(request.Context(), request.Method, upstreamURL, request.Body)
+	upstreamRequest, err := http.NewRequestWithContext(ctx, request.Method, upstreamURL, request.Body)
 	if err != nil {
 		failure = "无法创建上游请求"
 		s.writeRuntimeLLMError(w, runtimeLLMProtocolGemini, http.StatusBadGateway, "无法创建上游请求")
@@ -142,7 +147,9 @@ func (s *Server) forwardNativeRuntimeLLMGemini(
 	copyRuntimeLLMHeaders(response.Header, w.Header())
 	w.Header().Set("Content-Type", response.Header.Get("Content-Type"))
 	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = http.NewResponseController(w).SetWriteDeadline(deadline)
+		}
 		w.Header().Set("X-Accel-Buffering", "no")
 	}
 	w.WriteHeader(response.StatusCode)
@@ -150,10 +157,11 @@ func (s *Server) forwardNativeRuntimeLLMGemini(
 }
 
 func (s *Server) runtimeLLMAnthropicCountTokens(w http.ResponseWriter, request *http.Request) {
-	target, ok := s.resolveRuntimeLLMTarget(w, request, runtimeLLMProtocolAnthropic)
+	target, release, ok := s.resolveRuntimeLLMTarget(w, request, runtimeLLMProtocolAnthropic)
 	if !ok {
 		return
 	}
+	defer release()
 	body, ok := readRuntimeLLMBody(w, request)
 	if !ok {
 		return
@@ -193,10 +201,11 @@ func (s *Server) runtimeLLMAnthropicCountTokens(w http.ResponseWriter, request *
 }
 
 func (s *Server) runtimeLLM(w http.ResponseWriter, request *http.Request, clientProtocol runtimeLLMProtocol) {
-	target, ok := s.resolveRuntimeLLMTarget(w, request, clientProtocol)
+	target, release, ok := s.resolveRuntimeLLMTarget(w, request, clientProtocol)
 	if !ok {
 		return
 	}
+	defer release()
 	body, ok := readRuntimeLLMBody(w, request)
 	if !ok {
 		return
@@ -242,25 +251,56 @@ func (s *Server) runtimeLLM(w http.ResponseWriter, request *http.Request, client
 
 func (s *Server) resolveRuntimeLLMTarget(
 	w http.ResponseWriter, request *http.Request, protocol runtimeLLMProtocol,
-) (platform.RuntimeLLMTarget, bool) {
+) (platform.RuntimeLLMTarget, func(), bool) {
 	runtimeToken := runtimeLLMToken(request)
 	if runtimeToken == "" {
 		s.writeRuntimeLLMError(w, protocol, http.StatusUnauthorized, "缺少沙箱运行时令牌")
-		return platform.RuntimeLLMTarget{}, false
+		return platform.RuntimeLLMTarget{}, nil, false
+	}
+	sandboxID := request.PathValue("id")
+	credentialID := request.PathValue("credentialId")
+	if err := s.store.ValidateRuntimeLLMToken(sandboxID, credentialID, runtimeToken); err != nil {
+		if errors.Is(err, store.ErrRuntimeUnauthorized) {
+			s.writeRuntimeLLMError(w, protocol, http.StatusUnauthorized, "沙箱运行时令牌无效或已失效")
+			return platform.RuntimeLLMTarget{}, nil, false
+		}
+		s.logger.Error("validate runtime LLM token failed", "error", err)
+		s.writeRuntimeLLMError(w, protocol, http.StatusInternalServerError, "LLM 接入层暂时不可用")
+		return platform.RuntimeLLMTarget{}, nil, false
+	}
+	var releaseResolution func()
+	if s.runtimeLLMAdmission != nil {
+		var allowed bool
+		releaseResolution, allowed = s.runtimeLLMAdmission.acquireResolution(sandboxID, time.Now().UTC())
+		if !allowed {
+			w.Header().Set("Retry-After", "60")
+			s.writeRuntimeLLMError(w, protocol, http.StatusTooManyRequests, "LLM 请求过于频繁，请稍后重试")
+			return platform.RuntimeLLMTarget{}, nil, false
+		}
+		defer releaseResolution()
 	}
 	target, err := s.store.ResolveRuntimeLLMTarget(
-		request.Context(), request.PathValue("id"), request.PathValue("credentialId"), runtimeToken,
+		request.Context(), sandboxID, credentialID, runtimeToken,
 	)
 	if errors.Is(err, store.ErrRuntimeUnauthorized) {
 		s.writeRuntimeLLMError(w, protocol, http.StatusUnauthorized, "沙箱运行时令牌无效或已失效")
-		return platform.RuntimeLLMTarget{}, false
+		return platform.RuntimeLLMTarget{}, nil, false
 	}
 	if err != nil {
 		s.logger.Error("resolve runtime LLM target failed", "error", err)
 		s.writeRuntimeLLMError(w, protocol, http.StatusInternalServerError, "LLM 接入层暂时不可用")
-		return platform.RuntimeLLMTarget{}, false
+		return platform.RuntimeLLMTarget{}, nil, false
 	}
-	return target, true
+	if s.runtimeLLMAdmission == nil {
+		return target, func() {}, true
+	}
+	release, allowed := s.runtimeLLMAdmission.acquireTarget(target.SandboxID, time.Now().UTC())
+	if !allowed {
+		w.Header().Set("Retry-After", "60")
+		s.writeRuntimeLLMError(w, protocol, http.StatusTooManyRequests, "LLM 请求过于频繁，请稍后重试")
+		return platform.RuntimeLLMTarget{}, nil, false
+	}
+	return target, release, true
 }
 
 func runtimeLLMToken(request *http.Request) string {
@@ -316,8 +356,8 @@ func runtimeLLMUpstreamURL(target platform.RuntimeLLMTarget, countTokens bool) (
 			return "", errors.New("凭据没有配置可用的 API 地址")
 		}
 	}
-	parsed, err := url.Parse(base)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+	parsed, err := parseRuntimeLLMEndpoint(base)
+	if err != nil {
 		return "", errors.New("凭据 API 地址无效")
 	}
 	operation := ""
@@ -357,8 +397,8 @@ func runtimeLLMGeminiURL(target platform.RuntimeLLMTarget, requestPath string, q
 	if base == "" {
 		base = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	parsed, err := url.Parse(base)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+	parsed, err := parseRuntimeLLMEndpoint(base)
+	if err != nil {
 		return "", errors.New("凭据 API 地址无效")
 	}
 	path, rawPath, err := runtimeLLMGeminiModelPath(requestPath, target.ModelID)
@@ -428,8 +468,8 @@ func runtimeLLMGeminiGenerateURL(target platform.RuntimeLLMTarget, streaming boo
 	if base == "" {
 		base = "https://generativelanguage.googleapis.com/v1beta"
 	}
-	parsed, err := url.Parse(base)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
+	parsed, err := parseRuntimeLLMEndpoint(base)
+	if err != nil {
 		return "", errors.New("凭据 API 地址无效")
 	}
 	modelID := strings.TrimSpace(target.ModelID)
@@ -453,6 +493,21 @@ func runtimeLLMGeminiGenerateURL(target platform.RuntimeLLMTarget, streaming boo
 func runtimeLLMGeminiStreaming(requestPath string, query url.Values) bool {
 	return strings.Contains(strings.ToLower(requestPath), ":streamgeneratecontent") ||
 		strings.EqualFold(strings.TrimSpace(query.Get("alt")), "sse")
+}
+
+func runtimeLLMTimeout(streaming bool) time.Duration {
+	if streaming {
+		return runtimeLLMStreamingTimeout
+	}
+	return runtimeLLMNonStreamingTimeout
+}
+
+func parseRuntimeLLMEndpoint(endpoint string) (*url.URL, error) {
+	parsed, err := url.Parse(endpoint)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" || parsed.User != nil {
+		return nil, errors.New("凭据 API 地址必须使用 HTTPS")
+	}
+	return parsed, nil
 }
 
 func (s *Server) forwardRuntimeLLM(
@@ -493,11 +548,8 @@ func (s *Server) forwardRuntimeLLM(
 		}
 		s.recordLog(request, entry)
 	}()
-	if !streaming {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, runtimeLLMNonStreamingTimeout)
-		defer cancel()
-	}
+	ctx, cancel := context.WithTimeout(ctx, runtimeLLMTimeout(streaming))
+	defer cancel()
 	upstreamRequest, err := http.NewRequestWithContext(
 		ctx, http.MethodPost, upstreamURL, bytes.NewReader(body),
 	)
@@ -545,7 +597,9 @@ func (s *Server) forwardRuntimeLLM(
 		return
 	}
 	if streaming {
-		_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = http.NewResponseController(w).SetWriteDeadline(deadline)
+		}
 		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no")
@@ -555,7 +609,7 @@ func (s *Server) forwardRuntimeLLM(
 			return
 		}
 		s.convertRuntimeLLMStream(
-			w, request.Context(), response.Body, target, upstreamProtocol, clientProtocol,
+			w, ctx, response.Body, target, upstreamProtocol, clientProtocol,
 			originalBody, body,
 		)
 		return
@@ -763,7 +817,7 @@ func newRuntimeLLMHTTPClient() *http.Client {
 			var lastError error
 			for _, candidate := range addresses {
 				ip := candidate.IP
-				if !allowPrivate && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
+				if !platform.ProviderEndpointIPAllowed(ip, allowPrivate) {
 					continue
 				}
 				connection, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))

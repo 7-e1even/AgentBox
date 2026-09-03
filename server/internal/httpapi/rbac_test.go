@@ -42,6 +42,9 @@ func rbacRequest(t *testing.T, handler http.Handler, method, path, body string) 
 		reader = strings.NewReader(body)
 	}
 	request := httptest.NewRequest(method, path, reader)
+	if body != "" {
+		request.Header.Set("Content-Type", "application/json")
+	}
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response

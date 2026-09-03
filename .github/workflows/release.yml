@@ -48,6 +48,11 @@ jobs:
       - name: Test Go services
         working-directory: server
         run: go test -count=1 ./...
+      - name: Scan Go dependencies for reachable vulnerabilities
+        working-directory: server
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -tags agentbox_driver ./internal/httpapi/assets/agentbox-microsandbox-driver
       - name: Test Microsandbox driver asset
         working-directory: server
         run: go test -count=1 -tags agentbox_driver ./internal/httpapi/assets/agentbox-microsandbox-driver
@@ -64,6 +69,7 @@ jobs:
         working-directory: app
         run: |
           pnpm install --frozen-lockfile
+          pnpm audit --audit-level=moderate
           pnpm typecheck
           pnpm lint
           pnpm test

@@ -7,6 +7,7 @@ type AuditActor struct {
 	Type string
 	ID   string
 	Name string
+	Role UserRole
 }
 
 type auditActorKey struct{}

@@ -24,6 +24,7 @@ func TestUpdateWorkerEnqueuesConfiguredReleaseVersion(t *testing.T) {
 	store := &workerUpdateStore{}
 	server := &Server{store: store, workerVersion: "v1.2.3"}
 	request := httptest.NewRequest(http.MethodPost, "/api/servers/server/actions/update-worker", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
 	request.SetPathValue("id", "79e642fc-5ae8-41f9-a609-a29f26f591e9")
 	response := httptest.NewRecorder()
 	server.updateWorker(response, request)
@@ -38,6 +39,7 @@ func TestUpdateWorkerEnqueuesConfiguredReleaseVersion(t *testing.T) {
 func TestUpdateWorkerRejectsDevelopmentVersion(t *testing.T) {
 	server := &Server{store: &workerUpdateStore{}, workerVersion: "dev"}
 	request := httptest.NewRequest(http.MethodPost, "/api/servers/server/actions/update-worker", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	server.updateWorker(response, request)
 	if response.Code != http.StatusServiceUnavailable {
@@ -49,6 +51,7 @@ func TestUpdateWorkerRejectsVersionOutsideCurrentServerRelease(t *testing.T) {
 	store := &workerUpdateStore{}
 	server := &Server{store: store, workerVersion: "v1.2.3"}
 	request := httptest.NewRequest(http.MethodPost, "/api/servers/server/actions/update-worker", strings.NewReader(`{"version":"v1.2.2"}`))
+	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	server.updateWorker(response, request)
 	if response.Code != http.StatusBadRequest {

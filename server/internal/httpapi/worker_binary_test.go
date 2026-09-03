@@ -11,6 +11,49 @@ import (
 	"testing"
 )
 
+func TestWorkerDownloadRedirectRejectsHTTPSDowngrade(t *testing.T) {
+	httpsRequest := httptest.NewRequest(http.MethodGet, "https://releases.example/worker", nil)
+	for _, target := range []string{
+		"http://localhost/worker",
+		"http://127.0.0.1/worker",
+		"http://[::1]/worker",
+	} {
+		redirect := httptest.NewRequest(http.MethodGet, target, nil)
+		if err := validateWorkerDownloadRedirect(redirect, []*http.Request{httpsRequest}); err == nil {
+			t.Errorf("validateWorkerDownloadRedirect() allowed HTTPS downgrade to %q", target)
+		}
+	}
+}
+
+func TestWorkerDownloadRedirectPreservesSecureAndLoopbackFlows(t *testing.T) {
+	tests := []struct {
+		from string
+		to   string
+	}{
+		{from: "https://releases.example/worker", to: "https://cdn.example/worker"},
+		{from: "http://localhost/worker", to: "http://127.0.0.1/worker"},
+		{from: "http://localhost/worker", to: "https://releases.example/worker"},
+	}
+	for _, test := range tests {
+		previous := httptest.NewRequest(http.MethodGet, test.from, nil)
+		redirect := httptest.NewRequest(http.MethodGet, test.to, nil)
+		if err := validateWorkerDownloadRedirect(redirect, []*http.Request{previous}); err != nil {
+			t.Errorf("validateWorkerDownloadRedirect(%q -> %q) error = %v", test.from, test.to, err)
+		}
+	}
+}
+
+func TestWorkerDownloadRedirectStopsAfterTenHops(t *testing.T) {
+	redirect := httptest.NewRequest(http.MethodGet, "https://cdn.example/worker", nil)
+	via := make([]*http.Request, 10)
+	for index := range via {
+		via[index] = httptest.NewRequest(http.MethodGet, "https://releases.example/worker", nil)
+	}
+	if err := validateWorkerDownloadRedirect(redirect, via); err == nil {
+		t.Fatal("validateWorkerDownloadRedirect() allowed more than 10 redirects")
+	}
+}
+
 func TestWorkerBinaryServesRequestedArchitecture(t *testing.T) {
 	directory := t.TempDir()
 	content := []byte("linux-worker-binary")

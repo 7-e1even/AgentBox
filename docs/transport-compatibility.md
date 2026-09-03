@@ -20,14 +20,14 @@ Worker 协议版本独立于发布版本。当前为 v1，覆盖现有任务和�
 
 | 链路 | 入口 | 传输 | 代理要求 |
 | --- | --- | --- | --- |
-| 控制台与普通 API | `/`、`/api/*` | HTTP/1.1 或 HTTP/2 | 保留 `Host`、`X-Forwarded-For`、`X-Forwarded-Proto` |
-| Webhook 与运行状态 | `/api/webhooks/*` | 普通 HTTP | 不改写请求体；保留认证和签名头 |
+| 控制台与普通 API | `/`、`/api/*` | 公网 HTTPS；反代上游 HTTP/1.1 或 HTTP/2 | 保留 `Host`、`X-Forwarded-For`、`X-Forwarded-Proto` |
+| Webhook 与运行状态 | `/api/webhooks/*` | 公网 HTTPS；反代上游 HTTP | 不改写请求体；保留认证和签名头 |
 | 模型流式响应 | `/api/runtime/sandboxes/*/llm/*` | SSE/分块响应 | 关闭响应缓冲与缓存；逐块刷新；读写超时长于最长模型调用 |
-| Worker 轮询、心跳和结果上报 | `/api/servers/*` | 普通 HTTP | Worker 必须能访问同一公开地址；不要缓存响应 |
-| Worker 会话总线 | `/api/servers/*/sessions/connect` | WebSocket | 转发 `Upgrade`/`Connection`；空闲超时长于最长会话 |
-| 浏览器终端与文件操作 | `/api/sandboxes/*/session` | WebSocket，文本帧 | 与 Worker 会话使用相同的 WebSocket 配置 |
-| 浏览器桌面 | `/api/sandboxes/*/desktop` | WebSocket，文本及二进制帧 | 禁止响应缓冲；允许二进制帧；不要做内容转换 |
-| Worker 与驱动下载 | `/api/worker/*` | 普通 HTTP 下载 | 允许较大的响应体和足够的下载超时 |
+| Worker 轮询、心跳和结果上报 | `/api/servers/*` | 远程必须 HTTPS；仅精确回环可用 HTTP | Worker 必须能访问同一公开地址；不要缓存响应 |
+| Worker 会话总线 | `/api/servers/*/sessions/connect` | 远程 WSS；仅精确回环可用 WS | 转发 `Upgrade`/`Connection`；空闲超时长于最长会话 |
+| 浏览器终端与文件操作 | `/api/sandboxes/*/session` | 远程 WSS；文本帧 | 与 Worker 会话使用相同的 WebSocket 配置 |
+| 浏览器桌面 | `/api/sandboxes/*/desktop` | 远程 WSS；文本及二进制帧 | 禁止响应缓冲；允许二进制帧；不要做内容转换 |
+| Worker 与驱动下载 | `/api/worker/*` | 远程必须 HTTPS；仅精确回环可用 HTTP | 允许较大的响应体和足够的下载超时；不得降级重定向 |
 
 浏览器到反向代理可以使用 HTTP/2 或 HTTP/3，但反向代理连接 AgentBox 3000 端口时必须支持 HTTP/1.1 Upgrade。SSE 不要求 HTTP/2，关键是代理不能聚合响应块。
 
@@ -74,9 +74,10 @@ Caddy 的 `reverse_proxy` 默认处理 WebSocket；仍需确认上游链路没�
 AGENTBOX_PUBLIC_URL=https://agentbox.example.com
 AGENTBOX_ALLOWED_ORIGINS=https://agentbox.example.com
 AGENTBOX_TRUSTED_PROXY=true
+AGENTBOX_TRUSTED_PROXY_CIDRS=172.20.0.0/24
 ```
 
-只有在 AgentBox 确实位于可信反向代理之后时才开启 `AGENTBOX_TRUSTED_PROXY`。否则客户端可以伪造 `X-Forwarded-*` 头，影响来源判断和 WebSocket Origin 校验。
+只有在 AgentBox 确实位于可信反向代理之后时才开启 `AGENTBOX_TRUSTED_PROXY`。`AGENTBOX_TRUSTED_PROXY_CIDRS` 必须替换为 **Server 直接连接方** 所在的精确网段（Compose 架构下通常是 `app` 与 `server` 所在 Docker 网络，而不是浏览器地址）；示例网段不能直接照搬。Server 只在直接对端受信任时解析转发头，并从 `X-Forwarded-For` 右侧向左剥离受信任代理。开启信任但 CIDR 缺失或无效会拒绝启动。不开启或直接对端不受信任时，转发头会被忽略，避免客户端伪造来源、协议或 WebSocket Origin。
 
 ## 验收
 

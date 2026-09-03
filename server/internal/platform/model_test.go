@@ -142,10 +142,11 @@ func TestEffectiveNetworkPolicyUsesDriverDefault(t *testing.T) {
 		network string
 		want    string
 	}{
-		{driver: "docker", want: "egress"},
-		{driver: "microsandbox", want: "egress"},
+		{driver: "docker", want: "none"},
+		{driver: "microsandbox", want: "none"},
 		{driver: "boxlite", want: "restricted"},
 		{driver: "docker", network: "none", want: "none"},
+		{driver: "docker", network: "egress", want: "egress"},
 	} {
 		if got := EffectiveNetworkPolicy(test.driver, test.network); got != test.want {
 			t.Fatalf("EffectiveNetworkPolicy(%q, %q) = %q, want %q", test.driver, test.network, got, test.want)
@@ -304,6 +305,10 @@ func TestValidateCredential(t *testing.T) {
 	}
 	if err := ValidateCredential(input, true); err != nil {
 		t.Fatalf("ValidateCredential() returned error: %v", err)
+	}
+	input.Endpoint = "http://api.openai.com/v1"
+	if err := ValidateCredential(input, true); !IsValidationError(err) {
+		t.Fatalf("ValidateCredential() error = %v, want insecure endpoint rejection", err)
 	}
 	input.Endpoint = "file:///etc/passwd"
 	if err := ValidateCredential(input, true); !IsValidationError(err) {

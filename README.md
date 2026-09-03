@@ -15,20 +15,22 @@ git clone https://github.com/7-e1even/AgentBox.git
 cd AgentBox
 ```
 
-本机或可信内网体验无需创建 `.env`，直接启动即可。Compose 会拉取 GHCR 中已构建的镜像，不需要在目标机编译 Go 或前端：
+同一台机器上的本地体验无需创建 `.env`，直接启动即可。Compose 会拉取 GHCR 中已构建的镜像，不需要在目标机编译 Go 或前端：
 
 ```sh
 docker compose up -d
 docker compose ps
 ```
 
+全新数据库首次启动时，Server 会生成一次性管理员初始化码。用 `docker compose logs server` 在本机日志中读取它，再在登录页完成初始化；初始化成功后该码立即失效。自动化部署可以通过 `AGENTBOX_SETUP_CODE` 提供至少 24 随机字节的无填充 Base64URL 值，并应在初始化完成后从环境中删除。可用 `openssl rand -base64 24 | tr '+/' '-_' | tr -d '='` 安全生成；短值、带填充或非 Base64URL 值会使 Server 拒绝启动。
+
 长期或生产部署请先将 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`；需要固定版本、端口或公开地址时也在该文件中覆盖。
 
 Server 当前必须保持 **1 个副本**：会话票据、Worker 和浏览器 WebSocket 均属于同一进程，不支持多副本或重叠滚动发布。重启后 Worker 会重连，浏览器需要重新打开终端/桌面。部署约束与 Worker v1 协议兼容规则见[传输兼容矩阵](docs/transport-compatibility.md)。
 
-生产环境建议由反向代理（如 Nginx、Caddy）终结 TLS，以 HTTPS 对外提供访问。位于反向代理之后时，在 `.env` 中设置 `AGENTBOX_TRUSTED_PROXY=true`，Server 才会信任代理传入的 `X-Forwarded-*` 头；直接暴露端口或可信内网保持默认即可。代理还必须关闭流式响应缓冲、保留 WebSocket Upgrade，并把读写超时设为长于最长 Agent 会话，完整配置见[传输兼容矩阵](docs/transport-compatibility.md)。
+生产环境建议由反向代理（如 Nginx、Caddy）终结 TLS，以 HTTPS 对外提供访问。位于反向代理之后时，在 `.env` 中同时设置 `AGENTBOX_TRUSTED_PROXY=true` 和 Server 直接连接方的精确 `AGENTBOX_TRUSTED_PROXY_CIDRS`，Server 才会信任代理传入的 `X-Forwarded-*` 头；开启信任但 CIDR 缺失或无效会拒绝启动。不在可信反向代理之后时保持默认 `false`；这只表示忽略转发头，并不豁免任何远程链路的 TLS 要求。代理还必须关闭流式响应缓冲、保留 WebSocket Upgrade，并把读写超时设为长于最长 Agent 会话，完整配置见[传输兼容矩阵](docs/transport-compatibility.md)。
 
-打开 `http://<服务器地址>:3000` 创建首个管理员，再到“服务器”页面复制命令安装并配对 Linux Worker。安装脚本会经由 AgentBox Server 下载当前 Release 中对应 `amd64` / `arm64` 的单个 Go Worker 二进制并校验 SHA-256；目标机不需要 Python，也不需要直接访问 GitHub。
+同机开发可打开 `http://localhost:3000`；任何远程浏览器或 Linux Worker 必须使用配置了有效 TLS 的 `https://<服务器地址>`。再到“服务器”页面复制命令安装并配对 Worker。安装脚本会经由 AgentBox Server 下载当前 Release 中对应 `amd64` / `arm64` 的单个 Go Worker 二进制并强制校验 SHA-256；目标机不需要 Python，也不需要直接访问 GitHub。
 
 Worker 上线后，服务器详情页会显示当前版本。发布新版本并升级 AgentBox Server 后，可在同一页面点击“更新 Worker”：Server 会缓存 Release 资产，Worker 校验 SHA-256 后原子替换二进制并重启；新版不能正常启动时会自动恢复上一版。
 
@@ -74,7 +76,7 @@ services:
 
 已安装 Go 1.24+、Node.js 20.9+ 和 pnpm 后，双击根目录的 `start-agentbox.bat` 即可同时启动 API 与 Web。脚本优先使用 `server/.env` 中已有的 `DATABASE_URL`；未配置数据库时，会使用 Docker 在本机启动开发用 PostgreSQL。服务就绪后会自动打开 `http://127.0.0.1:3000`。
 
-启动脚本不会关闭鉴权。首次打开时按页面提示创建管理员账号，之后使用用户名和密码登录；邮箱仅作为个人资料，不作为登录凭据。关闭脚本打开的两个 AgentBox 终端窗口即可停止 API 与 Web。
+启动脚本不会关闭鉴权。首次打开时，从 Server 终端的本地启动日志复制一次性初始化码，再按页面提示创建管理员账号；之后使用用户名和密码登录，邮箱仅作为个人资料，不作为登录凭据。关闭脚本打开的两个 AgentBox 终端窗口即可停止 API 与 Web。
 
 ## 备份与恢复
 

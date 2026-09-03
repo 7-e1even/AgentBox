@@ -122,6 +122,9 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
 	if err != nil {
 		return platform.Automation{}, "", err
 	}
+	if err := s.validateNetworkProxyBinding(ctx, tx, templateResource.Spec, "自动化模板"); err != nil {
+		return platform.Automation{}, "", err
+	}
 	if err := validateAutomationModelBindings(ctx, tx, templateResource.Spec, input.ModelBindings); err != nil {
 		return platform.Automation{}, "", err
 	}
@@ -148,7 +151,7 @@ func (s *Store) CreateAutomation(ctx context.Context, input platform.AutomationI
     RETURNING `+automationColumns,
 		uuid.NewString(), input.ProjectID, input.Name, input.Description, input.Enabled,
 		input.Trigger.AuthMode, uuid.NewString(), hashToken(secret), ciphertext, nonce,
-		lastFour(secret), input.TemplateID, automationModelBindingsJSON(input.ModelBindings), userID, now,
+		secretStorageMarker(secret), input.TemplateID, automationModelBindingsJSON(input.ModelBindings), userID, now,
 	))
 	if err != nil {
 		return platform.Automation{}, "", mapResourceError(err)
@@ -184,6 +187,9 @@ func (s *Store) UpdateAutomation(ctx context.Context, id string, input platform.
 	}
 	templateResource, err := loadAutomationTemplate(ctx, tx, input.ProjectID, input.TemplateID)
 	if err != nil {
+		return platform.Automation{}, err
+	}
+	if err := s.validateNetworkProxyBinding(ctx, tx, templateResource.Spec, "自动化模板"); err != nil {
 		return platform.Automation{}, err
 	}
 	if err := validateAutomationModelBindings(ctx, tx, templateResource.Spec, input.ModelBindings); err != nil {
@@ -269,7 +275,7 @@ func (s *Store) RotateAutomationSecret(ctx context.Context, id, userID string) (
     secret_hash = $1, secret_ciphertext = $2, secret_nonce = $3, secret_last_four = $4,
     updated_by = $5, secret_rotated_at = $6, updated_at = $6
 	    WHERE id = $7 AND action_type = 'create-sandbox' RETURNING `+automationColumns,
-		hashToken(secret), ciphertext, nonce, lastFour(secret), userID, now, id,
+		hashToken(secret), ciphertext, nonce, secretStorageMarker(secret), userID, now, id,
 	))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Automation{}, "", ErrResourceNotFound
@@ -306,6 +312,20 @@ func (s *Store) triggerAutomation(
 ) (platform.AutomationTriggerResult, error) {
 	if err := validateAutomationIdempotencyKey(delivery.IdempotencyKey); err != nil {
 		return platform.AutomationTriggerResult{}, err
+	}
+	if byEndpoint {
+		stored, err := scanStoredAutomation(s.pool.QueryRow(ctx, `SELECT `+automationColumns+`,
+			secret_hash, secret_ciphertext, secret_nonce FROM automations
+			WHERE endpoint_id = $1 AND action_type = 'create-sandbox'`, identifier))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return platform.AutomationTriggerResult{}, ErrResourceNotFound
+		}
+		if err != nil {
+			return platform.AutomationTriggerResult{}, fmt.Errorf("pre-authenticate automation trigger: %w", err)
+		}
+		if err := s.verifyAutomationDelivery(stored, delivery); err != nil {
+			return platform.AutomationTriggerResult{}, err
+		}
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -404,7 +424,7 @@ func (s *Store) triggerAutomation(
 		buildErr = platform.Validate(sandboxInput)
 	}
 	if buildErr == nil {
-		buildErr = ensureAutomatedSandboxReferences(ctx, tx, sandboxInput)
+		buildErr = s.ensureAutomatedSandboxReferences(ctx, tx, sandboxInput)
 	}
 	if buildErr == nil {
 		buildErr = s.encryptSpecEnvironmentVariables(sandboxInput.Spec)
@@ -741,7 +761,7 @@ func enqueueAutomationSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platfor
 	return jobID, payload, nil
 }
 
-func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input platform.Input) error {
+func (s *Store) ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input platform.Input) error {
 	runtimeID, _ := input.Spec["runtimeId"].(string)
 	var runtimeSpecJSON []byte
 	if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
@@ -755,6 +775,9 @@ func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input plat
 		return fmt.Errorf("decode automated sandbox environment: %w", err)
 	}
 	effectiveSpec := effectiveSandboxSpec(runtimeSpec, input.Spec)
+	if err := s.validateNetworkProxyBinding(ctx, tx, effectiveSpec, "自动化沙箱"); err != nil {
+		return err
+	}
 	if err := ensureExtensionReferences(ctx, tx, input.ProjectID, effectiveSpec, true); err != nil {
 		return err
 	}
@@ -884,7 +907,7 @@ func (s *Store) verifyAutomationDelivery(stored storedAutomation, delivery platf
 		return nil
 	case platform.AutomationAuthHMAC:
 		timestamp, err := strconv.ParseInt(strings.TrimSpace(delivery.Timestamp), 10, 64)
-		if err != nil || absDuration(time.Since(time.Unix(timestamp, 0))) > webhookSignatureWindow {
+		if err != nil || !webhookTimestampIsFresh(timestamp, time.Now()) {
 			return ErrWebhookUnauthorized
 		}
 		provided := strings.TrimPrefix(strings.TrimSpace(delivery.Signature), "v1=")
@@ -928,7 +951,7 @@ func (s *Store) verifyAutomationDelivery(stored storedAutomation, delivery platf
 	case platform.AutomationAuthStandardWebhook:
 		timestampValue := strings.TrimSpace(automationHeader(delivery.Headers, "webhook-timestamp"))
 		timestamp, err := strconv.ParseInt(timestampValue, 10, 64)
-		if err != nil || absDuration(time.Since(time.Unix(timestamp, 0))) > webhookSignatureWindow {
+		if err != nil || !webhookTimestampIsFresh(timestamp, time.Now()) {
 			return ErrWebhookUnauthorized
 		}
 		deliveryID := strings.TrimSpace(automationHeader(delivery.Headers, "webhook-id"))
@@ -1074,6 +1097,7 @@ func scanAutomation(row pgx.Row) (platform.Automation, error) {
 	result.Trigger.Type = triggerType
 	if err == nil {
 		err = json.Unmarshal(modelBindingsJSON, &result.ModelBindings)
+		result.SecretLastFour = secretMask
 	}
 	if createdBy.Valid {
 		result.CreatedBy = &createdBy.String
@@ -1102,6 +1126,7 @@ func scanStoredAutomation(row pgx.Row) (storedAutomation, error) {
 	result.Automation.Trigger.Type = triggerType
 	if err == nil {
 		err = json.Unmarshal(modelBindingsJSON, &result.Automation.ModelBindings)
+		result.Automation.SecretLastFour = secretMask
 	}
 	if createdBy.Valid {
 		result.Automation.CreatedBy = &createdBy.String
@@ -1168,11 +1193,10 @@ func newWebhookSecret() (string, error) {
 	return "abx_wh_" + token, nil
 }
 
-func absDuration(value time.Duration) time.Duration {
-	if value < 0 {
-		return -value
-	}
-	return value
+func webhookTimestampIsFresh(timestamp int64, now time.Time) bool {
+	signedAt := time.Unix(timestamp, 0)
+	return !signedAt.Before(now.Add(-webhookSignatureWindow)) &&
+		!signedAt.After(now.Add(webhookSignatureWindow))
 }
 
 func nullableBytes(value []byte) any {

@@ -819,12 +819,15 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 		`GOPROXY="${AGENTBOX_GOPROXY:-https://goproxy.cn,direct}" go mod tidy`,
 		`printf '%s\n%s\n%s\n' "$SERVER_URL" "$SERVER_ID" "$CREDENTIAL" > "$CONFIG"`,
 		`systemctl restart agentbox-worker.service`,
-		`curl -fsSL -D "$worker_headers_tmp" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"`,
+		`worker_origin_curl -fsS -D "$worker_headers_tmp" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"`,
 		`verify_worker_checksum "$worker_tmp" "$worker_headers_tmp"`,
+		`the server did not provide a Worker checksum; refusing to install`,
+		`SERVER_URL=$(normalize_worker_origin "${1:-}")`,
+		`Plain HTTP is allowed only for an exact localhost or loopback IP`,
+		`--proto '=https' --proto-redir '=https'`,
 		`command -v flock >/dev/null`,
 		`command -v sync >/dev/null`,
 		`PACKAGES="ca-certificates jq util-linux"`,
-		`WARNING: $SERVER_URL uses plain HTTP.`,
 	} {
 		if !strings.Contains(workerInstall, expected) {
 			t.Fatalf("interactive worker installer is missing %q", expected)
@@ -942,8 +945,9 @@ func TestWorkerSelfUpdateVerifiesChecksumBeforeExecutingDownload(t *testing.T) {
 	}
 	body := workerDaemon[start : start+end]
 	for _, expected := range []string{
-		`curl -fsSL -D "$WORKER_HEADERS"`,
+		`worker_origin_curl_follow -fsS -D "$WORKER_HEADERS"`,
 		`EXPECTED_SHA256=$(tr -d '\r' < "$WORKER_HEADERS"`,
+		`the server did not provide a Worker checksum`,
 		`ACTUAL_SHA256=$(worker_update_sha256 "$WORKER_TMP")`,
 		`downloaded Worker checksum mismatch`,
 	} {
@@ -1968,12 +1972,49 @@ func TestWorkerNetworkPolicyDefaultsAreFailClosed(t *testing.T) {
 	for _, expected := range []string{
 		`effective_sandbox_network_policy()`,
 		`NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")`,
+		`printf none`,
 		`restricted network is only supported by BoxLite`,
-		`unsupported network policy: $2`,
+		`unsupported network policy: $1`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("Worker network policy guard is missing %q", expected)
 		}
+	}
+}
+
+func TestWorkerChecksDockerNetworkModeBeforeReusingContainer(t *testing.T) {
+	for _, expected := range []string{
+		`enforce_docker_network_policy()`,
+		`docker inspect -f '{{.HostConfig.NetworkMode}}|{{range $name, $config := .NetworkSettings.Networks}}`,
+		`none:none:none,`,
+		`egress:default:bridge,`,
+		`docker stop --time 10 "$TARGET"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker Docker network drift guard is missing %q", expected)
+		}
+	}
+	createStart := strings.Index(workerDaemon, "create_sandbox()")
+	startStart := strings.Index(workerDaemon, "start_sandbox()")
+	restartStart := strings.Index(workerDaemon, "restart_sandbox()")
+	applyProxyStart := strings.Index(workerDaemon, "apply_sandbox_proxy()")
+	if createStart < 0 || startStart <= createStart || restartStart <= startStart || applyProxyStart <= restartStart {
+		t.Fatal("Worker sandbox lifecycle boundaries are missing")
+	}
+	createBody := workerDaemon[createStart:startStart]
+	startBody := workerDaemon[startStart:restartStart]
+	restartBody := workerDaemon[restartStart:applyProxyStart]
+	for name, body := range map[string]string{"create": createBody, "start": startBody} {
+		guardIndex := strings.Index(body, `enforce_docker_network_policy "$TARGET" "$NETWORK"`)
+		startIndex := strings.Index(body, `docker start "$TARGET"`)
+		if guardIndex < 0 || startIndex < 0 || guardIndex >= startIndex {
+			t.Fatalf("%s path does not validate Docker network mode before start", name)
+		}
+	}
+	stopIndex := strings.Index(restartBody, `stop_sandbox "$JOB_FILE"`)
+	startIndex := strings.Index(restartBody, `start_sandbox "$JOB_FILE"`)
+	if stopIndex < 0 || startIndex < 0 || stopIndex >= startIndex {
+		t.Fatal("restart path must stop the legacy container before the guarded start")
 	}
 }
 
@@ -1994,6 +2035,7 @@ func TestWorkerNormalizesEmptyNetworkPolicyBeforeValidation(t *testing.T) {
 	for _, expected := range []string{
 		`effective_sandbox_network_policy()`,
 		`elif [ "$1" = boxlite ]; then`,
+		`printf none`,
 		`NETWORK=$(effective_sandbox_network_policy "$DRIVER"`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {

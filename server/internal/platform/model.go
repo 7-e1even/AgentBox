@@ -500,8 +500,8 @@ func ValidateCredential(input CredentialInput, requireSecret bool) error {
 	}
 	if input.Endpoint != "" {
 		parsed, err := url.Parse(input.Endpoint)
-		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
-			return &ValidationError{Message: "接口地址必须是有效的 HTTP 或 HTTPS URL"}
+		if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" || parsed.User != nil {
+			return &ValidationError{Message: "接口地址必须是有效的 HTTPS URL"}
 		}
 	}
 	if requireSecret && input.Secret == "" {
@@ -794,7 +794,7 @@ func EffectiveNetworkPolicy(driver, network string) string {
 	if driver == "boxlite" {
 		return "restricted"
 	}
-	return "egress"
+	return "none"
 }
 
 func validateAgentTools(spec map[string]any) error {

@@ -1118,8 +1118,8 @@ function templateDefaults(template?: ResourceOfKind<"runtime">) {
     desktop: template?.spec.desktop,
     network:
       configuredNetwork === "restricted" && driver !== "boxlite"
-        ? "egress"
-        : configuredNetwork || (driver === "boxlite" ? "restricted" : "egress"),
+        ? "none"
+        : configuredNetwork || (driver === "boxlite" ? "restricted" : "none"),
     proxyId: stringValue(template?.spec.proxyId),
     agentTools: supportedAgentToolList(template?.spec.agentTools),
     skillIds: stringList(template?.spec.skillIds),

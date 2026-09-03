@@ -15,6 +15,21 @@ func TestParseConfigBuildsWorkerWebSocketURL(t *testing.T) {
 	}
 }
 
+func TestParseConfigRejectsNonLoopbackHTTP(t *testing.T) {
+	for _, serverURL := range []string{
+		"http://192.168.1.10:3000",
+		"http://localhost.example:3000",
+		"http://127.0.0.1.example:3000",
+	} {
+		if _, err := parseConfig(serverURL + "\nserver-one\nsecret-token\n"); err == nil {
+			t.Errorf("parseConfig(%q) unexpectedly succeeded", serverURL)
+		}
+	}
+	if _, err := parseConfig("http://127.0.0.1:3000\nserver-one\nsecret-token\n"); err != nil {
+		t.Fatalf("parseConfig() rejected loopback HTTP: %v", err)
+	}
+}
+
 func TestValidPathNormalizesAbsoluteContainerPath(t *testing.T) {
 	got, err := validPath("/workspace/project/../README.md")
 	if err != nil {

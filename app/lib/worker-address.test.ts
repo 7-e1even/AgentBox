@@ -7,56 +7,62 @@ describe("buildWorkerAddressCandidates", () => {
     expect(
       buildWorkerAddressCandidates({
         gatewayOrigin: "http://127.0.0.1:3000",
-        configuredOrigin: "http://192.168.31.83:3000/",
+        configuredOrigin: "https://agentbox.example/",
         interfaceAddresses: ["192.168.31.83"],
       })
     ).toEqual([
-      { url: "http://192.168.31.83:3000", source: "configured" },
+      { url: "https://agentbox.example", source: "configured" },
     ])
   })
 
-  it("replaces the loopback gateway host with reachable network interfaces", () => {
+  it("does not infer insecure LAN Worker addresses from a loopback gateway", () => {
     expect(
       buildWorkerAddressCandidates({
         gatewayOrigin: "http://127.0.0.1:3000",
         interfaceAddresses: ["192.168.31.83", "10.0.0.5"],
       })
-    ).toEqual([
-      { url: "http://192.168.31.83:3000", source: "network-interface" },
-      { url: "http://10.0.0.5:3000", source: "network-interface" },
-    ])
+    ).toEqual([])
   })
 
-  it("uses the incoming public gateway without explicit configuration", () => {
+  it("rejects an incoming public HTTP gateway", () => {
     expect(
       buildWorkerAddressCandidates({
         gatewayOrigin: "http://192.168.31.83:3000",
         interfaceAddresses: ["172.18.0.3"],
       })
-    ).toEqual([
-      { url: "http://192.168.31.83:3000", source: "gateway" },
-      { url: "http://172.18.0.3:3000", source: "network-interface" },
-    ])
+    ).toEqual([])
   })
 
-  it("uses an explicitly configured public gateway before inferred addresses", () => {
+  it("uses an HTTPS gateway and HTTPS inferred addresses", () => {
     expect(
       buildWorkerAddressCandidates({
-        gatewayOrigin: "http://127.0.0.1:3000",
-        configuredOrigin: "https://agentbox.example",
+        gatewayOrigin: "https://agentbox.example:3443",
         interfaceAddresses: ["192.168.31.83"],
       })
     ).toEqual([
-      { url: "https://agentbox.example", source: "configured" },
-      { url: "http://192.168.31.83:3000", source: "network-interface" },
+      { url: "https://agentbox.example:3443", source: "gateway" },
+      { url: "https://192.168.31.83:3443", source: "network-interface" },
     ])
   })
 })
 
 describe("normalizeHttpOrigin", () => {
-  it("removes paths and trailing slashes", () => {
-    expect(normalizeHttpOrigin("http://192.168.31.83:3000/api/"))
-      .toBe("http://192.168.31.83:3000")
+  it("allows exact loopback HTTP and removes paths", () => {
+    expect(normalizeHttpOrigin("http://127.0.0.1:3000/api/"))
+      .toBe("http://127.0.0.1:3000")
+    expect(normalizeHttpOrigin("http://localhost:3000/api/"))
+      .toBe("http://localhost:3000")
+    expect(normalizeHttpOrigin("http://[::1]:3000/api/"))
+      .toBe("http://[::1]:3000")
+  })
+
+  it("requires HTTPS for non-loopback Worker addresses", () => {
+    expect(normalizeHttpOrigin("http://192.168.31.83:3000")).toBeNull()
+    expect(normalizeHttpOrigin("http://localhost.example:3000")).toBeNull()
+    expect(normalizeHttpOrigin("http://127.example:3000")).toBeNull()
+    expect(normalizeHttpOrigin("http://127.0.0.1.example:3000")).toBeNull()
+    expect(normalizeHttpOrigin("https://agentbox.example/api/"))
+      .toBe("https://agentbox.example")
   })
 
   it("rejects non-http URLs", () => {

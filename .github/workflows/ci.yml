@@ -40,6 +40,11 @@ jobs:
       - name: Vet
         working-directory: server
         run: go vet ./...
+      - name: Scan Go dependencies for reachable vulnerabilities
+        working-directory: server
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
+          go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -tags agentbox_driver ./internal/httpapi/assets/agentbox-microsandbox-driver
       - name: Check Worker package boundary
         working-directory: server
         run: |
@@ -105,6 +110,9 @@ jobs:
       - name: Install dependencies
         working-directory: app
         run: pnpm install --frozen-lockfile
+      - name: Audit JavaScript dependencies
+        working-directory: app
+        run: pnpm audit --audit-level=moderate
       - name: Lint
         working-directory: app
         run: pnpm lint

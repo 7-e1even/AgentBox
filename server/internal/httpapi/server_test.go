@@ -157,6 +157,7 @@ func (fakeStore) OperateSandboxAgentTools(_ context.Context, id, action string, 
 		Spec: map[string]any{"requestedAgentTools": tools},
 	}}, nil
 }
+func (fakeStore) AuthorizeSandboxCredentialAccess(context.Context, string) error { return nil }
 func (fakeStore) ListAutomations(context.Context, string) ([]platform.Automation, error) {
 	return []platform.Automation{}, nil
 }
@@ -254,6 +255,9 @@ func (fakeStore) GetNetworkProxyCheck(_ context.Context, proxyID, checkID string
 	}, nil
 }
 func (fakeStore) DeleteNetworkProxy(context.Context, string) error { return nil }
+func (fakeStore) ValidateRuntimeLLMToken(string, string, string) error {
+	return store.ErrRuntimeUnauthorized
+}
 func (fakeStore) ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error) {
 	return platform.RuntimeLLMTarget{}, store.ErrRuntimeUnauthorized
 }
@@ -314,21 +318,33 @@ func (fakeStore) UpdateUserPreferences(_ context.Context, id string, input platf
 }
 func (fakeStore) DeleteUser(context.Context, string) error              { return nil }
 func (fakeStore) InsertLogs(context.Context, []platform.LogEntry) error { return nil }
+func (fakeStore) RecordDurableAudit(context.Context, platform.LogEntry) error {
+	return nil
+}
 func (fakeStore) ListLogs(context.Context, platform.LogFilter) ([]platform.LogEntry, int, error) {
 	return []platform.LogEntry{}, 0, nil
 }
 func (fakeStore) Ping(context.Context) error { return nil }
 
 func rawTestHandler() http.Handler {
-	return New(fakeStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{})
+	return withTestJSONContentType(New(fakeStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{}))
 }
 
 func debugTestHandler() http.Handler {
-	return New(fakeStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
+	return withTestJSONContentType(New(fakeStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true}))
 }
 
 func emptyDebugTestHandler() http.Handler {
-	return New(emptyUsersStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true})
+	return withTestJSONContentType(New(emptyUsersStore{}, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{DisableAuth: true}))
+}
+
+func withTestJSONContentType(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Body != nil && request.Body != http.NoBody && request.Header.Get("Content-Type") == "" {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		next.ServeHTTP(w, request)
+	})
 }
 
 func testHandler() http.Handler {

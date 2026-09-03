@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +24,14 @@ func loginRequest(t *testing.T, handler http.Handler, username string) *httptest
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	return response
+}
+
+func testTrustedProxySettings(prefixes ...string) trustedProxySettings {
+	parsed := make([]netip.Prefix, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		parsed = append(parsed, netip.MustParsePrefix(prefix))
+	}
+	return trustedProxySettings{enabled: true, prefixes: parsed}
 }
 
 func TestLoginRateLimitReturns429(t *testing.T) {
@@ -125,6 +134,7 @@ func TestSessionCookieIgnoresForwardedProtoByDefault(t *testing.T) {
 
 func TestSessionCookieHonorsForwardedProtoWhenProxyTrusted(t *testing.T) {
 	t.Setenv("AGENTBOX_TRUSTED_PROXY", "true")
+	t.Setenv("AGENTBOX_TRUSTED_PROXY_CIDRS", "192.0.2.0/24")
 	handler := rawTestHandler()
 	request := httptest.NewRequest(http.MethodPost, "/api/auth/login",
 		strings.NewReader(`{"username":"admin","password":"password123"}`))
@@ -144,10 +154,12 @@ func TestWorkerRequestBaseURLRespectsTrustedProxy(t *testing.T) {
 		request.Header.Set("X-Forwarded-Host", "public.example")
 		return request
 	}
-	if got := workerRequestBaseURL(build(), false); got != "http://internal.example:8091" {
+	untrusted := &Server{}
+	if got := untrusted.workerRequestBaseURL(build()); got != "http://internal.example:8091" {
 		t.Errorf("trustedProxy=false: got %q, want %q", got, "http://internal.example:8091")
 	}
-	if got := workerRequestBaseURL(build(), true); got != "https://public.example" {
+	trusted := &Server{trustedProxy: testTrustedProxySettings("192.0.2.0/24")}
+	if got := trusted.workerRequestBaseURL(build()); got != "https://public.example" {
 		t.Errorf("trustedProxy=true: got %q, want %q", got, "https://public.example")
 	}
 }
@@ -156,14 +168,14 @@ func TestAcceptOptionsIgnoresForwardedHostUnlessProxyTrusted(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	request.Header.Set("X-Forwarded-Host", "evil.example")
 
-	hub := newSessionHub([]string{"http://localhost:3000"}, false)
+	hub := newSessionHub([]string{"http://localhost:3000"}, trustedProxySettings{})
 	for _, pattern := range hub.acceptOptions(request).OriginPatterns {
 		if pattern == "evil.example" {
 			t.Fatal("trustedProxy=false 时不应把 X-Forwarded-Host 并入 Origin 白名单")
 		}
 	}
 
-	trustedHub := newSessionHub([]string{"http://localhost:3000"}, true)
+	trustedHub := newSessionHub([]string{"http://localhost:3000"}, testTrustedProxySettings("192.0.2.0/24"))
 	found := false
 	for _, pattern := range trustedHub.acceptOptions(request).OriginPatterns {
 		if pattern == "evil.example" {
@@ -172,6 +184,117 @@ func TestAcceptOptionsIgnoresForwardedHostUnlessProxyTrusted(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("trustedProxy=true 时应保留 X-Forwarded-Host 并入白名单的现状行为")
+	}
+}
+
+func TestTrustedProxyRequiresCIDRs(t *testing.T) {
+	t.Setenv("AGENTBOX_TRUSTED_PROXY", "true")
+	t.Setenv("AGENTBOX_TRUSTED_PROXY_CIDRS", "")
+	if err := ValidateTrustedProxyEnvironment(); err == nil {
+		t.Fatal("trusted proxy without CIDRs must be rejected")
+	}
+	t.Setenv("AGENTBOX_TRUSTED_PROXY_CIDRS", "not-a-cidr")
+	if err := ValidateTrustedProxyEnvironment(); err == nil {
+		t.Fatal("malformed trusted proxy CIDR must be rejected")
+	}
+}
+
+func TestClientIPWalksForwardedChainFromTrustedPeer(t *testing.T) {
+	server := &Server{trustedProxy: testTrustedProxySettings("192.0.2.0/24", "198.51.100.0/24")}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.RemoteAddr = "192.0.2.10:443"
+	request.Header.Add("X-Forwarded-For", "203.0.113.77, 198.51.100.9")
+	if got := server.clientIP(request); got != "203.0.113.77" {
+		t.Fatalf("clientIP = %q, want actual untrusted client", got)
+	}
+	request.Header.Set("X-Forwarded-For", "spoofed, 198.51.100.9")
+	if got := server.clientIP(request); got != "192.0.2.10" {
+		t.Fatalf("malformed chain clientIP = %q, want immediate peer", got)
+	}
+}
+
+func TestForwardedHeadersIgnoredFromUntrustedPeer(t *testing.T) {
+	server := &Server{trustedProxy: testTrustedProxySettings("192.0.2.0/24")}
+	request := httptest.NewRequest(http.MethodGet, "http://internal.example/", nil)
+	request.RemoteAddr = "203.0.113.8:1234"
+	request.Header.Set("X-Forwarded-For", "198.51.100.1")
+	request.Header.Set("X-Forwarded-Proto", "https")
+	request.Header.Set("X-Forwarded-Host", "public.example")
+	if got := server.clientIP(request); got != "203.0.113.8" {
+		t.Fatalf("clientIP = %q", got)
+	}
+	if got := server.workerRequestBaseURL(request); got != "http://internal.example" {
+		t.Fatalf("base URL = %q", got)
+	}
+}
+
+type csrfCaptureStore struct {
+	fakeStore
+	createCalls int
+	actionCalls int
+}
+
+func (s *csrfCaptureStore) CreateUser(_ context.Context, input platform.UserInput) (platform.User, error) {
+	s.createCalls++
+	return s.fakeStore.CreateUser(context.Background(), input)
+}
+
+func (s *csrfCaptureStore) OperateSandbox(ctx context.Context, id, action string) (platform.Resource, error) {
+	s.actionCalls++
+	return s.fakeStore.OperateSandbox(ctx, id, action)
+}
+
+func TestCookieAuthRejectsCrossOriginAdminCreate(t *testing.T) {
+	storage := &csrfCaptureStore{}
+	handler := New(storage, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), []string{"https://agentbox.example"}, Config{})
+	request := httptest.NewRequest(http.MethodPost, "https://agentbox.example/api/users", strings.NewReader(`{"name":"Evil","username":"evil","email":"evil@example.com","password":"password123","role":"admin","status":"active"}`))
+	request.Header.Set("Origin", "https://evil.agentbox.example")
+	request.Header.Set("Content-Type", "text/plain")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "test-session"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || storage.createCalls != 0 {
+		t.Fatalf("status=%d createCalls=%d body=%s", response.Code, storage.createCalls, response.Body.String())
+	}
+}
+
+func TestCookieAuthRejectsCrossOriginBodylessSandboxAction(t *testing.T) {
+	storage := &csrfCaptureStore{}
+	handler := New(storage, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), []string{"https://agentbox.example"}, Config{})
+	request := httptest.NewRequest(http.MethodPost, "https://agentbox.example/api/sandboxes/sandbox-one/actions/delete", nil)
+	request.Header.Set("Origin", "null")
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "test-session"})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden || storage.actionCalls != 0 {
+		t.Fatalf("status=%d actionCalls=%d body=%s", response.Code, storage.actionCalls, response.Body.String())
+	}
+}
+
+func TestCookieAuthAllowsConfiguredOriginAndHeaderlessClient(t *testing.T) {
+	for _, origin := range []string{"https://agentbox.example", ""} {
+		storage := &csrfCaptureStore{}
+		handler := New(storage, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), []string{"https://agentbox.example"}, Config{})
+		request := httptest.NewRequest(http.MethodPost, "https://agentbox.example/api/sandboxes/sandbox-one/actions/restart", nil)
+		if origin != "" {
+			request.Header.Set("Origin", origin)
+		}
+		request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: "test-session"})
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		if response.Code != http.StatusAccepted || storage.actionCalls != 1 {
+			t.Fatalf("origin=%q status=%d calls=%d body=%s", origin, response.Code, storage.actionCalls, response.Body.String())
+		}
+	}
+}
+
+func TestJSONDecoderRejectsExplicitNonJSONMediaType(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/api/auth/login", strings.NewReader(`{"username":"admin","password":"password123"}`))
+	request.Header.Set("Content-Type", "text/plain")
+	response := httptest.NewRecorder()
+	rawTestHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnsupportedMediaType {
+		t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 

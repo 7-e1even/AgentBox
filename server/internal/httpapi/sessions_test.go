@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 
 	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
+	"agentbox/internal/store"
 	"agentbox/internal/workerprotocol"
 	"github.com/coder/websocket"
 )
@@ -21,6 +23,22 @@ import (
 const sessionTestServerID = "7b20f83b-6418-4a9f-8477-3dc7c35d6310"
 
 type sessionTestStore struct{ fakeStore }
+
+type credentialedProxySessionTestStore struct{ sessionTestStore }
+
+func (credentialedProxySessionTestStore) AuthorizeSandboxCredentialAccess(context.Context, string) error {
+	return fmt.Errorf("%w: credentialed proxy", store.ErrForbidden)
+}
+
+func (sessionTestStore) RecordDurableAudit(context.Context, platform.LogEntry) error { return nil }
+
+func testSessionAuthorization(hub *sessionHub, userID, key string) sessionAuthorization {
+	return sessionAuthorization{
+		userID: userID, sessionKey: key, role: platform.UserRoleOperator,
+		actor: platform.AuditActor{Type: "user", ID: userID, Name: "Operator", Role: platform.UserRoleOperator},
+		epoch: hub.authorizationEpoch(),
+	}
+}
 
 func (sessionTestStore) ListResources(context.Context) ([]platform.Resource, error) {
 	projectID := "default"
@@ -43,6 +61,7 @@ func newSessionTestServer(t *testing.T) *httptest.Server {
 	// 该测试模拟反向代理部署（依赖 X-Forwarded-Host 放行浏览器 Origin），
 	// 因此显式开启可信代理模式。
 	t.Setenv("AGENTBOX_TRUSTED_PROXY", "true")
+	t.Setenv("AGENTBOX_TRUSTED_PROXY_CIDRS", "127.0.0.0/8")
 	handler := New(
 		sessionTestStore{}, catalog.BuiltinCatalog,
 		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
@@ -58,9 +77,9 @@ func websocketTestURL(serverURL, path string) string {
 }
 
 func TestSandboxSessionTicketIsSingleUse(t *testing.T) {
-	hub := newSessionHub(nil, false)
+	hub := newSessionHub(nil, trustedProxySettings{})
 	target := sandboxSessionTarget{SandboxID: "sandbox-one", ServerID: sessionTestServerID, ExternalID: "container", Driver: "docker"}
-	token, _, err := hub.issueTicket(target, "terminal")
+	token, _, err := hub.issueTicket(target, "terminal", testSessionAuthorization(hub, "user-one", "login-one"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,14 +92,14 @@ func TestSandboxSessionTicketIsSingleUse(t *testing.T) {
 }
 
 func TestSessionHubsDoNotShareWorkersOrTickets(t *testing.T) {
-	first := newSessionHub(nil, false)
-	second := newSessionHub(nil, false)
+	first := newSessionHub(nil, trustedProxySettings{})
+	second := newSessionHub(nil, trustedProxySettings{})
 	first.registerWorker(&workerSessionConnection{serverID: sessionTestServerID})
 	if !first.hasWorker(sessionTestServerID) || second.hasWorker(sessionTestServerID) {
 		t.Fatal("Worker connections must belong to exactly one process-local hub")
 	}
 	target := sandboxSessionTarget{SandboxID: "sandbox-one", ServerID: sessionTestServerID, ExternalID: "container", Driver: "docker"}
-	token, _, err := first.issueTicket(target, "terminal")
+	token, _, err := first.issueTicket(target, "terminal", testSessionAuthorization(first, "user-one", "login-one"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,9 +151,9 @@ func TestWorkerSessionProtocolHandshake(t *testing.T) {
 }
 
 func TestSandboxSessionTicketCannotChangeMode(t *testing.T) {
-	hub := newSessionHub(nil, false)
+	hub := newSessionHub(nil, trustedProxySettings{})
 	target := sandboxSessionTarget{SandboxID: "sandbox-one", ServerID: sessionTestServerID, ExternalID: "container", Driver: "docker"}
-	token, _, err := hub.issueTicket(target, "desktop")
+	token, _, err := hub.issueTicket(target, "desktop", testSessionAuthorization(hub, "user-one", "login-one"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,10 +194,24 @@ func TestSandboxDesktopTicketRejectsMissingDesktopSnapshot(t *testing.T) {
 	}
 }
 
+func TestSandboxSessionTicketRejectsCredentialedProxyWithoutAdminAuthorization(t *testing.T) {
+	handler := New(
+		credentialedProxySessionTestStore{}, catalog.BuiltinCatalog,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
+		Config{DisableAuth: true},
+	)
+	request := httptest.NewRequest(http.MethodPost, "/api/sandboxes/sandbox-one/session-ticket", nil)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusForbidden)
+	}
+}
+
 func TestSessionAcceptOptionsAllowForwardedGatewayHost(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://server:8091/api/sessions/connect", nil)
 	request.Header.Set("X-Forwarded-Host", "agentbox.example:3000")
-	patterns := newSessionHub(nil, true).acceptOptions(request).OriginPatterns
+	patterns := newSessionHub(nil, testTrustedProxySettings("192.0.2.0/24")).acceptOptions(request).OriginPatterns
 	if len(patterns) != 1 || patterns[0] != "agentbox.example:3000" {
 		t.Fatalf("origin patterns = %#v", patterns)
 	}
@@ -187,7 +220,7 @@ func TestSessionAcceptOptionsAllowForwardedGatewayHost(t *testing.T) {
 func TestSessionAcceptOptionsRejectInvalidForwardedGatewayHost(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://server:8091/api/sessions/connect", nil)
 	request.Header.Set("X-Forwarded-Host", "*")
-	if patterns := newSessionHub(nil, true).acceptOptions(request).OriginPatterns; len(patterns) != 0 {
+	if patterns := newSessionHub(nil, testTrustedProxySettings("192.0.2.0/24")).acceptOptions(request).OriginPatterns; len(patterns) != 0 {
 		t.Fatalf("origin patterns = %#v", patterns)
 	}
 }

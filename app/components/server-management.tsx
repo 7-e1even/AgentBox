@@ -169,8 +169,11 @@ export function ServerManagement({
   }
 
   const normalizedServerUrl = normalizeHttpOrigin(serverUrl)
+  const installCurlFlags = normalizedServerUrl?.startsWith("https://")
+    ? "-fsSL --proto '=https' --proto-redir '=https'"
+    : "-fsS --proto '=http'"
   const installCommand = normalizedServerUrl
-    ? `curl -fsSL ${normalizedServerUrl}/api/worker/install.sh | sudo sh -s -- ${normalizedServerUrl}`
+    ? `curl ${installCurlFlags} ${normalizedServerUrl}/api/worker/install.sh | sudo sh -s -- ${normalizedServerUrl}`
     : ""
   const setupCommand =
     pairing?.token && normalizedServerUrl
@@ -293,11 +296,11 @@ export function ServerManagement({
                 const normalized = normalizeHttpOrigin(serverUrl)
                 if (normalized) setServerUrl(normalized)
               }}
-              placeholder="http://192.168.1.10:3000"
+              placeholder="https://agentbox.example.com"
             />
             <AddressDescription status={addressStatus} />
             {invalidServerUrl ? (
-              <FieldError>请输入以 http:// 或 https:// 开头的地址。</FieldError>
+              <FieldError>远程入口必须使用 HTTPS；仅同机 localhost 或回环 IP 可使用 HTTP。</FieldError>
             ) : null}
           </Field>
 

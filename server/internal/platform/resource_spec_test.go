@@ -44,8 +44,9 @@ func TestDesiredSandboxSpecDropsRuntimeModelSources(t *testing.T) {
 		"runtimeModelSources": map[string]any{
 			"primary": map[string]any{"credentialId": "target", "modelId": "gpt-5.4"},
 		},
-		"runtimeModelSourcesComplete": true,
-		"runtimeModelTokenEpoch":      "restart-job-one",
+		"runtimeModelSourcesComplete":   true,
+		"runtimeModelTokenEpoch":        "restart-job-one",
+		"credentialedProxyIdAtCreation": "proxy-one",
 	})
 	if _, ok := desired["runtimeModelSources"]; ok {
 		t.Fatal("runtime model source observation leaked into desired configuration")
@@ -55,6 +56,9 @@ func TestDesiredSandboxSpecDropsRuntimeModelSources(t *testing.T) {
 	}
 	if _, ok := desired["runtimeModelTokenEpoch"]; ok {
 		t.Fatal("runtime model token epoch leaked into desired configuration")
+	}
+	if _, ok := desired["credentialedProxyIdAtCreation"]; ok {
+		t.Fatal("credentialed proxy provenance leaked into desired configuration")
 	}
 	if desired["runtimeId"] != "runtime-one" {
 		t.Fatalf("desired runtimeId = %#v", desired["runtimeId"])

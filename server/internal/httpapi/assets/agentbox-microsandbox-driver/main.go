@@ -651,7 +651,7 @@ func parseCommand(args []string) (command, error) {
 	if len(args) == 0 {
 		return command{}, errors.New("usage: agentbox-microsandbox-driver <action>")
 	}
-	parsed := command{action: args[0], cpus: 2, memory: 4096, workdir: "/workspace", network: "egress"}
+	parsed := command{action: args[0], cpus: 2, memory: 4096, workdir: "/workspace", network: "none"}
 	switch parsed.action {
 	case "probe", "images":
 		if len(args) != 1 {

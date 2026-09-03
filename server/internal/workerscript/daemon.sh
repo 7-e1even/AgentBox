@@ -10,6 +10,72 @@ BOXLITE_IMAGES_FILE=$STATE_DIR/boxlite-images.json
 WORKER_OCI_IMAGE_DIR=$STATE_DIR/oci-images
 BOXLITE_SERVER_PID_FILE=$STATE_DIR/boxlite-serve.pid
 
+normalize_worker_origin() {
+  WORKER_ORIGIN=${1:-}
+  while [ "${WORKER_ORIGIN%/}" != "$WORKER_ORIGIN" ]; do WORKER_ORIGIN=${WORKER_ORIGIN%/}; done
+  case "$WORKER_ORIGIN" in
+    *[[:space:]]*|*\?*|*\#*|*@*)
+      echo "Worker URL must be an HTTP(S) origin without credentials, path, query, or fragment" >&2
+      return 1
+      ;;
+    https://*) WORKER_AUTHORITY=${WORKER_ORIGIN#https://}; WORKER_PLAIN_HTTP=false ;;
+    http://*) WORKER_AUTHORITY=${WORKER_ORIGIN#http://}; WORKER_PLAIN_HTTP=true ;;
+    *) echo "Worker URL must use HTTPS, or HTTP on an exact loopback host" >&2; return 1 ;;
+  esac
+  case "$WORKER_AUTHORITY" in ''|*/*) echo "Worker URL must contain only an origin" >&2; return 1 ;; esac
+  WORKER_HOST=$WORKER_AUTHORITY
+  case "$WORKER_AUTHORITY" in
+    \[*\]:*)
+      WORKER_HOST=${WORKER_AUTHORITY%%]*}
+      WORKER_HOST=${WORKER_HOST#\[}
+      WORKER_PORT=${WORKER_AUTHORITY#*]:}
+      case "$WORKER_PORT" in ''|*[!0-9]*) echo "Worker URL port is invalid" >&2; return 1 ;; esac
+      ;;
+    \[*\]) WORKER_HOST=${WORKER_AUTHORITY#\[}; WORKER_HOST=${WORKER_HOST%\]} ;;
+    *:*)
+      WORKER_HOST=${WORKER_AUTHORITY%:*}
+      WORKER_PORT=${WORKER_AUTHORITY##*:}
+      case "$WORKER_HOST" in ''|*:*) echo "Worker URL authority is invalid" >&2; return 1 ;; esac
+      case "$WORKER_PORT" in ''|*[!0-9]*) echo "Worker URL port is invalid" >&2; return 1 ;; esac
+      ;;
+  esac
+  [ -n "$WORKER_HOST" ] || { echo "Worker URL host is required" >&2; return 1; }
+  if [ "$WORKER_PLAIN_HTTP" = true ]; then
+    case "$WORKER_HOST" in
+      localhost|::1) ;;
+      127.*)
+        printf '%s\n' "$WORKER_HOST" | grep -Eq '^127\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || {
+          echo "Plain HTTP is allowed only for an exact localhost or loopback IP" >&2
+          return 1
+        }
+        OLD_IFS=$IFS; IFS=.; set -- $WORKER_HOST; IFS=$OLD_IFS
+        for WORKER_OCTET in "$@"; do
+          [ "$WORKER_OCTET" -le 255 ] || {
+            echo "Plain HTTP is allowed only for an exact localhost or loopback IP" >&2
+            return 1
+          }
+        done
+        ;;
+      *) echo "Plain HTTP is allowed only for an exact localhost or loopback IP" >&2; return 1 ;;
+    esac
+  fi
+  printf '%s' "$WORKER_ORIGIN"
+}
+
+worker_origin_curl() {
+  case "$SERVER_URL" in
+    https://*) curl --proto '=https' --proto-redir '=https' "$@" ;;
+    http://*) curl --proto '=http' "$@" ;;
+  esac
+}
+
+worker_origin_curl_follow() {
+  case "$SERVER_URL" in
+    https://*) curl --proto '=https' --proto-redir '=https' -L "$@" ;;
+    http://*) curl --proto '=http' "$@" ;;
+  esac
+}
+
 usage() {
   echo "usage: agentbox-worker setup --server <url> --token <pairing-token>" >&2
   echo "       agentbox-worker run|status|recover-update --restore-previous" >&2
@@ -28,7 +94,7 @@ setup_worker() {
       *) usage ;;
     esac
   done
-  case "$SERVER_URL" in http://*|https://*) ;; *) usage ;; esac
+  SERVER_URL=$(normalize_worker_origin "$SERVER_URL") || exit 2
   [ -n "$TOKEN" ] || usage
   command -v curl >/dev/null || { echo "curl is required" >&2; exit 1; }
   command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
@@ -58,7 +124,7 @@ setup_worker() {
     --arg previousCredential "$PREVIOUS_CREDENTIAL" \
     '{pairingToken:$pairingToken,serverId:$serverId,name:$name,hostname:$hostname,os:"linux",arch:$arch,capabilities:$capabilities}
      + (if $previousCredential == "" then {} else {previousCredential:$previousCredential} end)')
-  RESPONSE=$(curl -fsS -X POST "$SERVER_URL/api/servers/register" -H 'Content-Type: application/json' --data "$BODY")
+  RESPONSE=$(worker_origin_curl -fsS -X POST "$SERVER_URL/api/servers/register" -H 'Content-Type: application/json' --data "$BODY")
   CREDENTIAL=$(printf '%s' "$RESPONSE" | sed -n 's/.*"credential":"\([^"]*\)".*/\1/p')
   [ -n "$CREDENTIAL" ] || { echo "registration response was invalid" >&2; exit 1; }
 
@@ -714,7 +780,7 @@ worker_request() (
   shift
   RESPONSE_HEADERS=$(mktemp)
   trap 'rm -f "$RESPONSE_HEADERS"' EXIT
-  RESPONSE_STATUS=$(curl -sS --connect-timeout 10 --max-time 30 \
+  RESPONSE_STATUS=$(worker_origin_curl -sS --connect-timeout 10 --max-time 30 \
     -o "$RESPONSE_FILE" -D "$RESPONSE_HEADERS" -w '%{http_code}' \
     -H 'X-AgentBox-Worker-Protocol-Min: 1' \
     -H 'X-AgentBox-Worker-Protocol-Max: 1' "$@") || return 1
@@ -1324,7 +1390,7 @@ refresh_microsandbox_driver() (
   install -d -m 0700 "$STATE_DIR/go" "$STATE_DIR/go-mod-cache" "$STATE_DIR/go-build-cache"
   BUILD_DIR=$(mktemp -d "$STATE_DIR/microsandbox-driver.XXXXXX") || return 1
   trap 'rm -rf "$BUILD_DIR"' EXIT
-  if ! curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$BUILD_DIR/main.go"; then
+  if ! worker_origin_curl_follow -fsS "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$BUILD_DIR/main.go"; then
     return 1
   fi
   cat > "$BUILD_DIR/go.mod" <<'EOF'
@@ -1392,7 +1458,7 @@ update_worker() (
 
   WORKER_TMP=$(mktemp "$STATE_DIR/agentbox-worker.XXXXXX") || return 1
   WORKER_HEADERS=$(mktemp "$STATE_DIR/agentbox-worker-headers.XXXXXX") || { rm -f "$WORKER_TMP"; return 1; }
-  if ! curl -fsSL -D "$WORKER_HEADERS" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH&version=$TARGET_VERSION" -o "$WORKER_TMP"; then
+  if ! worker_origin_curl_follow -fsS -D "$WORKER_HEADERS" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH&version=$TARGET_VERSION" -o "$WORKER_TMP"; then
     rm -f "$WORKER_TMP" "$WORKER_HEADERS"
     return 1
   fi
@@ -1405,14 +1471,15 @@ update_worker() (
     rm -f "$WORKER_TMP"
     return 1
   }
-  if [ -n "$EXPECTED_SHA256" ]; then
-    if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
-      echo "downloaded Worker checksum mismatch (expected $EXPECTED_SHA256, got $ACTUAL_SHA256)" >&2
-      rm -f "$WORKER_TMP"
-      return 1
-    fi
-  else
-    echo "warning: the server did not provide a Worker checksum; skipping integrity verification" >&2
+  if [ -z "$EXPECTED_SHA256" ]; then
+    echo "the server did not provide a Worker checksum; refusing to update" >&2
+    rm -f "$WORKER_TMP"
+    return 1
+  fi
+  if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+    echo "downloaded Worker checksum mismatch (expected $EXPECTED_SHA256, got $ACTUAL_SHA256)" >&2
+    rm -f "$WORKER_TMP"
+    return 1
   fi
   chmod 0755 "$WORKER_TMP" || { rm -f "$WORKER_TMP"; return 1; }
   DOWNLOADED_VERSION=$("$WORKER_TMP" version 2>/dev/null || true)
@@ -4053,20 +4120,23 @@ install_sandbox_extensions() (
   done
 )
 
-validate_sandbox_network_policy() {
-  case "$2" in
+validate_sandbox_network_policy_value() {
+  case "$1" in
     none|egress) ;;
-    restricted)
-      if [ "$1" != boxlite ]; then
-        echo "stage network-policy failed: restricted network is only supported by BoxLite" >&2
-        return 1
-      fi
-      ;;
+    restricted) ;;
     *)
-      echo "stage network-policy failed: unsupported network policy: $2" >&2
+      echo "stage network-policy failed: unsupported network policy: $1" >&2
       return 1
       ;;
   esac
+}
+
+validate_sandbox_network_policy() {
+  validate_sandbox_network_policy_value "$2" || return 1
+  if [ "$2" = restricted ] && [ "$1" != boxlite ]; then
+    echo "stage network-policy failed: restricted network is only supported by BoxLite" >&2
+    return 1
+  fi
 }
 
 effective_sandbox_network_policy() {
@@ -4075,8 +4145,43 @@ effective_sandbox_network_policy() {
   elif [ "$1" = boxlite ]; then
     printf restricted
   else
-    printf egress
+    printf none
   fi
+}
+
+enforce_docker_network_policy() {
+  TARGET=$1
+  EXPECTED_NETWORK=$2
+  if ! NETWORK_SNAPSHOT=$(docker inspect -f '{{.HostConfig.NetworkMode}}|{{range $name, $config := .NetworkSettings.Networks}}{{printf "%s," $name}}{{end}}' "$TARGET"); then
+    if ! docker stop --time 10 "$TARGET" >/dev/null 2>&1; then
+      echo "stage network-policy failed: Docker could not inspect network attachments for $TARGET or stop it" >&2
+      return 1
+    fi
+    echo "stage network-policy failed: Docker could not inspect network attachments for $TARGET; the sandbox was stopped" >&2
+    return 1
+  fi
+  case "$NETWORK_SNAPSHOT" in
+    *'|'*) ;;
+    *)
+      if ! docker stop --time 10 "$TARGET" >/dev/null 2>&1; then
+        echo "stage network-policy failed: Docker returned an invalid network snapshot for $TARGET and it could not be stopped" >&2
+        return 1
+      fi
+      echo "stage network-policy failed: Docker returned an invalid network snapshot for $TARGET; the sandbox was stopped" >&2
+      return 1
+      ;;
+  esac
+  ACTUAL_NETWORK=${NETWORK_SNAPSHOT%%|*}
+  ACTUAL_NETWORKS=${NETWORK_SNAPSHOT#*|}
+  case "$EXPECTED_NETWORK:$ACTUAL_NETWORK:$ACTUAL_NETWORKS" in
+    none:none:|none:none:none,|restricted:none:|restricted:none:none,|egress:default:|egress:default:bridge,|egress:bridge:|egress:bridge:bridge,) return 0 ;;
+  esac
+  if ! docker stop --time 10 "$TARGET" >/dev/null 2>&1; then
+    echo "stage network-policy failed: existing Docker sandbox uses mode $ACTUAL_NETWORK with attached networks ${ACTUAL_NETWORKS:-none} but requires $EXPECTED_NETWORK, and could not be stopped" >&2
+    return 1
+  fi
+  echo "stage network-policy failed: existing Docker sandbox uses mode $ACTUAL_NETWORK with attached networks ${ACTUAL_NETWORKS:-none} but requires $EXPECTED_NETWORK; recreate it before reuse" >&2
+  return 1
 }
 
 create_sandbox() {
@@ -4101,7 +4206,13 @@ create_sandbox() {
   SANDBOX_PREEXISTED=false
   SANDBOX_VOLUME_PREEXISTED=false
 
-  validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
+  # Reject corrupt policy values before inspecting or stopping any runtime.
+  validate_sandbox_network_policy_value "$NETWORK" || return 1
+  # Docker cannot create "restricted", but an existing bridge-attached
+  # container must be quarantined before returning that capability error.
+  if [ "$DRIVER" != docker ]; then
+    validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
+  fi
 
   report_job_progress runtime-check "正在检查 $DRIVER 运行时"
 
@@ -4133,10 +4244,18 @@ create_sandbox() {
       SANDBOX_PREEXISTED=true
       OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET")
       [ "$OWNER" = "$SANDBOX_ID" ] || { echo "container name collision: $TARGET" >&2; return 1; }
+      if ! enforce_docker_network_policy "$TARGET" "$NETWORK"; then
+        if [ "$NETWORK" = restricted ]; then
+          validate_sandbox_network_policy "$DRIVER" "$NETWORK" || true
+        fi
+        return 1
+      fi
+      validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
       record_create_resource docker-stop "$TARGET" "$SANDBOX_ID"
       report_job_progress runtime-create "正在启动已有沙箱实例"
       docker start "$TARGET" >/dev/null
     else
+      validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
       RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")
       report_job_progress runtime-create "正在创建 Docker 沙箱实例"
       if ! FOUND=$(command docker volume ls --filter "name=^$VOLUME$" --format '{{.Name}}'); then
@@ -4341,7 +4460,7 @@ start_sandbox() {
   JOB_FILE=$1
   DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
   NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
-  validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
+  validate_sandbox_network_policy_value "$NETWORK" || return 1
   EXTERNAL_ID=$(jq -r '.job.payload.externalId // empty' "$JOB_FILE")
   if [ -z "$EXTERNAL_ID" ]; then
     create_sandbox "$JOB_FILE"
@@ -4354,8 +4473,16 @@ start_sandbox() {
   report_job_progress runtime-start "正在启动沙箱实例"
   if [ "$DRIVER" = docker ]; then
     docker inspect "$TARGET" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
+    if ! enforce_docker_network_policy "$TARGET" "$NETWORK"; then
+      if [ "$NETWORK" = restricted ]; then
+        validate_sandbox_network_policy "$DRIVER" "$NETWORK" || true
+      fi
+      return 1
+    fi
+    validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
     docker start "$TARGET" >/dev/null || return 1
   else
+    validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
     runtime_call "$DRIVER" start "$TARGET" >/dev/null || return 1
     WORKDIR=$(jq -r '.job.payload.workdir // "/workspace"' "$JOB_FILE")
     if [ "$DRIVER" = boxlite ]; then
@@ -4387,7 +4514,20 @@ restart_sandbox() {
   JOB_FILE=$1
   DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
   NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
-  validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
+  validate_sandbox_network_policy_value "$NETWORK" || return 1
+  if [ "$DRIVER" = docker ]; then
+    TARGET=$(sandbox_container_name "$JOB_FILE")
+    docker inspect "$TARGET" >/dev/null 2>&1 || { echo "sandbox container not found" >&2; return 1; }
+    if ! enforce_docker_network_policy "$TARGET" "$NETWORK"; then
+      if [ "$NETWORK" = restricted ]; then
+        validate_sandbox_network_policy "$DRIVER" "$NETWORK" || true
+      fi
+      return 1
+    fi
+    validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
+  else
+    validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
+  fi
   stop_sandbox "$JOB_FILE" >/dev/null || return 1
   start_sandbox "$JOB_FILE"
 }
@@ -5093,11 +5233,11 @@ heartbeat_loop() {
       '{capabilities:$capabilities,workerVersion:$workerVersion}
        + (if $inventory == null then {} else {inventory:$inventory} end)')
     HEARTBEAT_SENT=true
-    if ! curl -fsS -X POST "$SERVER_URL/api/servers/$SERVER_ID/heartbeat" \
+    if ! worker_origin_curl -fsS -X POST "$SERVER_URL/api/servers/$SERVER_ID/heartbeat" \
       -H "Authorization: Bearer $CREDENTIAL" \
       -H 'Content-Type: application/json' --data "$HEARTBEAT" >/dev/null 2>&1; then
       LEGACY_HEARTBEAT=$(printf '%s' "$HEARTBEAT" | jq 'del(.workerVersion)')
-      curl -fsS -X POST "$SERVER_URL/api/servers/$SERVER_ID/heartbeat" \
+      worker_origin_curl -fsS -X POST "$SERVER_URL/api/servers/$SERVER_ID/heartbeat" \
         -H "Authorization: Bearer $CREDENTIAL" \
         -H 'Content-Type: application/json' --data "$LEGACY_HEARTBEAT" >/dev/null 2>&1 || HEARTBEAT_SENT=false
     fi
@@ -5118,6 +5258,8 @@ run_worker() {
   SERVER_URL=$(sed -n '1p' "$CONFIG")
   SERVER_ID=$(sed -n '2p' "$CONFIG")
   CREDENTIAL=$(sed -n '3p' "$CONFIG")
+  SERVER_URL=$(normalize_worker_origin "$SERVER_URL") || exit 1
+  [ -n "$SERVER_ID" ] && [ -n "$CREDENTIAL" ] || { echo "worker configuration is invalid" >&2; exit 1; }
   # Confirm a freshly installed Worker before any potentially slow runtime
   # discovery. The rollback timer is intentionally short so a broken binary
   # cannot leave the server unmanaged.

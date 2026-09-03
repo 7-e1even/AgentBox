@@ -27,21 +27,45 @@ func (s *Server) authStatus(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
-	s.writeJSON(w, http.StatusOK, map[string]bool{"needsSetup": needsSetup})
+	s.writeJSON(w, http.StatusOK, map[string]bool{
+		"needsSetup": needsSetup, "setupCodeRequired": needsSetup,
+	})
 }
 
 func (s *Server) setupAdmin(w http.ResponseWriter, request *http.Request) {
-	var input platform.UserInput
+	var input struct {
+		platform.UserInput
+		SetupCode string `json:"setupCode"`
+	}
 	if !s.decodeJSON(w, request, &input) {
 		return
 	}
+	if !s.setupLimiter.allow(s.clientIP(request), time.Now().UTC()) {
+		w.Header().Set("Retry-After", "60")
+		s.writeError(w, http.StatusTooManyRequests, "初始化尝试过于频繁，请稍后再试")
+		return
+	}
+	if err := s.setupGate.acquire(input.SetupCode); err != nil {
+		switch {
+		case errors.Is(err, errSetupBusy):
+			w.Header().Set("Retry-After", "1")
+			s.writeError(w, http.StatusTooManyRequests, "管理员初始化正在进行")
+		case errors.Is(err, errSetupCodeUnavailable):
+			s.writeError(w, http.StatusServiceUnavailable, "首次启动初始化码不可用，请重启服务")
+		default:
+			s.writeError(w, http.StatusForbidden, "首次启动初始化码无效")
+		}
+		return
+	}
+	succeeded := false
+	defer func() { s.setupGate.release(succeeded) }()
 	token, tokenHash, err := newSessionToken()
 	if err != nil {
 		s.handleError(w, err)
 		return
 	}
 	expiresAt := time.Now().UTC().Add(sessionLifetime)
-	user, err := s.store.SetupAdmin(request.Context(), input, tokenHash, expiresAt)
+	user, err := s.store.SetupAdmin(request.Context(), input.UserInput, tokenHash, expiresAt)
 	if err != nil {
 		s.recordLog(request, platform.LogEntry{
 			Level: platform.LogLevelWarn, Category: platform.LogCategoryAuth, Action: "setup-admin",
@@ -51,6 +75,7 @@ func (s *Server) setupAdmin(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
+	succeeded = true
 	s.setSessionCookie(w, request, token, expiresAt)
 	s.writeJSON(w, http.StatusCreated, map[string]any{"user": user})
 }
@@ -132,6 +157,7 @@ func (s *Server) updateCurrentUser(w http.ResponseWriter, request *http.Request)
 				s.handleError(w, err)
 				return
 			}
+			s.revokeUserSandboxSessions(current.ID)
 			s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 			return
 		}
@@ -144,6 +170,9 @@ func (s *Server) updateCurrentUser(w http.ResponseWriter, request *http.Request)
 		s.recordLog(request, entry)
 		s.handleError(w, err)
 		return
+	}
+	if input.Password != "" {
+		s.revokeUserSandboxSessions(current.ID)
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
@@ -179,6 +208,7 @@ func (s *Server) logout(w http.ResponseWriter, request *http.Request) {
 			s.handleError(w, err)
 			return
 		}
+		s.revokeLoginSandboxSessions(sessionKey(tokenHash))
 	}
 	s.clearSessionCookie(w, request)
 	w.WriteHeader(http.StatusNoContent)
@@ -232,6 +262,9 @@ func (s *Server) updateUser(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
+	// Administrative user edits can alter password, status, or role. Revoke all
+	// previously authorized privileged channels after the committed mutation.
+	s.revokeUserSandboxSessions(user.ID)
 	s.writeJSON(w, http.StatusOK, map[string]any{"user": user})
 }
 
@@ -251,23 +284,31 @@ func (s *Server) deleteUser(w http.ResponseWriter, request *http.Request) {
 		s.handleError(w, err)
 		return
 	}
+	s.revokeUserSandboxSessions(request.PathValue("id"))
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) requireUser(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		authEpoch := s.sessions.authorizationEpoch()
 		if s.disableAuth {
 			user, err := s.debugUser(request.Context())
 			if err != nil {
 				s.handleError(w, err)
 				return
 			}
-			next.ServeHTTP(w, request.WithContext(withUserAuditContext(request.Context(), user)))
+			ctx := withUserAuditContext(request.Context(), user)
+			ctx = withSessionAuthorization(ctx, user, "debug:"+user.ID, authEpoch)
+			next.ServeHTTP(w, request.WithContext(ctx))
 			return
 		}
 		tokenHash, ok := sessionHash(request)
 		if !ok {
 			s.writeError(w, http.StatusUnauthorized, "请先登录")
+			return
+		}
+		if !s.validCookieRequestSource(request) {
+			s.writeError(w, http.StatusForbidden, "请求来源不被允许")
 			return
 		}
 		user, err := s.store.UserBySession(request.Context(), tokenHash)
@@ -280,13 +321,32 @@ func (s *Server) requireUser(next http.Handler) http.Handler {
 			s.handleError(w, err)
 			return
 		}
-		next.ServeHTTP(w, request.WithContext(withUserAuditContext(request.Context(), user)))
+		ctx := withUserAuditContext(request.Context(), user)
+		ctx = withSessionAuthorization(ctx, user, sessionKey(tokenHash), authEpoch)
+		next.ServeHTTP(w, request.WithContext(ctx))
 	})
+}
+
+func sessionKey(tokenHash []byte) string {
+	return base64.RawURLEncoding.EncodeToString(tokenHash)
+}
+
+func withSessionAuthorization(ctx context.Context, user platform.User, key string, epoch uint64) context.Context {
+	return context.WithValue(ctx, sessionAuthorizationContextKey{}, sessionAuthorization{
+		userID: user.ID, sessionKey: key, role: user.Role,
+		actor: platform.AuditActor{Type: "user", ID: user.ID, Name: user.Name, Role: user.Role},
+		epoch: epoch,
+	})
+}
+
+func sessionAuthorizationFromContext(ctx context.Context) (sessionAuthorization, bool) {
+	authorization, ok := ctx.Value(sessionAuthorizationContextKey{}).(sessionAuthorization)
+	return authorization, ok && authorization.userID != "" && authorization.sessionKey != ""
 }
 
 func withUserAuditContext(ctx context.Context, user platform.User) context.Context {
 	ctx = context.WithValue(ctx, userContextKey{}, user)
-	return platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: user.ID, Name: user.Name})
+	return platform.WithAuditActor(ctx, platform.AuditActor{Type: "user", ID: user.ID, Name: user.Name, Role: user.Role})
 }
 
 func (s *Server) debugUser(ctx context.Context) (platform.User, error) {

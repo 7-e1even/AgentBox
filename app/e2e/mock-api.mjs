@@ -75,7 +75,10 @@ const server = createServer(async (request, response) => {
     return json(response, 200, e2eState)
   }
   if (request.method === "GET" && url.pathname === "/api/auth/status") {
-    return json(response, 200, { needsSetup: false })
+    return json(response, 200, {
+      needsSetup: false,
+      setupCodeRequired: false,
+    })
   }
   if (request.method === "POST" && url.pathname === "/api/auth/login") {
     const input = await readJSON(request)

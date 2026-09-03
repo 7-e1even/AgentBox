@@ -52,14 +52,14 @@ describe("requestJson", () => {
   })
 
   it("redirects to /login and throws on 401", async () => {
-    const assign = vi.fn()
-    vi.stubGlobal("window", { location: { assign } })
+    const replace = vi.fn()
+    vi.stubGlobal("window", { location: { replace } })
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => jsonResponse(401))
     )
     await expect(requestJson("/api/x")).rejects.toThrow("登录状态已过期")
-    expect(assign).toHaveBeenCalledWith("/login")
+    expect(replace).toHaveBeenCalledWith("/login")
   })
 
   it("surfaces the server error message", async () => {

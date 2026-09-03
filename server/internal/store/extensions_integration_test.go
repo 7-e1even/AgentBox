@@ -50,6 +50,12 @@ func extensionSandboxInput(serverID string, template platform.Resource) platform
 func TestExtensionCreationFreezesDefinitionsAndPreservesInstallationHistory(t *testing.T) {
 	s, serverID, credential, extension, template := newExtensionTestEnvironment(t)
 	ctx := t.Context()
+	adminCtx := platform.WithAuditActor(ctx, platform.AuditActor{
+		Type: "user", ID: uuid.NewString(), Role: platform.UserRoleAdmin,
+	})
+	operatorCtx := platform.WithAuditActor(ctx, platform.AuditActor{
+		Type: "user", ID: uuid.NewString(), Role: platform.UserRoleOperator,
+	})
 	proxy, err := s.CreateNetworkProxy(ctx, platform.NetworkProxyInput{
 		ID: "test-proxy", Name: "Test proxy", Scheme: "http", Host: "proxy.invalid", Port: 8080,
 		Username: "installer", Password: "special/@ password", Enabled: true,
@@ -59,10 +65,20 @@ func TestExtensionCreationFreezesDefinitionsAndPreservesInstallationHistory(t *t
 	}
 	input := extensionSandboxInput(serverID, template)
 	input.Spec["proxyId"] = proxy.ID
+	input.Spec["network"] = "egress"
 	input.Spec["extensionSnapshots"] = []any{map[string]any{"id": "forged"}}
-	sandbox, err := s.CreateResource(ctx, input)
+	if _, err := s.CreateResource(operatorCtx, input); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("operator credentialed proxy create error = %v, want ErrForbidden", err)
+	}
+	sandbox, err := s.CreateResource(adminCtx, input)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := s.AuthorizeSandboxCredentialAccess(operatorCtx, sandbox.ID); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("operator credentialed proxy access error = %v, want ErrForbidden", err)
+	}
+	if err := s.AuthorizeSandboxCredentialAccess(adminCtx, sandbox.ID); err != nil {
+		t.Fatalf("admin credentialed proxy access: %v", err)
 	}
 	if err := s.DeleteResource(ctx, extension.ID); !errors.Is(err, ErrConflict) {
 		t.Fatalf("delete referenced extension = %v", err)
@@ -114,13 +130,13 @@ func TestExtensionCreationFreezesDefinitionsAndPreservesInstallationHistory(t *t
 	changed := sandbox.Input
 	changed.Spec = maps.Clone(sandbox.Spec)
 	changed.Spec["extensionIds"] = []string{}
-	if _, err := s.UpdateResource(ctx, sandbox.ID, changed); !platform.IsValidationError(err) {
+	if _, err := s.UpdateResource(adminCtx, sandbox.ID, changed); !platform.IsValidationError(err) {
 		t.Fatalf("changed creation-only extensions = %v", err)
 	}
 	changed.Spec = maps.Clone(sandbox.Spec)
 	changed.Spec["extensionSnapshots"] = []any{}
 	changed.Spec["extensionStates"] = []any{}
-	if _, err := s.UpdateResource(ctx, sandbox.ID, changed); err != nil {
+	if _, err := s.UpdateResource(adminCtx, sandbox.ID, changed); err != nil {
 		t.Fatal(err)
 	}
 	template.Spec["extensionIds"] = []string{}
@@ -136,10 +152,10 @@ func TestExtensionCreationFreezesDefinitionsAndPreservesInstallationHistory(t *t
 		t.Fatal(err)
 	}
 	sandbox.Name = "Renamed after extension disabled"
-	if _, err := s.UpdateResource(ctx, sandbox.ID, sandbox.Input); err != nil {
+	if _, err := s.UpdateResource(adminCtx, sandbox.ID, sandbox.Input); err != nil {
 		t.Fatalf("existing sandbox should remain editable after extension is disabled: %v", err)
 	}
-	if _, err := s.OperateSandbox(ctx, sandbox.ID, "restart"); err != nil {
+	if _, err := s.OperateSandbox(adminCtx, sandbox.ID, "restart"); err != nil {
 		t.Fatal(err)
 	}
 	restart, err := s.ClaimWorkerJob(ctx, serverID, credential)

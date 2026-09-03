@@ -43,6 +43,7 @@ var (
 	ErrWorkerUnauthorized  = errors.New("worker unauthorized")
 	ErrRuntimeUnauthorized = errors.New("runtime credential unauthorized")
 	ErrUnauthorized        = errors.New("user unauthorized")
+	ErrForbidden           = errors.New("operation forbidden")
 	ErrNoJob               = errors.New("no worker job available")
 	ErrProviderUnavailable = errors.New("Provider 服务不可用")
 )
@@ -53,11 +54,12 @@ const (
 	workerJobAutomaticRetryLimit = 3
 	workerJobActivityWritePeriod = 15 * time.Second
 	runtimeLLMTokenTTL           = 30 * 24 * time.Hour
+	runtimeLLMTokenMaxBytes      = 4096
 	// controlPlaneMutationLockKey serializes low-frequency mutations whose
 	// references live in JSONB and therefore cannot be protected by foreign keys.
 	controlPlaneMutationLockKey int64 = 0x4147424d55544154
 	resourceUpdateSpecSQL             = `CASE WHEN kind = 'sandbox' THEN
-		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation' - 'agentToolVersions' - 'agentToolOperation' - 'automationId' - 'automationRunId' - 'extensionSnapshots' - 'extensionStates' - 'runtimeModelSources' - 'runtimeModelSourcesComplete' - 'runtimeModelTokenEpoch') || jsonb_build_object(
+		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation' - 'agentToolVersions' - 'agentToolOperation' - 'automationId' - 'automationRunId' - 'extensionSnapshots' - 'extensionStates' - 'runtimeModelSources' - 'runtimeModelSourcesComplete' - 'runtimeModelTokenEpoch' - 'credentialedProxyIdAtCreation') || jsonb_build_object(
 			'status', spec->'status',
 			'message', spec->'message',
 			'externalId', spec->'externalId',
@@ -80,6 +82,9 @@ const (
 			ELSE '{}'::jsonb END
 		|| CASE WHEN spec ? 'runtimeModelTokenEpoch'
 			THEN jsonb_build_object('runtimeModelTokenEpoch', spec->'runtimeModelTokenEpoch')
+			ELSE '{}'::jsonb END
+		|| CASE WHEN spec ? 'credentialedProxyIdAtCreation'
+			THEN jsonb_build_object('credentialedProxyIdAtCreation', spec->'credentialedProxyIdAtCreation')
 			ELSE '{}'::jsonb END
 	ELSE $5::jsonb END`
 	legacySandboxHasExplicitModelSourcesSQL = `(CASE
@@ -201,21 +206,20 @@ func lockControlPlaneReferences(ctx context.Context, tx pgx.Tx) error {
 }
 
 func (s *Store) seed(ctx context.Context) error {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin seed: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", int64(0x4147424f58)); err != nil {
-		return fmt.Errorf("lock seed: %w", err)
-	}
-	if err := seedResources(ctx, tx); err != nil {
-		return err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit seed: %w", err)
-	}
-	return nil
+	return s.withDatabaseMigrationLock(ctx, func(conn *pgxpool.Conn) error {
+		tx, err := conn.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin seed: %w", err)
+		}
+		defer tx.Rollback(ctx)
+		if err := seedResources(ctx, tx); err != nil {
+			return err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit seed: %w", err)
+		}
+		return nil
+	})
 }
 
 const janitorInterval = 5 * time.Minute
@@ -247,6 +251,9 @@ var janitorStatements = []janitorStatement{
 	    )`},
 	// Automation runs received more than 30 days ago.
 	{query: `DELETE FROM automation_runs WHERE received_at < NOW() - INTERVAL '30 days'`},
+	// The system log is the long-term record; delivered audit envelopes only
+	// need a short recovery window. Keep this off the 500 ms dispatch loop.
+	{query: `DELETE FROM audit_outbox WHERE delivered_at < NOW() - INTERVAL '7 days'`},
 	// Expired login sessions (login only cleans up opportunistically).
 	{query: `DELETE FROM user_sessions WHERE expires_at < NOW()`},
 	// A queued job is safe to fail only after the Worker's job loop has been
@@ -399,6 +406,12 @@ func (s *Store) startJanitor() {
 }
 
 func (s *Store) runJanitorPass(ctx context.Context) {
+	if err := s.runSystemLogMaintenance(ctx); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Warn("system log maintenance failed", "error", err)
+	}
 	for _, statement := range janitorStatements {
 		if _, err := s.pool.Exec(ctx, statement.query, statement.args...); err != nil {
 			if ctx.Err() != nil {
@@ -784,7 +797,7 @@ func scanCredential(row pgx.Row) (platform.ManagedCredential, error) {
 		result.Models = []platform.CredentialModel{}
 	}
 	result.Endpoint = normalizeKnownProviderEndpoint(result.Protocol, result.Endpoint)
-	result.MaskedSecret = "••••" + lastFour
+	result.MaskedSecret = secretMask
 	if lastCheckAt.Valid {
 		result.LastCheckAt = &lastCheckAt.Time
 	}
@@ -837,7 +850,7 @@ func (s *Store) CreateCredential(ctx context.Context, input platform.CredentialI
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)
     RETURNING `+credentialColumns,
 		input.ID, input.Name, input.ProviderID, input.Protocol, input.Endpoint,
-		input.ModelID, ciphertext, nonce, lastFour(input.Secret), input.Enabled, now,
+		input.ModelID, ciphertext, nonce, secretStorageMarker(input.Secret), input.Enabled, now,
 	))
 	if err != nil {
 		return platform.ManagedCredential{}, mapResourceError(err)
@@ -917,7 +930,7 @@ func (s *Store) UpdateCredential(ctx context.Context, id string, input platform.
 	last_check_error = '', updated_at = $10
 	WHERE id = $11 RETURNING `+credentialColumns,
 			input.Name, input.ProviderID, input.Protocol, input.Endpoint, input.ModelID,
-			ciphertext, nonce, lastFour(input.Secret), input.Enabled, time.Now().UTC(), id,
+			ciphertext, nonce, secretStorageMarker(input.Secret), input.Enabled, time.Now().UTC(), id,
 		))
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1037,7 +1050,7 @@ func scanNetworkProxy(row pgx.Row) (platform.ManagedNetworkProxy, error) {
 	}
 	result.HasPassword = lastFour != ""
 	if result.HasPassword {
-		result.MaskedPassword = "••••" + lastFour
+		result.MaskedPassword = secretMask
 	}
 	return result, nil
 }
@@ -1085,7 +1098,7 @@ func (s *Store) CreateNetworkProxy(ctx context.Context, input platform.NetworkPr
     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
     RETURNING `+networkProxyColumns,
 		input.ID, input.Name, input.Scheme, input.Host, input.Port, input.Username,
-		ciphertext, nonce, lastFour(input.Password), noProxyJSON, input.Enabled, now,
+		ciphertext, nonce, secretStorageMarker(input.Password), noProxyJSON, input.Enabled, now,
 	))
 	if err != nil {
 		return platform.ManagedNetworkProxy{}, mapResourceError(err)
@@ -1118,19 +1131,30 @@ func (s *Store) UpdateNetworkProxy(ctx context.Context, id string, input platfor
 	if err := lockControlPlaneMutation(ctx, tx); err != nil {
 		return platform.ManagedNetworkProxy{}, err
 	}
-	var currentEnabled bool
-	if err := tx.QueryRow(ctx, `SELECT enabled FROM network_proxies
-      WHERE id = $1 FOR UPDATE`, id).Scan(&currentEnabled); errors.Is(err, pgx.ErrNoRows) {
+	var currentEnabled, currentHasPassword bool
+	if err := tx.QueryRow(ctx, `SELECT enabled,
+      password_last_four <> ''
+      FROM network_proxies WHERE id = $1 FOR UPDATE`, id).Scan(
+		&currentEnabled, &currentHasPassword,
+	); errors.Is(err, pgx.ErrNoRows) {
 		return platform.ManagedNetworkProxy{}, ErrResourceNotFound
 	} else if err != nil {
 		return platform.ManagedNetworkProxy{}, fmt.Errorf("load network proxy for update: %w", err)
 	}
-	if currentEnabled && !input.Enabled {
+	preservesPassword := input.Password == "" && input.Username != ""
+	nextHasPassword := input.Password != ""
+	if preservesPassword {
+		nextHasPassword = currentHasPassword
+	}
+	if currentEnabled && !input.Enabled || currentHasPassword != nextHasPassword {
 		referenced, err := networkProxyIsReferenced(ctx, tx, id)
 		if err != nil {
 			return platform.ManagedNetworkProxy{}, err
 		}
 		if referenced {
+			if currentHasPassword != nextHasPassword {
+				return platform.ManagedNetworkProxy{}, fmt.Errorf("%w: referenced network proxy cannot change credential state", ErrConflict)
+			}
 			return platform.ManagedNetworkProxy{}, fmt.Errorf("%w: referenced network proxy cannot be disabled", ErrConflict)
 		}
 	}
@@ -1155,7 +1179,7 @@ func (s *Store) UpdateNetworkProxy(ctx context.Context, id string, input platfor
     no_proxy = $9, enabled = $10, updated_at = $11
     WHERE id = $12 RETURNING `+networkProxyColumns,
 			input.Name, input.Scheme, input.Host, input.Port, input.Username,
-			ciphertext, nonce, lastFour(input.Password), noProxyJSON, input.Enabled, now, id,
+			ciphertext, nonce, secretStorageMarker(input.Password), noProxyJSON, input.Enabled, now, id,
 		))
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -1340,6 +1364,15 @@ func networkProxyIsReferenced(ctx context.Context, tx pgx.Tx, id string) (bool, 
   ) OR EXISTS(
     SELECT 1 FROM worker_jobs
     WHERE payload->>'proxyId' = $1 AND status IN ('pending', 'leased')
+  ) OR EXISTS(
+    SELECT 1 FROM control_resources sandbox
+    WHERE sandbox.kind = 'sandbox' AND NOT (sandbox.spec ? 'appliedProxyId')
+      AND (
+        SELECT job.payload->>'proxyId' FROM worker_jobs job
+        WHERE job.resource_id = sandbox.id AND job.status = 'succeeded'
+          AND job.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox', 'configure-sandbox-proxy')
+        ORDER BY job.updated_at DESC, job.created_at DESC, job.id DESC LIMIT 1
+      ) = $1
   )`, id).Scan(&referenced); err != nil {
 		return false, fmt.Errorf("check network proxy bindings: %w", err)
 	}
@@ -1863,6 +1896,10 @@ func providerModelsRequest(ctx context.Context, providerID, protocol, endpoint, 
 			return nil, errors.New("该 Provider 未配置默认接口地址")
 		}
 	}
+	parsedBase, err := url.Parse(baseURL)
+	if err != nil || !strings.EqualFold(parsedBase.Scheme, "https") || parsedBase.Host == "" || parsedBase.User != nil {
+		return nil, errors.New("接口地址必须使用 HTTPS")
+	}
 	modelsURL := baseURL + "/models"
 	if protocol == "gemini" {
 		parsed, err := url.Parse(modelsURL)
@@ -1965,7 +2002,7 @@ func newSafeProviderHTTPClient() *http.Client {
 			}
 			for _, candidate := range addresses {
 				ip := candidate.IP
-				if !allowPrivate && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
+				if !platform.ProviderEndpointIPAllowed(ip, allowPrivate) {
 					continue
 				}
 				connection, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
@@ -1998,11 +2035,13 @@ func (s *Store) providerExists(providerID string) bool {
 	return false
 }
 
-func lastFour(value string) string {
-	if len(value) <= 4 {
-		return value
+const secretMask = "••••••••"
+
+func secretStorageMarker(value string) string {
+	if value == "" {
+		return ""
 	}
-	return value[len(value)-4:]
+	return "set"
 }
 
 func encryptSecret(key []byte, value string) ([]byte, []byte, error) {
@@ -2428,19 +2467,36 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	if err := json.Unmarshal(payloadJSON, &job.Payload); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("decode worker job payload: %w", err)
 	}
+	if resourceID.Valid {
+		job.ResourceID = resourceID.String
+	}
+	if err := s.attachWorkerNetworkProxy(
+		ctx, tx, job.ResourceID, job.Action, job.Payload, job.Action == "check-network-proxy",
+	); err != nil {
+		if !errors.Is(err, ErrConflict) {
+			return platform.WorkerJob{}, err
+		}
+		if err := failUnsafeSandboxProxyJob(ctx, tx, job.ID, job.ResourceID, job.Action); err != nil {
+			return platform.WorkerJob{}, err
+		}
+		ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "worker", ID: serverID})
+		if err := s.commitAudit(ctx, tx, platform.LogEntry{
+			Category: platform.LogCategoryJob, Action: "discard", ResourceKind: "job", ResourceID: job.ID,
+			Status: platform.LogStatusFailed,
+			Detail: map[string]any{"serverId": serverID, "generation": job.ResourceGeneration,
+				"errorCode": "sandbox_proxy_provenance_invalid"},
+		}); err != nil {
+			return platform.WorkerJob{}, err
+		}
+		return platform.WorkerJob{}, ErrNoJob
+	}
 	if err := s.decryptPayloadEnvironmentVariables(job.Payload); err != nil {
 		return platform.WorkerJob{}, err
 	}
 	if resourceID.Valid {
-		job.ResourceID = resourceID.String
 		if err := s.attachWorkerCredentials(ctx, tx, job.ResourceID, job.ID, job.Action, job.Payload); err != nil {
 			return platform.WorkerJob{}, err
 		}
-	}
-	if err := s.attachWorkerNetworkProxy(
-		ctx, tx, job.Payload, job.Action == "check-network-proxy",
-	); err != nil {
-		return platform.WorkerJob{}, err
 	}
 	leaseUntil := now.Add(workerJobLeaseDurationForAction(job.Action))
 	err = tx.QueryRow(ctx, `UPDATE worker_jobs SET
@@ -2548,6 +2604,8 @@ func (s *Store) attachWorkerCredentials(
 func (s *Store) attachWorkerNetworkProxy(
 	ctx context.Context,
 	tx pgx.Tx,
+	resourceID string,
+	action string,
 	payload map[string]any,
 	allowDisabled bool,
 ) error {
@@ -2555,6 +2613,14 @@ func (s *Store) attachWorkerNetworkProxy(
 	proxyID = strings.TrimSpace(proxyID)
 	if proxyID == "" {
 		return nil
+	}
+	if action != "create-sandbox" && action != "check-network-proxy" {
+		if strings.TrimSpace(resourceID) == "" {
+			return fmt.Errorf("%w: non-creation proxy job has no sandbox provenance", ErrConflict)
+		}
+		if err := validatePersistedSandboxProxyCreationProvenance(ctx, tx, strings.TrimSpace(resourceID), proxyID); err != nil {
+			return err
+		}
 	}
 	var scheme, host, username string
 	var port int
@@ -2626,6 +2692,9 @@ func (s *Store) issueRuntimeLLMTokenForEpoch(
 }
 
 func (s *Store) parseRuntimeLLMToken(token string, now time.Time) (runtimeLLMTokenClaims, error) {
+	if len(token) > runtimeLLMTokenMaxBytes {
+		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
+	}
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || parts[0] != "abxrt1" {
 		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
@@ -2644,11 +2713,9 @@ func (s *Store) parseRuntimeLLMToken(token string, now time.Time) (runtimeLLMTok
 		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
 	}
 	var claims runtimeLLMTokenClaims
-	// Epoch tokens are revoked by live sandbox state in ResolveRuntimeLLMTarget.
-	// Legacy tokens have no epoch, so their original time limit remains authoritative.
 	if err := json.Unmarshal(payload, &claims); err != nil || claims.SandboxID == "" ||
 		claims.CredentialID == "" || claims.ModelID == "" || claims.ExpiresAt <= 0 ||
-		(claims.Epoch == "" && claims.ExpiresAt <= now.Unix()) {
+		claims.ExpiresAt <= now.Unix() {
 		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
 	}
 	return claims, nil
@@ -2663,13 +2730,30 @@ func isSandboxRuntimeLifecycleAction(action string) bool {
 	return action == "create-sandbox" || action == "start-sandbox" || action == "restart-sandbox"
 }
 
+// ValidateRuntimeLLMToken authenticates the signed path claims without touching
+// PostgreSQL so HTTP admission control can run before target resolution.
+func (s *Store) ValidateRuntimeLLMToken(sandboxID, credentialID, token string) error {
+	_, err := s.validateRuntimeLLMTokenClaims(sandboxID, credentialID, token, time.Now().UTC())
+	return err
+}
+
+func (s *Store) validateRuntimeLLMTokenClaims(
+	sandboxID, credentialID, token string, now time.Time,
+) (runtimeLLMTokenClaims, error) {
+	claims, err := s.parseRuntimeLLMToken(token, now)
+	if err != nil || claims.SandboxID != sandboxID || claims.CredentialID != credentialID {
+		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
+	}
+	return claims, nil
+}
+
 func (s *Store) ResolveRuntimeLLMTarget(
 	ctx context.Context, sandboxID, credentialID, token string,
 ) (platform.RuntimeLLMTarget, error) {
 	now := time.Now().UTC()
-	claims, err := s.parseRuntimeLLMToken(token, now)
-	if err != nil || claims.SandboxID != sandboxID || claims.CredentialID != credentialID {
-		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	claims, err := s.validateRuntimeLLMTokenClaims(sandboxID, credentialID, token, now)
+	if err != nil {
+		return platform.RuntimeLLMTarget{}, err
 	}
 
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
@@ -3827,6 +3911,12 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		return nil, "", "", fmt.Errorf("decode sandbox environment template: %w", err)
 	}
 	effectiveSpec := effectiveSandboxSpec(runtimeSpec, sandbox.Spec)
+	if !creating {
+		proxyID, _ := effectiveSpec["proxyId"].(string)
+		if err := validateSandboxProxyCreationProvenance(ctx, tx, sandbox.Spec, proxyID); err != nil {
+			return nil, "", "", err
+		}
+	}
 	imageReference, _ := effectiveSpec["imageReference"].(string)
 	if imageReference == "" {
 		imageID, _ := effectiveSpec["imageId"].(string)
@@ -3966,6 +4056,11 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	if err := lockControlPlaneMutation(ctx, tx); err != nil {
 		return platform.Resource{}, err
 	}
+	if input.Kind == platform.KindRuntime || input.Kind == platform.KindSandbox {
+		if err := s.authorizeResourceCredentialedProxy(ctx, tx, id, input.Kind); err != nil {
+			return platform.Resource{}, err
+		}
+	}
 	if input.Kind == platform.KindSandbox {
 		// Configuration changes wait for an active operation to finish. We do not
 		// introduce cancellation/reconciliation of external Worker side effects.
@@ -4021,6 +4116,9 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 
 func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform.Resource, error) {
 	if action == "cancel-install" {
+		if err := s.AuthorizeSandboxCredentialAccess(ctx, id); err != nil {
+			return platform.Resource{}, err
+		}
 		return s.cancelSandboxInstallation(ctx, id)
 	}
 	workerAction := ""
@@ -4066,6 +4164,9 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 	}
 	if err := json.Unmarshal(specJSON, &resource.Spec); err != nil {
 		return platform.Resource{}, fmt.Errorf("decode sandbox operation: %w", err)
+	}
+	if err := s.authorizeSandboxCredentialedProxy(ctx, tx, id); err != nil {
+		return platform.Resource{}, err
 	}
 	var hasActiveJob bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(
@@ -4173,6 +4274,9 @@ func (s *Store) UpdateSandboxNetworkProxy(ctx context.Context, id, proxyID strin
 	if err := json.Unmarshal(specJSON, &resource.Spec); err != nil {
 		return platform.Resource{}, fmt.Errorf("decode sandbox proxy configuration: %w", err)
 	}
+	if err := s.authorizeSandboxCredentialedProxy(ctx, tx, id); err != nil {
+		return platform.Resource{}, err
+	}
 
 	var hasActiveJob bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(
@@ -4200,16 +4304,11 @@ func (s *Store) UpdateSandboxNetworkProxy(ctx context.Context, id, proxyID strin
 	if proxyID != "" && network == "none" {
 		return platform.Resource{}, &platform.ValidationError{Message: "完全隔离的环境不能使用网络代理"}
 	}
-	if proxyID != "" {
-		var available bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(
-      SELECT 1 FROM network_proxies WHERE id = $1 AND enabled = TRUE
-    )`, proxyID).Scan(&available); err != nil {
-			return platform.Resource{}, fmt.Errorf("check sandbox network proxy: %w", err)
-		}
-		if !available {
-			return platform.Resource{}, &platform.ValidationError{Message: "所选网络代理不存在或已停用"}
-		}
+	if err := s.validateNetworkProxyBinding(ctx, tx, map[string]any{"proxyId": proxyID}, "沙箱"); err != nil {
+		return platform.Resource{}, err
+	}
+	if err := rejectCredentialedSandboxProxyUpdate(ctx, tx, proxyID); err != nil {
+		return platform.Resource{}, err
 	}
 
 	previousProxyID, _ := resource.Spec["proxyId"].(string)
@@ -4290,6 +4389,9 @@ func (s *Store) UpdateSandboxModelSource(
 	}
 	if err != nil {
 		return platform.Resource{}, fmt.Errorf("load sandbox model source: %w", err)
+	}
+	if err := s.authorizeSandboxCredentialedProxy(ctx, tx, id); err != nil {
+		return platform.Resource{}, err
 	}
 	if status, _ := resource.Spec["status"].(string); status != "running" {
 		return platform.Resource{}, &platform.ValidationError{Message: "只有运行中的沙箱可以切换模型源"}
@@ -4428,6 +4530,9 @@ func (s *Store) OperateSandboxAgentTools(ctx context.Context, id, action string,
 	}
 	if err := json.Unmarshal(specJSON, &resource.Spec); err != nil {
 		return platform.Resource{}, fmt.Errorf("decode sandbox Agent tool operation: %w", err)
+	}
+	if err := s.authorizeSandboxCredentialedProxy(ctx, tx, id); err != nil {
+		return platform.Resource{}, err
 	}
 	if status, _ := resource.Spec["status"].(string); status != "running" {
 		return platform.Resource{}, fmt.Errorf("%w: sandbox must be running", ErrConflict)
@@ -4800,22 +4905,130 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 	return nil
 }
 
-func (s *Store) validateNetworkProxyBinding(ctx context.Context, tx pgx.Tx, spec map[string]any, subject string) error {
+type networkProxyQueryRow interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func rejectCredentialedSandboxProxyUpdate(ctx context.Context, query networkProxyQueryRow, proxyID string) error {
+	if proxyID == "" {
+		return nil
+	}
+	var hasPassword bool
+	if err := query.QueryRow(ctx, `SELECT password_last_four <> ''
+    FROM network_proxies WHERE id = $1`, proxyID).Scan(&hasPassword); err != nil {
+		return fmt.Errorf("check sandbox proxy credential transition: %w", err)
+	}
+	if hasPassword {
+		return fmt.Errorf("%w: 含密码的网络代理只能在创建沙箱时绑定；请新建沙箱以使用该代理", ErrConflict)
+	}
+	return nil
+}
+
+func (s *Store) validateNetworkProxyBinding(ctx context.Context, query networkProxyQueryRow, spec map[string]any, subject string) error {
 	proxyID, _ := spec["proxyId"].(string)
 	proxyID = strings.TrimSpace(proxyID)
 	if proxyID == "" {
 		return nil
 	}
-	var exists bool
-	if err := tx.QueryRow(ctx, `SELECT EXISTS(
-    SELECT 1 FROM network_proxies WHERE id = $1 AND enabled = TRUE
-  )`, proxyID).Scan(&exists); err != nil {
+	var enabled, hasPassword bool
+	if err := query.QueryRow(ctx, `SELECT enabled,
+    password_last_four <> ''
+    FROM network_proxies WHERE id = $1`, proxyID).Scan(&enabled, &hasPassword); errors.Is(err, pgx.ErrNoRows) {
+		return &platform.ValidationError{Message: subject + "包含不存在或已停用的网络代理"}
+	} else if err != nil {
 		return fmt.Errorf("check network proxy binding: %w", err)
 	}
-	if !exists {
+	if !enabled {
 		return &platform.ValidationError{Message: subject + "包含不存在或已停用的网络代理"}
 	}
+	if hasPassword && !credentialedProxyActorAllowed(ctx) {
+		return fmt.Errorf("%w: 含密码的网络代理仅限管理员使用", ErrForbidden)
+	}
 	return nil
+}
+
+// AuthorizeSandboxCredentialAccess protects every path that can operate or
+// enter a sandbox whose desired or already-applied proxy contains a reusable
+// upstream password.
+func (s *Store) AuthorizeSandboxCredentialAccess(ctx context.Context, sandboxID string) error {
+	return s.authorizeSandboxCredentialedProxy(ctx, s.pool, sandboxID)
+}
+
+func (s *Store) authorizeResourceCredentialedProxy(
+	ctx context.Context,
+	query networkProxyQueryRow,
+	resourceID string,
+	kind platform.Kind,
+) error {
+	if kind == platform.KindSandbox {
+		return s.authorizeSandboxCredentialedProxy(ctx, query, resourceID)
+	}
+	var proxyID string
+	if err := query.QueryRow(ctx, `SELECT COALESCE(spec->>'proxyId', '')
+    FROM control_resources WHERE id = $1 AND kind = $2`, resourceID, kind).Scan(&proxyID); errors.Is(err, pgx.ErrNoRows) {
+		return ErrResourceNotFound
+	} else if err != nil {
+		return fmt.Errorf("load resource network proxy: %w", err)
+	}
+	return s.authorizeCredentialedProxyIDs(ctx, query, proxyID, "")
+}
+
+func (s *Store) authorizeSandboxCredentialedProxy(
+	ctx context.Context,
+	query networkProxyQueryRow,
+	sandboxID string,
+) error {
+	var desiredProxyID, appliedProxyID string
+	var hasAppliedProxySnapshot bool
+	err := query.QueryRow(ctx, `SELECT
+      CASE WHEN sandbox.spec ? 'proxyId'
+        THEN COALESCE(sandbox.spec->>'proxyId', '')
+        ELSE COALESCE(runtime.spec->>'proxyId', '')
+      END,
+      COALESCE(sandbox.spec->>'appliedProxyId', ''),
+      sandbox.spec ? 'appliedProxyId'
+    FROM control_resources sandbox
+    LEFT JOIN control_resources runtime
+      ON runtime.id = sandbox.spec->>'runtimeId' AND runtime.kind = 'runtime'
+    WHERE sandbox.id = $1 AND sandbox.kind = 'sandbox'`, sandboxID).Scan(
+		&desiredProxyID, &appliedProxyID, &hasAppliedProxySnapshot,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrResourceNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("load sandbox credentialed proxy state: %w", err)
+	}
+	if !credentialedProxyActorAllowed(ctx) && !hasAppliedProxySnapshot {
+		return fmt.Errorf("%w: 旧版沙箱的已应用代理凭据状态未知，仅限管理员操作", ErrForbidden)
+	}
+	return s.authorizeCredentialedProxyIDs(ctx, query, desiredProxyID, appliedProxyID)
+}
+
+func (s *Store) authorizeCredentialedProxyIDs(
+	ctx context.Context,
+	query networkProxyQueryRow,
+	desiredProxyID, appliedProxyID string,
+) error {
+	if credentialedProxyActorAllowed(ctx) {
+		return nil
+	}
+	var hasPassword bool
+	if err := query.QueryRow(ctx, `SELECT EXISTS(
+      SELECT 1 FROM network_proxies
+      WHERE id IN ($1, $2) AND password_last_four <> ''
+    )`, strings.TrimSpace(desiredProxyID), strings.TrimSpace(appliedProxyID)).Scan(&hasPassword); err != nil {
+		return fmt.Errorf("check sandbox credentialed proxy state: %w", err)
+	}
+	if hasPassword {
+		return fmt.Errorf("%w: 含密码的网络代理工作负载仅限管理员操作", ErrForbidden)
+	}
+	return nil
+}
+
+func credentialedProxyActorAllowed(ctx context.Context) bool {
+	actor := platform.AuditActorFromContext(ctx)
+	return actor.Type == "user" && actor.Role == platform.UserRoleAdmin
 }
 
 func incompatibleAgentTools(agentTools []string, protocols map[string]bool) []string {

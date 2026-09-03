@@ -1013,7 +1013,7 @@ export function ControlPlaneShell({
       await fetch("/api/auth/logout", { method: "POST" })
     } finally {
       setNavigationBlocked(false)
-      window.location.assign("/login")
+      window.location.replace("/login")
     }
   }
 

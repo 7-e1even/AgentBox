@@ -53,6 +53,9 @@ export function buildWorkerAddressCandidates({
 
 export function normalizeHttpOrigin(value: string | undefined) {
   const parsed = parseHttpURL(value)
+  if (parsed?.protocol === "http:" && !isLoopbackHostname(parsed.hostname)) {
+    return null
+  }
   return parsed?.origin ?? null
 }
 
@@ -71,10 +74,12 @@ function parseHttpURL(value: string | undefined) {
 
 function isLoopbackHostname(hostname: string) {
   const normalized = hostname.replace(/^\[|\]$/g, "").toLowerCase()
+  if (normalized === "localhost" || normalized === "::1") return true
+  const octets = normalized.split(".")
   return (
-    normalized === "localhost" ||
-    normalized === "::1" ||
-    normalized.startsWith("127.")
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.every((octet) => /^\d{1,3}$/.test(octet) && Number(octet) <= 255)
   )
 }
 

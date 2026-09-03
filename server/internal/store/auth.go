@@ -47,10 +47,6 @@ func (s *Store) SetupAdmin(ctx context.Context, input platform.UserInput, sessio
 	if err := platform.ValidateUserInput(input, true); err != nil {
 		return platform.User{}, err
 	}
-	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
-	if err != nil {
-		return platform.User{}, fmt.Errorf("hash password: %w", err)
-	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return platform.User{}, fmt.Errorf("begin user setup: %w", err)
@@ -65,6 +61,12 @@ func (s *Store) SetupAdmin(ctx context.Context, input platform.UserInput, sessio
 	}
 	if count != 0 {
 		return platform.User{}, ErrConflict
+	}
+	// Hash only after the cross-process setup lock and completed-setup check.
+	// Losing concurrent requests and all post-setup requests avoid bcrypt work.
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return platform.User{}, fmt.Errorf("hash password: %w", err)
 	}
 	now := time.Now().UTC()
 	user, err := scanUser(tx.QueryRow(ctx, `INSERT INTO users

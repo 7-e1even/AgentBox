@@ -142,6 +142,9 @@ func TestSandboxUpdatesPreserveWorkerManagedLifecycleFields(t *testing.T) {
 		`- 'runtimeModelTokenEpoch'`,
 		`CASE WHEN spec ? 'runtimeModelTokenEpoch'`,
 		`'runtimeModelTokenEpoch', spec->'runtimeModelTokenEpoch'`,
+		`- 'credentialedProxyIdAtCreation'`,
+		`CASE WHEN spec ? 'credentialedProxyIdAtCreation'`,
+		`'credentialedProxyIdAtCreation', spec->'credentialedProxyIdAtCreation'`,
 	} {
 		if !strings.Contains(resourceUpdateSpecSQL, expected) {
 			t.Fatalf("sandbox update does not preserve Worker-managed field %q", expected)

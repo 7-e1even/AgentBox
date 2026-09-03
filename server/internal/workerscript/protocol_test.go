@@ -67,6 +67,7 @@ func TestWorkerRequestValidatesActualShellResponses(t *testing.T) {
   fi
   printf '%s' "$TEST_STATUS"
 }
+worker_origin_curl() { curl "$@"; }
 `
 			command := exec.CommandContext(t.Context(), sh, "-s")
 			command.Env = append(command.Environ(), "TEST_STATUS="+test.status, "TEST_SELECTED="+test.selected)

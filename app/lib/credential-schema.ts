@@ -12,7 +12,15 @@ export const credentialInputSchema = z.object({
   protocol: z.enum(["openai-responses", "openai-chat", "anthropic", "gemini"]),
   endpoint: z.union([
     z.literal(""),
-    z.string().trim().url("请输入有效的接口地址").max(500),
+    z
+      .string()
+      .trim()
+      .url("请输入有效的接口地址")
+      .max(500)
+      .refine(
+        (value) => new URL(value).protocol === "https:",
+        "接口地址必须使用 HTTPS"
+      ),
   ]),
   modelId: z.string().trim().max(160),
   secret: z

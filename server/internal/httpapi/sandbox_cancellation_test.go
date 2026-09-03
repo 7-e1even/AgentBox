@@ -42,6 +42,7 @@ func TestWorkerCancellationControlValidatesExactGenerationAndForwardsAuthenticat
 			storage := &cancellationControlStore{}
 			handler := New(storage, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{})
 			request := httptest.NewRequest(http.MethodPost, "/api/servers/server-id/jobs/job-id/control", strings.NewReader(test.body))
+			request.Header.Set("Content-Type", "application/json")
 			request.Header.Set("Authorization", "Bearer worker-token")
 			response := httptest.NewRecorder()
 			handler.ServeHTTP(response, request)
@@ -64,6 +65,7 @@ func TestWorkerCancellationControlRejectsInvalidWorkerCredential(t *testing.T) {
 	storage := &cancellationControlStore{err: store.ErrWorkerUnauthorized}
 	handler := New(storage, catalog.BuiltinCatalog, slog.New(slog.NewTextHandler(io.Discard, nil)), nil, Config{})
 	request := httptest.NewRequest(http.MethodPost, "/api/servers/server-id/jobs/job-id/control", strings.NewReader(`{"leaseGeneration":1}`))
+	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusUnauthorized {

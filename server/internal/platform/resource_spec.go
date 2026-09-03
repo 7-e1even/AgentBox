@@ -104,7 +104,7 @@ var sandboxObservedSpecFields = []string{
 	"status", "message", "externalId", "provisioning", "appliedProxyId", "proxyOperation",
 	"agentToolVersions", "agentToolOperation", "automationId", "automationRunId",
 	"extensionSnapshots", "extensionStates", "runtimeModelSources", "runtimeModelSourcesComplete",
-	"runtimeModelTokenEpoch",
+	"runtimeModelTokenEpoch", "credentialedProxyIdAtCreation",
 }
 
 func DesiredResourceSpec(kind Kind, spec map[string]any) map[string]any {

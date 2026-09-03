@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"agentbox/internal/platform"
 	"agentbox/internal/store"
@@ -190,6 +191,12 @@ func (s *Server) getAutomationRun(w http.ResponseWriter, request *http.Request) 
 }
 
 func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.Request) {
+	clientIP := s.clientIP(request)
+	if s.webhookLimiter != nil && !s.webhookLimiter.allowPreAuthentication(clientIP, time.Now()) {
+		w.Header().Set("Retry-After", "60")
+		s.writeAutomationWebhookError(w, http.StatusTooManyRequests, "rate_limited", "Webhook 请求过于频繁", true)
+		return
+	}
 	// endpoint_id 是 UUID 列：非法格式会让 Postgres 转型报错，
 	// 提前拦截，避免把 "地址不存在" 误报成 500。
 	if _, err := uuid.Parse(request.PathValue("endpointId")); err != nil {
@@ -219,6 +226,12 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 			query[key] = values
 		}
 	}
+	reservedAt := time.Now()
+	if s.webhookLimiter != nil && !s.webhookLimiter.reserveBusinessCapacity(request.PathValue("endpointId"), reservedAt) {
+		w.Header().Set("Retry-After", "60")
+		s.writeAutomationWebhookError(w, http.StatusTooManyRequests, "rate_limited", "Webhook 请求过于频繁", true)
+		return
+	}
 	result, err := s.store.TriggerAutomation(request.Context(), platform.AutomationDelivery{
 		EndpointID:     request.PathValue("endpointId"),
 		Authorization:  request.Header.Get("Authorization"),
@@ -230,6 +243,10 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 		Query:          query,
 	})
 	if err != nil {
+		if s.webhookLimiter != nil && (errors.Is(err, store.ErrResourceNotFound) ||
+			errors.Is(err, store.ErrWebhookUnauthorized) || platform.IsAutomationValidationError(err)) {
+			s.webhookLimiter.releaseBusinessCapacity(request.PathValue("endpointId"), reservedAt)
+		}
 		s.recordLog(request, platform.LogEntry{
 			Level: platform.LogLevelWarn, Category: platform.LogCategoryAutomation, Action: "webhook",
 			Message: "Webhook 触发失败：" + request.PathValue("endpointId"), Status: platform.LogStatusFailed,
@@ -242,7 +259,7 @@ func (s *Server) receiveAutomationWebhook(w http.ResponseWriter, request *http.R
 	if result.Duplicate {
 		status = http.StatusOK
 	}
-	statusURL := workerRequestBaseURL(request, s.trustedProxy) + "/api/webhooks/" +
+	statusURL := s.workerRequestBaseURL(request) + "/api/webhooks/" +
 		request.PathValue("endpointId") + "/runs/" + result.Run.ID
 	w.Header().Set("Location", statusURL)
 	w.Header().Set("Retry-After", "2")

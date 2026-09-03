@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"agentbox/internal/platform"
 )
 
 const maxWorkerBinarySize = 128 << 20
@@ -111,6 +113,9 @@ func (s *Server) resolveWorkerBinary(ctx context.Context, version, arch string) 
 	if s.workerCacheDir == "" || s.workerReleaseURL == "" || s.workerHTTPClient == nil {
 		return "", errors.New("Worker release proxy is not configured")
 	}
+	if err := platform.ValidateWorkerDownloadURL(s.workerReleaseURL); err != nil {
+		return "", fmt.Errorf("invalid Worker release URL: %w", err)
+	}
 
 	s.workerBinaryMu.Lock()
 	defer s.workerBinaryMu.Unlock()
@@ -136,6 +141,9 @@ func (s *Server) resolveWorkerBinary(ctx context.Context, version, arch string) 
 		return "", fmt.Errorf("download Worker asset: %w", err)
 	}
 	defer response.Body.Close()
+	if err := validateWorkerDownloadResponse(response); err != nil {
+		return "", err
+	}
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download Worker asset: unexpected status %d", response.StatusCode)
 	}
@@ -183,6 +191,9 @@ func (s *Server) fetchWorkerChecksum(ctx context.Context, version, asset string)
 		return "", fmt.Errorf("download Worker checksums: %w", err)
 	}
 	defer response.Body.Close()
+	if err := validateWorkerDownloadResponse(response); err != nil {
+		return "", err
+	}
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("download Worker checksums: unexpected status %d", response.StatusCode)
 	}
@@ -208,4 +219,34 @@ func (s *Server) fetchWorkerChecksum(ctx context.Context, version, asset string)
 
 func (s *Server) workerAssetURL(version, asset string) string {
 	return strings.TrimRight(s.workerReleaseURL, "/") + "/" + url.PathEscape(version) + "/" + url.PathEscape(asset)
+}
+
+func validateWorkerDownloadResponse(response *http.Response) error {
+	if response.Request == nil || response.Request.URL == nil {
+		return errors.New("Worker download response URL is unavailable")
+	}
+	if err := platform.ValidateWorkerDownloadURL(response.Request.URL.String()); err != nil {
+		return fmt.Errorf("insecure Worker download response: %w", err)
+	}
+	return nil
+}
+
+func validateWorkerDownloadRedirect(request *http.Request, via []*http.Request) error {
+	if request == nil || request.URL == nil {
+		return errors.New("Worker download redirect URL is unavailable")
+	}
+	if len(via) >= 10 {
+		return errors.New("Worker download stopped after 10 redirects")
+	}
+	if err := platform.ValidateWorkerDownloadURL(request.URL.String()); err != nil {
+		return err
+	}
+	if len(via) == 0 || via[len(via)-1] == nil || via[len(via)-1].URL == nil {
+		return errors.New("Worker download redirect source URL is unavailable")
+	}
+	previousScheme := strings.ToLower(via[len(via)-1].URL.Scheme)
+	if previousScheme == "https" && !strings.EqualFold(request.URL.Scheme, "https") {
+		return errors.New("Worker download redirect must not downgrade HTTPS")
+	}
+	return nil
 }

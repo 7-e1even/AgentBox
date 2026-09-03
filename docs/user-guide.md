@@ -26,9 +26,9 @@ docker compose up -d
 docker compose ps
 ```
 
-本机或可信内网体验可以直接启动。长期运行或公开部署时，先把 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`；位于 Nginx、Caddy 等反向代理之后时，还要设置公开地址、允许来源和 `AGENTBOX_TRUSTED_PROXY=true`。终端、桌面和模型流还要求代理正确处理 WebSocket 与 SSE，参见[《传输与反向代理兼容矩阵》](transport-compatibility.md)。
+同机本地体验可以直接启动。远程 Worker（包括可信内网）必须先配置 HTTPS；长期运行或公开部署时，先把 `.env.example` 复制为 `.env`，至少修改 `POSTGRES_PASSWORD`。位于 Nginx、Caddy 等反向代理之后时，还要设置公开地址、允许来源、`AGENTBOX_TRUSTED_PROXY=true` 和 Server 直接连接方的精确 `AGENTBOX_TRUSTED_PROXY_CIDRS`。终端、桌面和模型流还要求代理正确处理 WebSocket 与 SSE，参见[《传输与反向代理兼容矩阵》](transport-compatibility.md)。
 
-浏览器打开 `http://<控制面地址>:3000`。全新数据库会引导第一个用户创建管理员账号；之后使用用户名和密码登录，邮箱不是登录名。
+同机浏览器打开 `http://localhost:3000`；远程浏览器必须通过配置了有效 TLS 的 `https://<控制面地址>`。全新数据库会引导第一个用户创建管理员账号，但必须同时输入 Server 本地启动日志中的一次性初始化码；Compose 部署可用 `docker compose logs server` 读取。初始化成功后该码立即失效。自动化部署也可显式设置 `AGENTBOX_SETUP_CODE`，其值必须是至少 24 随机字节的无填充 Base64URL（例如 `openssl rand -base64 24 | tr '+/' '-_' | tr -d '='`），并在初始化完成后删除。之后使用用户名和密码登录，邮箱不是登录名。
 
 ![AgentBox 登录页](images/user-guide/00-login.png)
 
@@ -44,7 +44,7 @@ docker compose ps
 
 ![服务器列表](images/user-guide/02-servers.png)
 
-在“平台入口地址”中填写 Linux 服务器实际能够访问的 AgentBox Web 地址，例如 `https://agentbox.example.com` 或可信内网中的 `http://192.168.1.10:3000`。不要填写只在控制面本机有效的 `127.0.0.1`。
+在“平台入口地址”中填写 Linux 服务器实际能够访问的 HTTPS AgentBox Web 地址，例如 `https://agentbox.example.com`。普通 HTTP 仅保留给控制面与 Worker 位于同一台机器、并通过精确 `localhost` 或回环 IP 访问的开发环境；内网地址也不能使用 HTTP。
 
 ![添加服务器](images/user-guide/03-add-server.png)
 
@@ -149,7 +149,9 @@ DeepSeek Harness 使用随 DSH 固定版本安装的官方 MCP Client：STDIO �
 
 ![模板高级配置](images/user-guide/12-template-advanced.png)
 
-这里的普通环境变量会明文保存，适合 `NODE_ENV`、功能开关等非敏感配置。API Key 应继续放在“模型服务”中。BoxLite 的受限网络只控制沙箱内安装和运行流量；宿主机拉取镜像不使用这里的代理。Docker 与 Microsandbox 当前仅提供完全隔离或允许出站。
+这里的普通环境变量会明文保存，适合 `NODE_ENV`、功能开关等非敏感配置。API Key 应继续放在“模型服务”中。BoxLite 新模板默认受限网络；Docker 与 Microsandbox 新模板默认完全隔离，只有显式选择后才允许出站。BoxLite 的受限网络只控制沙箱内安装和运行流量；宿主机拉取镜像不使用这里的代理。restricted 当前仍仅由 BoxLite 强制执行。
+
+含密码的网络代理会在运行时向沙箱进程提供可复用的上游凭据，因此只有管理员可以在创建新模板或新沙箱时选定它，并启动、操作或进入对应工作负载。公开 Webhook 不具备管理员身份，不能从含密码代理的模板创建沙箱；无密码代理仍可由 Operator 和自动化使用。沙箱创建时会冻结实际代理选择，后续模板修改不会改变已有沙箱；已有沙箱也不能后绑定或切换到含密码代理，必须用目标代理新建沙箱。被模板、沙箱或进行中任务引用的代理不能在“无密码”和“含密码”之间切换。升级到包含该边界的版本后，应轮换所有曾绑定到沙箱的代理密码；代码升级不能撤销此前已进入沙箱文件或进程环境的历史凭据。旧版本沙箱没有可信的创建来源证明，不能通过重启或 Agent 工具任务新注入代理密码，应新建沙箱完成迁移。
 
 首个沙箱可能需要拉取镜像并构建所选 Agent 工具的缓存，耗时会比之后创建相同组合更长。
 

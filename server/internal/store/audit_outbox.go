@@ -56,8 +56,11 @@ func auditMetadata(input map[string]any) map[string]any {
 	out := make(map[string]any)
 	for _, key := range []string{
 		"projectId", "templateId", "serverId", "jobId", "runId", "driver", "action",
+		"sessionId", "channel", "sandboxId",
 		"role", "status", "enabled", "passwordChanged", "sessionsRevoked", "sessionPreserved",
 		"leaseGeneration", "resourceVersion", "generation", "triggerSource", "errorCode", "count",
+		"inputMessages", "inputBytes", "outputMessages", "outputBytes", "resizeCount",
+		"rpcListCount", "rpcReadCount", "rpcWriteCount", "rpcUploadCount",
 		"slotCredentialId", "fromCredentialId", "fromModelId", "toCredentialId", "toModelId",
 	} {
 		switch value := input[key].(type) {
@@ -107,6 +110,17 @@ func (s *Store) DispatchAuditEvents(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("read audit events: %w", err)
 	}
+	if len(events) == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit empty audit dispatch: %w", err)
+		}
+		return nil
+	}
+	// Dispatchers acquire outbox row locks before the shared system-log lock.
+	// No path may acquire these locks in the opposite order.
+	if err := lockSystemLogCapacity(ctx, tx); err != nil {
+		return err
+	}
 	for _, event := range events {
 		entry := event.entry
 		if _, err := tx.Exec(ctx, `INSERT INTO system_logs
@@ -122,12 +136,6 @@ func (s *Store) DispatchAuditEvents(ctx context.Context) error {
 		if _, err := tx.Exec(ctx, `UPDATE audit_outbox SET delivered_at = NOW() WHERE id = $1`, event.id); err != nil {
 			return fmt.Errorf("mark audit event delivered: %w", err)
 		}
-	}
-	// The system log is the long-term record; retain delivered envelopes for a
-	// short recovery window without allowing the outbox to grow indefinitely.
-	if _, err := tx.Exec(ctx, `DELETE FROM audit_outbox
-	  WHERE delivered_at < NOW() - INTERVAL '7 days'`); err != nil {
-		return fmt.Errorf("clean delivered audit events: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit audit dispatch: %w", err)

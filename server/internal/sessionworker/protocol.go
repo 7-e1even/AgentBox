@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"path"
 	"strings"
+
+	"agentbox/internal/platform"
 )
 
 const (
@@ -45,16 +47,17 @@ func parseConfig(content string) (workerConfig, error) {
 	if len(lines) < 3 {
 		return workerConfig{}, errors.New("worker configuration is invalid")
 	}
+	serverURL, err := platform.NormalizeWorkerOrigin(lines[0])
+	if err != nil {
+		return workerConfig{}, err
+	}
 	config := workerConfig{
-		serverURL:  strings.TrimRight(strings.TrimSpace(lines[0]), "/"),
+		serverURL:  serverURL,
 		serverID:   strings.TrimSpace(lines[1]),
 		credential: strings.TrimSpace(lines[2]),
 	}
 	if config.serverURL == "" || config.serverID == "" || config.credential == "" {
 		return workerConfig{}, errors.New("worker configuration is invalid")
-	}
-	if !strings.HasPrefix(config.serverURL, "http://") && !strings.HasPrefix(config.serverURL, "https://") {
-		return workerConfig{}, errors.New("worker server URL must use http or https")
 	}
 	return config, nil
 }

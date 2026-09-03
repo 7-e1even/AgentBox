@@ -26,7 +26,28 @@ func TestRuntimeLLMTokenRoundTrip(t *testing.T) {
 	}
 }
 
-func TestEpochRuntimeLLMTokenCanOutliveExpiry(t *testing.T) {
+func TestValidateRuntimeLLMTokenRequiresMatchingSignedPathClaims(t *testing.T) {
+	repository := &Store{secretKey: []byte("0123456789abcdef0123456789abcdef")}
+	token, err := repository.issueRuntimeLLMToken(
+		"sandbox-one", "credential-one", "model-one", time.Now().UTC().Add(time.Hour),
+	)
+	if err != nil {
+		t.Fatalf("issueRuntimeLLMToken() error = %v", err)
+	}
+	if err := repository.ValidateRuntimeLLMToken("sandbox-one", "credential-one", token); err != nil {
+		t.Fatalf("ValidateRuntimeLLMToken() error = %v", err)
+	}
+	for _, path := range [][2]string{
+		{"sandbox-two", "credential-one"},
+		{"sandbox-one", "credential-two"},
+	} {
+		if err := repository.ValidateRuntimeLLMToken(path[0], path[1], token); !errors.Is(err, ErrRuntimeUnauthorized) {
+			t.Fatalf("ValidateRuntimeLLMToken(%q, %q) error = %v, want ErrRuntimeUnauthorized", path[0], path[1], err)
+		}
+	}
+}
+
+func TestEpochRuntimeLLMTokenRejectsExpiry(t *testing.T) {
 	repository := &Store{secretKey: []byte("0123456789abcdef0123456789abcdef")}
 	now := time.Now().UTC()
 	token, err := repository.issueRuntimeLLMTokenForEpoch(
@@ -35,12 +56,8 @@ func TestEpochRuntimeLLMTokenCanOutliveExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("issue expired epoch token error = %v", err)
 	}
-	claims, err := repository.parseRuntimeLLMToken(token, now)
-	if err != nil {
-		t.Fatalf("parse expired epoch token error = %v", err)
-	}
-	if claims.Epoch != "active-epoch" {
-		t.Fatalf("expired epoch token claims = %#v", claims)
+	if _, err := repository.parseRuntimeLLMToken(token, now); !errors.Is(err, ErrRuntimeUnauthorized) {
+		t.Fatalf("parse expired epoch token error = %v, want ErrRuntimeUnauthorized", err)
 	}
 }
 
@@ -87,5 +104,9 @@ func TestRuntimeLLMTokenRejectsTamperingAndLegacyExpiry(t *testing.T) {
 	}
 	if _, err := repository.parseRuntimeLLMToken(expired, time.Now().UTC()); !errors.Is(err, ErrRuntimeUnauthorized) {
 		t.Fatalf("expired token error = %v, want ErrRuntimeUnauthorized", err)
+	}
+	oversized := strings.Repeat("x", runtimeLLMTokenMaxBytes+1)
+	if _, err := repository.parseRuntimeLLMToken(oversized, time.Now().UTC()); !errors.Is(err, ErrRuntimeUnauthorized) {
+		t.Fatalf("oversized token error = %v, want ErrRuntimeUnauthorized", err)
 	}
 }

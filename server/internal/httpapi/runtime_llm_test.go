@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +26,24 @@ type runtimeLLMTestStore struct {
 	wantToken string
 }
 
+type runtimeLLMCountingStore struct {
+	runtimeLLMTestStore
+	validateCalls int
+	resolveCalls  int
+}
+
+func (s *runtimeLLMCountingStore) ValidateRuntimeLLMToken(sandboxID, credentialID, token string) error {
+	s.validateCalls++
+	return s.runtimeLLMTestStore.ValidateRuntimeLLMToken(sandboxID, credentialID, token)
+}
+
+func (s *runtimeLLMCountingStore) ResolveRuntimeLLMTarget(
+	ctx context.Context, sandboxID, credentialID, token string,
+) (platform.RuntimeLLMTarget, error) {
+	s.resolveCalls++
+	return s.runtimeLLMTestStore.ResolveRuntimeLLMTarget(ctx, sandboxID, credentialID, token)
+}
+
 type runtimeLLMHotSwitchStore struct {
 	fakeStore
 	mu     sync.RWMutex
@@ -32,6 +51,15 @@ type runtimeLLMHotSwitchStore struct {
 	token  string
 	target platform.RuntimeLLMTarget
 	next   platform.RuntimeLLMTarget
+}
+
+func (s *runtimeLLMHotSwitchStore) ValidateRuntimeLLMToken(sandboxID, credentialID, token string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sandboxID != s.target.SandboxID || credentialID != s.slotID || token != s.token {
+		return store.ErrRuntimeUnauthorized
+	}
+	return nil
 }
 
 func (s *runtimeLLMHotSwitchStore) ResolveRuntimeLLMTarget(
@@ -73,16 +101,34 @@ func (s runtimeLLMTestStore) ResolveRuntimeLLMTarget(
 	return s.target, nil
 }
 
+func (s runtimeLLMTestStore) ValidateRuntimeLLMToken(sandboxID, credentialID, token string) error {
+	if token != s.wantToken || sandboxID != s.target.SandboxID || credentialID != s.target.CredentialID {
+		return store.ErrRuntimeUnauthorized
+	}
+	return nil
+}
+
 func runtimeLLMHandler(t *testing.T, target platform.RuntimeLLMTarget) http.Handler {
 	t.Helper()
+	return runtimeLLMTestServer(t, runtimeLLMTestStore{target: target, wantToken: "sandbox-token"})
+}
+
+func runtimeLLMTestServer(t *testing.T, repository PlatformStore) *Server {
+	t.Helper()
 	t.Setenv("AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "true")
-	return New(
-		runtimeLLMTestStore{target: target, wantToken: "sandbox-token"},
+	server := New(
+		repository,
 		catalog.BuiltinCatalog,
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		nil,
-		Config{},
+		Config{DisableAuth: true},
 	)
+	server.runtimeLLMClient = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{
+		MinVersion: tls.VersionTLS12,
+		// Test servers use an ephemeral self-signed certificate.
+		InsecureSkipVerify: true, //nolint:gosec
+	}}}
+	return server
 }
 
 func TestRuntimeLLMHotSwitchKeepsInflightTargetAndRoutesLaterRequestsToNewSource(t *testing.T) {
@@ -99,7 +145,7 @@ func TestRuntimeLLMHotSwitchKeepsInflightTargetAndRoutesLaterRequestsToNewSource
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"id":"chat","object":"chat.completion","created":1,"model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`, model, content)
 	}
-	firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	firstUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var payload map[string]any
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			t.Errorf("decode first upstream request: %v", err)
@@ -110,7 +156,7 @@ func TestRuntimeLLMHotSwitchKeepsInflightTargetAndRoutesLaterRequestsToNewSource
 		writeChatResponse(w, "model-a", "source-a")
 	}))
 	defer firstUpstream.Close()
-	secondUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	secondUpstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var payload map[string]any
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			t.Errorf("decode second upstream request: %v", err)
@@ -131,11 +177,7 @@ func TestRuntimeLLMHotSwitchKeepsInflightTargetAndRoutesLaterRequestsToNewSource
 			Protocol: "openai-chat", Endpoint: secondUpstream.URL + "/v1", ModelID: "model-b", Secret: "secret-b",
 		},
 	}
-	handler := New(
-		storage, catalog.BuiltinCatalog,
-		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
-		Config{DisableAuth: true},
-	)
+	handler := runtimeLLMTestServer(t, storage)
 	requestForRuntime := func() *http.Request {
 		request := httptest.NewRequest(
 			http.MethodPost,
@@ -160,11 +202,13 @@ func TestRuntimeLLMHotSwitchKeepsInflightTargetAndRoutesLaterRequestsToNewSource
 	}
 
 	switchResponse := httptest.NewRecorder()
-	handler.ServeHTTP(switchResponse, httptest.NewRequest(
+	switchRequest := httptest.NewRequest(
 		http.MethodPatch,
 		"/api/sandboxes/sandbox-one/model-source",
 		strings.NewReader(`{"slotCredentialId":"slot-one","credentialId":"source-b","modelId":"model-b","expectedCredentialId":"source-a","expectedModelId":"model-a"}`),
-	))
+	)
+	switchRequest.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(switchResponse, switchRequest)
 	if switchResponse.Code != http.StatusOK {
 		releaseFirst()
 		t.Fatalf("switch status = %d body = %s", switchResponse.Code, switchResponse.Body.String())
@@ -280,8 +324,142 @@ func TestRuntimeLLMGeminiURLRejectsInvalidModelPaths(t *testing.T) {
 	}
 }
 
+func TestRuntimeLLMURLsRejectCleartextProviderEndpoints(t *testing.T) {
+	openAI := platform.RuntimeLLMTarget{
+		Protocol: "openai-responses", Endpoint: "http://api.example.test/v1", ModelID: "model", Secret: "secret",
+	}
+	if _, err := runtimeLLMUpstreamURL(openAI, false); err == nil {
+		t.Fatal("runtimeLLMUpstreamURL() accepted a cleartext endpoint")
+	}
+	gemini := platform.RuntimeLLMTarget{
+		Protocol: "gemini", Endpoint: "http://api.example.test/v1beta", ModelID: "model", Secret: "secret",
+	}
+	if _, err := runtimeLLMGeminiGenerateURL(gemini, false); err == nil {
+		t.Fatal("runtimeLLMGeminiGenerateURL() accepted a cleartext endpoint")
+	}
+	if _, err := runtimeLLMGeminiURL(gemini, "models/client:generateContent", nil); err == nil {
+		t.Fatal("runtimeLLMGeminiURL() accepted a cleartext endpoint")
+	}
+}
+
+func TestRuntimeLLMTimeoutsAreFinite(t *testing.T) {
+	if got := runtimeLLMTimeout(false); got != 2*time.Minute {
+		t.Fatalf("non-streaming timeout = %v", got)
+	}
+	if got := runtimeLLMTimeout(true); got != 3*time.Minute {
+		t.Fatalf("streaming timeout = %v", got)
+	}
+}
+
+func TestRuntimeLLMAdmissionRejectionUsesProtocol429(t *testing.T) {
+	target := platform.RuntimeLLMTarget{
+		SandboxID: "sandbox-one", CredentialID: "credential-one", ProviderID: "openai",
+		Protocol: "openai-responses", Endpoint: "https://api.example.test/v1", ModelID: "model",
+		Secret: "upstream-secret",
+	}
+	storage := &runtimeLLMCountingStore{runtimeLLMTestStore: runtimeLLMTestStore{
+		target: target, wantToken: "sandbox-token",
+	}}
+	server := runtimeLLMTestServer(t, storage)
+	server.runtimeLLMAdmission = newRuntimeLLMAdmission(runtimeLLMAdmissionLimits{
+		resolutionConcurrency: 0, globalConcurrency: 1, sandboxConcurrency: 1,
+		globalRate: 1, sandboxRate: 1, maxSandboxes: 1, window: time.Minute,
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/runtime/sandboxes/sandbox-one/llm/credential-one/openai/v1/responses",
+		strings.NewReader(`{"model":"ignored","input":"hello"}`),
+	)
+	request.Header.Set("Authorization", "Bearer sandbox-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") != "60" {
+		t.Fatalf("status = %d, Retry-After = %q, body = %s", response.Code, response.Header().Get("Retry-After"), response.Body.String())
+	}
+	if storage.resolveCalls != 0 {
+		t.Fatalf("ResolveRuntimeLLMTarget calls = %d, want 0 before resolution admission", storage.resolveCalls)
+	}
+	if storage.validateCalls != 1 {
+		t.Fatalf("ValidateRuntimeLLMToken calls = %d, want 1 before admission", storage.validateCalls)
+	}
+	if got := len(server.runtimeLLMAdmission.sandboxes); got != 0 {
+		t.Fatalf("unauthenticated sandbox admission keys = %d, want 0", got)
+	}
+}
+
+func TestRuntimeLLMSandboxAdmissionRunsAfterTargetResolution(t *testing.T) {
+	target := platform.RuntimeLLMTarget{
+		SandboxID: "sandbox-one", CredentialID: "credential-one", ProviderID: "openai",
+		Protocol: "openai-responses", Endpoint: "https://api.example.test/v1", ModelID: "model",
+		Secret: "upstream-secret",
+	}
+	storage := &runtimeLLMCountingStore{runtimeLLMTestStore: runtimeLLMTestStore{
+		target: target, wantToken: "sandbox-token",
+	}}
+	server := runtimeLLMTestServer(t, storage)
+	server.runtimeLLMAdmission = newRuntimeLLMAdmission(runtimeLLMAdmissionLimits{
+		resolutionConcurrency: 1, globalConcurrency: 1, sandboxConcurrency: 0,
+		globalRate: 10, sandboxRate: 1, maxSandboxes: 1, window: time.Minute,
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/runtime/sandboxes/sandbox-one/llm/credential-one/openai/v1/responses",
+		strings.NewReader(`{"model":"ignored","input":"hello"}`),
+	)
+	request.Header.Set("Authorization", "Bearer sandbox-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if storage.resolveCalls != 1 {
+		t.Fatalf("ResolveRuntimeLLMTarget calls = %d, want 1 before sandbox admission", storage.resolveCalls)
+	}
+	if storage.validateCalls != 1 {
+		t.Fatalf("ValidateRuntimeLLMToken calls = %d, want 1", storage.validateCalls)
+	}
+	if server.runtimeLLMAdmission.resolutionActive != 0 {
+		t.Fatalf("active resolutions = %d after target rejection, want 0", server.runtimeLLMAdmission.resolutionActive)
+	}
+	if server.runtimeLLMAdmission.globalActive != 0 {
+		t.Fatalf("global active requests = %d after rejection, want 0", server.runtimeLLMAdmission.globalActive)
+	}
+}
+
+func TestRuntimeLLMInvalidTokenCannotCreateAdmissionState(t *testing.T) {
+	target := platform.RuntimeLLMTarget{SandboxID: "sandbox-one", CredentialID: "credential-one"}
+	storage := &runtimeLLMCountingStore{runtimeLLMTestStore: runtimeLLMTestStore{
+		target: target, wantToken: "sandbox-token",
+	}}
+	server := runtimeLLMTestServer(t, storage)
+	server.runtimeLLMAdmission = newRuntimeLLMAdmission(runtimeLLMAdmissionLimits{
+		resolutionConcurrency: 1, globalConcurrency: 1, sandboxConcurrency: 1,
+		globalRate: 1, sandboxRate: 1, maxSandboxes: 1, window: time.Minute,
+	})
+	request := httptest.NewRequest(
+		http.MethodPost,
+		"/api/runtime/sandboxes/attacker-chosen/llm/attacker-chosen/openai/v1/responses",
+		strings.NewReader(`{"model":"ignored","input":"hello"}`),
+	)
+	request.Header.Set("Authorization", "Bearer invalid-token")
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if storage.validateCalls != 1 || storage.resolveCalls != 0 {
+		t.Fatalf("validate calls = %d, resolve calls = %d", storage.validateCalls, storage.resolveCalls)
+	}
+	if got := len(server.runtimeLLMAdmission.sandboxes); got != 0 {
+		t.Fatalf("invalid token created %d sandbox admission keys", got)
+	}
+	if len(server.runtimeLLMAdmission.resolutionStarts) != 0 {
+		t.Fatal("invalid token consumed authenticated resolution rate capacity")
+	}
+}
+
 func TestRuntimeLLMConvertsAnthropicToResponses(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/responses" {
 			t.Errorf("path = %s, want /v1/responses", request.URL.Path)
 		}
@@ -333,7 +511,7 @@ func TestRuntimeLLMConvertsAnthropicToResponses(t *testing.T) {
 }
 
 func TestRuntimeLLMConvertsAnthropicToGeminiEndToEnd(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1beta/models/gemini-bound:generateContent" {
 			t.Errorf("path = %s", request.URL.Path)
 		}
@@ -382,7 +560,7 @@ func TestRuntimeLLMConvertsAnthropicToGeminiEndToEnd(t *testing.T) {
 }
 
 func TestRuntimeLLMConvertsGeminiPDFToAnthropicEndToEnd(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/messages" {
 			t.Errorf("path = %s", request.URL.Path)
 		}
@@ -428,7 +606,7 @@ func TestRuntimeLLMConvertsGeminiPDFToAnthropicEndToEnd(t *testing.T) {
 }
 
 func TestRuntimeLLMConvertsResponsesToAnthropicWithReasoningAndTools(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		if request.URL.Path != "/v1/messages" {
 			t.Errorf("path = %s, want /v1/messages", request.URL.Path)
 		}
@@ -489,7 +667,7 @@ func TestRuntimeLLMConvertsResponsesToAnthropicWithReasoningAndTools(t *testing.
 }
 
 func TestRuntimeLLMConvertsResponsesStreamToValidAnthropicLifecycle(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var payload map[string]any
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			t.Errorf("decode upstream request: %v", err)
@@ -538,7 +716,7 @@ func TestRuntimeLLMConvertsResponsesStreamToValidAnthropicLifecycle(t *testing.T
 }
 
 func TestRuntimeLLMConvertsParallelResponsesToolsToValidAnthropicLifecycle(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		for _, event := range []string{
 			`{"type":"response.created","response":{"id":"resp_parallel","model":"gpt-bound"}}`,
@@ -578,7 +756,7 @@ func TestRuntimeLLMConvertsParallelResponsesToolsToValidAnthropicLifecycle(t *te
 }
 
 func TestRuntimeLLMConvertsParallelChatToolsToValidAnthropicLifecycle(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		for _, event := range []string{
 			`{"id":"chat_parallel","model":"chat-bound","choices":[{"index":0,"delta":{"role":"assistant","content":"checking"},"finish_reason":null}]}`,
@@ -617,7 +795,7 @@ func TestRuntimeLLMConvertsParallelChatToolsToValidAnthropicLifecycle(t *testing
 }
 
 func TestRuntimeLLMConvertsAnthropicStreamToResponses(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		for _, event := range []string{
 			`{"type":"message_start","message":{"id":"msg_stream","type":"message","role":"assistant","model":"claude-bound","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}`,
@@ -658,7 +836,7 @@ func TestRuntimeLLMConvertsAnthropicStreamToResponses(t *testing.T) {
 }
 
 func TestRuntimeLLMConvertsAnthropicToolStreamToResponses(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		for _, event := range []string{
 			`{"type":"message_start","message":{"id":"msg_tool","type":"message","role":"assistant","model":"claude-bound","content":[],"usage":{"input_tokens":4,"output_tokens":0}}}`,
@@ -833,7 +1011,7 @@ func assertAnthropicStreamLifecycle(t *testing.T, body string, wantToolBlocks in
 }
 
 func TestRuntimeLLMNativeProtocolPreservesExtensionsAndOverridesModel(t *testing.T) {
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		var payload map[string]any
 		_ = json.NewDecoder(request.Body).Decode(&payload)
 		if payload["custom_extension"] != "kept" {
@@ -906,7 +1084,7 @@ func TestRuntimeLLMNormalizesCrossProtocolErrors(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusForbidden)
 				_, _ = io.WriteString(w, test.upstreamBody)

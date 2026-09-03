@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net"
 	"net/http"
 	"strings"
@@ -30,6 +31,7 @@ type PlatformStore interface {
 	UpdateSandboxNetworkProxy(context.Context, string, string) (platform.Resource, error)
 	UpdateSandboxModelSource(context.Context, string, platform.SandboxModelSourceInput) (platform.Resource, error)
 	OperateSandboxAgentTools(context.Context, string, string, []string) (platform.Resource, error)
+	AuthorizeSandboxCredentialAccess(context.Context, string) error
 	ListAutomations(context.Context, string) ([]platform.Automation, error)
 	GetAutomation(context.Context, string) (platform.Automation, error)
 	GetAutomationSecret(context.Context, string) (platform.Automation, string, error)
@@ -56,6 +58,7 @@ type PlatformStore interface {
 	CreateNetworkProxyCheck(context.Context, string, string, string) (platform.NetworkProxyCheck, error)
 	GetNetworkProxyCheck(context.Context, string, string) (platform.NetworkProxyCheck, error)
 	DeleteNetworkProxy(context.Context, string) error
+	ValidateRuntimeLLMToken(string, string, string) error
 	ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error)
 	ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error)
 	ControlWorkerJob(context.Context, string, string, string, platform.WorkerJobControlInput) (platform.WorkerJobControl, error)
@@ -84,29 +87,34 @@ type PlatformStore interface {
 }
 
 type Server struct {
-	store            PlatformStore
-	catalog          catalog.Catalog
-	logger           *slog.Logger
-	handler          http.Handler
-	allowedOrigins   map[string]struct{}
-	disableAuth      bool
-	trustedProxy     bool
-	loginLimiter     *loginRateLimiter
-	sessions         *sessionHub
-	logRecorder      *logRecorder
-	serverStatesMu   sync.Mutex
-	serverStates     map[string]string
-	runtimeLLMClient *http.Client
-	workerBinaryDir  string
-	workerVersion    string
-	workerReleaseURL string
-	workerCacheDir   string
-	workerHTTPClient *http.Client
-	workerBinaryMu   sync.Mutex
+	store               PlatformStore
+	catalog             catalog.Catalog
+	logger              *slog.Logger
+	handler             http.Handler
+	allowedOrigins      map[string]struct{}
+	disableAuth         bool
+	trustedProxy        trustedProxySettings
+	loginLimiter        *loginRateLimiter
+	setupLimiter        *loginRateLimiter
+	setupGate           *setupGate
+	webhookLimiter      *webhookRateLimiter
+	sessions            *sessionHub
+	logRecorder         *logRecorder
+	serverStatesMu      sync.Mutex
+	serverStates        map[string]string
+	runtimeLLMClient    *http.Client
+	runtimeLLMAdmission *runtimeLLMAdmission
+	workerBinaryDir     string
+	workerVersion       string
+	workerReleaseURL    string
+	workerCacheDir      string
+	workerHTTPClient    *http.Client
+	workerBinaryMu      sync.Mutex
 }
 
 type Config struct {
 	DisableAuth      bool
+	SetupCode        string
 	WorkerBinaryDir  string
 	WorkerVersion    string
 	WorkerReleaseURL string
@@ -114,28 +122,47 @@ type Config struct {
 }
 
 func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger, origins []string, config Config) *Server {
-	trustedProxy := trustedProxyFromEnv()
+	trustedProxy, trustedProxyErr := trustedProxyFromEnv()
+	if trustedProxyErr != nil {
+		// Embedders that do not call ValidateTrustedProxyEnvironment still fail
+		// closed: forwarding headers are ignored and the error remains visible.
+		logger.Error("trusted proxy configuration rejected", "error", trustedProxyErr)
+		trustedProxy = trustedProxySettings{}
+	}
+	setupGate, setupCodeErr := newSetupGate(config.SetupCode)
+	if setupCodeErr != nil {
+		// Keep New's existing embedding API while failing closed: setup remains
+		// unavailable instead of accepting a weak caller-provided override.
+		logger.Error("setup code configuration rejected", "error", setupCodeErr)
+	}
 	server := &Server{
-		store:            repository,
-		catalog:          catalog,
-		logger:           logger,
-		allowedOrigins:   make(map[string]struct{}, len(origins)),
-		disableAuth:      config.DisableAuth,
-		trustedProxy:     trustedProxy,
-		loginLimiter:     newLoginRateLimiter(),
-		sessions:         newSessionHub(origins, trustedProxy),
-		logRecorder:      newLogRecorder(repository, logger),
-		serverStates:     make(map[string]string),
-		runtimeLLMClient: newRuntimeLLMHTTPClient(),
-		workerBinaryDir:  config.WorkerBinaryDir,
-		workerVersion:    config.WorkerVersion,
-		workerReleaseURL: config.WorkerReleaseURL,
-		workerCacheDir:   config.WorkerCacheDir,
-		workerHTTPClient: &http.Client{Timeout: 2 * time.Minute},
+		store:               repository,
+		catalog:             catalog,
+		logger:              logger,
+		allowedOrigins:      make(map[string]struct{}, len(origins)),
+		disableAuth:         config.DisableAuth,
+		trustedProxy:        trustedProxy,
+		loginLimiter:        newLoginRateLimiter(),
+		setupLimiter:        newLoginRateLimiter(),
+		setupGate:           setupGate,
+		webhookLimiter:      newWebhookRateLimiter(webhookRateLimitAttempts, webhookGlobalRateLimitAttempts, webhookRateLimitMaxKeys),
+		sessions:            newSessionHub(origins, trustedProxy),
+		logRecorder:         newLogRecorder(repository, logger),
+		serverStates:        make(map[string]string),
+		runtimeLLMClient:    newRuntimeLLMHTTPClient(),
+		runtimeLLMAdmission: newRuntimeLLMAdmission(defaultRuntimeLLMAdmissionLimits),
+		workerBinaryDir:     config.WorkerBinaryDir,
+		workerVersion:       config.WorkerVersion,
+		workerReleaseURL:    config.WorkerReleaseURL,
+		workerCacheDir:      config.WorkerCacheDir,
+		workerHTTPClient: &http.Client{
+			Timeout:       2 * time.Minute,
+			CheckRedirect: validateWorkerDownloadRedirect,
+		},
 	}
 	for _, origin := range origins {
-		if trimmed := strings.TrimSpace(origin); trimmed != "" {
-			server.allowedOrigins[trimmed] = struct{}{}
+		if canonical, ok := canonicalOrigin(origin); ok {
+			server.allowedOrigins[canonical] = struct{}{}
 		}
 	}
 
@@ -346,6 +373,12 @@ func (s *Server) decodeJSON(w http.ResponseWriter, request *http.Request, target
 }
 
 func (s *Server) decodeJSONWithLimit(w http.ResponseWriter, request *http.Request, target any, limit int64) bool {
+	contentType := strings.TrimSpace(request.Header.Get("Content-Type"))
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil || (mediaType != "application/json" && !strings.HasSuffix(mediaType, "+json")) {
+		s.writeError(w, http.StatusUnsupportedMediaType, "请求内容必须使用 JSON 格式")
+		return false
+	}
 	request.Body = http.MaxBytesReader(w, request.Body, limit)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()
@@ -378,6 +411,8 @@ func (s *Server) handleError(w http.ResponseWriter, err error) {
 		s.writeError(w, http.StatusUnauthorized, "服务器认证无效或已过期")
 	case errors.Is(err, store.ErrUnauthorized):
 		s.writeError(w, http.StatusUnauthorized, "登录状态无效或已过期")
+	case errors.Is(err, store.ErrForbidden):
+		s.writeError(w, http.StatusForbidden, err.Error())
 	case errors.Is(err, store.ErrConflict):
 		s.writeError(w, http.StatusConflict, "记录已存在、已被更新，或仍被其他配置引用")
 	case errors.Is(err, store.ErrProviderUnavailable):
@@ -412,6 +447,8 @@ func apiErrorCode(status int) string {
 		return "conflict"
 	case http.StatusRequestEntityTooLarge:
 		return "payload_too_large"
+	case http.StatusUnsupportedMediaType:
+		return "unsupported_media_type"
 	case http.StatusTooManyRequests:
 		return "rate_limited"
 	case http.StatusBadGateway:
@@ -457,16 +494,16 @@ func (s *Server) cors(next http.Handler) http.Handler {
 
 func (s *Server) logRequests(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		if request.URL.Path == "/healthz" {
-			next.ServeHTTP(w, request)
-			return
-		}
 		started := time.Now()
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(recorder, request)
+		path := requestRoutePath(request)
+		if path == "/healthz" {
+			return
+		}
 		duration := time.Since(started)
 		s.logger.Info("request",
-			"method", request.Method, "path", request.URL.Path,
+			"method", request.Method, "path", path,
 			"status", recorder.status, "remote", request.RemoteAddr,
 			"duration", duration.String())
 		s.recordAPIRequest(request, recorder.status, duration)
@@ -476,11 +513,10 @@ func (s *Server) logRequests(next http.Handler) http.Handler {
 // recordAPIRequest 把 HTTP 请求写入系统日志（api 分类）。
 // 跳过高频轮询路径，以及已由 sessions.go 打点覆盖的 WebSocket 连接路径。
 func (s *Server) recordAPIRequest(request *http.Request, status int, duration time.Duration) {
-	path := request.URL.Path
-	if path == "/api/logs" || strings.HasSuffix(path, "/heartbeat") ||
-		(strings.HasPrefix(path, "/api/servers/") && strings.HasSuffix(path, "/sessions/connect")) ||
-		(strings.HasPrefix(path, "/api/sandboxes/") &&
-			(strings.HasSuffix(path, "/session") || strings.HasSuffix(path, "/desktop"))) {
+	path := requestRoutePath(request)
+	switch path {
+	case "unmatched", "/api/auth/status", "/api/logs", "/api/servers/{id}/heartbeat", "/api/servers/{id}/sessions/connect",
+		"/api/sandboxes/{id}/session", "/api/sandboxes/{id}/desktop":
 		return
 	}
 	level := platform.LogLevelInfo
@@ -500,6 +536,17 @@ func (s *Server) recordAPIRequest(request *http.Request, status int, duration ti
 		Status:  entryStatus, DurationMS: duration.Milliseconds(),
 		Detail: map[string]any{"method": request.Method, "path": path, "status": status},
 	})
+}
+
+func requestRoutePath(request *http.Request) string {
+	pattern := strings.TrimSpace(request.Pattern)
+	if _, path, ok := strings.Cut(pattern, " "); ok && path != "" {
+		return path
+	}
+	if pattern != "" {
+		return pattern
+	}
+	return "unmatched"
 }
 
 // statusRecorder 记录响应状态码；透传 Hijacker/Flusher 以兼容 WebSocket 升级与 SSE。

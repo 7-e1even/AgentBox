@@ -33,8 +33,22 @@ func TestEncryptSecretDoesNotStorePlaintext(t *testing.T) {
 	if plaintext != secret {
 		t.Fatalf("decryptSecret() = %q, want original secret", plaintext)
 	}
-	if got := lastFour(secret); got != "1234" {
-		t.Fatalf("lastFour() = %q, want %q", got, "1234")
+}
+
+func TestSecretStorageMarkerAndMaskNeverExposeSecret(t *testing.T) {
+	for _, secret := range []string{"", "x", "1234", "12345", "密钥"} {
+		t.Run(secret, func(t *testing.T) {
+			marker := secretStorageMarker(secret)
+			if secret == "" && marker != "" {
+				t.Fatalf("secretStorageMarker(%q) = %q, want empty", secret, marker)
+			}
+			if secret != "" && (marker == "" || strings.Contains(marker, secret)) {
+				t.Fatalf("secretStorageMarker(%q) exposed secret as %q", secret, marker)
+			}
+			if secret != "" && strings.Contains(secretMask, secret) {
+				t.Fatalf("secretMask exposed %q", secret)
+			}
+		})
 	}
 }
 
@@ -123,6 +137,15 @@ func TestKimiCodingConnectionUsesMessagesEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(string(body), `"model":"kimi-for-coding"`) {
 		t.Fatalf("body = %s", body)
+	}
+}
+
+func TestProviderRequestRejectsCleartextEndpointBeforeAttachingSecret(t *testing.T) {
+	request, err := providerModelsRequest(
+		t.Context(), "openai", "openai-responses", "http://api.example.test/v1", "short-secret",
+	)
+	if err == nil || request != nil {
+		t.Fatalf("providerModelsRequest() = %#v, %v; want cleartext endpoint rejection", request, err)
 	}
 }
 

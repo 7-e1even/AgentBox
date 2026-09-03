@@ -58,7 +58,10 @@ export const userInputSchema = z.object({
 
 export const userResponseSchema = z.object({ user: userSchema })
 export const usersResponseSchema = z.object({ users: z.array(userSchema) })
-export const authStatusSchema = z.object({ needsSetup: z.boolean() })
+export const authStatusSchema = z.object({
+  needsSetup: z.boolean(),
+  setupCodeRequired: z.boolean(),
+})
 
 export type ManagedUser = z.infer<typeof userSchema>
 export type UserInput = z.infer<typeof userInputSchema>
