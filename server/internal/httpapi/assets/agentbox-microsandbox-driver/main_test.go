@@ -5,6 +5,8 @@ package main
 import (
 	"reflect"
 	"testing"
+
+	microsandbox "github.com/superradcompany/microsandbox/sdk/go"
 )
 
 func TestParseImagesCommand(t *testing.T) {
@@ -52,6 +54,90 @@ func TestParseCreateCommand(t *testing.T) {
 	}
 	if parsed.cpus != 4 || parsed.memory != 8192 || parsed.workdir != "/workspace" || parsed.network != "none" {
 		t.Fatalf("unexpected create options: %#v", parsed)
+	}
+}
+
+func TestParseCreateCommandDefaultsToEgress(t *testing.T) {
+	parsed, err := parseCommand([]string{"create", "agentbox-test", "ubuntu:24.04"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.network != "egress" {
+		t.Fatalf("default network = %q, want egress", parsed.network)
+	}
+}
+
+func TestParseCreateCommandRejectsUnsupportedNetworkPolicies(t *testing.T) {
+	for _, network := range []string{"restricted", "unexpected"} {
+		t.Run(network, func(t *testing.T) {
+			_, err := parseCommand([]string{
+				"create", "agentbox-test", "ubuntu:24.04", "--network", network,
+			})
+			if err == nil {
+				t.Fatalf("network policy %q was accepted", network)
+			}
+		})
+	}
+}
+
+func TestMicrosandboxNetworkPolicyMatchesAgentBoxSemantics(t *testing.T) {
+	if policy := microsandboxNetworkPolicy("none"); policy.DefaultEgress != microsandbox.PolicyActionDeny {
+		t.Fatalf("none default egress = %q, want deny", policy.DefaultEgress)
+	}
+	policy := microsandboxNetworkPolicy("egress")
+	destinations := make(map[string]bool, len(policy.Rules))
+	for _, rule := range policy.Rules {
+		if rule.Action == microsandbox.PolicyActionAllow && rule.Direction == microsandbox.PolicyDirectionEgress {
+			destinations[rule.Destination] = true
+		}
+	}
+	for _, destination := range []string{"public", "private", "host"} {
+		if !destinations[destination] {
+			t.Fatalf("egress policy does not allow %s destinations: %#v", destination, policy.Rules)
+		}
+	}
+}
+
+func TestValidateMicrosandboxLabels(t *testing.T) {
+	needsAdoption, err := validateMicrosandboxLabels(
+		map[string]string{"agentbox.sandbox": "sandbox-one"},
+		"agentbox-sandbox-one",
+	)
+	if err != nil || needsAdoption {
+		t.Fatalf("validateMicrosandboxLabels() rejected owned sandbox: %v", err)
+	}
+	needsAdoption, err = validateMicrosandboxLabels(nil, "agentbox-sandbox-one")
+	if err != nil || !needsAdoption {
+		t.Fatalf("legacy labels adoption = %v, error = %v", needsAdoption, err)
+	}
+	for _, labels := range []map[string]string{
+		{"agentbox.sandbox": "another-sandbox"},
+		{"agentbox.sandbox": ""},
+	} {
+		if _, err := validateMicrosandboxLabels(labels, "agentbox-sandbox-one"); err == nil {
+			t.Fatalf("validateMicrosandboxLabels(%v) accepted mismatched ownership", labels)
+		}
+	}
+}
+
+func TestExpectedMicrosandboxOwnerRequiresExactManagedTarget(t *testing.T) {
+	owner, err := expectedMicrosandboxOwner("agentbox-sandbox-one", "agentbox-sandbox-one")
+	if err != nil || owner != "sandbox-one" {
+		t.Fatalf("expectedMicrosandboxOwner() = %q, %v", owner, err)
+	}
+	for _, test := range []struct {
+		handleName string
+		target     string
+	}{
+		{handleName: "agentbox-other", target: "agentbox-sandbox-one"},
+		{handleName: "sandbox-one", target: "sandbox-one"},
+		{handleName: "agentbox-A", target: "agentbox-A"},
+		{handleName: "agentbox-a--b", target: "agentbox-a--b"},
+		{handleName: "agentbox-a", target: "agentbox-a"},
+	} {
+		if _, err := expectedMicrosandboxOwner(test.handleName, test.target); err == nil {
+			t.Fatalf("expectedMicrosandboxOwner(%q, %q) accepted invalid target", test.handleName, test.target)
+		}
 	}
 }
 

@@ -105,8 +105,18 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 	    ('legacy-custom-skill', 'skill', 'legacy-project', 'Existing custom skill', '', TRUE,
 	      '{"content":"keep this custom skill"}'::jsonb, NOW(), NOW()),
 	    ('legacy-runtime', 'runtime', 'legacy-project', 'Existing template', '', TRUE,
-	      '{"driver":"docker","skillIds":["legacy-custom-skill"],"customValue":"preserved"}'::jsonb,
-	      NOW(), NOW())`); err != nil {
+	      '{"driver":"docker","network":"restricted","skillIds":["legacy-custom-skill"],"customValue":"preserved"}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-microsandbox-runtime', 'runtime', 'legacy-project', 'Existing Microsandbox template', '', TRUE,
+	      '{"driver":"microsandbox","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ('legacy-boxlite-runtime', 'runtime', 'legacy-project', 'Existing BoxLite template', '', TRUE,
+	      '{"driver":"boxlite","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ('legacy-docker-sandbox', 'sandbox', 'legacy-project', 'Existing Docker sandbox', '', TRUE,
+	      '{"runtimeId":"legacy-runtime","driver":"docker","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ('legacy-microsandbox-sandbox', 'sandbox', 'legacy-project', 'Existing Microsandbox sandbox', '', TRUE,
+	      '{"runtimeId":"legacy-microsandbox-runtime","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ('legacy-boxlite-sandbox', 'sandbox', 'legacy-project', 'Existing BoxLite sandbox', '', TRUE,
+	      '{"runtimeId":"legacy-boxlite-runtime","network":"restricted"}'::jsonb, NOW(), NOW())`); err != nil {
 		t.Fatalf("insert v0.1.6 resources: %v", err)
 	}
 	serverID := uuid.NewString()
@@ -116,6 +126,24 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 	  VALUES ($1, 'Existing Worker', 'existing-worker', 'linux', 'amd64', $2, $3, $3, $3)`,
 		serverID, hashToken(serverID), lastSeenAt); err != nil {
 		t.Fatalf("insert v0.1.6 Worker: %v", err)
+	}
+	dockerJobID := uuid.NewString()
+	microsandboxJobID := uuid.NewString()
+	boxliteJobID := uuid.NewString()
+	completedJobID := uuid.NewString()
+	if _, err := store.pool.Exec(ctx, `INSERT INTO worker_jobs
+	  (id, server_id, resource_id, action, status, payload, created_at, updated_at)
+	  VALUES
+	    ($1, $5, 'legacy-docker-sandbox', 'create-sandbox', 'pending',
+	      '{"driver":"docker","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ($2, $5, 'legacy-microsandbox-sandbox', 'start-sandbox', 'pending',
+	      '{"driver":"microsandbox","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ($3, $5, 'legacy-boxlite-sandbox', 'restart-sandbox', 'pending',
+	      '{"driver":"boxlite","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ($4, $5, 'legacy-docker-sandbox', 'restart-sandbox', 'succeeded',
+	      '{"driver":"docker","network":"restricted"}'::jsonb, NOW(), NOW())`,
+		dockerJobID, microsandboxJobID, boxliteJobID, completedJobID, serverID); err != nil {
+		t.Fatalf("insert v0.1.6 Worker jobs: %v", err)
 	}
 
 	for range 2 {
@@ -136,6 +164,42 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 	}
 	if !resourcesPreserved {
 		t.Fatal("upgrade did not preserve the existing project, custom skill, or template")
+	}
+	for _, expected := range []struct {
+		id      string
+		network string
+	}{
+		{id: "legacy-runtime", network: "egress"},
+		{id: "legacy-microsandbox-runtime", network: "egress"},
+		{id: "legacy-boxlite-runtime", network: "restricted"},
+		{id: "legacy-docker-sandbox", network: "egress"},
+		{id: "legacy-microsandbox-sandbox", network: "egress"},
+		{id: "legacy-boxlite-sandbox", network: "restricted"},
+	} {
+		var network string
+		if err := store.pool.QueryRow(ctx, `SELECT spec->>'network' FROM control_resources WHERE id = $1`, expected.id).Scan(&network); err != nil {
+			t.Fatalf("load migrated network for %s: %v", expected.id, err)
+		}
+		if network != expected.network {
+			t.Fatalf("migrated network for %s = %q, want %q", expected.id, network, expected.network)
+		}
+	}
+	for _, expected := range []struct {
+		id      string
+		network string
+	}{
+		{id: dockerJobID, network: "egress"},
+		{id: microsandboxJobID, network: "egress"},
+		{id: boxliteJobID, network: "restricted"},
+		{id: completedJobID, network: "restricted"},
+	} {
+		var network string
+		if err := store.pool.QueryRow(ctx, `SELECT payload->>'network' FROM worker_jobs WHERE id = $1`, expected.id).Scan(&network); err != nil {
+			t.Fatalf("load migrated Worker job network for %s: %v", expected.id, err)
+		}
+		if network != expected.network {
+			t.Fatalf("migrated Worker job network for %s = %q, want %q", expected.id, network, expected.network)
+		}
 	}
 	var activityAt time.Time
 	if err := store.pool.QueryRow(ctx, `SELECT last_job_activity_at

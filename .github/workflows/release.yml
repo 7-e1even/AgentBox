@@ -8,9 +8,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: agentbox-release-latest
+  cancel-in-progress: false
+
 jobs:
   worker:
-    name: Test and publish Worker binaries
+    name: Test and build Worker binaries
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -27,8 +31,6 @@ jobs:
           --health-retries 12
     env:
       AGENTBOX_TEST_DATABASE_URL: postgres://postgres:agentbox@127.0.0.1:5432/agentbox_test?sslmode=disable
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -46,6 +48,9 @@ jobs:
       - name: Test Go services
         working-directory: server
         run: go test -count=1 ./...
+      - name: Test Microsandbox driver asset
+        working-directory: server
+        run: go test -count=1 -tags agentbox_driver ./internal/httpapi/assets/agentbox-microsandbox-driver
       - name: Exercise Docker lifecycle and real Session Worker RPC
         working-directory: server
         env:
@@ -73,15 +78,13 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o ../dist/agentbox-worker-linux-arm64 ./cmd/agentbox-worker
           cd ../dist
           sha256sum agentbox-worker-linux-amd64 agentbox-worker-linux-arm64 > SHA256SUMS
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
-            gh release upload "${{ github.ref_name }}" dist/* --clobber
-          else
-            gh release create "${{ github.ref_name }}" dist/* --generate-notes --verify-tag
-          fi
+      - name: Upload Worker release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: worker-release-assets
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
 
   images:
     name: Publish multi-architecture images
@@ -113,7 +116,6 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           tags: |
             ghcr.io/7-e1even/agentbox-server:${{ github.ref_name }}
-            ghcr.io/7-e1even/agentbox-server:latest
       - name: Publish Web image
         uses: docker/build-push-action@v6
         with:
@@ -128,4 +130,116 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
           tags: |
             ghcr.io/7-e1even/agentbox-app:${{ github.ref_name }}
-            ghcr.io/7-e1even/agentbox-app:latest
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - worker
+      - images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download Worker release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: worker-release-assets
+          path: dist
+      - name: Promote the complete image set and create the GitHub Release
+        env:
+          VERSION: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          server_repo=ghcr.io/7-e1even/agentbox-server
+          app_repo=ghcr.io/7-e1even/agentbox-app
+
+          manifest_digest() {
+            docker buildx imagetools inspect "$1" --format '{{json .Manifest}}' |
+              jq -er '.digest | strings | select(test("^sha256:[0-9a-f]{64}$"))'
+          }
+
+          optional_manifest_digest() {
+            local reference=$1 error_file digest
+            error_file=$(mktemp)
+            if digest=$(manifest_digest "$reference" 2>"$error_file"); then
+              rm -f "$error_file"
+              printf '%s' "$digest"
+              return 0
+            fi
+            if grep -Eqi 'not found|manifest unknown|no such manifest' "$error_file"; then
+              rm -f "$error_file"
+              return 0
+            fi
+            cat "$error_file" >&2
+            rm -f "$error_file"
+            return 1
+          }
+
+          rollback_latest() {
+            local rollback_failed=0
+            if [ -n "$old_server" ]; then
+              docker buildx imagetools create --tag "$server_repo:latest" "$server_repo@$old_server" &&
+                test "$(manifest_digest "$server_repo:latest")" = "$old_server" || rollback_failed=1
+            else
+              echo '::warning::server latest did not exist before this bootstrap release and cannot be restored to an absent tag'
+            fi
+            if [ -n "$old_app" ]; then
+              docker buildx imagetools create --tag "$app_repo:latest" "$app_repo@$old_app" &&
+                test "$(manifest_digest "$app_repo:latest")" = "$old_app" || rollback_failed=1
+            else
+              echo '::warning::app latest did not exist before this bootstrap release and cannot be restored to an absent tag'
+            fi
+            if [ "$rollback_failed" -ne 0 ]; then
+              echo '::error::latest image rollback was incomplete'
+              return 1
+            fi
+          }
+
+          publish_release() {
+            if gh release view "$VERSION" >/dev/null 2>&1; then
+              gh release upload "$VERSION" dist/* --clobber
+            else
+              gh release create "$VERSION" dist/* --generate-notes --verify-tag
+            fi
+          }
+
+          old_server=$(optional_manifest_digest "$server_repo:latest")
+          old_app=$(optional_manifest_digest "$app_repo:latest")
+          new_server=$(manifest_digest "$server_repo:$VERSION")
+          new_app=$(manifest_digest "$app_repo:$VERSION")
+
+          release_published=false
+          if [ -z "$old_server" ] || [ -z "$old_app" ]; then
+            if ! publish_release; then
+              echo '::error::GitHub Release publication failed before bootstrap latest promotion'
+              exit 1
+            fi
+            release_published=true
+          fi
+
+          if ! {
+            docker buildx imagetools create --tag "$server_repo:latest" "$server_repo@$new_server" &&
+            docker buildx imagetools create --tag "$app_repo:latest" "$app_repo@$new_app" &&
+            test "$(manifest_digest "$server_repo:latest")" = "$new_server" &&
+            test "$(manifest_digest "$app_repo:latest")" = "$new_app"
+          }; then
+            rollback_latest || true
+            exit 1
+          fi
+
+          if [ "$release_published" = false ]; then
+            if ! publish_release; then
+              echo '::error::GitHub Release publication failed; restoring the previous latest image set'
+              rollback_latest || true
+              exit 1
+            fi
+          fi

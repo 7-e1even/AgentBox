@@ -722,7 +722,7 @@ func automatedSandboxName(automationName, shortID string) string {
 }
 
 func enqueueAutomationSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource, runID string) (string, map[string]any, error) {
-	payload, driver, imageReference, err := buildSandboxJobPayload(ctx, tx, sandbox)
+	payload, driver, imageReference, err := buildSandboxJobPayload(ctx, tx, sandbox, true)
 	if err != nil {
 		return "", nil, err
 	}
@@ -755,6 +755,9 @@ func ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx, input plat
 		return fmt.Errorf("decode automated sandbox environment: %w", err)
 	}
 	effectiveSpec := effectiveSandboxSpec(runtimeSpec, input.Spec)
+	if err := ensureExtensionReferences(ctx, tx, input.ProjectID, effectiveSpec, true); err != nil {
+		return err
+	}
 	serverID, _ := effectiveSpec["serverId"].(string)
 	driver, _ := effectiveSpec["driver"].(string)
 	requiredCapability := driver

@@ -361,13 +361,24 @@ func runtimeLLMGeminiURL(target platform.RuntimeLLMTarget, requestPath string, q
 	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
 		return "", errors.New("凭据 API 地址无效")
 	}
-	path := "/" + strings.TrimLeft(requestPath, "/")
+	path, rawPath, err := runtimeLLMGeminiModelPath(requestPath, target.ModelID)
+	if err != nil {
+		return "", err
+	}
 	basePath := strings.TrimRight(parsed.Path, "/")
-	if strings.HasSuffix(basePath, "/v1beta") && strings.HasPrefix(path, "/v1beta/") {
-		path = strings.TrimPrefix(path, "/v1beta")
+	baseRawPath := strings.TrimRight(parsed.EscapedPath(), "/")
+	baseHasVersion := strings.HasSuffix(basePath, "/v1beta") || strings.HasSuffix(basePath, "/v1")
+	if baseHasVersion {
+		for _, requestVersion := range []string{"/v1beta", "/v1"} {
+			if strings.HasPrefix(path, requestVersion+"/") {
+				path = strings.TrimPrefix(path, requestVersion)
+				rawPath = strings.TrimPrefix(rawPath, requestVersion)
+				break
+			}
+		}
 	}
 	parsed.Path = basePath + path
-	parsed.RawPath = ""
+	parsed.RawPath = baseRawPath + rawPath
 	forwardQuery := make(url.Values, len(query))
 	for key, values := range query {
 		forwardQuery[key] = slices.Clone(values)
@@ -375,6 +386,41 @@ func runtimeLLMGeminiURL(target platform.RuntimeLLMTarget, requestPath string, q
 	forwardQuery.Set("key", target.Secret)
 	parsed.RawQuery = forwardQuery.Encode()
 	return parsed.String(), nil
+}
+
+func runtimeLLMGeminiModelPath(requestPath, modelID string) (string, string, error) {
+	path := strings.TrimLeft(requestPath, "/")
+	prefix := ""
+	switch {
+	case strings.HasPrefix(path, "v1beta/models/"):
+		prefix = "v1beta/"
+		path = strings.TrimPrefix(path, prefix)
+	case strings.HasPrefix(path, "v1/models/"):
+		prefix = "v1/"
+		path = strings.TrimPrefix(path, prefix)
+	}
+	if !strings.HasPrefix(path, "models/") {
+		return "", "", errors.New("Gemini 请求路径无效")
+	}
+	modelAndOperation := strings.TrimPrefix(path, "models/")
+	separator := strings.LastIndex(modelAndOperation, ":")
+	if separator <= 0 || separator == len(modelAndOperation)-1 {
+		return "", "", errors.New("Gemini 请求路径无效")
+	}
+	operation := modelAndOperation[separator+1:]
+	for _, char := range operation {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+			return "", "", errors.New("Gemini 请求路径无效")
+		}
+	}
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return "", "", errors.New("凭据没有绑定可用模型")
+	}
+	pathPrefix := "/" + prefix + "models/"
+	escapedModelID := strings.ReplaceAll(url.PathEscape(modelID), ":", "%3A")
+	return pathPrefix + modelID + ":" + operation,
+		pathPrefix + escapedModelID + ":" + operation, nil
 }
 
 func runtimeLLMGeminiGenerateURL(target platform.RuntimeLLMTarget, streaming bool) (string, error) {

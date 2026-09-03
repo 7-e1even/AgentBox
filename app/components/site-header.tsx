@@ -17,6 +17,10 @@ type SiteHeaderContextValue = {
 
 const SiteHeaderContext = createContext<SiteHeaderContextValue | null>(null)
 
+export function useSiteHeaderUser() {
+  return useContext(SiteHeaderContext)?.user ?? null
+}
+
 export function SiteHeaderProvider({
   children,
   ...value
@@ -41,12 +45,12 @@ export function SiteHeader({
 }) {
   const account = useContext(SiteHeaderContext)
   return (
-    <header className="relative flex h-16 shrink-0 items-center gap-2 border-b transition-[width,height] ease-linear group-has-data-[collapsible=icon]/sidebar-wrapper:h-12">
-      <div className="flex min-w-0 flex-1 items-center gap-2 px-4">
+    <header className="relative flex h-(--header-height) shrink-0 items-center gap-2 border-b transition-[width,height] ease-linear">
+      <div className="flex min-w-0 flex-1 items-center gap-1 px-4 lg:gap-2 lg:px-6">
         <SidebarTrigger className="-ml-1" />
         <Separator
           orientation="vertical"
-          className="mr-1 data-[orientation=vertical]:h-4"
+          className="mx-2 data-[orientation=vertical]:h-4"
         />
         <h1 className="truncate text-sm font-semibold sm:text-base">{title}</h1>
         {typeof count === "number" && (
@@ -63,7 +67,7 @@ export function SiteHeader({
           {center}
         </div>
       ) : null}
-      <div className="flex shrink-0 items-center gap-2 px-4">
+      <div className="flex shrink-0 items-center gap-2 px-4 lg:px-6">
         {action}
         {action && account ? (
           <Separator orientation="vertical" className="h-5" />

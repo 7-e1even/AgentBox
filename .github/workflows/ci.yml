@@ -51,6 +51,23 @@ jobs:
       - name: Test
         working-directory: server
         run: go test -count=1 ./...
+      - name: Test Microsandbox driver
+        working-directory: server
+        run: go test -count=1 -tags agentbox_driver ./internal/httpapi/assets/agentbox-microsandbox-driver
+      - name: Build source Server image with bundled Workers
+        run: docker build --build-arg VERSION=dev -t agentbox-server-source-smoke ./server
+      - name: Verify bundled Worker assets
+        run: |
+          docker run --rm --entrypoint sh agentbox-server-source-smoke -ec '
+            test -x /usr/local/lib/agentbox/workers/agentbox-worker-linux-amd64
+            test -x /usr/local/lib/agentbox/workers/agentbox-worker-linux-arm64
+            test -r /usr/local/lib/agentbox/workers/agentbox-worker-linux-amd64.sha256
+            test -r /usr/local/lib/agentbox/workers/agentbox-worker-linux-arm64.sha256
+            test "$AGENTBOX_WORKER_BINARY_DIR" = /usr/local/lib/agentbox/workers
+          '
+          docker run --rm \
+            --entrypoint /usr/local/lib/agentbox/workers/agentbox-worker-linux-amd64 \
+            agentbox-server-source-smoke version | grep -Fx dev
 
   worker-docker:
     name: Session Worker Docker data-plane E2E
@@ -99,4 +116,12 @@ jobs:
         run: pnpm test
       - name: Build
         working-directory: app
+        env:
+          AGENTBOX_API_URL: http://127.0.0.1:18091
         run: pnpm build
+      - name: Install Chromium
+        working-directory: app
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Desktop end-to-end tests
+        working-directory: app
+        run: pnpm test:e2e

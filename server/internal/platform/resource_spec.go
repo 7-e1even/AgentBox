@@ -40,6 +40,7 @@ type ExecutionSpec struct {
 	SkillIDs             []string              `json:"skillIds,omitempty"`
 	MCPServerIDs         []string              `json:"mcpServerIds,omitempty"`
 	VariableIDs          []string              `json:"variableIds,omitempty"`
+	ExtensionIDs         []string              `json:"extensionIds,omitempty"`
 	CredentialIDs        []string              `json:"credentialIds,omitempty"`
 	EnvironmentVariables []EnvironmentVariable `json:"environmentVariables,omitempty"`
 	ModelBindings        map[string]string     `json:"modelBindings,omitempty"`
@@ -102,6 +103,8 @@ func (f ResourceFilter) Validate() error {
 var sandboxObservedSpecFields = []string{
 	"status", "message", "externalId", "provisioning", "appliedProxyId", "proxyOperation",
 	"agentToolVersions", "agentToolOperation", "automationId", "automationRunId",
+	"extensionSnapshots", "extensionStates", "runtimeModelSources", "runtimeModelSourcesComplete",
+	"runtimeModelTokenEpoch",
 }
 
 func DesiredResourceSpec(kind Kind, spec map[string]any) map[string]any {
@@ -134,6 +137,8 @@ func DecodeResourceSpec(input Input) (any, error) {
 		target = &MCPSpec{}
 	case KindVariable:
 		target = &VariableSpec{}
+	case KindExtension:
+		target = &ExtensionSpec{}
 	default:
 		return nil, &ValidationError{Message: "资源类型无效"}
 	}

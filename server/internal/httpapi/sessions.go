@@ -31,6 +31,8 @@ const (
 	sandboxWorkerKeepalive       = 20 * time.Second
 )
 
+var errSandboxDesktopNotEnabled = errors.New("sandbox desktop is not enabled")
+
 type sandboxSessionTarget struct {
 	SandboxID  string
 	ServerID   string
@@ -252,6 +254,10 @@ func (s *Server) createSandboxDesktopTicket(w http.ResponseWriter, request *http
 
 func (s *Server) createSandboxConnectionTicket(w http.ResponseWriter, request *http.Request, mode string) {
 	target, err := s.resolveSandboxSessionTarget(request.Context(), request.PathValue("id"), mode == "desktop")
+	if errors.Is(err, errSandboxDesktopNotEnabled) {
+		s.writeError(w, http.StatusConflict, "此沙箱未预配图形桌面，请先重启并应用配置或重新创建沙箱")
+		return
+	}
 	if err != nil {
 		s.handleError(w, err)
 		return
@@ -298,23 +304,18 @@ func (s *Server) resolveSandboxSessionTarget(ctx context.Context, sandboxID stri
 	serverID, _ := sandbox.Spec["serverId"].(string)
 	externalID, _ := sandbox.Spec["externalId"].(string)
 	driver, _ := sandbox.Spec["driver"].(string)
-	desktop, desktopSet := sandbox.Spec["desktop"].(bool)
-	if driver == "" || !desktopSet {
+	desktop, _ := sandbox.Spec["desktop"].(bool)
+	if driver == "" {
 		runtimeID, _ := sandbox.Spec["runtimeId"].(string)
 		for index := range resources {
 			if resources[index].Kind == platform.KindRuntime && resources[index].ID == runtimeID {
-				if driver == "" {
-					driver, _ = resources[index].Spec["driver"].(string)
-				}
-				if !desktopSet {
-					desktop, _ = resources[index].Spec["desktop"].(bool)
-				}
+				driver, _ = resources[index].Spec["driver"].(string)
 				break
 			}
 		}
 	}
 	if requireDesktop && !desktop {
-		return sandboxSessionTarget{}, fmt.Errorf("%w: sandbox desktop is not enabled", store.ErrConflict)
+		return sandboxSessionTarget{}, errSandboxDesktopNotEnabled
 	}
 	if serverID == "" || externalID == "" || driver == "" {
 		return sandboxSessionTarget{}, fmt.Errorf("%w: sandbox session target is incomplete", store.ErrConflict)

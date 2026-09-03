@@ -126,7 +126,7 @@ func (fakeStore) UpdateResource(_ context.Context, _ string, input platform.Inpu
 func (fakeStore) DeleteResource(context.Context, string) error { return nil }
 func (fakeStore) OperateSandbox(_ context.Context, id, action string) (platform.Resource, error) {
 	switch action {
-	case "start", "stop", "restart", "delete":
+	case "start", "stop", "restart", "delete", "cancel-install":
 	default:
 		return platform.Resource{}, &platform.ValidationError{Message: "不支持的沙箱操作"}
 	}
@@ -136,6 +136,14 @@ func (fakeStore) UpdateSandboxNetworkProxy(_ context.Context, id, proxyID string
 	return platform.Resource{Input: platform.Input{
 		ID: id, Kind: platform.KindSandbox, Name: "proxy",
 		Spec: map[string]any{"proxyId": proxyID},
+	}}, nil
+}
+func (fakeStore) UpdateSandboxModelSource(_ context.Context, id string, input platform.SandboxModelSourceInput) (platform.Resource, error) {
+	return platform.Resource{Input: platform.Input{
+		ID: id, Kind: platform.KindSandbox, Name: "model-source",
+		Spec: map[string]any{"runtimeModelSources": map[string]any{
+			input.SlotCredentialID: map[string]any{"credentialId": input.CredentialID, "modelId": input.ModelID},
+		}},
 	}}, nil
 }
 func (fakeStore) OperateSandboxAgentTools(_ context.Context, id, action string, tools []string) (platform.Resource, error) {
@@ -251,6 +259,9 @@ func (fakeStore) ResolveRuntimeLLMTarget(context.Context, string, string, string
 }
 func (fakeStore) ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error) {
 	return platform.WorkerJob{}, store.ErrNoJob
+}
+func (fakeStore) ControlWorkerJob(context.Context, string, string, string, platform.WorkerJobControlInput) (platform.WorkerJobControl, error) {
+	return platform.WorkerJobControl{}, nil
 }
 func (fakeStore) ReportWorkerJobProgress(context.Context, string, string, string, platform.WorkerJobProgressInput) (platform.ProvisioningProgress, error) {
 	return platform.ProvisioningProgress{}, nil
@@ -609,6 +620,20 @@ func TestSandboxNetworkProxyUpdateAcceptsDirectAndNamedProxy(t *testing.T) {
 				t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestSandboxModelSourceUpdateReturnsCommittedRuntimeRoute(t *testing.T) {
+	request := httptest.NewRequest(
+		http.MethodPatch,
+		"/api/sandboxes/sandbox-one/model-source",
+		strings.NewReader(`{"slotCredentialId":"primary","credentialId":"backup","modelId":"gpt-5.4","expectedCredentialId":"primary","expectedModelId":"gpt-5.3"}`),
+	)
+	response := httptest.NewRecorder()
+	testHandler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), `"primary":{"credentialId":"backup","modelId":"gpt-5.4"}`) {
+		t.Fatalf("status = %d body = %s", response.Code, response.Body.String())
 	}
 }
 

@@ -5,7 +5,10 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
+  useRef,
   useState,
+  type CSSProperties,
   type ReactNode,
   type SetStateAction,
 } from "react"
@@ -16,7 +19,7 @@ import { usePathname, useRouter } from "next/navigation"
 import { AppSidebar } from "@/components/app-sidebar"
 import { ResourceEditorDialog } from "@/components/resource-editor-dialog"
 import { SandboxEditorDialog } from "@/components/sandbox-editor-dialog"
-import { SettingsView } from "@/components/settings-view"
+import { ExtensionEditorDialog } from "@/components/extension-editor-dialog"
 import { SiteHeaderProvider } from "@/components/site-header"
 import { catalogSchema } from "@/lib/catalog"
 import { observePollingVisibility, usePolling } from "@/hooks/use-polling"
@@ -38,6 +41,7 @@ import {
   type Resource,
   type ResourceInput,
   type ResourceKind,
+  type ResourceOfKind,
 } from "@/lib/platform-schema"
 import {
   PROJECT_COOKIE_NAME,
@@ -86,6 +90,13 @@ import {
   appSectionPath,
   type AppSection,
 } from "@/lib/app-section"
+import {
+  historyEntryIndex,
+  historyRestoreDelta,
+  NavigationBlockerContext,
+  unsavedNavigationMessage,
+  withHistoryEntryIndex,
+} from "@/lib/navigation-blocker"
 
 // 各管理视图按需加载，避免所有 section 的代码打进首屏 chunk。
 const AccessManagement = dynamic(() =>
@@ -104,6 +115,11 @@ const AutomationRunHistory = dynamic(() =>
 const ImageManagement = dynamic(() =>
   import("@/components/image-management").then((mod) => mod.ImageManagement)
 )
+const ExtensionManagement = dynamic(() =>
+  import("@/components/extension-management").then(
+    (mod) => mod.ExtensionManagement
+  )
+)
 const LogsView = dynamic(() =>
   import("@/components/logs-view").then((mod) => mod.LogsView)
 )
@@ -120,6 +136,9 @@ const UserManagement = dynamic(() =>
 )
 const ResourceView = dynamic(() =>
   import("@/components/control-plane-view").then((mod) => mod.ResourceView)
+)
+const SettingsView = dynamic(() =>
+  import("@/components/settings-view").then((mod) => mod.SettingsView)
 )
 const DashboardView = dynamic(() =>
   import("@/components/environment-views").then((mod) => mod.DashboardView)
@@ -165,9 +184,14 @@ function resourcesPollingInterval(
   return resources?.some(
     (item) =>
       item.kind === "sandbox" &&
-      (["requested", "starting", "stopping", "restarting", "deleting"].includes(
-        String(item.spec.status)
-      ) ||
+      ([
+        "requested",
+        "starting",
+        "cancelling",
+        "stopping",
+        "restarting",
+        "deleting",
+      ].includes(String(item.spec.status)) ||
         ["queued", "running"].includes(
           String(item.spec.proxyOperation?.status)
         ) ||
@@ -211,6 +235,29 @@ export function ControlPlaneShell({
 }) {
   const router = useRouter()
   const pathname = usePathname()
+  const navigationBlockedRef = useRef(false)
+  const currentHistoryIndexRef = useRef(0)
+  const restoringHistoryRef = useRef(false)
+  const setNavigationBlocked = useCallback((blocked: boolean) => {
+    navigationBlockedRef.current = blocked
+  }, [])
+  const confirmNavigation = useCallback(
+    () =>
+      !navigationBlockedRef.current || window.confirm(unsavedNavigationMessage),
+    []
+  )
+  const isNavigationBlocked = useCallback(
+    () => navigationBlockedRef.current,
+    []
+  )
+  const navigationBlocker = useMemo(
+    () => ({
+      confirmNavigation,
+      isBlocked: isNavigationBlocked,
+      setBlocked: setNavigationBlocked,
+    }),
+    [confirmNavigation, isNavigationBlocked, setNavigationBlocked]
+  )
   const [sessionUser, setSessionUser] = useState(currentUser)
   const [selectedProjectId, setProjectId] = useState(initialProjectId)
   const [resourceEditor, setResourceEditor] = useState<{
@@ -383,9 +430,119 @@ export function ControlPlaneShell({
     )
   }, [sessionUser.preferences])
 
+  useEffect(() => {
+    const navigation = browserNavigation()
+    if (navigation) {
+      const guardBrowserTraversal: EventListener = (event) => {
+        const navigateEvent = event as BrowserNavigateEvent
+        if (
+          navigateEvent.navigationType !== "traverse" ||
+          !navigateEvent.cancelable
+        ) {
+          return
+        }
+        if (!confirmNavigation()) navigateEvent.preventDefault()
+      }
+      navigation.addEventListener("navigate", guardBrowserTraversal)
+      return () => {
+        navigation.removeEventListener("navigate", guardBrowserTraversal)
+      }
+    }
+
+    let installed = false
+    let originalPushState: History["pushState"] | null = null
+    let originalReplaceState: History["replaceState"] | null = null
+    let patchedPushState: History["pushState"] | null = null
+    let patchedReplaceState: History["replaceState"] | null = null
+    let guardBrowserTraversal: ((event: PopStateEvent) => void) | null = null
+
+    // Install after the App Router has wrapped history so cleanup restores its
+    // implementation instead of replacing it with the browser native methods.
+    const installTimer = window.setTimeout(() => {
+      const history = window.history
+      const initialIndex = historyEntryIndex(history.state) ?? 0
+      currentHistoryIndexRef.current = initialIndex
+      history.replaceState(
+        withHistoryEntryIndex(history.state, initialIndex),
+        ""
+      )
+
+      originalPushState = history.pushState
+      originalReplaceState = history.replaceState
+      patchedPushState = function (data, unused, url) {
+        const nextIndex = currentHistoryIndexRef.current + 1
+        originalPushState!.call(
+          history,
+          withHistoryEntryIndex(data, nextIndex),
+          unused,
+          url
+        )
+        currentHistoryIndexRef.current = nextIndex
+      }
+      patchedReplaceState = function (data, unused, url) {
+        const currentIndex = currentHistoryIndexRef.current
+        originalReplaceState!.call(
+          history,
+          withHistoryEntryIndex(data, currentIndex),
+          unused,
+          url
+        )
+        currentHistoryIndexRef.current = currentIndex
+      }
+      history.pushState = patchedPushState
+      history.replaceState = patchedReplaceState
+
+      guardBrowserTraversal = (event) => {
+        const targetIndex = historyEntryIndex(event.state)
+        if (targetIndex === null) return
+        if (restoringHistoryRef.current) {
+          restoringHistoryRef.current = false
+          currentHistoryIndexRef.current = targetIndex
+          return
+        }
+
+        const restoreDelta = historyRestoreDelta(
+          currentHistoryIndexRef.current,
+          targetIndex
+        )
+        if (restoreDelta === 0) return
+        if (confirmNavigation()) {
+          currentHistoryIndexRef.current = targetIndex
+          return
+        }
+
+        // popstate fires after the history pointer moves. Stop Next.js from
+        // rendering the rejected target, then traverse back to the source.
+        event.stopImmediatePropagation()
+        restoringHistoryRef.current = true
+        history.go(restoreDelta)
+      }
+      window.addEventListener("popstate", guardBrowserTraversal, true)
+      installed = true
+    }, 0)
+
+    return () => {
+      window.clearTimeout(installTimer)
+      if (!installed) return
+      if (guardBrowserTraversal) {
+        window.removeEventListener("popstate", guardBrowserTraversal, true)
+      }
+      if (patchedPushState && window.history.pushState === patchedPushState) {
+        window.history.pushState = originalPushState!
+      }
+      if (
+        patchedReplaceState &&
+        window.history.replaceState === patchedReplaceState
+      ) {
+        window.history.replaceState = originalReplaceState!
+      }
+    }
+  }, [confirmNavigation])
+
   function selectProject(nextProjectId: string, notify = true) {
     const project = projectResources.find((item) => item.id === nextProjectId)
     if (!project || project.id === projectId) return
+    if (!confirmNavigation()) return
     setProjectId(project.id)
     if (notify) {
       toast.success("已切换项目", { description: project.name })
@@ -670,7 +827,7 @@ export function ControlPlaneShell({
 
   async function operateSandbox(
     sandbox: Resource,
-    action: "start" | "stop" | "restart" | "delete"
+    action: "start" | "stop" | "restart" | "delete" | "cancel-install"
   ) {
     setSandboxBusyId(sandbox.id)
     try {
@@ -692,13 +849,52 @@ export function ControlPlaneShell({
             ? "停止任务已提交"
             : action === "restart"
               ? "重启任务已提交"
-              : "删除任务已提交",
+              : action === "cancel-install"
+                ? result.resource.kind === "sandbox" &&
+                  result.resource.spec.status === "cancelled"
+                  ? "安装已取消"
+                  : "取消请求已提交，等待 Worker 清理"
+                : "删除任务已提交",
         { description: sandbox.name }
       )
     } catch (error) {
       toast.error("沙箱操作失败", { description: errorMessage(error) })
     } finally {
       setSandboxBusyId(null)
+    }
+  }
+
+  async function updateSandboxNetworkProxy(
+    sandbox: ResourceOfKind<"sandbox">,
+    proxyId: string
+  ) {
+    try {
+      const result = resourceResponseSchema.parse(
+        await requestJson<unknown>(
+          `/api/sandboxes/${sandbox.id}/network-proxy`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({ proxyId }),
+          }
+        )
+      )
+      handleSandboxResourceChange(result.resource)
+      toast.success(
+        sandbox.spec.status === "running"
+          ? "网络出口任务已提交"
+          : "网络出口已保存",
+        {
+          description:
+            proxyId === ""
+              ? "新的进程将使用直连"
+              : (proxies.find((proxy) => proxy.id === proxyId)?.name ??
+                proxyId),
+        }
+      )
+      return result.resource
+    } catch (error) {
+      toast.error("网络出口更新失败", { description: errorMessage(error) })
+      throw error
     }
   }
 
@@ -812,15 +1008,19 @@ export function ControlPlaneShell({
   }
 
   async function logout() {
+    if (!confirmNavigation()) return
     try {
       await fetch("/api/auth/logout", { method: "POST" })
     } finally {
+      setNavigationBlocked(false)
       window.location.assign("/login")
     }
   }
 
   function navigate(section: AppSection) {
-    router.push(appSectionPath(section))
+    const destination = appSectionPath(section)
+    if (pathname === destination || !confirmNavigation()) return
+    router.push(destination)
   }
 
   function renderSection(section: AppSection) {
@@ -879,17 +1079,32 @@ export function ControlPlaneShell({
           })
         }
       />
+    ) : section === "extensions" ? (
+      <ExtensionManagement
+        key={projectId}
+        resources={scopedResources}
+        canMutate={canMutateResources}
+        onCreate={() =>
+          setResourceEditor({ kind: "extension", resource: null })
+        }
+        onEdit={(resource) =>
+          setResourceEditor({ kind: "extension", resource })
+        }
+        onDelete={setDeletingResource}
+      />
     ) : section === "sandboxes" ? (
       <SandboxesView
         key={projectId}
         resources={scopedResources}
         servers={servers}
+        proxies={proxies}
         canMutate={canMutateResources}
         canOpenWorkspace={!isViewer}
         onCreate={() => setSandboxEditor({ resource: null })}
         onEdit={(resource) => setSandboxEditor({ resource })}
         busyId={sandboxBusyId}
         onAction={operateSandbox}
+        onApplyNetworkProxy={updateSandboxNetworkProxy}
         onDelete={setDeletingResource}
         onResourceChange={handleSandboxResourceChange}
         onRefresh={refreshResources}
@@ -1035,141 +1250,181 @@ export function ControlPlaneShell({
   }
 
   return (
-    <SectionRendererContext.Provider value={renderSection}>
-      <SidebarProvider className="h-svh min-h-0 overflow-hidden">
-        <SiteHeaderProvider
-          user={sessionUser}
-          onSettings={() => navigate("settings")}
-          onManageUsers={() => navigate("users")}
-          onLogout={() => void logout()}
+    <NavigationBlockerContext.Provider value={navigationBlocker}>
+      <SectionRendererContext.Provider value={renderSection}>
+        <SidebarProvider
+          className="h-svh min-h-0 overflow-hidden"
+          style={
+            {
+              "--sidebar-width": "calc(var(--spacing) * 72)",
+              "--header-height": "calc(var(--spacing) * 12)",
+            } as CSSProperties
+          }
         >
-          <a
-            href="#main-content"
-            className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:ring-2 focus:ring-ring"
+          <SiteHeaderProvider
+            user={sessionUser}
+            onSettings={() => navigate("settings")}
+            onManageUsers={() => navigate("users")}
+            onLogout={() => void logout()}
           >
-            跳到主要内容
-          </a>
-          <AppSidebar
-            currentUser={sessionUser}
-            projects={projectResources}
-            projectId={projectId}
-            onProjectChange={selectProject}
-          />
-          <SidebarInset
-            id="main-content"
-            tabIndex={-1}
-            className="min-w-0 overflow-hidden focus:outline-none"
-          >
-            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-              {(projectsDomain.data === undefined ||
-                Boolean(projectsDomain.error)) && (
-                <LoadState
-                  label="项目"
-                  {...projectsDomain}
-                  onRetry={projectsDomain.refresh}
+            <a
+              href="#main-content"
+              className="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 focus:rounded-lg focus:bg-background focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:ring-2 focus:ring-ring"
+            >
+              跳到主要内容
+            </a>
+            <AppSidebar
+              currentUser={sessionUser}
+              projects={projectResources}
+              projectId={projectId}
+              onProjectChange={selectProject}
+            />
+            <SidebarInset
+              id="main-content"
+              tabIndex={-1}
+              className="min-w-0 overflow-hidden focus:outline-none"
+            >
+              <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+                {(projectsDomain.data === undefined ||
+                  Boolean(projectsDomain.error)) && (
+                  <LoadState
+                    label="项目"
+                    {...projectsDomain}
+                    onRetry={projectsDomain.refresh}
+                  />
+                )}
+                {sectionNeeds
+                  .filter((key) => domains[key].stale)
+                  .map((key) => (
+                    <LoadState
+                      key={key}
+                      label={domainLabels[key]}
+                      {...domains[key]}
+                      onRetry={domains[key].refresh}
+                    />
+                  ))}
+                {editorWaiting && (
+                  <div className="px-4">
+                    {editorDependencyStatus}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setResourceEditor(null)
+                        setSandboxEditor(null)
+                      }}
+                    >
+                      取消编辑
+                    </Button>
+                  </div>
+                )}
+                {children}
+              </div>
+            </SidebarInset>
+
+            {resourceEditor &&
+              editorNeeds.every((key) => domains[key].data !== undefined) &&
+              (resourceEditor.kind === "extension" ? (
+                <ExtensionEditorDialog
+                  key={resourceEditor.resource?.id ?? "new-extension"}
+                  resource={resourceEditor.resource}
+                  projectId={projectId}
+                  resources={resources}
+                  onOpenChange={(open) => !open && setResourceEditor(null)}
+                  onSave={saveResource}
+                  dependenciesReady={editorReady}
+                  dependencyStatus={editorDependencyStatus}
+                />
+              ) : (
+                <ResourceEditorDialog
+                  key={resourceEditor.resource?.id ?? resourceEditor.kind}
+                  kind={resourceEditor.kind}
+                  resource={resourceEditor.resource}
+                  projectId={projectId}
+                  resources={resources}
+                  servers={servers}
+                  credentials={credentials}
+                  proxies={proxies}
+                  initialSpec={resourceEditor.initialSpec}
+                  onOpenChange={(open) => !open && setResourceEditor(null)}
+                  onSave={saveResource}
+                  dependenciesReady={editorReady}
+                  dependencyStatus={editorDependencyStatus}
+                />
+              ))}
+
+            {sandboxEditor &&
+              editorNeeds.every((key) => domains[key].data !== undefined) && (
+                <SandboxEditorDialog
+                  key={
+                    sandboxEditor.resource?.id ??
+                    sandboxEditor.initialRuntimeId ??
+                    "new"
+                  }
+                  resource={sandboxEditor.resource}
+                  projectId={projectId}
+                  resources={resources}
+                  servers={servers}
+                  credentials={credentials}
+                  proxies={proxies}
+                  initialRuntimeId={sandboxEditor.initialRuntimeId}
+                  onOpenChange={(open) => !open && setSandboxEditor(null)}
+                  onSave={saveSandbox}
+                  dependenciesReady={editorReady}
+                  dependencyStatus={editorDependencyStatus}
                 />
               )}
-              {sectionNeeds
-                .filter((key) => domains[key].stale)
-                .map((key) => (
-                  <LoadState
-                    key={key}
-                    label={domainLabels[key]}
-                    {...domains[key]}
-                    onRetry={domains[key].refresh}
-                  />
-                ))}
-              {editorWaiting && (
-                <div className="px-4">
-                  {editorDependencyStatus}
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={() => {
-                      setResourceEditor(null)
-                      setSandboxEditor(null)
-                    }}
+
+            <AlertDialog
+              open={Boolean(deletingResource)}
+              onOpenChange={(open) => !open && setDeletingResource(null)}
+            >
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogMedia>
+                    <Trash2Icon />
+                  </AlertDialogMedia>
+                  <AlertDialogTitle>
+                    删除 {deletingResource?.name}？
+                  </AlertDialogTitle>
+                  <AlertDialogDescription>
+                    {deletingResource?.kind === "sandbox"
+                      ? "沙箱容器、独立工作区卷和控制面记录都会被永久删除，无法恢复。"
+                      : "该配置会从 PostgreSQL 永久删除，无法恢复。"}
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>取消</AlertDialogCancel>
+                  <AlertDialogAction
+                    variant="destructive"
+                    onClick={permanentlyDeleteResource}
                   >
-                    取消编辑
-                  </Button>
-                </div>
-              )}
-              {children}
-            </div>
-          </SidebarInset>
-
-          {resourceEditor &&
-            editorNeeds.every((key) => domains[key].data !== undefined) && (
-              <ResourceEditorDialog
-                key={resourceEditor.resource?.id ?? resourceEditor.kind}
-                kind={resourceEditor.kind}
-                resource={resourceEditor.resource}
-                projectId={projectId}
-                resources={resources}
-                servers={servers}
-                credentials={credentials}
-                proxies={proxies}
-                initialSpec={resourceEditor.initialSpec}
-                onOpenChange={(open) => !open && setResourceEditor(null)}
-                onSave={saveResource}
-                dependenciesReady={editorReady}
-                dependencyStatus={editorDependencyStatus}
-              />
-            )}
-
-          {sandboxEditor &&
-            editorNeeds.every((key) => domains[key].data !== undefined) && (
-              <SandboxEditorDialog
-                key={
-                  sandboxEditor.resource?.id ??
-                  sandboxEditor.initialRuntimeId ??
-                  "new"
-                }
-                resource={sandboxEditor.resource}
-                projectId={projectId}
-                resources={resources}
-                servers={servers}
-                credentials={credentials}
-                proxies={proxies}
-                initialRuntimeId={sandboxEditor.initialRuntimeId}
-                onOpenChange={(open) => !open && setSandboxEditor(null)}
-                onSave={saveSandbox}
-                dependenciesReady={editorReady}
-                dependencyStatus={editorDependencyStatus}
-              />
-            )}
-
-          <AlertDialog
-            open={Boolean(deletingResource)}
-            onOpenChange={(open) => !open && setDeletingResource(null)}
-          >
-            <AlertDialogContent>
-              <AlertDialogHeader>
-                <AlertDialogMedia>
-                  <Trash2Icon />
-                </AlertDialogMedia>
-                <AlertDialogTitle>
-                  删除 {deletingResource?.name}？
-                </AlertDialogTitle>
-                <AlertDialogDescription>
-                  {deletingResource?.kind === "sandbox"
-                    ? "沙箱容器、独立工作区卷和控制面记录都会被永久删除，无法恢复。"
-                    : "该配置会从 PostgreSQL 永久删除，无法恢复。"}
-                </AlertDialogDescription>
-              </AlertDialogHeader>
-              <AlertDialogFooter>
-                <AlertDialogCancel>取消</AlertDialogCancel>
-                <AlertDialogAction
-                  variant="destructive"
-                  onClick={permanentlyDeleteResource}
-                >
-                  永久删除
-                </AlertDialogAction>
-              </AlertDialogFooter>
-            </AlertDialogContent>
-          </AlertDialog>
-        </SiteHeaderProvider>
-      </SidebarProvider>
-    </SectionRendererContext.Provider>
+                    永久删除
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </SiteHeaderProvider>
+        </SidebarProvider>
+      </SectionRendererContext.Provider>
+    </NavigationBlockerContext.Provider>
   )
+}
+
+type BrowserNavigateEvent = Event & {
+  navigationType?: "push" | "replace" | "reload" | "traverse"
+}
+
+type BrowserNavigation = {
+  addEventListener: (type: "navigate", listener: EventListener) => void
+  removeEventListener: (type: "navigate", listener: EventListener) => void
+}
+
+function browserNavigation() {
+  const navigation = (
+    window as Window & {
+      navigation?: BrowserNavigation
+    }
+  ).navigation
+  return navigation ?? null
 }

@@ -38,6 +38,29 @@ func TestResourceSpecPreservesLegacyMissingDesktop(t *testing.T) {
 	}
 }
 
+func TestDesiredSandboxSpecDropsRuntimeModelSources(t *testing.T) {
+	desired := DesiredResourceSpec(KindSandbox, map[string]any{
+		"runtimeId": "runtime-one",
+		"runtimeModelSources": map[string]any{
+			"primary": map[string]any{"credentialId": "target", "modelId": "gpt-5.4"},
+		},
+		"runtimeModelSourcesComplete": true,
+		"runtimeModelTokenEpoch":      "restart-job-one",
+	})
+	if _, ok := desired["runtimeModelSources"]; ok {
+		t.Fatal("runtime model source observation leaked into desired configuration")
+	}
+	if _, ok := desired["runtimeModelSourcesComplete"]; ok {
+		t.Fatal("runtime model source completeness marker leaked into desired configuration")
+	}
+	if _, ok := desired["runtimeModelTokenEpoch"]; ok {
+		t.Fatal("runtime model token epoch leaked into desired configuration")
+	}
+	if desired["runtimeId"] != "runtime-one" {
+		t.Fatalf("desired runtimeId = %#v", desired["runtimeId"])
+	}
+}
+
 func TestResourceSpecVersionAndMalformedEnvironment(t *testing.T) {
 	input := Input{ID: "project", Kind: KindProject, Name: "Project", Enabled: true}
 	Normalize(&input)

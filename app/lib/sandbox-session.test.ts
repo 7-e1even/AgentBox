@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { SandboxSessionClient } from "./sandbox-session"
+import {
+  SandboxSessionClient,
+  sandboxSessionTicketTimeoutMs,
+} from "./sandbox-session"
 
 class MockWebSocket {
   static OPEN = 1
@@ -88,6 +91,85 @@ describe("SandboxSessionClient", () => {
   })
 
   describe("重连退避", () => {
+    it("restart 和 stop 会中止尚未完成的会话票据请求", async () => {
+      const signals: AbortSignal[] = []
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async (_input: RequestInfo | URL, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+              const signal = init?.signal
+              expect(signal).toBeInstanceOf(AbortSignal)
+              signals.push(signal as AbortSignal)
+              signal?.addEventListener("abort", () => reject(signal.reason), {
+                once: true,
+              })
+            })
+        )
+      )
+      const client = new SandboxSessionClient("sandbox-1")
+
+      client.start()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(signals).toHaveLength(1)
+
+      client.restart()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(signals[0].aborted).toBe(true)
+      expect(signals).toHaveLength(2)
+
+      client.stop()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(signals[1].aborted).toBe(true)
+      expect(client.getState()).toBe("disconnected")
+    })
+
+    it("忽略已被 restart 替换的旧 WebSocket 迟到消息", async () => {
+      vi.stubGlobal("fetch", stubFetchTicket())
+      const { client, socket: first } = await connectReadyClient()
+
+      client.restart()
+      await vi.advanceTimersByTimeAsync(0)
+      const second = MockWebSocket.instances.at(-1)
+      expect(second).toBeDefined()
+      expect(second).not.toBe(first)
+      expect(client.getState()).toBe("connecting")
+
+      first.receive({ type: "ready" })
+      first.receive({ type: "closed", retryable: true })
+
+      expect(client.getState()).toBe("connecting")
+      expect(second!.closeCode).toBeUndefined()
+      second!.receive({ type: "ready" })
+      expect(client.getState()).toBe("ready")
+      client.stop()
+    })
+
+    it("会话票据请求超时后进入可恢复的重试状态", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async (_input: RequestInfo | URL, init?: RequestInit) =>
+            new Promise<Response>((_resolve, reject) => {
+              const signal = init?.signal
+              signal?.addEventListener("abort", () => reject(signal.reason), {
+                once: true,
+              })
+            })
+        )
+      )
+      const client = new SandboxSessionClient("sandbox-1")
+      const states: Array<{ state: string; detail?: string }> = []
+      client.onState((state, detail) => states.push({ state, detail }))
+
+      client.start()
+      await vi.advanceTimersByTimeAsync(sandboxSessionTicketTimeoutMs)
+
+      expect(client.getState()).toBe("connecting")
+      expect(states.at(-1)?.detail).toBe("创建沙箱会话超时，正在重试")
+      client.stop()
+    })
+
     it("断线后按 1s、2s 翻倍重连，ready 后重置为 1s", async () => {
       vi.stubGlobal("fetch", stubFetchTicket())
       const { client, socket } = await connectReadyClient()
@@ -198,6 +280,42 @@ describe("SandboxSessionClient", () => {
       expect(states.at(-1)).toEqual({
         state: "error",
         detail: "没有权限创建沙箱会话",
+      })
+      expect(fetch).toHaveBeenCalledTimes(1)
+      client.stop()
+    })
+
+    it("结构化不可重试错误进入终态且不再请求票据", async () => {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                error: {
+                  code: "conflict",
+                  message: "沙箱当前未运行",
+                  retryable: false,
+                },
+              }),
+              {
+                status: 409,
+                headers: { "Content-Type": "application/json" },
+              }
+            )
+        )
+      )
+      const client = new SandboxSessionClient("sandbox-1")
+      const states: Array<{ state: string; detail?: string }> = []
+      client.onState((state, detail) => states.push({ state, detail }))
+
+      client.start()
+      await vi.advanceTimersByTimeAsync(30_000)
+
+      expect(client.getState()).toBe("error")
+      expect(states.at(-1)).toEqual({
+        state: "error",
+        detail: "沙箱当前未运行",
       })
       expect(fetch).toHaveBeenCalledTimes(1)
       client.stop()

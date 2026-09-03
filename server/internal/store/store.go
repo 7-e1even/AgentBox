@@ -49,6 +49,7 @@ var (
 
 const (
 	workerJobLeaseDuration       = 2 * time.Hour
+	workerUpdateJobLeaseDuration = 2 * time.Hour
 	workerJobAutomaticRetryLimit = 3
 	workerJobActivityWritePeriod = 15 * time.Second
 	runtimeLLMTokenTTL           = 30 * 24 * time.Hour
@@ -56,7 +57,7 @@ const (
 	// references live in JSONB and therefore cannot be protected by foreign keys.
 	controlPlaneMutationLockKey int64 = 0x4147424d55544154
 	resourceUpdateSpecSQL             = `CASE WHEN kind = 'sandbox' THEN
-		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation' - 'agentToolVersions' - 'agentToolOperation' - 'automationId' - 'automationRunId') || jsonb_build_object(
+		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation' - 'agentToolVersions' - 'agentToolOperation' - 'automationId' - 'automationRunId' - 'extensionSnapshots' - 'extensionStates' - 'runtimeModelSources' - 'runtimeModelSourcesComplete' - 'runtimeModelTokenEpoch') || jsonb_build_object(
 			'status', spec->'status',
 			'message', spec->'message',
 			'externalId', spec->'externalId',
@@ -66,10 +67,42 @@ const (
 			'proxyOperation', spec->'proxyOperation',
 			'agentToolVersions', spec->'agentToolVersions',
 			'agentToolOperation', spec->'agentToolOperation',
+			'extensionSnapshots', spec->'extensionSnapshots',
+			'extensionStates', spec->'extensionStates',
 			'automationId', spec->'automationId',
 			'automationRunId', spec->'automationRunId'
 		)
+		|| CASE WHEN spec ? 'runtimeModelSources'
+			THEN jsonb_build_object('runtimeModelSources', spec->'runtimeModelSources')
+			ELSE '{}'::jsonb END
+		|| CASE WHEN spec ? 'runtimeModelSourcesComplete'
+			THEN jsonb_build_object('runtimeModelSourcesComplete', spec->'runtimeModelSourcesComplete')
+			ELSE '{}'::jsonb END
+		|| CASE WHEN spec ? 'runtimeModelTokenEpoch'
+			THEN jsonb_build_object('runtimeModelTokenEpoch', spec->'runtimeModelTokenEpoch')
+			ELSE '{}'::jsonb END
 	ELSE $5::jsonb END`
+	legacySandboxHasExplicitModelSourcesSQL = `(CASE
+		WHEN jsonb_typeof(legacy.spec->'credentialIds') IS DISTINCT FROM 'array'
+		  OR jsonb_typeof(legacy.spec->'modelBindings') IS DISTINCT FROM 'object'
+		THEN FALSE
+		ELSE jsonb_array_length(legacy.spec->'credentialIds') = (
+		    SELECT COUNT(*) FROM jsonb_object_keys(legacy.spec->'modelBindings')
+		  )
+		  AND jsonb_array_length(legacy.spec->'credentialIds') = (
+		    SELECT COUNT(DISTINCT credential.value #>> '{}')
+		    FROM jsonb_array_elements(legacy.spec->'credentialIds') AS credential(value)
+		  )
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM jsonb_array_elements(legacy.spec->'credentialIds') AS credential(value)
+		    WHERE jsonb_typeof(credential.value) IS DISTINCT FROM 'string'
+		      OR btrim(credential.value #>> '{}') = ''
+		      OR NOT ((legacy.spec->'modelBindings') ? (credential.value #>> '{}'))
+		      OR jsonb_typeof((legacy.spec->'modelBindings')->(credential.value #>> '{}')) IS DISTINCT FROM 'string'
+		      OR btrim((legacy.spec->'modelBindings')->>(credential.value #>> '{}')) = ''
+		  )
+	END)`
 )
 
 var automaticallyRetryableWorkerJobActions = []string{
@@ -86,7 +119,7 @@ func workerJobAttemptLimit(action string) int {
 
 func workerJobLeaseDurationForAction(action string) time.Duration {
 	if action == "update-worker" {
-		return 5 * time.Minute
+		return workerUpdateJobLeaseDuration
 	}
 	return workerJobLeaseDuration
 }
@@ -196,8 +229,22 @@ type janitorStatement struct {
 // repeated execution converges to the same state.
 var janitorStatements = []janitorStatement{
 	// Finished worker jobs older than 7 days.
-	{query: `DELETE FROM worker_jobs
-	  WHERE status IN ('succeeded', 'failed') AND updated_at < NOW() - INTERVAL '7 days'`},
+	{query: `DELETE FROM worker_jobs job
+	  WHERE job.status IN ('succeeded', 'failed') AND job.updated_at < NOW() - INTERVAL '7 days'
+	    AND NOT EXISTS (
+	      SELECT 1 FROM control_resources sandbox
+	      WHERE sandbox.id = job.resource_id AND sandbox.kind = 'sandbox'
+	        AND sandbox.spec->>'status' = 'running'
+	        AND COALESCE((sandbox.spec->>'runtimeModelSourcesComplete')::boolean, FALSE) = FALSE
+	        AND job.status = 'succeeded'
+	        AND job.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+	        AND job.id = (
+	          SELECT applied.id FROM worker_jobs applied
+	          WHERE applied.resource_id = sandbox.id AND applied.status = 'succeeded'
+	            AND applied.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+	          ORDER BY applied.updated_at DESC, applied.created_at DESC, applied.id DESC LIMIT 1
+	        )
+	    )`},
 	// Automation runs received more than 30 days ago.
 	{query: `DELETE FROM automation_runs WHERE received_at < NOW() - INTERVAL '30 days'`},
 	// Expired login sessions (login only cleans up opportunistically).
@@ -239,6 +286,7 @@ var janitorStatements = []janitorStatement{
 	  result_error_details = '{}'::jsonb, updated_at = NOW()
 	  FROM managed_servers worker
 	  WHERE job.server_id = worker.id AND job.status = 'leased' AND job.lease_until < NOW()
+	    AND job.cancel_requested_at IS NULL
 	    AND (NOT (job.action = ANY($1::text[])) OR job.attempts >= $2
 	      OR COALESCE(worker.last_job_activity_at, worker.last_seen_at, worker.created_at)
 	        < NOW() - INTERVAL '15 minutes')`,
@@ -653,7 +701,9 @@ func (s *Store) EnqueueWorkerUpdate(ctx context.Context, serverID, targetVersion
 	if _, err := tx.Exec(ctx, `INSERT INTO worker_jobs
       (id, server_id, resource_id, action, status, payload, created_at, updated_at)
       VALUES ($1, $2, NULL, 'update-worker', 'pending', $3::jsonb, $4, $4)`,
-		uuid.NewString(), serverID, mustMapJSON(map[string]any{"version": targetVersion}), now); err != nil {
+		uuid.NewString(), serverID, mustMapJSON(map[string]any{
+			"version": targetVersion, "previousVersion": currentVersion,
+		}), now); err != nil {
 		return fmt.Errorf("enqueue Worker update: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
@@ -919,10 +969,38 @@ func (s *Store) DeleteCredential(ctx context.Context, id string) error {
 func credentialIsReferenced(ctx context.Context, tx pgx.Tx, id string) (bool, error) {
 	var referenced bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(
-    SELECT 1 FROM control_resources
-    WHERE kind IN ('runtime', 'sandbox') AND (
-      spec->'credentialIds' ? $1 OR spec->'modelBindings' ? $1
-    )
+	    SELECT 1 FROM control_resources resource
+	    WHERE resource.kind IN ('runtime', 'sandbox') AND (
+	  resource.spec->'credentialIds' ? $1 OR resource.spec->'modelBindings' ? $1 OR (resource.spec->>'status' = 'running' AND EXISTS(
+	    SELECT 1 FROM jsonb_each(COALESCE(resource.spec->'runtimeModelSources', '{}'::jsonb)) AS source
+	    WHERE source.value->>'credentialId' = $1
+	  )) OR (
+	    resource.kind = 'sandbox' AND resource.spec->>'status' = 'running'
+	    AND resource.spec->'runtimeModelSourcesComplete' IS DISTINCT FROM 'true'::jsonb
+	    AND EXISTS (
+	      SELECT 1 FROM worker_jobs applied
+	      WHERE applied.id = (
+	        SELECT candidate.id FROM worker_jobs candidate
+	        WHERE candidate.resource_id = resource.id AND candidate.status = 'succeeded'
+	          AND candidate.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+	        ORDER BY candidate.updated_at DESC, candidate.created_at DESC, candidate.id DESC LIMIT 1
+	      ) AND (applied.payload->'credentialIds' ? $1 OR applied.payload->'modelBindings' ? $1)
+	    )
+	  )
+	    )
+	) OR EXISTS (
+	  SELECT 1 FROM control_resources legacy
+	  WHERE legacy.kind = 'sandbox' AND legacy.spec->>'status' = 'running'
+	    AND legacy.spec->'runtimeModelSourcesComplete' IS DISTINCT FROM 'true'::jsonb
+	    AND (
+	      legacy.generation <> legacy.observed_generation
+	      OR NOT `+legacySandboxHasExplicitModelSourcesSQL+`
+	    )
+	    AND NOT EXISTS (
+	      SELECT 1 FROM worker_jobs applied
+	      WHERE applied.resource_id = legacy.id AND applied.status = 'succeeded'
+	        AND applied.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+	    )
 	) OR EXISTS(
 	  SELECT 1 FROM automations
 	  WHERE action_type = 'create-sandbox' AND model_bindings ? $1
@@ -1409,8 +1487,38 @@ func (s *Store) DeleteCredentialModel(ctx context.Context, id, modelID string) (
 	}
 	var referenced bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(
-    SELECT 1 FROM control_resources
-	WHERE kind IN ('runtime', 'sandbox') AND spec->'modelBindings'->>$1 = $2
+	    SELECT 1 FROM control_resources resource
+	WHERE resource.kind IN ('runtime', 'sandbox') AND (
+	  resource.spec->'modelBindings'->>$1 = $2 OR (resource.spec->>'status' = 'running' AND EXISTS(
+	    SELECT 1 FROM jsonb_each(COALESCE(resource.spec->'runtimeModelSources', '{}'::jsonb)) AS source
+	    WHERE source.value->>'credentialId' = $1 AND source.value->>'modelId' = $2
+	  )) OR (
+	    resource.kind = 'sandbox' AND resource.spec->>'status' = 'running'
+	    AND resource.spec->'runtimeModelSourcesComplete' IS DISTINCT FROM 'true'::jsonb
+	    AND EXISTS (
+	      SELECT 1 FROM worker_jobs applied
+	      WHERE applied.id = (
+	        SELECT candidate.id FROM worker_jobs candidate
+	        WHERE candidate.resource_id = resource.id AND candidate.status = 'succeeded'
+	          AND candidate.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+	        ORDER BY candidate.updated_at DESC, candidate.created_at DESC, candidate.id DESC LIMIT 1
+	      ) AND applied.payload->'modelBindings'->>$1 = $2
+	    )
+	  )
+	)
+	) OR EXISTS (
+	  SELECT 1 FROM control_resources legacy
+	  WHERE legacy.kind = 'sandbox' AND legacy.spec->>'status' = 'running'
+	    AND legacy.spec->'runtimeModelSourcesComplete' IS DISTINCT FROM 'true'::jsonb
+	    AND (
+	      legacy.generation <> legacy.observed_generation
+	      OR NOT `+legacySandboxHasExplicitModelSourcesSQL+`
+	    )
+	    AND NOT EXISTS (
+	      SELECT 1 FROM worker_jobs applied
+	      WHERE applied.resource_id = legacy.id AND applied.status = 'succeeded'
+	        AND applied.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+	    )
 	) OR EXISTS(
 	  SELECT 1 FROM automations
 	  WHERE action_type = 'create-sandbox' AND model_bindings->>$1 = $2
@@ -1501,9 +1609,40 @@ func mutateCredentialModelsTx(
 	if len(removedModelIDs) > 0 {
 		var referenced bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(
-		  SELECT 1 FROM control_resources
-		  WHERE kind IN ('runtime', 'sandbox')
-		    AND spec->'modelBindings'->>$1 = ANY($2::text[])
+		  SELECT 1 FROM control_resources resource
+		  WHERE resource.kind IN ('runtime', 'sandbox')
+		    AND (
+		      resource.spec->'modelBindings'->>$1 = ANY($2::text[]) OR (resource.spec->>'status' = 'running' AND EXISTS(
+		        SELECT 1 FROM jsonb_each(COALESCE(resource.spec->'runtimeModelSources', '{}'::jsonb)) AS source
+		        WHERE source.value->>'credentialId' = $1
+		          AND source.value->>'modelId' = ANY($2::text[])
+		      )) OR (
+		        resource.kind = 'sandbox' AND resource.spec->>'status' = 'running'
+		        AND resource.spec->'runtimeModelSourcesComplete' IS DISTINCT FROM 'true'::jsonb
+		        AND EXISTS (
+		          SELECT 1 FROM worker_jobs applied
+		          WHERE applied.id = (
+		            SELECT candidate.id FROM worker_jobs candidate
+		            WHERE candidate.resource_id = resource.id AND candidate.status = 'succeeded'
+		              AND candidate.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+		            ORDER BY candidate.updated_at DESC, candidate.created_at DESC, candidate.id DESC LIMIT 1
+		          ) AND applied.payload->'modelBindings'->>$1 = ANY($2::text[])
+		        )
+		      )
+		    )
+		) OR EXISTS (
+		  SELECT 1 FROM control_resources legacy
+		  WHERE legacy.kind = 'sandbox' AND legacy.spec->>'status' = 'running'
+		    AND legacy.spec->'runtimeModelSourcesComplete' IS DISTINCT FROM 'true'::jsonb
+		    AND (
+		      legacy.generation <> legacy.observed_generation
+		      OR NOT `+legacySandboxHasExplicitModelSourcesSQL+`
+		    )
+		    AND NOT EXISTS (
+		      SELECT 1 FROM worker_jobs applied
+		      WHERE applied.resource_id = legacy.id AND applied.status = 'succeeded'
+		        AND applied.action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+		    )
 		) OR EXISTS(
 		  SELECT 1 FROM automations
 		  WHERE action_type = 'create-sandbox'
@@ -2245,6 +2384,7 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	err = tx.QueryRow(ctx, `SELECT id, resource_id, action, payload, resource_generation
     FROM worker_jobs
     WHERE server_id = $1
+	  AND cancel_requested_at IS NULL
 	  AND (
 	    (status = 'pending' AND attempts = 0)
 	    OR (
@@ -2293,7 +2433,7 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	}
 	if resourceID.Valid {
 		job.ResourceID = resourceID.String
-		if err := s.attachWorkerCredentials(ctx, tx, job.ResourceID, job.Payload); err != nil {
+		if err := s.attachWorkerCredentials(ctx, tx, job.ResourceID, job.ID, job.Action, job.Payload); err != nil {
 			return platform.WorkerJob{}, err
 		}
 	}
@@ -2344,9 +2484,36 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 	return job, nil
 }
 
-func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, sandboxID string, payload map[string]any) error {
+func (s *Store) attachWorkerCredentials(
+	ctx context.Context,
+	tx pgx.Tx,
+	sandboxID, jobID, action string,
+	payload map[string]any,
+) error {
 	credentialIDs := specStringList(payload, "credentialIds")
 	modelBindings := specStringMap(payload, "modelBindings")
+	tokenEpoch := ""
+	if isSandboxRuntimeLifecycleAction(action) {
+		tokenEpoch = jobID
+		commandTag, err := tx.Exec(ctx, `UPDATE worker_jobs
+		  SET payload = jsonb_set(payload, '{runtimeTokenEpoch}', to_jsonb($1::text), TRUE)
+		  WHERE id = $2`, tokenEpoch, jobID)
+		if err != nil {
+			return fmt.Errorf("persist runtime LLM token epoch: %w", err)
+		}
+		if commandTag.RowsAffected() != 1 {
+			return ErrResourceNotFound
+		}
+		payload["runtimeTokenEpoch"] = tokenEpoch
+	} else if len(credentialIDs) > 0 {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(spec->>'runtimeModelTokenEpoch', '')
+		  FROM control_resources WHERE id = $1 AND kind = 'sandbox'`, sandboxID).Scan(&tokenEpoch); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrResourceNotFound
+			}
+			return fmt.Errorf("load runtime LLM token epoch: %w", err)
+		}
+	}
 	credentials := make([]map[string]any, 0, len(credentialIDs))
 	for _, id := range credentialIDs {
 		var providerID, protocol string
@@ -2361,7 +2528,9 @@ func (s *Store) attachWorkerCredentials(ctx context.Context, tx pgx.Tx, sandboxI
 			return fmt.Errorf("load worker credential: %w", err)
 		}
 		modelID := modelBindings[id]
-		token, err := s.issueRuntimeLLMToken(sandboxID, id, modelID, time.Now().UTC().Add(runtimeLLMTokenTTL))
+		token, err := s.issueRuntimeLLMTokenForEpoch(
+			sandboxID, id, modelID, tokenEpoch, time.Now().UTC().Add(runtimeLLMTokenTTL),
+		)
 		if err != nil {
 			return err
 		}
@@ -2418,6 +2587,9 @@ func (s *Store) attachWorkerNetworkProxy(
 	payload["proxy"] = map[string]any{
 		"id": proxyID, "url": proxyURL.String(), "host": host, "noProxy": noProxy,
 		"allowNet": append([]string{host}, noProxy...),
+		// Claim-only plaintext used to redact installer output; this payload is
+		// never written back to worker_jobs or included in the sandbox manifest.
+		"redactionValues": []string{username, password},
 	}
 	return nil
 }
@@ -2426,13 +2598,21 @@ type runtimeLLMTokenClaims struct {
 	SandboxID    string `json:"sandboxId"`
 	CredentialID string `json:"credentialId"`
 	ModelID      string `json:"modelId"`
+	Epoch        string `json:"epoch,omitempty"`
 	ExpiresAt    int64  `json:"expiresAt"`
 }
 
 func (s *Store) issueRuntimeLLMToken(sandboxID, credentialID, modelID string, expiresAt time.Time) (string, error) {
+	return s.issueRuntimeLLMTokenForEpoch(sandboxID, credentialID, modelID, "", expiresAt)
+}
+
+func (s *Store) issueRuntimeLLMTokenForEpoch(
+	sandboxID, credentialID, modelID, epoch string,
+	expiresAt time.Time,
+) (string, error) {
 	claims := runtimeLLMTokenClaims{
 		SandboxID: sandboxID, CredentialID: credentialID, ModelID: modelID,
-		ExpiresAt: expiresAt.Unix(),
+		Epoch: epoch, ExpiresAt: expiresAt.Unix(),
 	}
 	payload, err := json.Marshal(claims)
 	if err != nil {
@@ -2464,8 +2644,11 @@ func (s *Store) parseRuntimeLLMToken(token string, now time.Time) (runtimeLLMTok
 		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
 	}
 	var claims runtimeLLMTokenClaims
+	// Epoch tokens are revoked by live sandbox state in ResolveRuntimeLLMTarget.
+	// Legacy tokens have no epoch, so their original time limit remains authoritative.
 	if err := json.Unmarshal(payload, &claims); err != nil || claims.SandboxID == "" ||
-		claims.CredentialID == "" || claims.ModelID == "" || claims.ExpiresAt <= now.Unix() {
+		claims.CredentialID == "" || claims.ModelID == "" || claims.ExpiresAt <= 0 ||
+		(claims.Epoch == "" && claims.ExpiresAt <= now.Unix()) {
 		return runtimeLLMTokenClaims{}, ErrRuntimeUnauthorized
 	}
 	return claims, nil
@@ -2476,25 +2659,99 @@ func runtimeLLMTokenKey(secretKey []byte) []byte {
 	return sum[:]
 }
 
+func isSandboxRuntimeLifecycleAction(action string) bool {
+	return action == "create-sandbox" || action == "start-sandbox" || action == "restart-sandbox"
+}
+
 func (s *Store) ResolveRuntimeLLMTarget(
 	ctx context.Context, sandboxID, credentialID, token string,
 ) (platform.RuntimeLLMTarget, error) {
-	claims, err := s.parseRuntimeLLMToken(token, time.Now().UTC())
+	now := time.Now().UTC()
+	claims, err := s.parseRuntimeLLMToken(token, now)
 	if err != nil || claims.SandboxID != sandboxID || claims.CredentialID != credentialID {
 		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
 	}
 
-	var sandboxSpecJSON, runtimeSpecJSON, ciphertext, nonce []byte
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return platform.RuntimeLLMTarget{}, fmt.Errorf("begin runtime LLM resolution: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var sandboxSpecJSON []byte
+	var generation, observedGeneration int64
+	err = tx.QueryRow(ctx, `SELECT spec, generation, observed_generation FROM control_resources
+	  WHERE id = $1 AND kind = 'sandbox'`, sandboxID).Scan(
+		&sandboxSpecJSON, &generation, &observedGeneration,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	}
+	if err != nil {
+		return platform.RuntimeLLMTarget{}, fmt.Errorf("resolve runtime LLM sandbox: %w", err)
+	}
+	var sandboxSpec map[string]any
+	if err := json.Unmarshal(sandboxSpecJSON, &sandboxSpec); err != nil {
+		return platform.RuntimeLLMTarget{}, fmt.Errorf("decode runtime sandbox spec: %w", err)
+	}
+	status, _ := sandboxSpec["status"].(string)
+	observedEpoch, _ := sandboxSpec["runtimeModelTokenEpoch"].(string)
+	observedEpoch = strings.TrimSpace(observedEpoch)
+	pendingLifecycleEpoch := false
+	if claims.Epoch == "" {
+		if observedEpoch != "" {
+			return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+		}
+	} else if claims.Epoch != observedEpoch || observedEpoch == "" {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		  SELECT 1 FROM worker_jobs
+		  WHERE id = $1 AND resource_id = $2
+		    AND action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+		    AND status = 'leased' AND lease_until >= $3
+		    AND cancel_requested_at IS NULL
+		)`, claims.Epoch, sandboxID, now).Scan(&pendingLifecycleEpoch); err != nil {
+			return platform.RuntimeLLMTarget{}, fmt.Errorf("validate pending runtime LLM token epoch: %w", err)
+		}
+		if !pendingLifecycleEpoch {
+			return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+		}
+	}
+	if status != "running" && !pendingLifecycleEpoch {
+		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	}
+
+	targetCredentialID, targetModelID := claims.CredentialID, claims.ModelID
+	if pendingLifecycleEpoch {
+		// The Worker installs credentials before reporting a successful lifecycle
+		// completion. During that narrow window, the signed job payload—not the
+		// previous running snapshot—is authoritative.
+	} else if source, ok := sandboxRuntimeModelSource(sandboxSpec, claims.CredentialID); ok {
+		targetCredentialID, targetModelID = source.CredentialID, source.ModelID
+	} else if sandboxHasRuntimeModelSourceSnapshot(sandboxSpec) {
+		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	} else if appliedSources, found, err := latestAppliedRuntimeModelSources(ctx, tx, sandboxID); err != nil {
+		return platform.RuntimeLLMTarget{}, err
+	} else if found {
+		applied, exists := appliedSources[claims.CredentialID]
+		if !exists || applied.ModelID != claims.ModelID {
+			return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+		}
+	} else if baseline, complete := explicitSandboxRuntimeModelSources(sandboxSpec, time.Time{}); generation == observedGeneration && complete {
+		applied, exists := baseline[claims.CredentialID]
+		if !exists || applied.ModelID != claims.ModelID {
+			return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+		}
+	}
+
+	var ciphertext, nonce []byte
 	var providerID, protocol, endpoint string
-	err = s.pool.QueryRow(ctx, `SELECT sandbox.spec, COALESCE(runtime.spec, '{}'::jsonb),
-      credential.provider_id, credential.protocol, credential.endpoint,
-      credential.secret_ciphertext, credential.secret_nonce
-    FROM control_resources sandbox
-    LEFT JOIN control_resources runtime
-      ON runtime.id = sandbox.spec->>'runtimeId' AND runtime.kind = 'runtime'
-    JOIN provider_credentials credential ON credential.id = $2 AND credential.enabled = TRUE
-    WHERE sandbox.id = $1 AND sandbox.kind = 'sandbox'`, sandboxID, credentialID).Scan(
-		&sandboxSpecJSON, &runtimeSpecJSON, &providerID, &protocol, &endpoint, &ciphertext, &nonce,
+	err = tx.QueryRow(ctx, `SELECT provider_id, protocol, endpoint, secret_ciphertext, secret_nonce
+	  FROM provider_credentials
+	  WHERE id = $1 AND enabled = TRUE
+	    AND models @> jsonb_build_array(jsonb_build_object('id', $2::text))`,
+		targetCredentialID, targetModelID,
+	).Scan(
+		&providerID, &protocol, &endpoint, &ciphertext, &nonce,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
@@ -2502,37 +2759,178 @@ func (s *Store) ResolveRuntimeLLMTarget(
 	if err != nil {
 		return platform.RuntimeLLMTarget{}, fmt.Errorf("resolve runtime LLM credential: %w", err)
 	}
-	var sandboxSpec, runtimeSpec map[string]any
-	if err := json.Unmarshal(sandboxSpecJSON, &sandboxSpec); err != nil {
-		return platform.RuntimeLLMTarget{}, fmt.Errorf("decode runtime sandbox spec: %w", err)
-	}
-	if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
-		return platform.RuntimeLLMTarget{}, fmt.Errorf("decode runtime template spec: %w", err)
-	}
-	if status, _ := sandboxSpec["status"].(string); status != "running" {
-		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
-	}
-	effectiveSpec := effectiveSandboxSpec(runtimeSpec, sandboxSpec)
-	if !stringListContains(specStringList(effectiveSpec, "credentialIds"), credentialID) ||
-		specStringMap(effectiveSpec, "modelBindings")[credentialID] != claims.ModelID {
-		return platform.RuntimeLLMTarget{}, ErrRuntimeUnauthorized
+	if err := tx.Commit(ctx); err != nil {
+		return platform.RuntimeLLMTarget{}, fmt.Errorf("commit runtime LLM resolution: %w", err)
 	}
 	secret, err := decryptSecret(s.secretKey, ciphertext, nonce)
 	if err != nil {
 		return platform.RuntimeLLMTarget{}, err
 	}
 	return platform.RuntimeLLMTarget{
-		SandboxID: sandboxID, CredentialID: credentialID, ProviderID: providerID,
+		SandboxID: sandboxID, CredentialID: targetCredentialID, ProviderID: providerID,
 		Protocol: protocol, Endpoint: normalizeKnownProviderEndpoint(protocol, endpoint),
-		ModelID: claims.ModelID, Secret: secret,
+		ModelID: targetModelID, Secret: secret,
 	}, nil
 }
 
-func stringListContains(values []string, target string) bool {
-	return slices.Contains(values, target)
+func sandboxRuntimeModelSource(spec map[string]any, slotCredentialID string) (platform.RuntimeModelSource, bool) {
+	sources, ok := spec["runtimeModelSources"].(map[string]any)
+	if !ok {
+		return platform.RuntimeModelSource{}, false
+	}
+	value, ok := sources[slotCredentialID].(map[string]any)
+	if !ok {
+		return platform.RuntimeModelSource{}, false
+	}
+	credentialID, _ := value["credentialId"].(string)
+	modelID, _ := value["modelId"].(string)
+	if credentialID == "" || modelID == "" {
+		return platform.RuntimeModelSource{}, false
+	}
+	result := platform.RuntimeModelSource{CredentialID: credentialID, ModelID: modelID}
+	if updatedAt, ok := value["updatedAt"].(string); ok {
+		result.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	}
+	return result, true
+}
+
+func sandboxHasRuntimeModelSourceSnapshot(spec map[string]any) bool {
+	complete, _ := spec["runtimeModelSourcesComplete"].(bool)
+	return complete
+}
+
+func latestAppliedRuntimeModelSources(
+	ctx context.Context,
+	tx pgx.Tx,
+	sandboxID string,
+) (map[string]platform.RuntimeModelSource, bool, error) {
+	var payloadJSON []byte
+	var appliedAt time.Time
+	err := tx.QueryRow(ctx, `SELECT payload, updated_at FROM worker_jobs
+	  WHERE resource_id = $1 AND status = 'succeeded'
+	    AND action IN ('create-sandbox', 'start-sandbox', 'restart-sandbox')
+	  ORDER BY updated_at DESC, created_at DESC, id DESC LIMIT 1`, sandboxID).Scan(&payloadJSON, &appliedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("load applied runtime model sources: %w", err)
+	}
+	var payload struct {
+		CredentialIDs []string          `json:"credentialIds"`
+		ModelBindings map[string]string `json:"modelBindings"`
+	}
+	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+		return nil, false, fmt.Errorf("decode applied runtime model sources: %w", err)
+	}
+	return runtimeModelSources(payload.CredentialIDs, payload.ModelBindings, appliedAt), true, nil
+}
+
+func runtimeModelSourcesFromSpec(spec map[string]any, updatedAt time.Time) map[string]platform.RuntimeModelSource {
+	return runtimeModelSources(specStringList(spec, "credentialIds"), specStringMap(spec, "modelBindings"), updatedAt)
+}
+
+func explicitSandboxRuntimeModelSources(
+	spec map[string]any,
+	updatedAt time.Time,
+) (map[string]platform.RuntimeModelSource, bool) {
+	rawCredentialIDs, exists := spec["credentialIds"]
+	if !exists {
+		return nil, false
+	}
+	credentialIDs := make([]string, 0)
+	switch values := rawCredentialIDs.(type) {
+	case []any:
+		credentialIDs = make([]string, 0, len(values))
+		for _, value := range values {
+			credentialID, ok := value.(string)
+			if !ok {
+				return nil, false
+			}
+			credentialIDs = append(credentialIDs, credentialID)
+		}
+	case []string:
+		credentialIDs = values
+	default:
+		return nil, false
+	}
+	for _, credentialID := range credentialIDs {
+		if strings.TrimSpace(credentialID) == "" {
+			return nil, false
+		}
+	}
+
+	rawModelBindings, exists := spec["modelBindings"]
+	if !exists {
+		return nil, false
+	}
+	modelBindings := make(map[string]string)
+	switch values := rawModelBindings.(type) {
+	case map[string]any:
+		modelBindings = make(map[string]string, len(values))
+		for credentialID, value := range values {
+			modelID, ok := value.(string)
+			if !ok {
+				return nil, false
+			}
+			modelBindings[credentialID] = modelID
+		}
+	case map[string]string:
+		modelBindings = values
+	default:
+		return nil, false
+	}
+
+	sources := runtimeModelSources(credentialIDs, modelBindings, updatedAt)
+	if len(sources) != len(credentialIDs) || len(modelBindings) != len(credentialIDs) {
+		return nil, false
+	}
+	return sources, true
+}
+
+func runtimeModelSources(
+	credentialIDs []string,
+	modelBindings map[string]string,
+	updatedAt time.Time,
+) map[string]platform.RuntimeModelSource {
+	sources := make(map[string]platform.RuntimeModelSource, len(credentialIDs))
+	for _, credentialID := range credentialIDs {
+		modelID := strings.TrimSpace(modelBindings[credentialID])
+		if credentialID == "" || modelID == "" {
+			continue
+		}
+		sources[credentialID] = platform.RuntimeModelSource{
+			CredentialID: credentialID,
+			ModelID:      modelID,
+			UpdatedAt:    updatedAt,
+		}
+	}
+	return sources
+}
+
+func sandboxRuntimeModelSourcesForUpdate(
+	spec map[string]any,
+	applied map[string]platform.RuntimeModelSource,
+) map[string]any {
+	sources := make(map[string]any, len(applied))
+	for slotCredentialID, source := range applied {
+		sources[slotCredentialID] = source
+	}
+	if current, ok := spec["runtimeModelSources"].(map[string]any); ok {
+		maps.Copy(sources, current)
+	}
+	return sources
 }
 
 func advanceProvisioningProgress(current platform.ProvisioningProgress, input platform.WorkerJobProgressInput, now time.Time) platform.ProvisioningProgress {
+	if current.CancelRequested {
+		// Late installation reports may renew the lease, but cannot undo a cancel.
+		current.UpdatedAt = &now
+		if current.StartedAt != nil {
+			current.DurationMS = now.Sub(*current.StartedAt).Milliseconds()
+		}
+		return current
+	}
 	if current.StartedAt == nil {
 		startedAt := now
 		current.StartedAt = &startedAt
@@ -2587,12 +2985,14 @@ func advanceProvisioningProgress(current platform.ProvisioningProgress, input pl
 		tool.DurationMS = now.Sub(*tool.StartedAt).Milliseconds()
 	}
 	updatedAt := now
+	advanceExtensionProgress(&current, input, now)
 	current.UpdatedAt = &updatedAt
 	current.DurationMS = now.Sub(*current.StartedAt).Milliseconds()
 	return current
 }
 
 func finishProvisioningProgress(current platform.ProvisioningProgress, result platform.WorkerJobResult, now time.Time) platform.ProvisioningProgress {
+	finishExtensionProgress(&current, result, now)
 	if current.Stage == "" || current.StartedAt == nil {
 		return current
 	}
@@ -2607,6 +3007,9 @@ func finishProvisioningProgress(current platform.ProvisioningProgress, result pl
 	if result.Success {
 		current.Stage = "completed"
 		current.Status = "succeeded"
+	} else if installationCancelled(result) {
+		current.Stage = "cancelled"
+		current.Status = "cancelled"
 	}
 	current.Message = result.Message
 	current.StageStartedAt = nil
@@ -2627,6 +3030,9 @@ func finishProvisioningProgress(current platform.ProvisioningProgress, result pl
 			tool.Status = "succeeded"
 		} else {
 			tool.Status = "failed"
+			if installationCancelled(result) {
+				tool.Status = "cancelled"
+			}
 			tool.Message = result.Message
 		}
 	}
@@ -2634,6 +3040,9 @@ func finishProvisioningProgress(current platform.ProvisioningProgress, result pl
 }
 
 func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credential, jobID string, input platform.WorkerJobProgressInput) (platform.ProvisioningProgress, error) {
+	if err := platform.ValidateExtensionProgress(input); err != nil {
+		return platform.ProvisioningProgress{}, err
+	}
 	if _, err := uuid.Parse(serverID); err != nil || len(credential) < 32 {
 		return platform.ProvisioningProgress{}, ErrWorkerUnauthorized
 	}
@@ -2657,21 +3066,25 @@ func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credentia
 	var resourceID pgtype.Text
 	var action string
 	var progressJSON []byte
+	var payloadJSON []byte
 	var leaseGeneration int
 	var resourceGeneration int64
 	now := time.Now().UTC()
-	err = tx.QueryRow(ctx, `SELECT resource_id, action, progress, attempts, resource_generation FROM worker_jobs
+	err = tx.QueryRow(ctx, `SELECT resource_id, action, progress, attempts, resource_generation, payload FROM worker_jobs
 	WHERE id = $1 AND server_id = $2 AND status = 'leased'
 	  AND lease_until >= $3
 	  AND (attempts = $4 OR ($4 = 0 AND attempts = 1))
 	FOR UPDATE`, jobID, serverID, now, input.LeaseGeneration).Scan(
-		&resourceID, &action, &progressJSON, &leaseGeneration, &resourceGeneration,
+		&resourceID, &action, &progressJSON, &leaseGeneration, &resourceGeneration, &payloadJSON,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.ProvisioningProgress{}, ErrResourceNotFound
 	}
 	if err != nil {
 		return platform.ProvisioningProgress{}, fmt.Errorf("select worker job progress: %w", err)
+	}
+	if err := validateExtensionProgressPayload(input, action, payloadJSON); err != nil {
+		return platform.ProvisioningProgress{}, err
 	}
 	if resourceID.Valid {
 		if err := ensureWorkerResourceGeneration(ctx, tx, resourceID.String, resourceGeneration); err != nil {
@@ -2723,7 +3136,7 @@ func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credentia
 	} else if resourceID.Valid && strings.Contains(action, "sandbox") {
 		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
       spec = spec || jsonb_build_object('message', $1::text, 'provisioning', $2::jsonb), updated_at = $3
-      WHERE id = $4 AND kind = 'sandbox'`, input.Message, encoded, now, resourceID.String); err != nil {
+      WHERE id = $4 AND kind = 'sandbox'`, progress.Message, encoded, now, resourceID.String); err != nil {
 			return platform.ProvisioningProgress{}, fmt.Errorf("update sandbox progress: %w", err)
 		}
 	}
@@ -2783,16 +3196,71 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		WHERE id = $13 AND server_id = $14 AND status = 'leased'
 		  AND lease_until >= $12
 		  AND (attempts = $15 OR ($15 = 0 AND attempts = 1))
+		  AND (cancel_requested_at IS NULL OR
+		    (NOT $16::boolean AND $8 IN ('job_cancelled', 'cancellation_cleanup_failed') AND NOT $10::boolean))
+		  AND ($8 NOT IN ('job_cancelled', 'cancellation_cleanup_failed') OR
+		    (action = 'create-sandbox' AND cancel_requested_at IS NOT NULL AND attempts = $15))
 		RETURNING resource_id, action, progress, payload, resource_generation`, status, result.Message,
 		result.ExternalID, result.ExitCode, result.Output, result.OutputTruncated, result.TimedOut,
 		workerError.Code, workerError.Stage, workerError.Retryable, errorDetailsJSON,
-		now, jobID, serverID, result.LeaseGeneration,
+		now, jobID, serverID, result.LeaseGeneration, result.Success,
 	).Scan(&resourceID, &action, &progressJSON, &jobPayloadJSON, &resourceGeneration)
 	if errors.Is(err, pgx.ErrNoRows) {
+		reconciledRollback, matchErr := reconcileCompletedWorkerUpdateRollback(
+			ctx, tx, serverID, jobID, status, result, workerError, errorDetailsJSON, now,
+		)
+		if matchErr != nil {
+			return matchErr
+		}
+		if reconciledRollback {
+			ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "worker", ID: serverID})
+			if err := s.commitAudit(ctx, tx, platform.LogEntry{
+				Category: platform.LogCategoryJob, Action: "reconcile-rollback", ResourceKind: "job", ResourceID: jobID,
+				Status: platform.LogStatusFailed,
+				Detail: map[string]any{"serverId": serverID, "leaseGeneration": result.LeaseGeneration},
+			}); err != nil {
+				return fmt.Errorf("commit reconciled Worker update rollback: %w", err)
+			}
+			return nil
+		}
+		matchingUpdate, matchErr := completedWorkerUpdateMatches(
+			ctx, tx, serverID, jobID, status, result, workerError, errorDetailsJSON,
+		)
+		if matchErr != nil {
+			return matchErr
+		}
+		if matchingUpdate {
+			return nil
+		}
 		return ErrResourceNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("complete worker job: %w", err)
+	}
+	if action == "create-sandbox" && result.Success {
+		unverifiedID, err := unverifiedSandboxExtension(jobPayloadJSON, progressJSON)
+		if err != nil {
+			return err
+		}
+		if unverifiedID != "" {
+			result.Success = false
+			result.Message = "沙箱扩展缺少成功的验证结果: " + unverifiedID
+			result.Error = &platform.WorkerJobError{
+				Code: "sandbox_extension_unverified", Stage: "extensions", Retryable: false,
+				Details: map[string]string{"extensionId": unverifiedID},
+			}
+			workerError = normalizedWorkerJobError(result)
+			errorDetailsJSON, err = json.Marshal(workerError.Details)
+			if err != nil {
+				return fmt.Errorf("encode unverified extension details: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET status = 'failed', result_message = $1,
+        result_error_code = $2, result_error_stage = $3, result_error_retryable = FALSE,
+        result_error_details = $4 WHERE id = $5`, result.Message, workerError.Code,
+				workerError.Stage, errorDetailsJSON, jobID); err != nil {
+				return fmt.Errorf("reject unverified extension completion: %w", err)
+			}
+		}
 	}
 	ctx = platform.WithAuditActor(ctx, platform.AuditActor{Type: "worker", ID: serverID})
 	audit := platform.LogEntry{
@@ -2963,6 +3431,14 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		return commitCompletion()
 	}
 	sandboxStatus := "error"
+	if action == "create-sandbox" && installationCancelled(result) {
+		sandboxStatus = "cancelled"
+	}
+	desktopSnapshot := false
+	persistDesktopSnapshot := false
+	runtimeModelSourcesJSON := []byte("{}")
+	persistRuntimeModelSources := false
+	runtimeModelTokenEpoch := ""
 	appliedProxyID := ""
 	persistProxySnapshot := false
 	proxySnapshotMessage := ""
@@ -2971,11 +3447,26 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		case "create-sandbox", "start-sandbox", "restart-sandbox":
 			sandboxStatus = "running"
 			var jobPayload struct {
-				ProxyID string `json:"proxyId"`
+				Desktop           *bool             `json:"desktop"`
+				ProxyID           string            `json:"proxyId"`
+				CredentialIDs     []string          `json:"credentialIds"`
+				ModelBindings     map[string]string `json:"modelBindings"`
+				RuntimeTokenEpoch string            `json:"runtimeTokenEpoch"`
 			}
 			if err := json.Unmarshal(jobPayloadJSON, &jobPayload); err != nil {
 				return fmt.Errorf("decode completed sandbox job payload: %w", err)
 			}
+			if jobPayload.Desktop != nil {
+				desktopSnapshot = *jobPayload.Desktop
+				persistDesktopSnapshot = true
+			}
+			runtimeModelSources := runtimeModelSources(jobPayload.CredentialIDs, jobPayload.ModelBindings, now)
+			runtimeModelSourcesJSON, err = json.Marshal(runtimeModelSources)
+			if err != nil {
+				return fmt.Errorf("encode runtime model source snapshot: %w", err)
+			}
+			persistRuntimeModelSources = true
+			runtimeModelTokenEpoch = strings.TrimSpace(jobPayload.RuntimeTokenEpoch)
 			appliedProxyID = strings.TrimSpace(jobPayload.ProxyID)
 			persistProxySnapshot = true
 			if appliedProxyID == "" {
@@ -2993,28 +3484,65 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	  'externalId', $2::text,
 	  'message', $3::text
 	) || CASE WHEN $4::boolean
-	  THEN jsonb_build_object('provisioning', $5::jsonb)
+	  THEN jsonb_build_object('desktop', $5::boolean)
 	  ELSE '{}'::jsonb END
 	|| CASE WHEN $6::boolean
+	  THEN jsonb_build_object('provisioning', $7::jsonb)
+	  ELSE '{}'::jsonb END
+	|| CASE WHEN $8::boolean
 	  THEN jsonb_build_object(
-	    'appliedProxyId', $7::text,
+	    'appliedProxyId', $9::text,
 	    'proxyOperation', jsonb_build_object(
-	      'status', 'succeeded'::text, 'desiredProxyId', $7::text,
-	      'appliedProxyId', $7::text, 'message', $8::text,
-	      'updatedAt', $9::timestamptz, 'finishedAt', $9::timestamptz
+	      'status', 'succeeded'::text, 'desiredProxyId', $9::text,
+	      'appliedProxyId', $9::text, 'message', $10::text,
+	      'updatedAt', $11::timestamptz, 'finishedAt', $11::timestamptz
 	    )
 	  )
-	  ELSE '{}'::jsonb END,
-	observed_generation = CASE WHEN $11::boolean THEN generation ELSE observed_generation END,
-	updated_at = $9
-	WHERE id = $10 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
-		result.Message, hasProgress, progressJSON,
+	  ELSE '{}'::jsonb END
+	|| CASE WHEN $13::boolean
+	  THEN jsonb_build_object(
+	    'runtimeModelSources', $14::jsonb,
+	    'runtimeModelSourcesComplete', TRUE
+	  )
+	  ELSE '{}'::jsonb END
+	|| CASE WHEN $15::text <> ''
+	    THEN jsonb_build_object('runtimeModelTokenEpoch', $15::text)
+	    ELSE '{}'::jsonb END,
+	observed_generation = CASE WHEN $16::boolean THEN generation ELSE observed_generation END,
+	updated_at = $11
+	WHERE id = $12 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
+		result.Message, persistDesktopSnapshot, desktopSnapshot, hasProgress, progressJSON,
 		persistProxySnapshot, appliedProxyID, proxySnapshotMessage, now, resourceIDValue,
+		persistRuntimeModelSources, runtimeModelSourcesJSON,
+		runtimeModelTokenEpoch,
 		result.Success && (action == "create-sandbox" || action == "start-sandbox" || action == "restart-sandbox"),
 	); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
+	if persistRuntimeModelSources && runtimeModelTokenEpoch == "" {
+		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
+		  spec = spec - 'runtimeModelTokenEpoch'
+		  WHERE id = $1 AND kind = 'sandbox'`, resourceIDValue); err != nil {
+			return fmt.Errorf("clear legacy sandbox model token epoch: %w", err)
+		}
+	}
+	if result.Success && action == "stop-sandbox" {
+		if _, err := tx.Exec(ctx, `UPDATE control_resources SET
+		  spec = spec - 'runtimeModelSources' - 'runtimeModelSourcesComplete' - 'runtimeModelTokenEpoch'
+		  WHERE id = $1 AND kind = 'sandbox'`, resourceIDValue); err != nil {
+			return fmt.Errorf("clear stopped sandbox model sources: %w", err)
+		}
+	}
 	if action == "create-sandbox" {
+		extensionStatesJSON, err := json.Marshal(progress.Extensions)
+		if err != nil {
+			return fmt.Errorf("encode sandbox extension results: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE control_resources SET spec = spec ||
+      jsonb_build_object('extensionStates', $1::jsonb) WHERE id = $2 AND kind = 'sandbox'`,
+			extensionStatesJSON, resourceIDValue); err != nil {
+			return fmt.Errorf("persist sandbox extension results: %w", err)
+		}
 		if result.Success {
 			if _, err := tx.Exec(ctx, `UPDATE automation_runs SET status = 'succeeded',
 				error_code = '', error_message = '', error_stage = '', error_retryable = FALSE,
@@ -3037,6 +3565,81 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		return fmt.Errorf("commit worker job completion: %w", err)
 	}
 	return nil
+}
+
+func reconcileCompletedWorkerUpdateRollback(
+	ctx context.Context,
+	tx pgx.Tx,
+	serverID, jobID, status string,
+	result platform.WorkerJobResult,
+	workerError platform.WorkerJobError,
+	errorDetailsJSON []byte,
+	now time.Time,
+) (bool, error) {
+	workerVersion := strings.TrimSpace(workerError.Details["workerVersion"])
+	if result.Success || status != "failed" || workerError.Code != "worker_update_rolled_back" ||
+		workerError.Stage != "worker-update" || !workerError.Retryable ||
+		!strings.HasPrefix(workerVersion, "v") || len(workerVersion) > 64 {
+		return false, nil
+	}
+	var targetVersion string
+	err := tx.QueryRow(ctx, `UPDATE worker_jobs SET
+		status = 'failed', lease_until = NULL, result_message = $1, external_id = $2,
+		result_exit_code = $3, result_output = $4, result_truncated = $5,
+		result_timed_out = $6, result_error_code = $7, result_error_stage = $8,
+		result_error_retryable = $9, result_error_details = $10, updated_at = $11
+		WHERE id = $12 AND server_id = $13 AND action = 'update-worker'
+		  AND (status = 'succeeded' OR
+		    (status = 'failed' AND result_error_code = 'worker_lease_expired'))
+		  AND (attempts = $14 OR ($14 = 0 AND attempts = 1))
+		  AND payload->>'previousVersion' = $15
+		RETURNING payload->>'version'`, result.Message, result.ExternalID, result.ExitCode,
+		result.Output, result.OutputTruncated, result.TimedOut, workerError.Code,
+		workerError.Stage, workerError.Retryable, errorDetailsJSON, now, jobID, serverID,
+		result.LeaseGeneration, workerVersion,
+	).Scan(&targetVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reconcile completed Worker update rollback: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE managed_servers SET
+		worker_version = $1,
+		worker_update_status = CASE WHEN worker_update_target = $2 THEN 'failed' ELSE worker_update_status END,
+		worker_update_message = CASE WHEN worker_update_target = $2 THEN $3 ELSE worker_update_message END,
+		updated_at = $4 WHERE id = $5`, workerVersion, targetVersion, result.Message, now, serverID); err != nil {
+		return false, fmt.Errorf("reconcile managed Server Worker rollback: %w", err)
+	}
+	return true, nil
+}
+
+func completedWorkerUpdateMatches(
+	ctx context.Context,
+	tx pgx.Tx,
+	serverID, jobID, status string,
+	result platform.WorkerJobResult,
+	workerError platform.WorkerJobError,
+	errorDetailsJSON []byte,
+) (bool, error) {
+	var matching bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM worker_jobs
+		WHERE id = $1 AND server_id = $2 AND action = 'update-worker'
+		  AND status = $3
+		  AND (attempts = $4 OR ($4 = 0 AND attempts = 1))
+		  AND result_message = $5 AND external_id = $6
+		  AND result_exit_code IS NOT DISTINCT FROM $7::integer
+		  AND result_output = $8 AND result_truncated = $9 AND result_timed_out = $10
+		  AND result_error_code = $11 AND result_error_stage = $12
+		  AND result_error_retryable = $13 AND result_error_details = $14::jsonb
+	)`, jobID, serverID, status, result.LeaseGeneration, result.Message, result.ExternalID,
+		result.ExitCode, result.Output, result.OutputTruncated, result.TimedOut,
+		workerError.Code, workerError.Stage, workerError.Retryable, errorDetailsJSON,
+	).Scan(&matching); err != nil {
+		return false, fmt.Errorf("match completed Worker update: %w", err)
+	}
+	return matching, nil
 }
 
 func normalizedWorkerJobError(result platform.WorkerJobResult) platform.WorkerJobError {
@@ -3193,7 +3796,7 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 }
 
 func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource) (string, error) {
-	payload, driver, imageReference, err := buildSandboxJobPayload(ctx, tx, sandbox)
+	payload, driver, imageReference, err := buildSandboxJobPayload(ctx, tx, sandbox, true)
 	if err != nil {
 		return "", err
 	}
@@ -3212,7 +3815,7 @@ func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource
 	return jobID, nil
 }
 
-func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Resource) (map[string]any, string, string, error) {
+func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Resource, creating bool) (map[string]any, string, string, error) {
 	runtimeID, _ := sandbox.Spec["runtimeId"].(string)
 	var runtimeSpecJSON []byte
 	if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
@@ -3236,6 +3839,8 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 	if driver == "" {
 		return nil, "", "", fmt.Errorf("environment template has no runtime driver")
 	}
+	network, _ := effectiveSpec["network"].(string)
+	network = platform.EffectiveNetworkPolicy(driver, network)
 	payload := map[string]any{
 		"sandboxId":            sandbox.ID,
 		"name":                 sandbox.Name,
@@ -3246,7 +3851,7 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		"cpu":                  effectiveSpec["cpu"],
 		"memory":               effectiveSpec["memory"],
 		"desktop":              effectiveSpec["desktop"],
-		"network":              effectiveSpec["network"],
+		"network":              network,
 		"proxyId":              effectiveSpec["proxyId"],
 		"agentTools":           effectiveSpec["agentTools"],
 		"skillIds":             effectiveSpec["skillIds"],
@@ -3272,6 +3877,12 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		}
 		payload[definitions.payloadKey] = resources
 	}
+	extensions, err := loadSandboxExtensions(ctx, tx, sandbox, effectiveSpec, creating)
+	if err != nil {
+		return nil, "", "", err
+	}
+	payload["extensions"] = extensions
+	payload["extensionIds"] = extensionIDs(extensions)
 	return payload, driver, imageReference, nil
 }
 
@@ -3294,6 +3905,7 @@ func effectiveSandboxSpec(runtimeSpec, sandboxSpec map[string]any) map[string]an
 		"skillIds",
 		"mcpServerIds",
 		"variableIds",
+		"extensionIds",
 		"environmentVariables",
 		"credentialIds",
 		"modelBindings",
@@ -3408,6 +4020,9 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 }
 
 func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform.Resource, error) {
+	if action == "cancel-install" {
+		return s.cancelSandboxInstallation(ctx, id)
+	}
 	workerAction := ""
 	pendingStatus := ""
 	message := ""
@@ -3462,6 +4077,10 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 		return platform.Resource{}, fmt.Errorf("%w: sandbox already has an operation in progress", ErrConflict)
 	}
 	status, _ := resource.Spec["status"].(string)
+	provisioning, _ := resource.Spec["provisioning"].(map[string]any)
+	if action == "start" && (status == "cancelled" || provisioning["cancelRequested"] == true) {
+		return platform.Resource{}, &platform.ValidationError{Message: "安装已取消，请删除此沙箱后重新创建"}
+	}
 	if status == "requested" || status == "starting" || status == "stopping" || status == "restarting" || status == "deleting" {
 		return platform.Resource{}, fmt.Errorf("%w: sandbox already has an operation in progress", ErrConflict)
 	}
@@ -3489,7 +4108,7 @@ func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform
 		"driver":     driver,
 	}
 	if action == "start" || action == "restart" {
-		configuredPayload, configuredDriver, _, err := buildSandboxJobPayload(ctx, tx, resource)
+		configuredPayload, configuredDriver, _, err := buildSandboxJobPayload(ctx, tx, resource, false)
 		if err != nil {
 			return platform.Resource{}, err
 		}
@@ -3646,6 +4265,126 @@ func (s *Store) UpdateSandboxNetworkProxy(ctx context.Context, id, proxyID strin
 	return resource, nil
 }
 
+func (s *Store) UpdateSandboxModelSource(
+	ctx context.Context,
+	id string,
+	input platform.SandboxModelSourceInput,
+) (platform.Resource, error) {
+	platform.NormalizeSandboxModelSourceInput(&input)
+	if err := platform.ValidateSandboxModelSourceInput(input); err != nil {
+		return platform.Resource{}, err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return platform.Resource{}, fmt.Errorf("begin sandbox model source update: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if err := lockControlPlaneMutation(ctx, tx); err != nil {
+		return platform.Resource{}, err
+	}
+
+	resource, err := scanResource(tx.QueryRow(ctx, `SELECT `+resourceColumns+` FROM control_resources
+	  WHERE id = $1 AND kind = 'sandbox' FOR UPDATE`, id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return platform.Resource{}, ErrResourceNotFound
+	}
+	if err != nil {
+		return platform.Resource{}, fmt.Errorf("load sandbox model source: %w", err)
+	}
+	if status, _ := resource.Spec["status"].(string); status != "running" {
+		return platform.Resource{}, &platform.ValidationError{Message: "只有运行中的沙箱可以切换模型源"}
+	}
+
+	var targetAvailable bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM provider_credentials
+	  WHERE id = $1 AND enabled = TRUE
+	    AND models @> jsonb_build_array(jsonb_build_object('id', $2::text)))`,
+		input.CredentialID, input.ModelID,
+	).Scan(&targetAvailable); err != nil {
+		return platform.Resource{}, fmt.Errorf("check sandbox model source: %w", err)
+	}
+	if !targetAvailable {
+		return platform.Resource{}, &platform.ValidationError{Message: "所选模型不存在、已停用或模型列表已更新"}
+	}
+
+	from := platform.RuntimeModelSource{CredentialID: input.SlotCredentialID}
+	var runtimeSpec map[string]any
+	if runtimeID, _ := resource.Spec["runtimeId"].(string); runtimeID != "" {
+		var runtimeSpecJSON []byte
+		if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+		  WHERE id = $1 AND kind = 'runtime'`, runtimeID).Scan(&runtimeSpecJSON); err == nil {
+			if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
+				return platform.Resource{}, fmt.Errorf("decode sandbox runtime model bindings: %w", err)
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return platform.Resource{}, fmt.Errorf("load sandbox runtime model bindings: %w", err)
+		}
+	}
+	effectiveSpec := effectiveSandboxSpec(runtimeSpec, resource.Spec)
+	snapshotComplete := sandboxHasRuntimeModelSourceSnapshot(resource.Spec)
+	var appliedSources map[string]platform.RuntimeModelSource
+	if !snapshotComplete {
+		var found bool
+		appliedSources, found, err = latestAppliedRuntimeModelSources(ctx, tx, id)
+		if err != nil {
+			return platform.Resource{}, err
+		}
+		if !found && resource.Generation == resource.ObservedGeneration {
+			appliedSources, found = explicitSandboxRuntimeModelSources(resource.Spec, resource.UpdatedAt)
+		}
+		if !found {
+			return platform.Resource{}, &platform.ValidationError{
+				Message: "旧版沙箱的运行模型快照无法确认；请先重启一次再切换模型源",
+			}
+		}
+	}
+	from.ModelID = specStringMap(effectiveSpec, "modelBindings")[input.SlotCredentialID]
+	if current, ok := sandboxRuntimeModelSource(resource.Spec, input.SlotCredentialID); ok {
+		from = current
+	} else if snapshotComplete {
+		return platform.Resource{}, &platform.ValidationError{Message: "所选运行时模型槽位不存在"}
+	} else if applied, ok := appliedSources[input.SlotCredentialID]; ok {
+		from = applied
+	} else {
+		return platform.Resource{}, &platform.ValidationError{Message: "所选运行时模型槽位不存在"}
+	}
+	if from.CredentialID != input.ExpectedCredentialID || from.ModelID != input.ExpectedModelID {
+		return platform.Resource{}, fmt.Errorf("%w: sandbox runtime model source changed", ErrConflict)
+	}
+
+	now := time.Now().UTC()
+	sources := sandboxRuntimeModelSourcesForUpdate(resource.Spec, appliedSources)
+	sources[input.SlotCredentialID] = map[string]any{
+		"credentialId": input.CredentialID,
+		"modelId":      input.ModelID,
+		"updatedAt":    now,
+	}
+	resource, err = scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
+	  spec = jsonb_set(spec, '{runtimeModelSources}', $1::jsonb, TRUE)
+	    || jsonb_build_object('runtimeModelSourcesComplete', TRUE), updated_at = $2
+	  WHERE id = $3 AND kind = 'sandbox' RETURNING `+resourceColumns,
+		mustMapJSON(sources), now, id,
+	))
+	if err != nil {
+		return platform.Resource{}, fmt.Errorf("update sandbox model source: %w", err)
+	}
+	if err := s.commitAudit(ctx, tx, platform.LogEntry{
+		Category: platform.LogCategorySandbox, Action: "switch-model-source",
+		ResourceKind: "sandbox", ResourceID: id,
+		Detail: map[string]any{
+			"slotCredentialId": input.SlotCredentialID,
+			"fromCredentialId": from.CredentialID,
+			"fromModelId":      from.ModelID,
+			"toCredentialId":   input.CredentialID,
+			"toModelId":        input.ModelID,
+		},
+	}); err != nil {
+		return platform.Resource{}, fmt.Errorf("commit sandbox model source update: %w", err)
+	}
+	maskResourceEnvironmentVariables(&resource)
+	return resource, nil
+}
+
 func (s *Store) OperateSandboxAgentTools(ctx context.Context, id, action string, requestedTools []string) (platform.Resource, error) {
 	workerAction := ""
 	message := ""
@@ -3703,7 +4442,7 @@ func (s *Store) OperateSandboxAgentTools(ctx context.Context, id, action string,
 		return platform.Resource{}, fmt.Errorf("%w: sandbox already has an operation in progress", ErrConflict)
 	}
 
-	payload, _, _, err := buildSandboxJobPayload(ctx, tx, resource)
+	payload, _, _, err := buildSandboxJobPayload(ctx, tx, resource, false)
 	if err != nil {
 		return platform.Resource{}, err
 	}
@@ -3767,6 +4506,9 @@ func (s *Store) DeleteResource(ctx context.Context, id string) error {
 	} else if err != nil {
 		return fmt.Errorf("get resource: %w", err)
 	}
+	if kind == platform.KindSandbox {
+		return fmt.Errorf("%w: sandboxes must be deleted through the sandbox delete operation", ErrConflict)
+	}
 	var referenced bool
 	var referenceQuery string
 	switch kind {
@@ -3782,15 +4524,8 @@ func (s *Store) DeleteResource(ctx context.Context, id string) error {
 		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'mcpServerIds' ? $1)"
 	case platform.KindVariable:
 		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'variableIds' ? $1)"
-	case platform.KindSandbox:
-		referenceQuery = `SELECT EXISTS(
-      SELECT 1 FROM control_resources
-      WHERE id = $1 AND kind = 'sandbox'
-        AND spec->>'status' IN ('requested', 'starting', 'running', 'stopping', 'restarting', 'deleting')
-    ) OR EXISTS(
-      SELECT 1 FROM worker_jobs
-      WHERE resource_id = $1 AND status IN ('pending', 'leased')
-    )`
+	case platform.KindExtension:
+		referenceQuery = "SELECT EXISTS(SELECT 1 FROM control_resources WHERE kind IN ('runtime', 'sandbox') AND spec->'extensionIds' ? $1)"
 	}
 	if referenceQuery != "" {
 		if err := tx.QueryRow(ctx, referenceQuery, id).Scan(&referenced); err != nil {
@@ -3828,6 +4563,17 @@ func (s *Store) ensureProject(ctx context.Context, tx pgx.Tx, input platform.Inp
 }
 
 func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input platform.Input, requireOnlineServer bool) error {
+	if input.Kind == platform.KindExtension {
+		var crossProject bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM control_resources
+      WHERE kind IN ('runtime', 'sandbox') AND spec->'extensionIds' ? $1
+        AND project_id IS DISTINCT FROM $2)`, input.ID, input.ProjectID).Scan(&crossProject); err != nil {
+			return fmt.Errorf("check extension project references: %w", err)
+		}
+		if crossProject {
+			return fmt.Errorf("%w: 被引用的扩展不能移动到其他项目", ErrConflict)
+		}
+	}
 	if input.Kind == platform.KindImage {
 		rows, err := tx.Query(ctx, `SELECT spec->>'driver' FROM control_resources
       WHERE kind = 'runtime' AND spec->>'imageId' = $1`, input.ID)
@@ -3860,6 +4606,10 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 	if input.Kind == platform.KindRuntime {
 		serverID, _ := input.Spec["serverId"].(string)
 		driver, _ := input.Spec["driver"].(string)
+		network, _ := input.Spec["network"].(string)
+		if err := platform.ValidateNetworkPolicyForDriver(driver, network); err != nil {
+			return err
+		}
 		requiredCapability := driver
 		if driver == "vm" {
 			requiredCapability = "kvm"
@@ -3921,7 +4671,7 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 		if err := s.validateNetworkProxyBinding(ctx, tx, input.Spec, "环境模板"); err != nil {
 			return err
 		}
-		return nil
+		return ensureExtensionReferences(ctx, tx, input.ProjectID, input.Spec, false)
 	}
 	if input.Kind != platform.KindSandbox {
 		return nil
@@ -3939,6 +4689,16 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 		return fmt.Errorf("decode sandbox environment: %w", err)
 	}
 	effectiveSpec := effectiveSandboxSpec(runtimeSpec, input.Spec)
+	driver, _ := effectiveSpec["driver"].(string)
+	network, _ := effectiveSpec["network"].(string)
+	if err := platform.ValidateNetworkPolicyForDriver(driver, network); err != nil {
+		return err
+	}
+	if requireOnlineServer {
+		if err := ensureExtensionReferences(ctx, tx, input.ProjectID, effectiveSpec, true); err != nil {
+			return err
+		}
+	}
 	if proxyID, _ := effectiveSpec["proxyId"].(string); strings.TrimSpace(proxyID) != "" {
 		if network, _ := effectiveSpec["network"].(string); network == "none" {
 			return &platform.ValidationError{Message: "完全隔离的环境不能同时使用网络代理"}
@@ -3948,7 +4708,6 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 		return err
 	}
 	serverID, _ := effectiveSpec["serverId"].(string)
-	driver, _ := effectiveSpec["driver"].(string)
 	requiredCapability := driver
 	if driver == "vm" {
 		requiredCapability = "kvm"
@@ -4037,6 +4796,7 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 		return &platform.ValidationError{Message: strings.Join(incompatible, "、") + " 与当前所选模型服务的接口协议不兼容"}
 	}
 	input.Spec["credentialIds"] = allowedCredentialIDs
+	input.Spec["modelBindings"] = modelBindings
 	return nil
 }
 

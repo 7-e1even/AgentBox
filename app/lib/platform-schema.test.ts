@@ -25,6 +25,11 @@ const validSpecs: Record<ResourceKind, object> = {
   mcp: { transport: "stdio", command: "npx", args: "-y example" },
   sandbox: { serverId, runtimeId: "example-template" },
   variable: { key: "TOKEN", reference: "secret:example" },
+  extension: {
+    version: "1.0.0",
+    installScript: "touch /tmp/extension-ready",
+    verifyScript: "test -f /tmp/extension-ready",
+  },
 }
 
 describe("typed resource contracts", () => {
@@ -106,6 +111,16 @@ describe("typed resource contracts", () => {
         proxyOperation: {},
         agentToolVersions: [],
         agentToolOperation: {},
+        extensionSnapshots: [],
+        extensionStates: [],
+        runtimeModelSources: {
+          primary: {
+            credentialId: "backup",
+            modelId: "model-next",
+            updatedAt: timestamp,
+          },
+        },
+        runtimeModelSourcesComplete: true,
         automationId: "automation-id",
         automationRunId: "run-id",
       },
@@ -224,6 +239,7 @@ describe("typed resource contracts", () => {
       network: "restricted",
       workdir: "/workspace",
       setup: "echo setup",
+      extensionIds: ["new-template-extension"],
       workspace: "display-workspace",
       proxyId: "display-proxy",
       agentTools: ["codex"],
@@ -244,5 +260,63 @@ describe("typed resource contracts", () => {
         { desktop: false }
       )
     ).toEqual({ desktop: false })
+  })
+
+  it("allows incomplete extension drafts but requires scripts before enabling", () => {
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "extension",
+        enabled: false,
+        spec: {},
+      }).success
+    ).toBe(true)
+    expect(
+      resourceInputSchema.safeParse({ ...base, kind: "extension", spec: {} })
+        .success
+    ).toBe(false)
+  })
+
+  it("limits extension scripts by UTF-8 bytes, including disabled drafts", () => {
+    const draft = {
+      ...base,
+      kind: "extension",
+      enabled: false,
+      spec: { installScript: "中".repeat(21845) },
+    }
+    expect(resourceInputSchema.safeParse(draft).success).toBe(true)
+    expect(
+      resourceInputSchema.safeParse({
+        ...draft,
+        spec: { installScript: "中".repeat(21846) },
+      }).success
+    ).toBe(false)
+  })
+
+  it("uses the same Unicode version length limit as the API", () => {
+    const spec = { ...validSpecs.extension, version: "🧩".repeat(64) }
+    expect(
+      resourceInputSchema.safeParse({ ...base, kind: "extension", spec })
+        .success
+    ).toBe(true)
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "extension",
+        spec: { ...spec, version: spec.version + "x" },
+      }).success
+    ).toBe(false)
+  })
+
+  it("keeps the original extension selection when saving an existing sandbox", () => {
+    expect(
+      sandboxSpecForUpdate(
+        { extensionIds: ["new-extension"] },
+        { extensionIds: ["original-extension"] }
+      )
+    ).toEqual({ extensionIds: ["original-extension"] })
+    expect(
+      sandboxSpecForUpdate({ extensionIds: ["new-extension"] }, {})
+    ).not.toHaveProperty("extensionIds")
   })
 })

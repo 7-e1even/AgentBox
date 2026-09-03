@@ -14,6 +14,7 @@ const sectionDomains: Record<AppSection, ConsoleDomain[]> = {
   images: ["servers"],
   access: ["credentials", "catalog"],
   proxies: ["proxies", "servers"],
+  extensions: ["resources"],
   settings: ["resources"],
   mcp: ["resources"],
   skills: ["resources"],

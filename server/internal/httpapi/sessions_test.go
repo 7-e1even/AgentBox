@@ -29,6 +29,11 @@ func (sessionTestStore) ListResources(context.Context) ([]platform.Resource, err
 		{Input: platform.Input{ID: "sandbox-one", Kind: platform.KindSandbox, ProjectID: &projectID, Spec: map[string]any{
 			"runtimeId": "runtime-one", "serverId": sessionTestServerID,
 			"externalId": "agentbox-sandbox-one", "status": "running", "driver": "boxlite",
+			"desktop": true,
+		}}},
+		{Input: platform.Input{ID: "sandbox-legacy", Kind: platform.KindSandbox, ProjectID: &projectID, Spec: map[string]any{
+			"runtimeId": "runtime-one", "serverId": sessionTestServerID,
+			"externalId": "agentbox-sandbox-legacy", "status": "running", "driver": "boxlite",
 		}}},
 	}, nil
 }
@@ -135,6 +140,38 @@ func TestSandboxSessionTicketCannotChangeMode(t *testing.T) {
 	}
 	if _, ok := hub.consumeTicket(token, target.SandboxID, "terminal"); ok {
 		t.Fatal("desktop ticket was accepted by the terminal endpoint")
+	}
+}
+
+func TestSandboxDesktopTicketRejectsMissingDesktopSnapshot(t *testing.T) {
+	server := newSessionTestServer(t)
+	request, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodPost,
+		server.URL+"/api/sandboxes/sandbox-legacy/desktop-ticket",
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var body struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusConflict)
+	}
+	if body.Error.Message != "此沙箱未预配图形桌面，请先重启并应用配置或重新创建沙箱" {
+		t.Fatalf("error = %q", body.Error.Message)
 	}
 }
 

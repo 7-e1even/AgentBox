@@ -9,6 +9,43 @@ import (
 	"github.com/google/uuid"
 )
 
+func TestWorkerJobLeaseDurationsKeepUpdateBuildsAlive(t *testing.T) {
+	if got := workerJobLeaseDurationForAction("create-sandbox"); got != workerJobLeaseDuration {
+		t.Fatalf("ordinary Worker job lease = %v, want %v", got, workerJobLeaseDuration)
+	}
+	if got := workerJobLeaseDurationForAction("update-worker"); got != workerUpdateJobLeaseDuration {
+		t.Fatalf("Worker update lease = %v, want %v", got, workerUpdateJobLeaseDuration)
+	} else if got <= 5*time.Minute {
+		t.Fatalf("Worker update lease = %v, too short for a cold driver build", got)
+	}
+}
+
+func TestEnqueueWorkerUpdatePinsPreviousVersion(t *testing.T) {
+	s := newIntegrationTestStore(t)
+	ctx := t.Context()
+	serverID := uuid.NewString()
+	if _, _, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s))); err != nil {
+		t.Fatalf("register Worker: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE managed_servers
+	  SET worker_version = 'v1', last_seen_at = NOW() WHERE id = $1`, serverID); err != nil {
+		t.Fatalf("prepare Worker version: %v", err)
+	}
+	if err := s.EnqueueWorkerUpdate(ctx, serverID, "v2"); err != nil {
+		t.Fatalf("enqueue Worker update: %v", err)
+	}
+	var targetVersion, previousVersion string
+	if err := s.pool.QueryRow(ctx, `SELECT payload->>'version', payload->>'previousVersion'
+	  FROM worker_jobs WHERE server_id = $1 AND action = 'update-worker'`, serverID).Scan(
+		&targetVersion, &previousVersion,
+	); err != nil {
+		t.Fatalf("load Worker update payload: %v", err)
+	}
+	if targetVersion != "v2" || previousVersion != "v1" {
+		t.Fatalf("Worker update payload = target %q previous %q", targetVersion, previousVersion)
+	}
+}
+
 func TestWorkerLeaseGenerationFencesStaleProgressAndCompletion(t *testing.T) {
 	s := newIntegrationTestStore(t)
 	ctx := t.Context()
@@ -85,6 +122,156 @@ func TestWorkerLeaseGenerationFencesStaleProgressAndCompletion(t *testing.T) {
 	}
 	if status != "succeeded" || attempts != 2 {
 		t.Fatalf("completed job status = %q attempts = %d", status, attempts)
+	}
+}
+
+func TestCompletedWorkerUpdateIsIdempotentAndReconcilesRollback(t *testing.T) {
+	s := newIntegrationTestStore(t)
+	ctx := t.Context()
+	serverID := uuid.NewString()
+	_, credential, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s)))
+	if err != nil {
+		t.Fatalf("register Worker: %v", err)
+	}
+
+	jobID := uuid.NewString()
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_jobs
+	  (id, server_id, action, status, payload, created_at, updated_at)
+	  VALUES ($1, $2, 'update-worker', 'pending',
+	    '{"version":"v2","previousVersion":"v1"}'::jsonb, NOW(), NOW())`,
+		jobID, serverID); err != nil {
+		t.Fatalf("insert Worker update: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE managed_servers SET worker_version = 'v1',
+	  worker_update_target = 'v2', worker_update_status = 'pending' WHERE id = $1`, serverID); err != nil {
+		t.Fatalf("prepare managed Server update: %v", err)
+	}
+	claimedAt := time.Now()
+	job, err := s.ClaimWorkerJob(ctx, serverID, credential)
+	if err != nil {
+		t.Fatalf("claim Worker update: %v", err)
+	}
+	if job.LeaseExpiresAt.Sub(claimedAt) < 90*time.Minute {
+		t.Fatalf("Worker update lease = %v, want enough time for a cold driver build", job.LeaseExpiresAt.Sub(claimedAt))
+	}
+
+	result := platform.WorkerJobResult{
+		LeaseGeneration: job.LeaseGeneration,
+		Success:         true,
+		Message:         "Worker updated to v2",
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, result); err != nil {
+		t.Fatalf("complete Worker update: %v", err)
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, result); err != nil {
+		t.Fatalf("retry identical Worker update completion: %v", err)
+	}
+
+	changed := result
+	changed.Message = "different completion"
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, changed); !errors.Is(err, ErrResourceNotFound) {
+		t.Fatalf("changed Worker update completion error = %v, want ErrResourceNotFound", err)
+	}
+	stale := result
+	stale.LeaseGeneration++
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, stale); !errors.Is(err, ErrResourceNotFound) {
+		t.Fatalf("stale Worker update completion error = %v, want ErrResourceNotFound", err)
+	}
+
+	rollback := platform.WorkerJobResult{
+		LeaseGeneration: job.LeaseGeneration,
+		Success:         false,
+		Message:         "Worker update rolled back to v1",
+		Error: &platform.WorkerJobError{
+			Code: "worker_update_rolled_back", Stage: "worker-update", Retryable: true,
+			Details: map[string]string{"action": "update-worker", "workerVersion": "v1"},
+		},
+	}
+	wrongRollback := rollback
+	wrongRollback.Error = &platform.WorkerJobError{
+		Code: "worker_update_rolled_back", Stage: "worker-update", Retryable: true,
+		Details: map[string]string{"action": "update-worker", "workerVersion": "v0"},
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, wrongRollback); !errors.Is(err, ErrResourceNotFound) {
+		t.Fatalf("rollback with wrong previous version error = %v, want ErrResourceNotFound", err)
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, rollback); err != nil {
+		t.Fatalf("reconcile rollback after lost success response: %v", err)
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, rollback); err != nil {
+		t.Fatalf("retry identical reconciled rollback: %v", err)
+	}
+	var jobStatus, errorCode, workerVersion, updateStatus string
+	if err := s.pool.QueryRow(ctx, `SELECT job.status, job.result_error_code,
+	  worker.worker_version, worker.worker_update_status
+	  FROM worker_jobs job JOIN managed_servers worker ON worker.id = job.server_id
+	  WHERE job.id = $1`, jobID).Scan(&jobStatus, &errorCode, &workerVersion, &updateStatus); err != nil {
+		t.Fatalf("load reconciled Worker update: %v", err)
+	}
+	if jobStatus != "failed" || errorCode != "worker_update_rolled_back" ||
+		workerVersion != "v1" || updateStatus != "failed" {
+		t.Fatalf("reconciled Worker update = status %q error %q version %q update %q",
+			jobStatus, errorCode, workerVersion, updateStatus)
+	}
+}
+
+func TestExpiredWorkerUpdateLeaseReconcilesPhysicalRollback(t *testing.T) {
+	s := newIntegrationTestStore(t)
+	ctx := t.Context()
+	serverID := uuid.NewString()
+	_, credential, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s)))
+	if err != nil {
+		t.Fatalf("register Worker: %v", err)
+	}
+
+	jobID := uuid.NewString()
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_jobs
+	  (id, server_id, action, status, payload, created_at, updated_at)
+	  VALUES ($1, $2, 'update-worker', 'pending',
+	    '{"version":"v2","previousVersion":"v1"}'::jsonb, NOW(), NOW())`,
+		jobID, serverID); err != nil {
+		t.Fatalf("insert Worker update: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE managed_servers SET worker_version = 'v1',
+	  worker_update_target = 'v2', worker_update_status = 'updating' WHERE id = $1`, serverID); err != nil {
+		t.Fatalf("prepare managed Server update: %v", err)
+	}
+	job, err := s.ClaimWorkerJob(ctx, serverID, credential)
+	if err != nil {
+		t.Fatalf("claim Worker update: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE worker_jobs SET status = 'failed', lease_until = NULL,
+	  result_message = 'Worker lease expired', result_error_code = 'worker_lease_expired',
+	  result_error_stage = 'dispatch', result_error_retryable = FALSE, updated_at = NOW()
+	  WHERE id = $1`, jobID); err != nil {
+		t.Fatalf("expire Worker update lease: %v", err)
+	}
+
+	rollback := platform.WorkerJobResult{
+		LeaseGeneration: job.LeaseGeneration,
+		Success:         false,
+		Message:         "Worker update rolled back to v1",
+		Error: &platform.WorkerJobError{
+			Code: "worker_update_rolled_back", Stage: "worker-update", Retryable: true,
+			Details: map[string]string{"action": "update-worker", "workerVersion": "v1"},
+		},
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, rollback); err != nil {
+		t.Fatalf("reconcile rollback after update lease expiry: %v", err)
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, rollback); err != nil {
+		t.Fatalf("retry rollback reconciled after lease expiry: %v", err)
+	}
+
+	var jobStatus, errorCode, workerVersion string
+	if err := s.pool.QueryRow(ctx, `SELECT job.status, job.result_error_code, worker.worker_version
+	  FROM worker_jobs job JOIN managed_servers worker ON worker.id = job.server_id
+	  WHERE job.id = $1`, jobID).Scan(&jobStatus, &errorCode, &workerVersion); err != nil {
+		t.Fatalf("load reconciled expired Worker update: %v", err)
+	}
+	if jobStatus != "failed" || errorCode != "worker_update_rolled_back" || workerVersion != "v1" {
+		t.Fatalf("reconciled expired Worker update = status %q error %q version %q",
+			jobStatus, errorCode, workerVersion)
 	}
 }
 

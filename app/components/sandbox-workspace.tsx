@@ -20,10 +20,13 @@ import {
   FileUpIcon,
   FolderIcon,
   FolderOpenIcon,
+  InfoIcon,
   MonitorIcon,
   PanelBottomIcon,
   PanelLeftIcon,
   PanelRightIcon,
+  PanelTopCloseIcon,
+  PanelTopIcon,
   RefreshCwIcon,
   SaveIcon,
   SearchIcon,
@@ -36,6 +39,7 @@ import Link from "next/link"
 
 import { usePolling } from "@/hooks/use-polling"
 import { LoadState } from "@/components/load-state"
+import { requestJson } from "@/lib/api-client"
 import {
   resourceResponseSchema,
   type ResourceOfKind,
@@ -43,13 +47,15 @@ import {
 import { serversResponseSchema, type ManagedServer } from "@/lib/server-schema"
 import { SandboxCodeEditor } from "@/components/sandbox-code-editor"
 import { SandboxDesktop } from "@/components/sandbox-desktop"
+import { SandboxModelSourceSwitcher } from "@/components/sandbox-model-source-switcher"
 import {
   SandboxTerminal,
   type SandboxTerminalHandle,
 } from "@/components/sandbox-terminal"
-import { SiteHeader } from "@/components/site-header"
+import { SiteHeader, useSiteHeaderUser } from "@/components/site-header"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { ButtonGroup } from "@/components/ui/button-group"
 import {
   Empty,
   EmptyDescription,
@@ -81,13 +87,20 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip"
 import { appToast as toast } from "@/lib/app-toast"
-import { errorMessage, requestJson } from "@/lib/api-client"
+import { supportedAgentToolList } from "@/lib/agent-tools"
+import { errorMessage } from "@/lib/api-client"
 import { writeClipboardText } from "@/lib/clipboard"
+import {
+  credentialsResponseSchema,
+  type ManagedCredential,
+} from "@/lib/credential-schema"
 import {
   sandboxFileEntriesSchema,
   type SandboxFileEntry,
 } from "@/lib/sandbox-file-schema"
 import { isSandboxDesktopEnabled } from "@/lib/sandbox-desktop"
+import { createLatestByKeyQueue, enqueueLatestByKey } from "@/lib/latest-by-key"
+import { useNavigationBlocker } from "@/lib/navigation-blocker"
 import {
   SandboxSessionClient,
   sandboxFileReadMaxSize,
@@ -154,6 +167,14 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
         await requestJson<unknown>("/api/servers", { signal })
       ).servers,
   })
+  const credentialsData = usePolling({
+    queryKey: `workspace-credentials:${sandboxId}`,
+    enabled: sandboxData.data?.spec.status === "running",
+    load: async (signal) =>
+      credentialsResponseSchema.parse(
+        await requestJson<unknown>("/api/credentials", { signal })
+      ).credentials,
+  })
   if (!sandboxData.data)
     return (
       <LoadState label="沙箱" {...sandboxData} onRetry={sandboxData.refresh} />
@@ -182,12 +203,21 @@ export function SandboxWorkspace({ sandboxId }: { sandboxId: string }) {
         />
       )}
       <SandboxWorkspaceContent
+        key={sandboxId}
         sandboxId={sandboxId}
         sandbox={sandboxData.data}
         runtime={runtimeData.data}
         server={serverData.data?.find(
           (item) => item.id === sandboxData.data?.spec.serverId
         )}
+        credentials={credentialsData.data ?? []}
+        credentialsLoading={
+          credentialsData.loading ||
+          (credentialsData.data === undefined && !credentialsData.error)
+        }
+        credentialsError={credentialsData.error}
+        onRetryCredentials={() => void credentialsData.refresh()}
+        onSandboxChange={sandboxData.setData}
       />
     </>
   )
@@ -198,15 +228,33 @@ function SandboxWorkspaceContent({
   sandbox,
   runtime,
   server,
+  credentials,
+  credentialsLoading,
+  credentialsError,
+  onRetryCredentials,
+  onSandboxChange,
 }: {
   sandboxId: string
   sandbox: ResourceOfKind<"sandbox">
   runtime?: ResourceOfKind<"runtime">
   server?: ManagedServer
+  credentials: ManagedCredential[]
+  credentialsLoading: boolean
+  credentialsError: unknown
+  onRetryCredentials: () => void
+  onSandboxChange: (resource: ResourceOfKind<"sandbox">) => void
 }) {
+  const currentUser = useSiteHeaderUser()
+  const {
+    confirmNavigation,
+    isBlocked: isNavigationBlocked,
+    setBlocked: setNavigationBlocked,
+  } = useNavigationBlocker()
   const terminalRef = useRef<SandboxTerminalHandle>(null)
   const uploadInputRef = useRef<HTMLInputElement>(null)
   const uploadDirectoryRef = useRef("/")
+  const mountedRef = useRef(true)
+  const operationGenerationRef = useRef(0)
   const session = useMemo(
     () => new SandboxSessionClient(sandboxId),
     [sandboxId]
@@ -220,16 +268,24 @@ function SandboxWorkspaceContent({
   const [loadingDirectories, setLoadingDirectories] = useState(
     () => new Set<string>()
   )
+  const [directoryErrors, setDirectoryErrors] = useState<
+    Record<string, string>
+  >({})
   const [fileFilter, setFileFilter] = useState("")
   const [openFiles, setOpenFiles] = useState<OpenFile[]>([])
   const [activeFilePath, setActiveFilePath] = useState<string | null>(null)
   const [openingFilePath, setOpeningFilePath] = useState<string | null>(null)
-  const [savingFilePath, setSavingFilePath] = useState<string | null>(null)
+  const fileSaveQueueRef = useRef(createLatestByKeyQueue<string>())
+  const [savingFilePaths, setSavingFilePaths] = useState(
+    () => new Set<string>()
+  )
   const [sessionState, setSessionState] =
     useState<SandboxSessionState>("disconnected")
+  const [sessionStateDetail, setSessionStateDetail] = useState("")
   const [propertiesTab, setPropertiesTab] = useState("sandbox")
   const [workspaceMode, setWorkspaceMode] = useState<"code" | "desktop">("code")
   const [showExplorer, setShowExplorer] = useState(true)
+  const [showEditor, setShowEditor] = useState(false)
   const [showInspector, setShowInspector] = useState(false)
   const [showTerminal, setShowTerminal] = useState(true)
   const [showSearch, setShowSearch] = useState(false)
@@ -239,22 +295,31 @@ function SandboxWorkspaceContent({
   const [dragUploadTarget, setDragUploadTarget] = useState<string | null>(null)
 
   const isRunning = sandbox?.spec.status === "running"
+  const creationCancelled =
+    sandbox?.spec.status === "cancelled" ||
+    Boolean(sandbox?.spec.provisioning?.cancelRequested)
   const inheritedAgents = runtime?.spec.agentTools
-  const sandboxAgents = stringList(
+  const sandboxAgents = supportedAgentToolList(
     Array.isArray(sandbox?.spec.agentTools)
       ? sandbox.spec.agentTools
       : inheritedAgents
   )
-  const desktopEnabled = isSandboxDesktopEnabled(sandbox?.spec, runtime?.spec)
+  const desktopEnabled = isSandboxDesktopEnabled(sandbox?.spec)
+  const desktopUnavailableReason =
+    typeof sandbox?.spec.desktop !== "boolean" && runtime?.spec.desktop === true
+      ? "此旧沙箱尚未应用模板的图形桌面配置；请从沙箱列表选择“重启并应用配置”"
+      : "此沙箱创建时未启用图形桌面；请重新创建沙箱"
   const activeWorkspaceMode = desktopEnabled ? workspaceMode : "code"
   const activeFile = useMemo(
     () => openFiles.find((file) => file.path === activeFilePath) ?? null,
     [activeFilePath, openFiles]
   )
-  const hasDirtyFiles = openFiles.some(
-    (file) => file.content !== file.savedContent
-  )
-  const showEditorPanel = openFiles.length > 0 || !showTerminal
+  const hasDirtyFiles =
+    savingFilePaths.size > 0 ||
+    openFiles.some((file) => file.content !== file.savedContent)
+  const activeFileSaving = activeFile
+    ? savingFilePaths.has(activeFile.path)
+    : false
   const visibleSearchFiles = useMemo(() => {
     const query = fileFilter.trim().toLowerCase()
     if (!query) return []
@@ -280,35 +345,75 @@ function SandboxWorkspaceContent({
     },
     [session]
   )
+  const isOperationCurrent = useCallback(
+    (generation: number) =>
+      mountedRef.current && operationGenerationRef.current === generation,
+    []
+  )
+
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    const generation = operationGenerationRef.current
+    return () => {
+      if (operationGenerationRef.current === generation) {
+        operationGenerationRef.current += 1
+      }
+    }
+  }, [sandboxId, session])
 
   const loadDirectory = useCallback(
     async (path: string, showToast = true) => {
+      const operationGeneration = operationGenerationRef.current
       setLoadingDirectories((current) => new Set(current).add(path))
+      setDirectoryErrors((current) => {
+        if (!(path in current)) return current
+        const next = { ...current }
+        delete next[path]
+        return next
+      })
       try {
         const entries = sandboxFileEntriesSchema.parse(
           await runFileOperation({ kind: "list", path })
         )
+        if (!isOperationCurrent(operationGeneration)) return
         setDirectoryEntries((current) => ({ ...current, [path]: entries }))
       } catch (error) {
+        if (!isOperationCurrent(operationGeneration)) return
+        const detail = errorMessage(error) || "无法读取目录"
+        setDirectoryErrors((current) => ({ ...current, [path]: detail }))
         if (showToast) {
-          toast.error("无法打开目录", { description: errorMessage(error) })
+          toast.error("无法打开目录", { description: detail })
         }
       } finally {
-        setLoadingDirectories((current) => {
-          const next = new Set(current)
-          next.delete(path)
-          return next
-        })
+        if (isOperationCurrent(operationGeneration)) {
+          setLoadingDirectories((current) => {
+            const next = new Set(current)
+            next.delete(path)
+            return next
+          })
+        }
       }
     },
-    [runFileOperation]
+    [isOperationCurrent, runFileOperation]
   )
 
   useEffect(() => {
-    const unsubscribe = session.onState((state) => setSessionState(state))
-    if (isRunning) session.start()
-    else session.stop()
+    const unsubscribe = session.onState((state, detail) => {
+      setSessionState(state)
+      setSessionStateDetail(detail ?? "")
+    })
+    const startTimer = isRunning
+      ? window.setTimeout(() => session.start(), 0)
+      : null
+    if (!isRunning) session.stop()
     return () => {
+      if (startTimer !== null) window.clearTimeout(startTimer)
       unsubscribe()
       session.stop()
     }
@@ -319,6 +424,7 @@ function SandboxWorkspaceContent({
       isRunning &&
       sessionState === "ready" &&
       !directoryEntries["/"] &&
+      !directoryErrors["/"] &&
       !loadingDirectories.has("/")
     ) {
       const timeout = window.setTimeout(() => void loadDirectory("/", false), 0)
@@ -326,6 +432,7 @@ function SandboxWorkspaceContent({
     }
   }, [
     directoryEntries,
+    directoryErrors,
     isRunning,
     loadDirectory,
     loadingDirectories,
@@ -333,15 +440,20 @@ function SandboxWorkspaceContent({
   ])
 
   useEffect(() => {
+    setNavigationBlocked(hasDirtyFiles)
     if (!hasDirtyFiles) return
     const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
-      event.preventDefault()
+      if (isNavigationBlocked()) event.preventDefault()
     }
     window.addEventListener("beforeunload", warnBeforeLeaving)
-    return () => window.removeEventListener("beforeunload", warnBeforeLeaving)
-  }, [hasDirtyFiles])
+    return () => {
+      window.removeEventListener("beforeunload", warnBeforeLeaving)
+      setNavigationBlocked(false)
+    }
+  }, [hasDirtyFiles, isNavigationBlocked, setNavigationBlocked])
 
   async function openEntry(entry: SandboxFileEntry) {
+    const operationGeneration = operationGenerationRef.current
     if (entry.type === "directory") {
       const expanded = expandedDirectories.has(entry.path)
       setExpandedDirectories((current) => {
@@ -361,6 +473,7 @@ function SandboxWorkspaceContent({
     if (openFiles.some((file) => file.path === entry.path)) {
       setActiveFilePath(entry.path)
       setPropertiesTab("file")
+      setShowEditor(true)
       return
     }
     setOpeningFilePath(entry.path)
@@ -373,6 +486,7 @@ function SandboxWorkspaceContent({
     }
     try {
       const content = await runFileOperation({ kind: "read", path: entry.path })
+      if (!isOperationCurrent(operationGeneration)) return
       if (typeof content !== "string") throw new Error("文件响应格式无效")
       const file: OpenFile = {
         path: entry.path,
@@ -384,41 +498,74 @@ function SandboxWorkspaceContent({
       setOpenFiles((current) => [...current, file])
       setActiveFilePath(entry.path)
       setPropertiesTab("file")
+      setShowEditor(true)
     } catch (error) {
+      if (!isOperationCurrent(operationGeneration)) return
       toast.error("无法打开文件", { description: errorMessage(error) })
     } finally {
-      setOpeningFilePath(null)
+      if (isOperationCurrent(operationGeneration)) setOpeningFilePath(null)
     }
   }
 
   async function saveActiveFile() {
-    if (!activeFile || activeFile.content === activeFile.savedContent) return
-    const content = activeFile.content
-    setSavingFilePath(activeFile.path)
-    try {
-      await runFileOperation({
-        kind: "write",
-        path: activeFile.path,
-        content,
-      })
-      setOpenFiles((current) =>
-        current.map((file) =>
-          file.path === activeFile.path
-            ? { ...file, savedContent: content }
-            : file
-        )
-      )
-      toast.success("文件已保存", { description: activeFile.path })
-    } catch (error) {
-      toast.error("保存失败", { description: errorMessage(error) })
-    } finally {
-      setSavingFilePath(null)
+    if (
+      !activeFile ||
+      (activeFile.content === activeFile.savedContent && !activeFileSaving)
+    ) {
+      return
     }
+    const operationGeneration = operationGenerationRef.current
+    const { path, content } = activeFile
+    const save = enqueueLatestByKey(
+      fileSaveQueueRef.current,
+      path,
+      content,
+      async (nextContent) => {
+        await runFileOperation({ kind: "write", path, content: nextContent })
+        if (!isOperationCurrent(operationGeneration)) return
+        setOpenFiles((current) =>
+          current.map((file) =>
+            file.path === path ? { ...file, savedContent: nextContent } : file
+          )
+        )
+      }
+    )
+    if (!save) return
+
+    setSavingFilePaths((current) => new Set(current).add(path))
+    try {
+      await save
+      if (isOperationCurrent(operationGeneration)) {
+        toast.success("文件已保存", { description: path })
+      }
+    } catch (error) {
+      if (isOperationCurrent(operationGeneration)) {
+        toast.error("保存失败", { description: errorMessage(error) })
+      }
+    } finally {
+      if (isOperationCurrent(operationGeneration)) {
+        setSavingFilePaths((current) => {
+          const next = new Set(current)
+          next.delete(path)
+          return next
+        })
+      }
+    }
+  }
+
+  function refreshFileTree() {
+    setDirectoryEntries({})
+    setExpandedDirectories(new Set(["/"]))
+    void loadDirectory("/")
   }
 
   function closeFile(path: string) {
     const file = openFiles.find((item) => item.path === path)
     if (!file) return
+    if (savingFilePaths.has(path)) {
+      toast.error("文件正在保存", { description: "保存完成后再关闭该文件。" })
+      return
+    }
     if (file.content !== file.savedContent) {
       toast.error("文件尚未保存", { description: "保存后再关闭该文件。" })
       return
@@ -484,6 +631,7 @@ function SandboxWorkspaceContent({
     const selectedFiles = Array.from(files ?? [])
     if (selectedFiles.length === 0) return
 
+    const operationGeneration = operationGenerationRef.current
     const directory = uploadDirectoryRef.current
     let uploaded = 0
     const failures: string[] = []
@@ -491,6 +639,7 @@ function SandboxWorkspaceContent({
       const currentEntries = sandboxFileEntriesSchema.parse(
         await runFileOperation({ kind: "list", path: directory })
       )
+      if (!isOperationCurrent(operationGeneration)) return
       setDirectoryEntries((current) => ({
         ...current,
         [directory]: currentEntries,
@@ -521,22 +670,28 @@ function SandboxWorkspaceContent({
         })
         try {
           await uploadFile(file, destination, (percent) =>
-            setUploadProgress({
-              fileName: file.name,
-              fileIndex: index + 1,
-              fileCount: selectedFiles.length,
-              percent,
-            })
+            isOperationCurrent(operationGeneration)
+              ? setUploadProgress({
+                  fileName: file.name,
+                  fileIndex: index + 1,
+                  fileCount: selectedFiles.length,
+                  percent,
+                })
+              : undefined
           )
+          if (!isOperationCurrent(operationGeneration)) return
           existingNames.add(file.name)
           uploaded += 1
         } catch (error) {
+          if (!isOperationCurrent(operationGeneration)) return
           failures.push(`${file.name}：${uploadErrorMessage(error)}`)
         }
       }
 
+      if (!isOperationCurrent(operationGeneration)) return
       setExpandedDirectories((current) => new Set(current).add(directory))
       await loadDirectory(directory, false)
+      if (!isOperationCurrent(operationGeneration)) return
       if (uploaded > 0) {
         toast.success(`已上传 ${uploaded} 个文件`, { description: directory })
       }
@@ -546,9 +701,10 @@ function SandboxWorkspaceContent({
         })
       }
     } catch (error) {
+      if (!isOperationCurrent(operationGeneration)) return
       toast.error("上传失败", { description: errorMessage(error) })
     } finally {
-      setUploadProgress(null)
+      if (isOperationCurrent(operationGeneration)) setUploadProgress(null)
     }
   }
 
@@ -579,12 +735,25 @@ function SandboxWorkspaceContent({
   }
 
   async function copyPath(path: string) {
+    const operationGeneration = operationGenerationRef.current
     try {
       await writeClipboardText(path)
+      if (!isOperationCurrent(operationGeneration)) return
       toast.success("路径已复制", { description: path })
     } catch {
+      if (!isOperationCurrent(operationGeneration)) return
       toast.error("复制失败", { description: "浏览器未授权访问剪贴板。" })
     }
+  }
+
+  function toggleEditorPanel() {
+    if (showEditor && !showTerminal) setShowTerminal(true)
+    setShowEditor((visible) => !visible)
+  }
+
+  function toggleTerminalPanel() {
+    if (showTerminal && !showEditor) setShowEditor(true)
+    setShowTerminal((visible) => !visible)
   }
 
   function renderEntry(entry: SandboxFileEntry, depth = 0) {
@@ -594,7 +763,7 @@ function SandboxWorkspaceContent({
     return (
       <div
         key={entry.path}
-        style={{ contentVisibility: "auto", containIntrinsicSize: "24px" }}
+        style={{ contentVisibility: "auto", containIntrinsicSize: "28px" }}
       >
         <ContextMenu>
           <ContextMenuTrigger asChild>
@@ -602,8 +771,8 @@ function SandboxWorkspaceContent({
               type="button"
               aria-expanded={entry.type === "directory" ? expanded : undefined}
               className={cn(
-                "flex h-6 w-full items-center gap-1 pr-2 text-left text-[13px] hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
-                active && "bg-accent text-accent-foreground",
+                "mx-1 flex h-7 w-[calc(100%-0.5rem)] items-center gap-1 rounded-md pr-2 text-left text-[13px] hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none",
+                active && "bg-sidebar-accent text-sidebar-accent-foreground",
                 dragUploadTarget === entry.path &&
                   "bg-primary/10 text-foreground ring-1 ring-primary/60 ring-inset"
               )}
@@ -744,9 +913,9 @@ function SandboxWorkspaceContent({
 
   function renderExplorer() {
     return (
-      <aside className="flex h-full min-w-0 flex-col bg-muted/10">
-        <div className="flex h-9 shrink-0 items-center gap-1 border-b px-2">
-          <h2 className="min-w-0 flex-1 truncate text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
+      <aside className="flex h-full min-w-0 flex-col bg-sidebar text-sidebar-foreground">
+        <div className="flex h-10 shrink-0 items-center gap-1 border-b px-2.5">
+          <h2 className="min-w-0 flex-1 truncate text-xs font-medium">
             资源管理器
           </h2>
           <Tooltip>
@@ -783,12 +952,10 @@ function SandboxWorkspaceContent({
                 variant="ghost"
                 size="icon-xs"
                 aria-label="刷新文件树"
-                disabled={loadingDirectories.has("/")}
-                onClick={() => {
-                  setDirectoryEntries({})
-                  setExpandedDirectories(new Set(["/"]))
-                  void loadDirectory("/")
-                }}
+                disabled={
+                  sessionState !== "ready" || loadingDirectories.has("/")
+                }
+                onClick={refreshFileTree}
               >
                 {loadingDirectories.has("/") ? (
                   <Spinner />
@@ -819,16 +986,19 @@ function SandboxWorkspaceContent({
             </div>
           </div>
         ) : null}
-        <div className="flex h-7 shrink-0 items-center gap-1 border-b px-2 text-[11px] font-semibold tracking-[0.06em] uppercase">
-          <ChevronDownIcon aria-hidden="true" className="size-3" />
-          <span className="truncate">{sandbox?.id}</span>
+        <div className="mx-2 mt-2 flex h-8 shrink-0 items-center gap-1.5 rounded-lg border bg-sidebar-accent/50 px-2.5 text-[11px] font-medium">
+          <FolderOpenIcon aria-hidden="true" className="size-3.5" />
+          <span className="min-w-0 flex-1 truncate">{sandbox?.id}</span>
+          <span className="shrink-0 text-sidebar-foreground/60">
+            {directoryEntries["/"]?.length ?? 0} 项
+          </span>
         </div>
         <ContextMenu>
           <ContextMenuTrigger asChild>
             <div
               aria-label="资源管理器文件列表"
               className={cn(
-                "relative min-h-0 flex-1 overflow-auto py-1",
+                "relative min-h-0 flex-1 overflow-auto py-1.5",
                 dragUploadTarget === "/" &&
                   "bg-primary/5 ring-1 ring-primary/60 ring-inset"
               )}
@@ -843,7 +1013,36 @@ function SandboxWorkspaceContent({
                   松开上传到根目录
                 </div>
               ) : null}
-              {fileFilter.trim() ? (
+              {directoryErrors["/"] && !directoryEntries["/"] ? (
+                <div
+                  role="alert"
+                  className="mx-2 mt-1 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-xs"
+                >
+                  <p className="font-medium text-foreground">无法读取根目录</p>
+                  <p
+                    className="mt-1 line-clamp-2 break-words text-muted-foreground"
+                    title={directoryErrors["/"]}
+                  >
+                    {directoryErrors["/"]}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="xs"
+                    className="mt-2"
+                    disabled={
+                      sessionState !== "ready" || loadingDirectories.has("/")
+                    }
+                    onClick={refreshFileTree}
+                  >
+                    {loadingDirectories.has("/") ? (
+                      <Spinner />
+                    ) : (
+                      <RefreshCwIcon aria-hidden="true" />
+                    )}
+                    重试
+                  </Button>
+                </div>
+              ) : fileFilter.trim() ? (
                 visibleSearchFiles.length > 0 ? (
                   visibleSearchFiles.map((entry) => renderEntry(entry))
                 ) : (
@@ -872,12 +1071,10 @@ function SandboxWorkspaceContent({
                 上传文件
               </ContextMenuItem>
               <ContextMenuItem
-                disabled={loadingDirectories.has("/")}
-                onSelect={() => {
-                  setDirectoryEntries({})
-                  setExpandedDirectories(new Set(["/"]))
-                  void loadDirectory("/")
-                }}
+                disabled={
+                  sessionState !== "ready" || loadingDirectories.has("/")
+                }
+                onSelect={refreshFileTree}
               >
                 <RefreshCwIcon aria-hidden="true" />
                 刷新文件树
@@ -926,7 +1123,7 @@ function SandboxWorkspaceContent({
         <div
           role="tablist"
           aria-label="已打开文件"
-          className="flex h-9 shrink-0 items-stretch overflow-x-auto border-b bg-muted/20"
+          className="flex h-10 shrink-0 items-stretch overflow-x-auto border-b bg-sidebar/80"
         >
           {openFiles.length > 0 ? (
             openFiles.map((file) => {
@@ -936,8 +1133,8 @@ function SandboxWorkspaceContent({
                 <div
                   key={file.path}
                   className={cn(
-                    "group flex max-w-52 min-w-0 shrink-0 items-center border-r",
-                    active && "bg-background"
+                    "group my-1 ml-1 flex h-8 max-w-52 min-w-0 shrink-0 items-center rounded-lg border border-transparent",
+                    active && "border-border bg-background shadow-xs"
                   )}
                 >
                   <button
@@ -980,8 +1177,9 @@ function SandboxWorkspaceContent({
               )
             })
           ) : (
-            <div className="flex items-center px-3 text-xs text-muted-foreground">
-              未打开文件
+            <div className="flex items-center gap-1.5 px-3 text-xs font-medium text-muted-foreground">
+              <Code2Icon aria-hidden="true" className="size-3.5" />
+              编辑器
             </div>
           )}
           <div className="ml-auto flex shrink-0 items-center border-l px-1">
@@ -990,15 +1188,21 @@ function SandboxWorkspaceContent({
               size="icon-xs"
               aria-label="保存当前文件"
               disabled={
-                !activeFile || activeFile.content === activeFile.savedContent
+                !activeFile ||
+                activeFile.content === activeFile.savedContent ||
+                activeFileSaving
               }
               onClick={() => void saveActiveFile()}
             >
-              {savingFilePath === activeFile?.path ? (
-                <Spinner />
-              ) : (
-                <SaveIcon aria-hidden="true" />
-              )}
+              {activeFileSaving ? <Spinner /> : <SaveIcon aria-hidden="true" />}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon-xs"
+              aria-label="收起编辑器"
+              onClick={toggleEditorPanel}
+            >
+              <PanelTopCloseIcon aria-hidden="true" />
             </Button>
           </div>
         </div>
@@ -1018,14 +1222,15 @@ function SandboxWorkspaceContent({
               onSave={() => void saveActiveFile()}
             />
           ) : (
-            <Empty className="h-full rounded-none border-0">
+            <Empty className="h-full rounded-none border-0 bg-muted/10">
               <EmptyHeader>
                 <EmptyMedia variant="icon">
                   <Code2Icon aria-hidden="true" />
                 </EmptyMedia>
-                <EmptyTitle>打开文件开始编辑</EmptyTitle>
+                <EmptyTitle>选择一个文件开始编辑</EmptyTitle>
                 <EmptyDescription>
-                  文件通过 root 权限从当前沙箱读取。
+                  从左侧资源管理器打开文件，或继续使用下方终端。文件读写使用
+                  root 权限。
                 </EmptyDescription>
               </EmptyHeader>
             </Empty>
@@ -1039,12 +1244,16 @@ function SandboxWorkspaceContent({
     if (!sandbox) return null
     return (
       <section className="flex h-full min-h-0 flex-col bg-background">
-        <div className="flex h-8 shrink-0 items-center border-b bg-muted/20">
-          <div className="flex h-full items-center border-b-2 border-foreground px-3 text-[11px] font-medium tracking-wide uppercase">
+        <div className="flex h-10 shrink-0 items-center border-b bg-sidebar/80">
+          <div className="m-1 flex h-8 items-center gap-1.5 rounded-md bg-background px-2.5 text-xs font-medium shadow-xs">
+            <TerminalIcon aria-hidden="true" className="size-3.5" />
             终端
           </div>
-          <div className="ml-auto flex items-center px-1">
-            <Badge variant="outline" className="h-5 rounded-sm text-[10px]">
+          <div className="ml-auto flex items-center gap-1 px-1.5">
+            <Badge variant="secondary" className="h-5 text-[10px]">
+              {sessionStateLabel(sessionState)}
+            </Badge>
+            <Badge variant="outline" className="h-5 text-[10px]">
               root
             </Badge>
             <Tooltip>
@@ -1077,7 +1286,7 @@ function SandboxWorkspaceContent({
               variant="ghost"
               size="icon-xs"
               aria-label="关闭终端面板"
-              onClick={() => setShowTerminal(false)}
+              onClick={toggleTerminalPanel}
             >
               <XIcon aria-hidden="true" />
             </Button>
@@ -1100,9 +1309,11 @@ function SandboxWorkspaceContent({
             ["行数", String(activeFile.content.split("\n").length)],
             [
               "状态",
-              activeFile.content === activeFile.savedContent
-                ? "已保存"
-                : "未保存",
+              activeFileSaving
+                ? "正在保存"
+                : activeFile.content === activeFile.savedContent
+                  ? "已保存"
+                  : "未保存",
             ],
           ]
         : [
@@ -1122,9 +1333,9 @@ function SandboxWorkspaceContent({
           ]
 
     return (
-      <aside className="flex h-full min-w-0 flex-col bg-muted/10">
-        <div className="flex h-9 shrink-0 items-center border-b px-2">
-          <h2 className="min-w-0 flex-1 truncate text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
+      <aside className="flex h-full min-w-0 flex-col bg-sidebar text-sidebar-foreground">
+        <div className="flex h-10 shrink-0 items-center border-b px-2.5">
+          <h2 className="min-w-0 flex-1 truncate text-xs font-medium">
             检查器
           </h2>
           <Button
@@ -1151,71 +1362,110 @@ function SandboxWorkspaceContent({
             文件
           </ToggleGroupItem>
         </ToggleGroup>
-        <div className="border-y px-3 py-3">
-          <h3 className="truncate text-sm font-semibold">
-            {propertiesTab === "file" && activeFile
-              ? activeFile.name
-              : (sandbox?.name ?? "沙箱")}
-          </h3>
-          <p className="mt-1 line-clamp-2 text-xs break-all text-muted-foreground">
-            {propertiesTab === "file" && activeFile
-              ? activeFile.path
-              : sandbox?.description || sandbox?.id}
-          </p>
-        </div>
-        <div className="min-h-0 flex-1 overflow-auto p-3">
-          <dl className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs">
-            {rows.map(([label, value]) => (
-              <div key={label} className="contents">
-                <dt className="text-muted-foreground">{label}</dt>
-                <dd
-                  className="min-w-0 break-words text-foreground"
-                  title={value}
-                >
-                  {value}
-                </dd>
-              </div>
-            ))}
-          </dl>
-        </div>
+        <>
+          <div className="border-y px-3 py-3">
+            <h3 className="truncate text-sm font-semibold">
+              {propertiesTab === "file" && activeFile
+                ? activeFile.name
+                : (sandbox?.name ?? "沙箱")}
+            </h3>
+            <p className="mt-1 line-clamp-2 text-xs break-all text-muted-foreground">
+              {propertiesTab === "file" && activeFile
+                ? activeFile.path
+                : sandbox?.description || sandbox?.id}
+            </p>
+          </div>
+          <div className="min-h-0 flex-1 overflow-auto p-3">
+            <dl className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3 gap-y-2 text-xs">
+              {rows.map(([label, value]) => (
+                <div key={label} className="contents">
+                  <dt className="text-muted-foreground">{label}</dt>
+                  <dd
+                    className="min-w-0 break-words text-foreground"
+                    title={value}
+                  >
+                    {value}
+                  </dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        </>
       </aside>
     )
   }
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col">
+    <section className="flex min-h-0 flex-1 flex-col bg-background">
       <SiteHeader
         title={
-          <Link
-            href="/sandboxes"
-            className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-          >
-            <ArrowLeftIcon aria-hidden="true" className="size-3.5" />
-            沙箱
-          </Link>
+          <span className="flex min-w-0 items-center gap-2">
+            <Link
+              href="/sandboxes"
+              className="flex shrink-0 items-center gap-1.5 text-xs font-medium text-muted-foreground hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
+              onNavigate={(event) => {
+                if (!confirmNavigation()) event.preventDefault()
+              }}
+            >
+              <ArrowLeftIcon aria-hidden="true" className="size-3.5" />
+              <span className="hidden sm:inline">沙箱</span>
+            </Link>
+            <span aria-hidden="true" className="text-muted-foreground/50">
+              /
+            </span>
+            <span className="flex min-w-0 items-center gap-1.5">
+              <BoxIcon aria-hidden="true" className="size-3.5 shrink-0" />
+              <span className="truncate">{sandbox?.name ?? sandboxId}</span>
+            </span>
+            {sandbox ? (
+              <Badge variant={isRunning ? "secondary" : "outline"}>
+                {isRunning ? "运行中" : "未运行"}
+              </Badge>
+            ) : null}
+          </span>
         }
         center={
           <WorkspaceModeToggle
             value={activeWorkspaceMode}
             desktopEnabled={desktopEnabled}
+            desktopUnavailableReason={desktopUnavailableReason}
             onChange={setWorkspaceMode}
             className="pointer-events-auto mx-auto"
           />
         }
         action={
           <>
+            {isRunning ? (
+              <SandboxModelSourceSwitcher
+                sandbox={sandbox}
+                runtime={runtime}
+                credentials={credentials}
+                credentialsLoading={credentialsLoading}
+                credentialsError={credentialsError}
+                canMutate={
+                  currentUser?.role === "admin" ||
+                  currentUser?.role === "operator"
+                }
+                onRetryCredentials={onRetryCredentials}
+                onResourceChange={onSandboxChange}
+              />
+            ) : null}
             <WorkspaceModeToggle
               value={activeWorkspaceMode}
               desktopEnabled={desktopEnabled}
+              desktopUnavailableReason={desktopUnavailableReason}
               onChange={setWorkspaceMode}
               className="lg:hidden"
             />
             {activeWorkspaceMode === "code" ? (
-              <>
+              <ButtonGroup
+                aria-label="工作区面板"
+                className="rounded-lg border bg-muted/30 p-0.5"
+              >
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      variant="ghost"
+                      variant={showExplorer ? "secondary" : "ghost"}
                       size="icon-sm"
                       aria-label={
                         showExplorer ? "隐藏资源管理器" : "显示资源管理器"
@@ -1231,11 +1481,25 @@ function SandboxWorkspaceContent({
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      variant="ghost"
+                      variant={showEditor ? "secondary" : "ghost"}
+                      size="icon-sm"
+                      aria-label={showEditor ? "隐藏编辑器" : "显示编辑器"}
+                      aria-pressed={showEditor}
+                      onClick={toggleEditorPanel}
+                    >
+                      <PanelTopIcon aria-hidden="true" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>编辑器</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant={showTerminal ? "secondary" : "ghost"}
                       size="icon-sm"
                       aria-label={showTerminal ? "隐藏终端" : "显示终端"}
                       aria-pressed={showTerminal}
-                      onClick={() => setShowTerminal((visible) => !visible)}
+                      onClick={toggleTerminalPanel}
                     >
                       <PanelBottomIcon aria-hidden="true" />
                     </Button>
@@ -1245,7 +1509,7 @@ function SandboxWorkspaceContent({
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      variant="ghost"
+                      variant={showInspector ? "secondary" : "ghost"}
                       size="icon-sm"
                       aria-label={showInspector ? "隐藏检查器" : "显示检查器"}
                       aria-pressed={showInspector}
@@ -1256,33 +1520,81 @@ function SandboxWorkspaceContent({
                   </TooltipTrigger>
                   <TooltipContent>检查器</TooltipContent>
                 </Tooltip>
-              </>
+              </ButtonGroup>
             ) : null}
           </>
         }
       />
 
-      {!isRunning ? (
+      {!sandbox ? (
+        <Empty className="min-h-0 flex-1 rounded-none border-0">
+          <EmptyHeader>
+            <EmptyMedia variant="icon">
+              <InfoIcon aria-hidden="true" />
+            </EmptyMedia>
+            <EmptyTitle>无法打开沙箱</EmptyTitle>
+            <EmptyDescription>沙箱不存在</EmptyDescription>
+          </EmptyHeader>
+        </Empty>
+      ) : !isRunning ? (
         <Empty className="min-h-0 flex-1 rounded-none border-0">
           <EmptyHeader>
             <EmptyMedia variant="icon">
               <BoxIcon aria-hidden="true" />
             </EmptyMedia>
-            <EmptyTitle>沙箱未运行</EmptyTitle>
+            <EmptyTitle>
+              {creationCancelled
+                ? sandbox.spec.status === "cancelling"
+                  ? "正在取消安装"
+                  : "沙箱创建已中止"
+                : "沙箱未运行"}
+            </EmptyTitle>
             <EmptyDescription>
-              先启动沙箱，再进入 IDE 操作文件和终端。
+              {creationCancelled
+                ? "请返回沙箱列表查看取消进度或清理结果。需要使用时请重新创建沙箱。"
+                : "先启动沙箱，再进入 IDE 操作文件和终端。"}
             </EmptyDescription>
           </EmptyHeader>
         </Empty>
       ) : (
-        <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        <div className="m-2 flex min-h-0 flex-1 flex-col gap-2 overflow-hidden">
+          {sessionStateDetail && sessionState !== "ready" ? (
+            <div
+              role="alert"
+              className="flex shrink-0 items-center gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs"
+            >
+              <div className="min-w-0 flex-1">
+                <p className="font-medium text-foreground">
+                  {sessionState === "connecting"
+                    ? "实时会话正在重连"
+                    : "实时会话连接异常"}
+                </p>
+                <p
+                  className="truncate text-muted-foreground"
+                  title={sessionStateDetail || "无法连接 Worker 实时会话"}
+                >
+                  {sessionStateDetail || "无法连接 Worker 实时会话"}
+                </p>
+              </div>
+              <Button
+                variant="outline"
+                size="xs"
+                onClick={() => session.restart()}
+              >
+                <RefreshCwIcon aria-hidden="true" />
+                重新连接
+              </Button>
+            </div>
+          ) : null}
           <div className="min-h-0 flex-1 overflow-hidden">
             {activeWorkspaceMode === "desktop" ? (
-              <SandboxDesktop
-                sandboxId={sandbox.id}
-                active
-                running={isRunning}
-              />
+              <div className="h-full overflow-hidden rounded-xl border bg-background shadow-sm">
+                <SandboxDesktop
+                  sandboxId={sandbox.id}
+                  active
+                  running={isRunning}
+                />
+              </div>
             ) : (
               <ResizablePanelGroup orientation="horizontal">
                 {showExplorer ? (
@@ -1293,34 +1605,46 @@ function SandboxWorkspaceContent({
                       minSize="190px"
                       maxSize="40%"
                     >
-                      {renderExplorer()}
+                      <div className="h-full overflow-hidden rounded-xl border bg-background shadow-sm">
+                        {renderExplorer()}
+                      </div>
                     </ResizablePanel>
-                    <ResizableHandle aria-label="调整资源管理器宽度" />
+                    <ResizableHandle
+                      aria-label="调整资源管理器宽度"
+                      className="w-2 bg-transparent after:w-2 hover:bg-muted/50 focus-visible:bg-muted/50"
+                    />
                   </>
                 ) : null}
                 <ResizablePanel id="sandbox-editor" minSize="320px">
                   <ResizablePanelGroup orientation="vertical">
-                    {showEditorPanel ? (
+                    {showEditor ? (
                       <ResizablePanel
                         id="sandbox-code"
-                        defaultSize={showTerminal ? "65%" : "100%"}
+                        defaultSize={showTerminal ? "64%" : "100%"}
                         minSize="180px"
                       >
-                        {renderEditor()}
+                        <div className="h-full overflow-hidden rounded-xl border bg-background shadow-sm">
+                          {renderEditor()}
+                        </div>
                       </ResizablePanel>
                     ) : null}
                     {showTerminal ? (
                       <>
-                        {showEditorPanel ? (
-                          <ResizableHandle aria-label="调整终端高度" />
+                        {showEditor ? (
+                          <ResizableHandle
+                            aria-label="调整终端高度"
+                            className="bg-transparent hover:bg-muted/50 focus-visible:bg-muted/50 aria-[orientation=horizontal]:h-2 aria-[orientation=horizontal]:after:h-2"
+                          />
                         ) : null}
                         <ResizablePanel
                           id="sandbox-terminal"
-                          defaultSize={showEditorPanel ? "35%" : "100%"}
+                          defaultSize={showEditor ? "36%" : "100%"}
                           minSize="120px"
-                          maxSize={showEditorPanel ? "70%" : "100%"}
+                          maxSize={showEditor ? "70%" : "100%"}
                         >
-                          {renderTerminal()}
+                          <div className="h-full overflow-hidden rounded-xl border bg-background shadow-sm">
+                            {renderTerminal()}
+                          </div>
                         </ResizablePanel>
                       </>
                     ) : null}
@@ -1328,21 +1652,26 @@ function SandboxWorkspaceContent({
                 </ResizablePanel>
                 {showInspector ? (
                   <>
-                    <ResizableHandle aria-label="调整检查器宽度" />
+                    <ResizableHandle
+                      aria-label="调整检查器宽度"
+                      className="w-2 bg-transparent after:w-2 hover:bg-muted/50 focus-visible:bg-muted/50"
+                    />
                     <ResizablePanel
                       id="sandbox-inspector"
-                      defaultSize="270px"
-                      minSize="220px"
-                      maxSize="40%"
+                      defaultSize="320px"
+                      minSize="280px"
+                      maxSize="45%"
                     >
-                      {renderInspector()}
+                      <div className="h-full overflow-hidden rounded-xl border bg-background shadow-sm">
+                        {renderInspector()}
+                      </div>
                     </ResizablePanel>
                   </>
                 ) : null}
               </ResizablePanelGroup>
             )}
           </div>
-          <footer className="flex h-6 shrink-0 items-center gap-3 border-t bg-sidebar px-2 text-[11px] text-sidebar-foreground">
+          <footer className="flex h-7 shrink-0 items-center gap-3 rounded-lg border bg-sidebar px-2.5 text-[11px] text-sidebar-foreground shadow-xs">
             <span
               className="flex min-w-0 items-center gap-1"
               aria-live="polite"
@@ -1387,11 +1716,13 @@ function SandboxWorkspaceContent({
 function WorkspaceModeToggle({
   value,
   desktopEnabled,
+  desktopUnavailableReason,
   onChange,
   className,
 }: {
   value: "code" | "desktop"
   desktopEnabled: boolean
+  desktopUnavailableReason: string
   onChange: (value: "code" | "desktop") => void
   className?: string
 }) {
@@ -1408,15 +1739,16 @@ function WorkspaceModeToggle({
     >
       <ToggleGroupItem value="code">
         <Code2Icon aria-hidden="true" data-icon="inline-start" />
-        代码
+        <span className="hidden sm:inline">代码</span>
       </ToggleGroupItem>
       <ToggleGroupItem
         value="desktop"
         disabled={!desktopEnabled}
-        title={desktopEnabled ? "打开图形桌面" : "此沙箱未启用图形桌面"}
+        aria-label={desktopEnabled ? "打开图形桌面" : desktopUnavailableReason}
+        title={desktopEnabled ? "打开图形桌面" : desktopUnavailableReason}
       >
         <MonitorIcon aria-hidden="true" data-icon="inline-start" />
-        桌面
+        <span className="hidden sm:inline">桌面</span>
       </ToggleGroupItem>
     </ToggleGroup>
   )
@@ -1467,12 +1799,6 @@ function sessionStateLabel(state: SandboxSessionState) {
     default:
       return "未连接"
   }
-}
-
-function stringList(value: unknown) {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : []
 }
 
 function formatBytes(value: number) {

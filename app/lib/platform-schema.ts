@@ -19,10 +19,60 @@ export const provisioningAgentToolSchema = z.object({
   durationMs: z.number().int().nonnegative().default(0),
 })
 
+export const provisioningExtensionSchema = z.object({
+  id: z.string(),
+  status: z.string(),
+  message: z.string().default(""),
+  output: z.string().default(""),
+  startedAt: z.string().datetime({ offset: true }).nullable().optional(),
+  finishedAt: z.string().datetime({ offset: true }).nullable().optional(),
+  durationMs: z.number().int().nonnegative().default(0),
+})
+
+export const extensionSpecSchema = z.object({
+  version: z
+    .string()
+    .trim()
+    .refine((value) => Array.from(value).length <= 64, "版本不能超过 64 个字符")
+    .refine((value) => !/[\r\n\0]/.test(value), "版本不能包含换行或空字节")
+    .default(""),
+  source: z.enum(["custom", "preset"]).default("custom"),
+  installScript: z
+    .string()
+    .refine(
+      (value) =>
+        new TextEncoder().encode(value).length <= 65536 &&
+        !value.includes("\0"),
+      "安装脚本不能超过 64 KiB 或包含空字节"
+    )
+    .default(""),
+  verifyScript: z
+    .string()
+    .refine(
+      (value) =>
+        new TextEncoder().encode(value).length <= 65536 &&
+        !value.includes("\0"),
+      "验证脚本不能超过 64 KiB 或包含空字节"
+    )
+    .default(""),
+  timeoutSeconds: z.number().int().min(30).max(1800).default(600),
+  requiresNetwork: z.boolean().default(true),
+})
+
+export const extensionSnapshotSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().default(""),
+  generation: z.number().int().positive(),
+  spec: extensionSpecSchema,
+})
+
 export const provisioningProgressSchema = z.object({
   stage: z.string().default(""),
   message: z.string().default(""),
   status: z.string().default(""),
+  cancellationSupported: z.boolean().default(false),
+  cancelRequested: z.boolean().default(false),
   cacheStatus: z.string().default(""),
   cacheReason: z.string().default(""),
   startedAt: z.string().datetime({ offset: true }).nullable().default(null),
@@ -36,6 +86,7 @@ export const provisioningProgressSchema = z.object({
   durationMs: z.number().int().nonnegative().default(0),
   timings: z.array(provisioningStageTimingSchema).default([]),
   agentTools: z.array(provisioningAgentToolSchema).default([]),
+  extensions: z.array(provisioningExtensionSchema).default([]),
 })
 
 export const resourceKindSchema = z.enum([
@@ -46,6 +97,7 @@ export const resourceKindSchema = z.enum([
   "mcp",
   "sandbox",
   "variable",
+  "extension",
 ])
 
 const resourceBaseSchema = z.object({
@@ -75,6 +127,7 @@ const executionSpecSchema = z.object({
   imageId: z.string().optional(),
   workdir: z.string().optional(),
   setup: z.string().optional(),
+  extensionIds: z.array(z.string().min(1)).max(64).optional(),
   cpu: z.string().optional(),
   memory: z.string().optional(),
   desktop: z.boolean().optional(),
@@ -130,6 +183,17 @@ const executionInputSpecSchema = executionSpecSchema
   .strict()
 
 // These fields describe Worker observations/provenance, never desired input.
+export const runtimeModelSourceSchema = z.object({
+  credentialId: z.string().min(1),
+  modelId: z.string().min(1),
+  updatedAt: z.string().datetime({ offset: true }),
+})
+
+export const runtimeModelSourcesSchema = z.record(
+  z.string().min(1),
+  runtimeModelSourceSchema
+)
+
 const sandboxObservedSpecSchema = z.object({
   status: z.string().nullish(),
   message: z.string().nullish(),
@@ -165,6 +229,10 @@ const sandboxObservedSpecSchema = z.object({
     .nullish(),
   automationId: z.string().nullish(),
   automationRunId: z.string().nullish(),
+  runtimeModelSources: runtimeModelSourcesSchema.nullish(),
+  runtimeModelSourcesComplete: z.boolean().nullish(),
+  extensionSnapshots: z.array(extensionSnapshotSchema).nullish(),
+  extensionStates: z.array(provisioningExtensionSchema).nullish(),
 })
 
 const sandboxInputSpecSchema = z.preprocess(
@@ -216,6 +284,10 @@ export const resourceInputSchema = z
       spec: skillSpecSchema.strict(),
     }),
     resourceBaseSchema.extend({
+      kind: z.literal("extension"),
+      spec: extensionSpecSchema.strict(),
+    }),
+    resourceBaseSchema.extend({
       kind: z.literal("mcp"),
       spec: mcpSpecSchema
         .extend({
@@ -250,6 +322,21 @@ export const resourceInputSchema = z
     }),
   ])
   .superRefine((resource, context) => {
+    if (resource.kind === "extension" && resource.enabled) {
+      for (const [key, label] of [
+        ["version", "固定版本"],
+        ["installScript", "安装脚本"],
+        ["verifyScript", "验证脚本"],
+      ] as const) {
+        if (!resource.spec[key].trim()) {
+          context.addIssue({
+            code: "custom",
+            path: ["spec", key],
+            message: `启用扩展前请填写${label}`,
+          })
+        }
+      }
+    }
     if (
       resource.kind !== "project" &&
       resource.kind !== "image" &&
@@ -289,6 +376,10 @@ export const resourceSchema = z.discriminatedUnion("kind", [
     spec: skillSpecSchema,
   }),
   resourceResponseBaseSchema.extend({
+    kind: z.literal("extension"),
+    spec: extensionSpecSchema,
+  }),
+  resourceResponseBaseSchema.extend({
     kind: z.literal("mcp"),
     spec: mcpSpecSchema.partial(),
   }),
@@ -315,6 +406,7 @@ export const resourceResponseSchema = z.object({ resource: resourceSchema })
 export type ResourceKind = z.infer<typeof resourceKindSchema>
 export type ResourceInput = z.infer<typeof resourceInputSchema>
 export type Resource = z.infer<typeof resourceSchema>
+export type RuntimeModelSource = z.infer<typeof runtimeModelSourceSchema>
 export type ResourceOfKind<K extends ResourceKind> = Extract<
   Resource,
   { kind: K }
@@ -343,6 +435,7 @@ export function sandboxSpecForUpdate(
     "network",
     "workdir",
     "setup",
+    "extensionIds",
     "workspace",
     "proxyId",
   ] as const) {

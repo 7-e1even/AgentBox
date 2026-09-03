@@ -241,7 +241,7 @@ func TestControlPlaneMutationLockSerializesNetworkProxyChecks(t *testing.T) {
 	}
 }
 
-func TestDeleteResourceRejectsActiveOrTransitionalSandbox(t *testing.T) {
+func TestDeleteResourceRejectsDirectSandboxDeletion(t *testing.T) {
 	s := newIntegrationTestStore(t)
 	ctx := t.Context()
 	serverID := uuid.NewString()
@@ -285,8 +285,17 @@ func TestDeleteResourceRejectsActiveOrTransitionalSandbox(t *testing.T) {
 	  SET spec = spec || '{"status":"error"}'::jsonb WHERE id = $1`, sandboxID); err != nil {
 		t.Fatalf("mark sandbox safe to remove: %v", err)
 	}
-	if err := s.DeleteResource(ctx, sandboxID); err != nil {
-		t.Fatalf("delete inactive failed sandbox: %v", err)
+	if err := s.DeleteResource(ctx, sandboxID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("delete inactive failed sandbox: err = %v, want ErrConflict", err)
+	}
+	var exists bool
+	if err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+	  SELECT 1 FROM control_resources WHERE id = $1 AND kind = 'sandbox'
+	)`, sandboxID).Scan(&exists); err != nil {
+		t.Fatalf("check rejected sandbox deletion: %v", err)
+	}
+	if !exists {
+		t.Fatal("direct deletion removed the sandbox despite the lifecycle guard")
 	}
 }
 

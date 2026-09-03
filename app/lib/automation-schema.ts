@@ -96,6 +96,8 @@ export const automationRunSchema = z.object({
     stage: "",
     message: "",
     status: "",
+    cancellationSupported: false,
+    cancelRequested: false,
     cacheStatus: "",
     cacheReason: "",
     startedAt: null,
@@ -105,6 +107,7 @@ export const automationRunSchema = z.object({
     durationMs: 0,
     timings: [],
     agentTools: [],
+    extensions: [],
   }),
 })
 

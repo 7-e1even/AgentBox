@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -111,7 +112,11 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		fmt.Fprintln(stdout, parsed.image)
 		return 0, nil
 	case "inspect":
-		if _, err := microsandbox.GetSandbox(ctx, parsed.target); err != nil {
+		handle, err := microsandbox.GetSandbox(ctx, parsed.target)
+		if err != nil {
+			return 1, err
+		}
+		if _, err := ensureMicrosandboxOwnership(ctx, handle, parsed.target); err != nil {
 			return 1, err
 		}
 		fmt.Fprintln(stdout, parsed.target)
@@ -120,6 +125,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return startSandbox(ctx, parsed.target, stdout)
 	case "stop":
 		handle, err := microsandbox.GetSandbox(ctx, parsed.target)
+		if err != nil {
+			return 1, err
+		}
+		handle, err = ensureMicrosandboxOwnership(ctx, handle, parsed.target)
 		if err != nil {
 			return 1, err
 		}
@@ -192,6 +201,10 @@ func formatImageSize(bytes *int64) string {
 func createSandbox(ctx context.Context, parsed command, stdout io.Writer) (int, error) {
 	handle, err := microsandbox.GetSandbox(ctx, parsed.target)
 	if err == nil {
+		handle, err = ensureMicrosandboxOwnership(ctx, handle, parsed.target)
+		if err != nil {
+			return 1, err
+		}
 		if handle.Status() != microsandbox.SandboxStatusRunning {
 			return startSandbox(ctx, parsed.target, stdout)
 		}
@@ -216,9 +229,7 @@ func createSandbox(ctx context.Context, parsed command, stdout io.Writer) (int, 
 		}),
 		microsandbox.WithDetached(),
 	}
-	if parsed.network == "none" {
-		options = append(options, microsandbox.WithNetwork(microsandbox.NetworkPolicy.None()))
-	}
+	options = append(options, microsandbox.WithNetwork(microsandboxNetworkPolicy(parsed.network)))
 	sandbox, err := microsandbox.CreateSandbox(ctx, parsed.target, options...)
 	if err != nil {
 		return 1, fmt.Errorf("create sandbox: %w", err)
@@ -235,6 +246,17 @@ func createSandbox(ctx context.Context, parsed command, stdout io.Writer) (int, 
 	}
 	fmt.Fprintln(stdout, parsed.target)
 	return 0, nil
+}
+
+func microsandboxNetworkPolicy(network string) *microsandbox.NetworkConfig {
+	if network == "none" {
+		return microsandbox.NetworkPolicy.None()
+	}
+	return microsandbox.NetworkPolicy.FromProfiles(
+		microsandbox.NetworkProfilePublic,
+		microsandbox.NetworkProfilePrivate,
+		microsandbox.NetworkProfileHost,
+	)
 }
 
 func prepareImage(ctx context.Context, reference, archivePath string) error {
@@ -304,6 +326,10 @@ func startSandbox(ctx context.Context, target string, stdout io.Writer) (int, er
 	if err != nil {
 		return 1, err
 	}
+	handle, err = ensureMicrosandboxOwnership(ctx, handle, target)
+	if err != nil {
+		return 1, err
+	}
 	if handle.Status() != microsandbox.SandboxStatusRunning {
 		sandbox, err := handle.StartDetached(ctx)
 		if err != nil {
@@ -325,6 +351,10 @@ func deleteSandbox(ctx context.Context, target string) (int, error) {
 	if err != nil {
 		return 1, err
 	}
+	handle, err = ensureMicrosandboxOwnership(ctx, handle, target)
+	if err != nil {
+		return 1, err
+	}
 	if handle.Status() == microsandbox.SandboxStatusRunning || handle.Status() == microsandbox.SandboxStatusDraining {
 		if err := handle.Kill(ctx); err != nil {
 			return 1, err
@@ -341,6 +371,10 @@ func connectSandbox(ctx context.Context, target string) (*microsandbox.Sandbox, 
 	if err != nil {
 		return nil, err
 	}
+	handle, err = ensureMicrosandboxOwnership(ctx, handle, target)
+	if err != nil {
+		return nil, err
+	}
 	if handle.Status() != microsandbox.SandboxStatusRunning {
 		sandbox, err := handle.StartDetached(ctx)
 		if err != nil {
@@ -353,8 +387,90 @@ func connectSandbox(ctx context.Context, target string) (*microsandbox.Sandbox, 
 		if err != nil {
 			return nil, err
 		}
+		handle, err = ensureMicrosandboxOwnership(ctx, handle, target)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return handle.Connect(ctx)
+}
+
+var microsandboxTargetPattern = regexp.MustCompile(`^agentbox-([a-z0-9]+(?:-[a-z0-9]+)*)$`)
+
+func ensureMicrosandboxOwnership(
+	ctx context.Context,
+	handle *microsandbox.SandboxHandle,
+	target string,
+) (*microsandbox.SandboxHandle, error) {
+	expected, err := expectedMicrosandboxOwner(handle.Name(), target)
+	if err != nil {
+		return nil, err
+	}
+	config, err := handle.Config()
+	if err != nil {
+		return nil, fmt.Errorf("read sandbox ownership: %w", err)
+	}
+	needsAdoption, err := validateMicrosandboxLabels(config.Labels, target)
+	if err != nil {
+		return nil, err
+	}
+	if !needsAdoption {
+		return handle, nil
+	}
+	plan, err := handle.Modify(ctx, microsandbox.ModifyOptions{
+		Labels: map[string]string{
+			"agentbox.sandbox": expected,
+		},
+		Policy: microsandbox.ModificationPolicyNoRestart,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("adopt legacy Microsandbox %s: %w", target, err)
+	}
+	if plan == nil || !plan.Applied || len(plan.Conflicts) > 0 {
+		return nil, fmt.Errorf("legacy Microsandbox %s ownership adoption was not applied", target)
+	}
+	refreshed, err := handle.Refresh(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("refresh adopted Microsandbox %s: %w", target, err)
+	}
+	if _, err := expectedMicrosandboxOwner(refreshed.Name(), target); err != nil {
+		return nil, err
+	}
+	refreshedConfig, err := refreshed.Config()
+	if err != nil {
+		return nil, fmt.Errorf("read adopted sandbox ownership: %w", err)
+	}
+	needsAdoption, err = validateMicrosandboxLabels(refreshedConfig.Labels, target)
+	if err != nil {
+		return nil, err
+	}
+	if needsAdoption {
+		return nil, fmt.Errorf("legacy Microsandbox %s ownership adoption could not be verified", target)
+	}
+	return refreshed, nil
+}
+
+func expectedMicrosandboxOwner(handleName, target string) (string, error) {
+	match := microsandboxTargetPattern.FindStringSubmatch(target)
+	if len(match) != 2 || len(match[1]) < 2 || len(match[1]) > 64 || handleName != target {
+		return "", fmt.Errorf("refusing to use invalid Microsandbox target %q", target)
+	}
+	return match[1], nil
+}
+
+func validateMicrosandboxLabels(labels map[string]string, target string) (bool, error) {
+	expected, err := expectedMicrosandboxOwner(target, target)
+	if err != nil {
+		return false, err
+	}
+	owner, exists := labels["agentbox.sandbox"]
+	if !exists {
+		return true, nil
+	}
+	if owner != expected {
+		return false, fmt.Errorf("refusing to use Microsandbox %s with mismatched ownership", target)
+	}
+	return false, nil
 }
 
 func execSandbox(ctx context.Context, parsed command, stdin io.Reader, stdout, stderr io.Writer) (int, error) {
@@ -535,7 +651,7 @@ func parseCommand(args []string) (command, error) {
 	if len(args) == 0 {
 		return command{}, errors.New("usage: agentbox-microsandbox-driver <action>")
 	}
-	parsed := command{action: args[0], cpus: 2, memory: 4096, workdir: "/workspace", network: "restricted"}
+	parsed := command{action: args[0], cpus: 2, memory: 4096, workdir: "/workspace", network: "egress"}
 	switch parsed.action {
 	case "probe", "images":
 		if len(args) != 1 {
@@ -572,6 +688,13 @@ func parseCommand(args []string) (command, error) {
 				return command{}, fmt.Errorf("unsupported create option: %s", args[index])
 			}
 			index++
+		}
+		switch parsed.network {
+		case "none", "egress":
+		case "restricted":
+			return command{}, errors.New("restricted network is not supported by Microsandbox")
+		default:
+			return command{}, fmt.Errorf("unsupported network policy: %s", parsed.network)
 		}
 	case "prepare-image":
 		if len(args) != 2 && len(args) != 4 {

@@ -34,6 +34,7 @@ import type { ManagedServer } from "@/lib/server-schema"
 import type { ImportedSkill } from "@/lib/skill-import"
 import { cn } from "@/lib/utils"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
+import { ExtensionSelector } from "@/components/extension-selector"
 import { RuntimeImageCombobox } from "@/components/runtime-image-combobox"
 import { SkillImportPanel } from "@/components/skill-import-panel"
 import { SkillSearchPanel } from "@/components/skill-search-panel"
@@ -78,6 +79,7 @@ const labels: Record<ResourceKind, string> = {
   mcp: "MCP Server",
   sandbox: "Sandbox",
   variable: "变量引用",
+  extension: "沙箱扩展",
 }
 
 type Option = { value: string; label: string; disabled?: boolean }
@@ -281,15 +283,19 @@ function fields(
         {
           key: "network",
           label: "网络策略",
-          options: values("none", "restricted", "egress"),
+          options: [
+            { value: "none", label: "完全隔离" },
+            ...(driver === "boxlite"
+              ? [{ value: "restricted", label: "受限网络（BoxLite）" }]
+              : []),
+            { value: "egress", label: "允许出站" },
+          ],
           description:
             spec.network === "none"
               ? "完全隔离，不创建环境网络接口。"
-              : spec.network === "egress"
-                ? "允许环境直接访问出站网络；代理只负责路由兼容。"
-                : driver === "boxlite"
-                  ? "受限网络配合代理时，只放行代理、直连地址和控制面。"
-                  : "Docker 的受限网络依赖环境内程序遵守代理配置。",
+              : spec.network === "restricted"
+                ? "只放行代理、直连地址和控制面；当前仅 BoxLite 支持。"
+                : "允许环境直接访问出站网络；代理只负责路由兼容。",
           advanced: true,
         },
         {
@@ -419,6 +425,8 @@ function fields(
           description: "为所选 Agent 注入需要的模型访问配置。",
         },
       ]
+    case "extension":
+      return []
     case "variable":
       return [
         {
@@ -473,11 +481,12 @@ function defaults(kind: ResourceKind) {
       workdir: "/workspace",
       cpu: "2",
       memory: "4 GiB",
-      network: "restricted",
+      network: "egress",
       proxyId: "",
       skillIds: [],
       mcpServerIds: [],
       variableIds: [],
+      extensionIds: [],
       environmentVariables: sandboxEnvironmentVariables(undefined),
       credentialIds: [],
     },
@@ -491,6 +500,14 @@ function defaults(kind: ResourceKind) {
       credentialIds: [],
     },
     variable: { mode: "secret-ref" },
+    extension: {
+      version: "",
+      source: "custom",
+      installScript: "",
+      verifyScript: "",
+      timeoutSeconds: 600,
+      requiresNetwork: true,
+    },
   }
   return common[kind]
 }
@@ -688,6 +705,9 @@ function nextSpec(
   if (!availableDrivers.includes(String(next.driver ?? ""))) {
     next.driver = availableDrivers[0] ?? ""
   }
+  if (next.driver !== "boxlite" && next.network === "restricted") {
+    next.network = "egress"
+  }
 
   next.imageReference = normalizeRuntimeImageReference(
     server,
@@ -751,6 +771,9 @@ function initialEditorSpec(
       runtimeDriverOptions(server).find((option) => !option.disabled)?.value ??
       ""
   }
+  if (spec.driver !== "boxlite" && spec.network === "restricted") {
+    spec.network = "egress"
+  }
   const legacyImage = resources.find(
     (item) => item.kind === "image" && item.id === spec.imageId
   )
@@ -768,12 +791,20 @@ function initialEditorSpec(
 function inputFromResource(resource: Resource): ResourceDraft {
   if (resource.kind !== "runtime" && resource.kind !== "sandbox")
     return { ...resource, spec: { ...resource.spec } }
+  const spec = {
+    ...resource.spec,
+    agentTools: supportedAgentToolList(resource.spec.agentTools),
+  }
+  if (
+    resource.kind === "runtime" &&
+    spec.driver !== "boxlite" &&
+    spec.network === "restricted"
+  ) {
+    spec.network = "egress"
+  }
   return {
     ...resource,
-    spec: {
-      ...resource.spec,
-      agentTools: supportedAgentToolList(resource.spec.agentTools),
-    },
+    spec,
   }
 }
 
@@ -786,6 +817,7 @@ function specAfterProjectChange(
     next.skillIds = []
     next.mcpServerIds = []
     next.variableIds = []
+    next.extensionIds = []
   }
   if (kind === "sandbox") {
     next.runtimeId = ""
@@ -1214,6 +1246,18 @@ export function ResourceEditorDialog({
                 />
               ))}
             </div>
+            {kind === "runtime" && (
+              <ExtensionSelector
+                resources={projectResources}
+                selectedIds={stringArray(input.spec.extensionIds)}
+                onChange={(ids) => updateSpec("extensionIds", ids)}
+                network={
+                  typeof input.spec.network === "string"
+                    ? input.spec.network
+                    : undefined
+                }
+              />
+            )}
             {advancedSpecFields.length > 0 && (
               <details
                 className="group rounded-xl border"

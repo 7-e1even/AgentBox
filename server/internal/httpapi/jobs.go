@@ -158,7 +158,7 @@ func (s *Server) reportWorkerJobProgress(w http.ResponseWriter, request *http.Re
 		return
 	}
 	var input platform.WorkerJobProgressInput
-	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {
+	if !s.decodeJSONWithLimit(w, request, &input, 32<<10) {
 		return
 	}
 	input.Stage = strings.TrimSpace(input.Stage)
@@ -167,6 +167,10 @@ func (s *Server) reportWorkerJobProgress(w http.ResponseWriter, request *http.Re
 	input.CacheReason = strings.TrimSpace(input.CacheReason)
 	input.AgentTool = strings.TrimSpace(input.AgentTool)
 	input.AgentToolStatus = strings.TrimSpace(input.AgentToolStatus)
+	if err := platform.ValidateExtensionProgress(input); err != nil {
+		s.handleError(w, err)
+		return
+	}
 	validAgentToolStatus := false
 	switch input.AgentToolStatus {
 	case "", "running", "installed", "verifying", "succeeded", "failed", "cached":
@@ -215,6 +219,27 @@ func (s *Server) completeWorkerJob(w http.ResponseWriter, request *http.Request)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Server) controlWorkerJob(w http.ResponseWriter, request *http.Request) {
+	if !s.negotiateWorkerProtocol(w, request) {
+		return
+	}
+	var input platform.WorkerJobControlInput
+	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {
+		return
+	}
+	if input.LeaseGeneration < 1 {
+		s.writeError(w, http.StatusBadRequest, "Worker 租约版本无效")
+		return
+	}
+	control, err := s.store.ControlWorkerJob(request.Context(), request.PathValue("id"),
+		authBearer(request), request.PathValue("jobId"), input)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, control)
 }
 
 func normalizeWorkerJobResult(result *platform.WorkerJobResult) bool {

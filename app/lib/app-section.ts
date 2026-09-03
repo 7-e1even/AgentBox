@@ -11,6 +11,7 @@ export const APP_SECTION_PATHS = {
   mcp: "/mcp-servers",
   access: "/model-services",
   proxies: "/network-proxies",
+  extensions: "/sandbox-extensions",
   settings: "/settings",
   variables: "/variables",
   users: "/users",

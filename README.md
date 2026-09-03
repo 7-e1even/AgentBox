@@ -50,7 +50,7 @@ docker compose down
 docker compose up -d --build
 ```
 
-源码构建的 Server 版本默认为 `dev`，不会提供 Web 在线更新。
+源码构建的 Server 版本默认为 `dev`，不会提供 Web 在线更新；镜像会同时内置 amd64 和 arm64 Worker，服务器页面生成的安装命令仍可直接使用。
 
 需要限制容器资源占用时，可添加 `compose.override.yaml`（Compose 会自动合并），按需调整：
 
@@ -78,26 +78,162 @@ services:
 
 ## 备份与恢复
 
-升级 AgentBox 前请先备份。需要备份两部分：PostgreSQL 数据，以及 `agentbox-secrets` 卷中的凭据加密主密钥。
+升级 AgentBox 前请先备份。需要备份两部分：PostgreSQL 数据，以及 `agentbox-secrets` 卷中的凭据加密主密钥。为保证两份备份对应同一时刻，先停止会写入数据的 App 和 Server；备份完成后再启动它们。
 
 ```sh
+set -eu
+
+backup_name=agentbox-backup-$(date -u +%Y%m%dT%H%M%SZ)
+backup_tmp=$(mktemp -d "./.${backup_name}.tmp.XXXXXX")
+backup_final=./$backup_name
+backup_complete=false
+cleanup_backup() {
+  rm -rf "$backup_tmp"
+  if [ "$backup_complete" != true ]; then
+    docker compose start server app >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup_backup 0 1 2 15
+test ! -e "$backup_final"
+
+docker compose stop app server
+
 # 备份数据库（默认库名与用户均为 agentbox）
-docker compose exec postgres pg_dump -U agentbox -d agentbox > agentbox-backup.sql
+docker compose exec -T postgres pg_dump --format=plain --no-owner --no-privileges \
+  -U agentbox -d agentbox > "$backup_tmp/database.sql"
+test -s "$backup_tmp/database.sql"
 
 # 备份凭据加密主密钥（卷名带 Compose 项目名前缀，可用 docker volume ls 确认）
 docker run --rm -v agentbox_agentbox-secrets:/data:ro -v "$PWD":/backup alpine \
-  tar czf /backup/agentbox-secrets.tar.gz -C /data .
+  tar czf "/backup/${backup_tmp#./}/agentbox-secrets.tar.gz" -C /data .
+
+# 错误卷名会被 Docker 创建为空卷，所以发布备份前也按恢复契约验证唯一主密钥。
+docker run --rm -v "$PWD/${backup_tmp#./}":/backup:ro alpine sh -eu -c '
+  staging=$(mktemp -d)
+  trap "rm -rf $staging" 0 1 2 15
+  tar tzf /backup/agentbox-secrets.tar.gz > "$staging/archive.list"
+  secret_member=
+  while IFS= read -r entry; do
+    case "$entry" in
+      /*|..|../*|*/../*|*/..) exit 1 ;;
+      secret-key|./secret-key)
+        test -z "$secret_member" || exit 1
+        secret_member=$entry
+        ;;
+    esac
+  done < "$staging/archive.list"
+  test -n "$secret_member"
+  tar xzf /backup/agentbox-secrets.tar.gz -C "$staging" "$secret_member"
+  test -f "$staging/secret-key"
+  test ! -L "$staging/secret-key"
+  encoded=$(tr -d "\r\n" < "$staging/secret-key")
+  case "$encoded" in *[!A-Za-z0-9+/=]*) exit 1 ;; esac
+  case "${#encoded}:$encoded" in
+    43:*=*) exit 1 ;;
+    43:*) padded="$encoded=" ;;
+    44:*=)
+      body=${encoded%=}
+      case "$body" in *=*) exit 1 ;; esac
+      padded=$encoded
+      ;;
+    *) exit 1 ;;
+  esac
+  printf %s "$padded" | base64 -d > "$staging/decoded-key"
+  test "$(wc -c < "$staging/decoded-key" | tr -d " ")" = 32
+'
+
+# 清单把数据库与密钥绑定到同一代际；目录 rename 是唯一发布点。
+(
+  cd "$backup_tmp"
+  sha256sum database.sql agentbox-secrets.tar.gz > SHA256SUMS
+  test -s SHA256SUMS
+)
+mv "$backup_tmp" "$backup_final"
+docker compose start server app
+backup_complete=true
+trap - 0 1 2 15
+printf 'Backup published at %s\n' "$backup_final"
 ```
 
-恢复时反向执行：
+恢复会替换目标实例的数据库和主密钥。请先额外备份目标实例，并确认下面的卷名、数据库名和用户与 `.env` 一致。整个过程中保持 App 和 Server 停止；主密钥归档会先验证，再清空这个明确指定的目标卷，避免新旧密钥文件混合。
 
 ```sh
-docker compose exec -T postgres psql -U agentbox -d agentbox < agentbox-backup.sql
-docker run --rm -v agentbox_agentbox-secrets:/data -v "$PWD":/backup alpine \
-  tar xzf /backup/agentbox-secrets.tar.gz -C /data
+set -eu
+
+# 替换为备份命令实际输出的代际目录；不要混用两个目录中的文件。
+backup_dir=./agentbox-backup-20260903T120000Z
+test -d "$backup_dir"
+(
+  cd "$backup_dir"
+  sha256sum -c SHA256SUMS
+)
+test -s "$backup_dir/database.sql"
+test -s "$backup_dir/agentbox-secrets.tar.gz"
+docker compose stop app server
+
+# 先把归档中的 secret-key 单独解到临时目录并完整验证，再清空明确指定的目标卷。
+docker run --rm -v agentbox_agentbox-secrets:/data \
+  -v "$PWD/${backup_dir#./}":/backup:ro alpine sh -eu -c '
+  staging=$(mktemp -d)
+  trap "rm -rf $staging" 0 1 2 15
+  tar tzf /backup/agentbox-secrets.tar.gz > "$staging/archive.list"
+  secret_member=
+  while IFS= read -r entry; do
+    case "$entry" in
+      /*|..|../*|*/../*|*/..) echo "unsafe path in secret archive: $entry" >&2; exit 1 ;;
+      secret-key|./secret-key)
+        test -z "$secret_member" || { echo "duplicate secret-key in archive" >&2; exit 1; }
+        secret_member=$entry
+        ;;
+    esac
+  done < "$staging/archive.list"
+  test -n "$secret_member"
+  tar xzf /backup/agentbox-secrets.tar.gz -C "$staging" "$secret_member"
+  test -f "$staging/secret-key"
+  test ! -L "$staging/secret-key"
+  test -s "$staging/secret-key"
+  encoded=$(tr -d "\r\n" < "$staging/secret-key")
+  case "$encoded" in *[!A-Za-z0-9+/=]*) echo "secret-key is not standard base64" >&2; exit 1 ;; esac
+  case "${#encoded}:$encoded" in
+    43:*=*) echo "43-character secret-key must be unpadded" >&2; exit 1 ;;
+    43:*) padded="$encoded=" ;;
+    44:*=)
+      body=${encoded%=}
+      case "$body" in *=*) echo "secret-key padding is invalid" >&2; exit 1 ;; esac
+      padded=$encoded
+      ;;
+    *) echo "secret-key must be 43 raw or 44 padded base64 characters" >&2; exit 1 ;;
+  esac
+  printf %s "$padded" | base64 -d > "$staging/decoded-key"
+  test "$(wc -c < "$staging/decoded-key" | tr -d " ")" = 32
+  rm -f "$staging/archive.list" "$staging/decoded-key"
+  find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+  test -z "$(find /data -mindepth 1 -maxdepth 1 -print -quit)"
+  cp -a "$staging/secret-key" /data/secret-key
+  test -s /data/secret-key
+'
+
+# 断开残留连接并重建空数据库；恢复本身是单事务且遇到首个错误立即终止。
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 -U agentbox -d postgres <<'SQL'
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE datname = 'agentbox' AND pid <> pg_backend_pid();
+DROP DATABASE IF EXISTS agentbox;
+CREATE DATABASE agentbox OWNER agentbox;
+SQL
+docker compose exec -T postgres psql -v ON_ERROR_STOP=1 --single-transaction \
+  -U agentbox -d agentbox < "$backup_dir/database.sql"
+
+# 两部分都成功后才重新启动，并验证数据库健康和主密钥哨兵解密。
+if ! docker compose up -d --wait server app; then
+  docker compose logs --tail=100 server
+  exit 1
+fi
+docker compose exec -T server wget -qO- http://127.0.0.1:8091/healthz
+docker compose logs --tail=100 server
 ```
 
-主密钥一旦丢失，数据库中已加密保存的模型凭据将无法解密，只能逐个重新录入，请与数据库备份分开妥善保管。
+Server 启动时会使用恢复的主密钥解密数据库中的加密哨兵；密钥不匹配时 Server 不会进入健康状态，并会在日志中报告错误。主密钥一旦丢失，数据库中已加密保存的模型凭据将无法解密，只能逐个重新录入，请与数据库备份分开妥善保管。
 
 ## 核心能力
 
@@ -105,16 +241,16 @@ docker run --rm -v agentbox_agentbox-secrets:/data -v "$PWD":/backup alpine \
 - 使用沙箱模板复用镜像、Agent 工具、变量、Skills、MCP 和初始化命令，支持多项目分组管理
 - 支持 Docker、BoxLite 和 Microsandbox；实际可用类型以服务器能力检测为准（VM 运行时暂不支持，仅保留存量数据只读盘点）
 - 预装和配置 Codex、Claude Code、Gemini CLI、OpenCode、Kimi、Pi、Reasonix 等 Agent 工具
-- 通过自动化 Webhook 联动外部系统，通过网络代理控制沙箱出入流量
-- 内置运行时 LLM 网关：模型凭据只保存在 Server，由 Server 代理协议转换，不下发到沙箱
+- 通过自动化 Webhook 从固定模板创建沙箱；网络策略支持完全隔离或出站访问，BoxLite 额外支持受限网络
+- 内置运行时 LLM 网关：模型凭据只保存在 Server，由 Server 代理协议转换；运行中可切换模型源，不停止沙箱、终端或图形桌面
 - 在浏览器中使用 root 终端、文件管理器和代码编辑器运维沙箱
 - 使用 PostgreSQL 持久化配置，并加密保存模型凭据
 
 ## Webhook 与流水线
 
-“自动化”页面可以把 GitHub、GitLab、Jenkins、n8n 或其他系统的事件转换为持久 Run，执行创建沙箱、在隔离沙箱中运行命令或销毁沙箱。首次请求返回独立的 `statusUrl` 和 `runToken`，调用方无需登录控制台即可轮询最终状态、退出码、输出和清理结果。
+“自动化”页面可以把 GitHub、GitLab、Jenkins、n8n 或其他系统的事件转换为持久 Run，并按自动化中固定的模板和模型绑定创建、启动一个沙箱。首次请求返回独立的 `statusUrl` 和 `runToken`，调用方无需登录控制台即可轮询创建进度与最终结果。
 
-完整的鉴权方式、事件字段、幂等语义、轮询脚本和各平台接入步骤见 [Webhook 流水线接入指南](docs/webhook-automation.md)。AgentBox 只提供一个可靠的隔离任务原语；条件分支、并行矩阵和跨步骤 DAG 仍应留在现有 CI/CD 或工作流系统中。
+完整的鉴权方式、幂等语义、轮询脚本和各平台接入步骤见 [Webhook 自动创建沙箱接入指南](docs/webhook-automation.md)。Webhook Payload 不会覆盖模板或作为命令执行；后续命令、清理、条件分支、并行矩阵和跨步骤 DAG 仍应留在现有 CI/CD 或工作流系统中。
 
 ## 架构
 
@@ -130,7 +266,7 @@ Linux Worker 的调度、交互会话和文件操作收敛在同一个 Go 二进
 
 ## 发布
 
-推送 `v*` 标签会触发发布流水线：先运行 Go 测试与 Web 的 lint、typecheck、test 和 build，全部通过后再生成两个架构的 Worker、`SHA256SUMS` 和 GitHub Release，最后将 Server/Web 多架构镜像发布到 GHCR。同一 Release 中的 Server 与 Worker 会保持版本一致。
+推送 `v*` 标签会触发发布流水线：先运行 Go 测试与 Web 的 lint、typecheck、test 和 build，再生成两个架构的 Worker 与 `SHA256SUMS`，并将 Server/Web 多架构镜像分别发布为对应版本标签。两个镜像均成功后，流水线才统一推进 `latest` 并创建 GitHub Release；推进或 Release 发布失败会尝试恢复上一组 `latest`。同一 Release 中的 Server、Web 与 Worker 会保持版本一致。
 
 ## 验证
 

@@ -16,13 +16,14 @@ import (
 type Kind string
 
 const (
-	KindProject  Kind = "project"
-	KindImage    Kind = "image"
-	KindRuntime  Kind = "runtime"
-	KindSkill    Kind = "skill"
-	KindMCP      Kind = "mcp"
-	KindSandbox  Kind = "sandbox"
-	KindVariable Kind = "variable"
+	KindProject   Kind = "project"
+	KindImage     Kind = "image"
+	KindRuntime   Kind = "runtime"
+	KindSkill     Kind = "skill"
+	KindMCP       Kind = "mcp"
+	KindSandbox   Kind = "sandbox"
+	KindVariable  Kind = "variable"
+	KindExtension Kind = "extension"
 )
 
 var idPattern = regexp.MustCompile(`^[a-z0-9]+(?:-[a-z0-9]+)*$`)
@@ -216,6 +217,24 @@ type RuntimeLLMTarget struct {
 	Secret       string
 }
 
+// SandboxModelSourceInput redirects one credential slot already configured in
+// a running sandbox to a different managed credential and model. The slot stays
+// stable so existing Agent processes can keep using their current facade URL
+// and runtime token.
+type SandboxModelSourceInput struct {
+	SlotCredentialID     string `json:"slotCredentialId"`
+	CredentialID         string `json:"credentialId"`
+	ModelID              string `json:"modelId"`
+	ExpectedCredentialID string `json:"expectedCredentialId"`
+	ExpectedModelID      string `json:"expectedModelId"`
+}
+
+type RuntimeModelSource struct {
+	CredentialID string    `json:"credentialId"`
+	ModelID      string    `json:"modelId"`
+	UpdatedAt    time.Time `json:"updatedAt"`
+}
+
 type WorkerJob struct {
 	ID                 string         `json:"id"`
 	ResourceID         string         `json:"resourceId"`
@@ -240,6 +259,14 @@ type WorkerJobResult struct {
 	TimedOut        bool                    `json:"timedOut,omitzero"`
 	Error           *WorkerJobError         `json:"error,omitempty"`
 	AgentTools      []SandboxAgentToolState `json:"agentTools,omitempty"`
+}
+
+type WorkerJobControlInput struct {
+	LeaseGeneration int `json:"leaseGeneration"`
+}
+
+type WorkerJobControl struct {
+	CancelRequested bool `json:"cancelRequested"`
 }
 
 type SandboxAgentToolState struct {
@@ -270,6 +297,9 @@ type WorkerJobProgressInput struct {
 	CacheReason     string `json:"cacheReason,omitempty"`
 	AgentTool       string `json:"agentTool,omitempty"`
 	AgentToolStatus string `json:"agentToolStatus,omitempty"`
+	ExtensionID     string `json:"extensionId,omitempty"`
+	ExtensionStatus string `json:"extensionStatus,omitempty"`
+	ExtensionOutput string `json:"extensionOutput,omitempty"`
 }
 
 type ProvisioningStageTiming struct {
@@ -289,18 +319,21 @@ type ProvisioningAgentTool struct {
 }
 
 type ProvisioningProgress struct {
-	Stage          string                    `json:"stage,omitempty"`
-	Message        string                    `json:"message,omitempty"`
-	Status         string                    `json:"status,omitempty"`
-	CacheStatus    string                    `json:"cacheStatus,omitempty"`
-	CacheReason    string                    `json:"cacheReason,omitempty"`
-	StartedAt      *time.Time                `json:"startedAt,omitempty"`
-	StageStartedAt *time.Time                `json:"stageStartedAt,omitempty"`
-	UpdatedAt      *time.Time                `json:"updatedAt,omitempty"`
-	FinishedAt     *time.Time                `json:"finishedAt,omitempty"`
-	DurationMS     int64                     `json:"durationMs,omitzero"`
-	Timings        []ProvisioningStageTiming `json:"timings,omitempty"`
-	AgentTools     []ProvisioningAgentTool   `json:"agentTools,omitempty"`
+	CancellationSupported bool                      `json:"cancellationSupported,omitzero"`
+	CancelRequested       bool                      `json:"cancelRequested,omitzero"`
+	Stage                 string                    `json:"stage,omitempty"`
+	Message               string                    `json:"message,omitempty"`
+	Status                string                    `json:"status,omitempty"`
+	CacheStatus           string                    `json:"cacheStatus,omitempty"`
+	CacheReason           string                    `json:"cacheReason,omitempty"`
+	StartedAt             *time.Time                `json:"startedAt,omitempty"`
+	StageStartedAt        *time.Time                `json:"stageStartedAt,omitempty"`
+	UpdatedAt             *time.Time                `json:"updatedAt,omitempty"`
+	FinishedAt            *time.Time                `json:"finishedAt,omitempty"`
+	DurationMS            int64                     `json:"durationMs,omitzero"`
+	Timings               []ProvisioningStageTiming `json:"timings,omitempty"`
+	AgentTools            []ProvisioningAgentTool   `json:"agentTools,omitempty"`
+	Extensions            []ProvisioningExtension   `json:"extensions,omitempty"`
 }
 
 type ValidationError struct{ Message string }
@@ -325,6 +358,7 @@ func Normalize(input *Input) {
 	if input.Spec == nil {
 		input.Spec = map[string]any{}
 	}
+	normalizeExtensionSpec(input)
 	if input.Kind == KindRuntime || input.Kind == KindSandbox {
 		// Do not normalize malformed values into a valid empty list before validation.
 		if value := input.Spec["environmentVariables"]; value == nil {
@@ -566,6 +600,32 @@ func ValidateCredentialModel(input CredentialModelInput) error {
 	return nil
 }
 
+func NormalizeSandboxModelSourceInput(input *SandboxModelSourceInput) {
+	input.SlotCredentialID = strings.ToLower(strings.TrimSpace(input.SlotCredentialID))
+	input.CredentialID = strings.ToLower(strings.TrimSpace(input.CredentialID))
+	input.ModelID = strings.TrimSpace(input.ModelID)
+	input.ExpectedCredentialID = strings.ToLower(strings.TrimSpace(input.ExpectedCredentialID))
+	input.ExpectedModelID = strings.TrimSpace(input.ExpectedModelID)
+}
+
+func ValidateSandboxModelSourceInput(input SandboxModelSourceInput) error {
+	for _, credentialID := range []string{
+		input.SlotCredentialID,
+		input.CredentialID,
+		input.ExpectedCredentialID,
+	} {
+		if n := utf8.RuneCountInString(credentialID); n < 2 || n > 64 || !idPattern.MatchString(credentialID) {
+			return &ValidationError{Message: "模型服务标识无效"}
+		}
+	}
+	for _, modelID := range []string{input.ModelID, input.ExpectedModelID} {
+		if n := utf8.RuneCountInString(modelID); n < 1 || n > 256 || strings.ContainsAny(modelID, "\r\n\t") {
+			return &ValidationError{Message: "模型 ID 无效"}
+		}
+	}
+	return nil
+}
+
 func Validate(input Input) error {
 	if input.SpecVersion != 0 && input.SpecVersion != 1 {
 		return &ValidationError{Message: "不支持的资源 specVersion"}
@@ -591,6 +651,14 @@ func Validate(input Input) error {
 	}
 	if input.Kind == KindSkill {
 		return ValidateSkillSpec(*decodedSpec.(*SkillSpec))
+	}
+	if input.Kind == KindExtension {
+		return ValidateExtensionSpec(*decodedSpec.(*ExtensionSpec), input.Enabled)
+	}
+	if input.Kind == KindRuntime || input.Kind == KindSandbox {
+		if err := validateExtensionIDs(input.Spec); err != nil {
+			return err
+		}
 	}
 	if input.Kind == KindImage {
 		if err := require(input.Spec, "reference", "请填写镜像引用"); err != nil {
@@ -645,6 +713,10 @@ func Validate(input Input) error {
 			return err
 		}
 		if err := validateNetworkSpec(input.Spec); err != nil {
+			return err
+		}
+		network, _ := input.Spec["network"].(string)
+		if err := ValidateNetworkPolicyForDriver(driver, network); err != nil {
 			return err
 		}
 		if err := validateDesktopSpec(input.Spec); err != nil {
@@ -706,6 +778,23 @@ func validateNetworkSpec(spec map[string]any) error {
 		return &ValidationError{Message: "完全隔离的环境不能同时使用网络代理"}
 	}
 	return nil
+}
+
+func ValidateNetworkPolicyForDriver(driver, network string) error {
+	if network == "restricted" && driver != "boxlite" {
+		return &ValidationError{Message: "受限网络仅支持 BoxLite 驱动"}
+	}
+	return nil
+}
+
+func EffectiveNetworkPolicy(driver, network string) string {
+	if network != "" {
+		return network
+	}
+	if driver == "boxlite" {
+		return "restricted"
+	}
+	return "egress"
 }
 
 func validateAgentTools(spec map[string]any) error {
@@ -786,7 +875,7 @@ func IsValidationError(err error) bool {
 
 func isKind(kind Kind) bool {
 	switch kind {
-	case KindProject, KindImage, KindRuntime, KindSkill, KindMCP, KindSandbox, KindVariable:
+	case KindProject, KindImage, KindRuntime, KindSkill, KindMCP, KindSandbox, KindVariable, KindExtension:
 		return true
 	default:
 		return false

@@ -133,9 +133,61 @@ func TestSandboxUpdatesPreserveWorkerManagedLifecycleFields(t *testing.T) {
 		`'proxyId', COALESCE(spec->'proxyId'`,
 		`'appliedProxyId', spec->'appliedProxyId'`,
 		`'proxyOperation', spec->'proxyOperation'`,
+		`- 'runtimeModelSources'`,
+		`- 'runtimeModelSourcesComplete'`,
+		`CASE WHEN spec ? 'runtimeModelSources'`,
+		`'runtimeModelSources', spec->'runtimeModelSources'`,
+		`CASE WHEN spec ? 'runtimeModelSourcesComplete'`,
+		`'runtimeModelSourcesComplete', spec->'runtimeModelSourcesComplete'`,
+		`- 'runtimeModelTokenEpoch'`,
+		`CASE WHEN spec ? 'runtimeModelTokenEpoch'`,
+		`'runtimeModelTokenEpoch', spec->'runtimeModelTokenEpoch'`,
 	} {
 		if !strings.Contains(resourceUpdateSpecSQL, expected) {
 			t.Fatalf("sandbox update does not preserve Worker-managed field %q", expected)
 		}
+	}
+}
+
+func TestSandboxRuntimeModelSourceSnapshotPresence(t *testing.T) {
+	for name, test := range map[string]struct {
+		spec map[string]any
+		want bool
+	}{
+		"absent legacy snapshot": {spec: map[string]any{}, want: false},
+		"null legacy snapshot":   {spec: map[string]any{"runtimeModelSources": nil}, want: false},
+		"unmarked sparse snapshot": {
+			spec: map[string]any{"runtimeModelSources": map[string]any{}}, want: false,
+		},
+		"complete empty snapshot": {
+			spec: map[string]any{
+				"runtimeModelSources":         map[string]any{},
+				"runtimeModelSourcesComplete": true,
+			},
+			want: true,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := sandboxHasRuntimeModelSourceSnapshot(test.spec); got != test.want {
+				t.Fatalf("sandboxHasRuntimeModelSourceSnapshot() = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSandboxRuntimeModelSourcesForUpdatePreservesSparseOverrides(t *testing.T) {
+	sources := sandboxRuntimeModelSourcesForUpdate(
+		map[string]any{
+			"runtimeModelSources": map[string]any{
+				"primary": map[string]any{"credentialId": "target", "modelId": "model-a"},
+			},
+		},
+		nil,
+	)
+	if len(sources) != 1 {
+		t.Fatalf("sparse runtime model sources = %#v", sources)
+	}
+	if _, ok := sources["secondary"]; ok {
+		t.Fatalf("legacy update invented an unapplied secondary source: %#v", sources)
 	}
 }

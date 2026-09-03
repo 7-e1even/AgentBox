@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useMemo, useState } from "react"
-import type { ColumnDef } from "@tanstack/react-table"
+import type { CellContext, ColumnDef } from "@tanstack/react-table"
 import Link from "next/link"
 import {
   BotIcon,
@@ -16,6 +16,7 @@ import {
   LoaderCircleIcon,
   MonitorIcon,
   MoreHorizontalIcon,
+  NetworkIcon,
   PencilIcon,
   PlayIcon,
   PlusIcon,
@@ -38,6 +39,11 @@ import {
 import { CollectionHeader } from "@/components/control-plane-view"
 import { DataTable, DataTableColumnHeader } from "@/components/data-table"
 import { SandboxAgentToolsPanel } from "@/components/sandbox-agent-tools-panel"
+import {
+  SandboxInstallCancelButton,
+  SandboxInstallCancelDialog,
+} from "@/components/sandbox-install-cancel-button"
+import { ExtensionProgressPanel } from "@/components/extension-progress-panel"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -80,6 +86,15 @@ import {
 } from "@/components/ui/empty"
 import { Progress } from "@/components/ui/progress"
 import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import {
   provisioningProgressSchema,
   type ProvisioningProgress,
   type Resource,
@@ -90,13 +105,15 @@ import {
   provisioningCacheLabel,
   provisioningDuration,
   provisioningStageLabel,
+  sandboxInstallCancellation,
 } from "@/lib/provisioning"
-import {
-  agentToolOptions,
-  supportedAgentToolList,
-} from "@/lib/agent-tools"
+import { agentToolOptions, supportedAgentToolList } from "@/lib/agent-tools"
 import { runtimeInventoryImages } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
+import {
+  sandboxProxyOperationSchema,
+  type ManagedNetworkProxy,
+} from "@/lib/network-proxy-schema"
 import { cn } from "@/lib/utils"
 
 type EnvironmentProps = {
@@ -472,16 +489,19 @@ export function EnvironmentTemplatesView({
 export function SandboxesView({
   resources,
   servers,
+  proxies,
   canMutate,
   canOpenWorkspace,
   onCreate,
   onEdit,
   busyId,
   onAction,
+  onApplyNetworkProxy,
   onDelete,
   onResourceChange,
   onRefresh,
 }: EnvironmentProps & {
+  proxies: ManagedNetworkProxy[]
   canMutate: boolean
   canOpenWorkspace: boolean
   onCreate: () => void
@@ -489,8 +509,12 @@ export function SandboxesView({
   busyId: string | null
   onAction: (
     resource: Resource,
-    action: "start" | "stop" | "restart" | "delete"
+    action: "start" | "stop" | "restart" | "delete" | "cancel-install"
   ) => Promise<void>
+  onApplyNetworkProxy: (
+    sandbox: ResourceOfKind<"sandbox">,
+    proxyId: string
+  ) => Promise<Resource>
   onDelete: (resource: Resource) => void
   onResourceChange: (resource: Resource) => void
   onRefresh: () => Promise<void>
@@ -498,6 +522,7 @@ export function SandboxesView({
   const sandboxes = resources.filter((item) => item.kind === "sandbox")
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [agentToolsId, setAgentToolsId] = useState<string | null>(null)
+  const [cancelInstallId, setCancelInstallId] = useState<string | null>(null)
   const columns = useMemo(
     () =>
       sandboxColumns({
@@ -508,6 +533,7 @@ export function SandboxesView({
         canOpenWorkspace,
         onOpen: (sandbox) => setSelectedId(sandbox.id),
         onOpenAgentTools: (sandbox) => setAgentToolsId(sandbox.id),
+        onCancelInstall: (sandbox) => setCancelInstallId(sandbox.id),
         onAction,
         onEdit,
         onDelete,
@@ -522,12 +548,15 @@ export function SandboxesView({
       resources,
       servers,
       setAgentToolsId,
+      setCancelInstallId,
       setSelectedId,
     ]
   )
   const selected = sandboxes.find((item) => item.id === selectedId) ?? null
   const agentToolsSandbox =
     sandboxes.find((item) => item.id === agentToolsId) ?? null
+  const cancelInstallSandbox =
+    sandboxes.find((item) => item.id === cancelInstallId) ?? null
   return (
     <section className="flex min-h-0 flex-1 flex-col">
       <CollectionHeader
@@ -578,6 +607,7 @@ export function SandboxesView({
                 options: [
                   { label: "运行中", value: "running" },
                   { label: "已停止", value: "stopped" },
+                  { label: "已取消", value: "cancelled" },
                   { label: "处理中", value: "pending" },
                   { label: "异常", value: "error" },
                 ],
@@ -594,7 +624,13 @@ export function SandboxesView({
             .find((item) => item.id === selected.spec.runtimeId)}
           server={servers.find((item) => item.id === selected.spec.serverId)}
           resources={resources}
+          proxies={proxies}
+          canMutate={canMutate}
           canOpenWorkspace={canOpenWorkspace}
+          busy={busyId === selected.id}
+          onCancelInstall={() => onAction(selected, "cancel-install")}
+          onApplyNetworkProxy={onApplyNetworkProxy}
+          onResourceChange={onResourceChange}
           onOpenChange={(open) => !open && setSelectedId(null)}
         />
       )}
@@ -605,6 +641,24 @@ export function SandboxesView({
           onResourceChange={onResourceChange}
           onRefresh={onRefresh}
           onOpenChange={(open) => !open && setAgentToolsId(null)}
+        />
+      )}
+      {canMutate && cancelInstallSandbox && (
+        <SandboxInstallCancelDialog
+          sandbox={cancelInstallSandbox}
+          busy={busyId === cancelInstallSandbox.id}
+          onCancel={() => onAction(cancelInstallSandbox, "cancel-install")}
+          open
+          onOpenChange={(open) => !open && setCancelInstallId(null)}
+          onCloseAutoFocus={(event) => {
+            const trigger = document.getElementById(
+              `sandbox-actions-${cancelInstallSandbox.id}`
+            )
+            if (trigger) {
+              event.preventDefault()
+              trigger.focus()
+            }
+          }}
         />
       )}
     </section>
@@ -764,6 +818,22 @@ function environmentColumns({
   return columns
 }
 
+type SandboxActionsMeta = {
+  className?: string
+  busyId: string | null
+  canMutate: boolean
+  canOpenWorkspace: boolean
+  onOpen: (sandbox: Resource) => void
+  onOpenAgentTools: (sandbox: Resource) => void
+  onCancelInstall: (sandbox: Resource) => void
+  onAction: (
+    resource: Resource,
+    action: "start" | "stop" | "restart" | "delete" | "cancel-install"
+  ) => Promise<void>
+  onEdit: (resource: Resource) => void
+  onDelete: (resource: Resource) => void
+}
+
 function sandboxColumns({
   resources,
   servers,
@@ -772,24 +842,13 @@ function sandboxColumns({
   canOpenWorkspace,
   onOpen,
   onOpenAgentTools,
+  onCancelInstall,
   onAction,
   onEdit,
   onDelete,
-}: {
-  resources: Resource[]
-  servers: ManagedServer[]
-  busyId: string | null
-  canMutate: boolean
-  canOpenWorkspace: boolean
-  onOpen: (sandbox: Resource) => void
-  onOpenAgentTools: (sandbox: Resource) => void
-  onAction: (
-    resource: Resource,
-    action: "start" | "stop" | "restart" | "delete"
-  ) => Promise<void>
-  onEdit: (resource: Resource) => void
-  onDelete: (resource: Resource) => void
-}): ColumnDef<ResourceOfKind<"sandbox">>[] {
+}: EnvironmentProps & SandboxActionsMeta): ColumnDef<
+  ResourceOfKind<"sandbox">
+>[] {
   return [
     {
       id: "name",
@@ -893,143 +952,197 @@ function sandboxColumns({
     },
     {
       id: "actions",
-      cell: ({ row }) => {
-        const sandbox = row.original
-        const busy = busyId === sandbox.id
-        return (
-          <div className="flex items-center justify-end gap-1">
-            {sandbox.spec.status === "running" ? (
-              <>
-                {canOpenWorkspace ? (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="px-2 sm:px-3"
-                    asChild
-                  >
-                    <Link
-                      href={`/sandboxes/${sandbox.id}`}
-                      aria-label={`打开 ${sandbox.name} 工作台`}
-                    >
-                      <MonitorIcon data-icon="inline-start" />
-                      <span className="hidden sm:inline">工作台</span>
-                    </Link>
-                  </Button>
-                ) : null}
-                {canMutate ? (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="px-2 sm:px-3"
-                    aria-label={`更新 ${sandbox.name} Agent`}
-                    onClick={() => onOpenAgentTools(sandbox)}
-                  >
-                    <BotIcon data-icon="inline-start" />
-                    <span className="hidden lg:inline">Agent 更新</span>
-                  </Button>
-                ) : null}
-                {canMutate ? (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    className="px-2 sm:px-3"
-                    aria-label={`停止 ${sandbox.name}`}
-                    disabled={busy}
-                    onClick={() => void onAction(sandbox, "stop")}
-                  >
-                    {busy ? (
-                      <LoaderCircleIcon className="animate-spin" />
-                    ) : (
-                      <SquareIcon />
-                    )}
-                    <span className="hidden sm:inline">停止</span>
-                  </Button>
-                ) : null}
-              </>
-            ) : sandbox.spec.status === "stopped" ||
-              sandbox.spec.status === "error" ? (
-              canMutate ? (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="px-2 sm:px-3"
-                  aria-label={`启动 ${sandbox.name}`}
-                  disabled={busy}
-                  onClick={() => void onAction(sandbox, "start")}
-                >
-                  {busy ? (
-                    <LoaderCircleIcon className="animate-spin" />
-                  ) : (
-                    <PlayIcon />
-                  )}
-                  <span className="hidden sm:inline">启动</span>
-                </Button>
-              ) : null
-            ) : null}
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <Button
-                  size="icon-sm"
-                  variant="ghost"
-                  aria-label={`${sandbox.name} 操作`}
-                >
-                  <MoreHorizontalIcon />
-                </Button>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent align="end">
-                <DropdownMenuGroup>
-                  <DropdownMenuModalItem onOpen={() => onOpen(sandbox)}>
-                    <Settings2Icon />
-                    管理
-                  </DropdownMenuModalItem>
-                  {canMutate ? (
-                    <DropdownMenuModalItem onOpen={() => onEdit(sandbox)}>
-                      <PencilIcon />
-                      编辑配置
-                    </DropdownMenuModalItem>
-                  ) : null}
-                  {canMutate && sandbox.spec.status === "running" && (
-                    <DropdownMenuItem
-                      disabled={busy}
-                      onClick={() => void onAction(sandbox, "restart")}
-                    >
-                      <RotateCwIcon />
-                      重启并应用配置
-                    </DropdownMenuItem>
-                  )}
-                </DropdownMenuGroup>
-                {canMutate ? (
-                  <>
-                    <DropdownMenuSeparator />
-                    <DropdownMenuModalItem
-                      variant="destructive"
-                      disabled={
-                        busy ||
-                        [
-                          "requested",
-                          "starting",
-                          "stopping",
-                          "restarting",
-                          "deleting",
-                        ].includes(String(sandbox.spec.status ?? ""))
-                      }
-                      onOpen={() => onDelete(sandbox)}
-                    >
-                      <Trash2Icon />
-                      删除
-                    </DropdownMenuModalItem>
-                  </>
-                ) : null}
-              </DropdownMenuContent>
-            </DropdownMenu>
-          </div>
-        )
-      },
+      cell: SandboxActionsCell,
       enableSorting: false,
       enableHiding: false,
-      meta: { className: "w-28 sm:w-56 lg:w-72" },
+      meta: {
+        className: "w-28 sm:w-56 lg:w-72",
+        busyId,
+        canMutate,
+        canOpenWorkspace,
+        onOpen,
+        onOpenAgentTools,
+        onCancelInstall,
+        onAction,
+        onEdit,
+        onDelete,
+      } satisfies SandboxActionsMeta,
     },
   ]
+}
+
+function SandboxActionsCell({
+  row,
+  column,
+}: CellContext<ResourceOfKind<"sandbox">, unknown>) {
+  const {
+    busyId,
+    canMutate,
+    canOpenWorkspace,
+    onOpen,
+    onOpenAgentTools,
+    onCancelInstall,
+    onAction,
+    onEdit,
+    onDelete,
+  } = column.columnDef.meta as SandboxActionsMeta
+  const sandbox = row.original
+  const busy = busyId === sandbox.id
+  const cancellation = sandboxInstallCancellation(sandbox.spec)
+  return (
+    <div className="flex items-center justify-end gap-1">
+      {sandbox.spec.status === "running" ? (
+        <>
+          {canOpenWorkspace ? (
+            <Button
+              size="sm"
+              variant="outline"
+              className="px-2 sm:px-3"
+              asChild
+            >
+              <Link
+                href={`/sandboxes/${sandbox.id}`}
+                aria-label={`打开 ${sandbox.name} 工作台`}
+              >
+                <MonitorIcon data-icon="inline-start" />
+                <span className="hidden sm:inline">工作台</span>
+              </Link>
+            </Button>
+          ) : null}
+          {canMutate ? (
+            <Button
+              size="sm"
+              variant="outline"
+              className="px-2 sm:px-3"
+              aria-label={`更新 ${sandbox.name} Agent`}
+              onClick={() => onOpenAgentTools(sandbox)}
+            >
+              <BotIcon data-icon="inline-start" />
+              <span className="hidden lg:inline">Agent 更新</span>
+            </Button>
+          ) : null}
+          {canMutate ? (
+            <Button
+              size="sm"
+              variant="outline"
+              className="px-2 sm:px-3"
+              aria-label={`停止 ${sandbox.name}`}
+              disabled={busy}
+              onClick={() => void onAction(sandbox, "stop")}
+            >
+              {busy ? (
+                <LoaderCircleIcon className="animate-spin" />
+              ) : (
+                <SquareIcon />
+              )}
+              <span className="hidden sm:inline">停止</span>
+            </Button>
+          ) : null}
+        </>
+      ) : (sandbox.spec.status === "stopped" ||
+          sandbox.spec.status === "error") &&
+        !sandbox.spec.provisioning?.cancelRequested ? (
+        canMutate ? (
+          <Button
+            size="sm"
+            variant="outline"
+            className="px-2 sm:px-3"
+            aria-label={`启动 ${sandbox.name}`}
+            disabled={busy}
+            onClick={() => void onAction(sandbox, "start")}
+          >
+            {busy ? (
+              <LoaderCircleIcon className="animate-spin" />
+            ) : (
+              <PlayIcon />
+            )}
+            <span className="hidden sm:inline">启动</span>
+          </Button>
+        ) : null
+      ) : null}
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            id={`sandbox-actions-${sandbox.id}`}
+            size="icon-sm"
+            variant="ghost"
+            aria-label={`${sandbox.name} 操作`}
+          >
+            <MoreHorizontalIcon />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          align="end"
+          className={cn(canMutate && cancellation === "unsupported" && "w-56")}
+        >
+          <DropdownMenuGroup>
+            <DropdownMenuModalItem onOpen={() => onOpen(sandbox)}>
+              <Settings2Icon />
+              管理
+            </DropdownMenuModalItem>
+            {canMutate ? (
+              <DropdownMenuModalItem onOpen={() => onEdit(sandbox)}>
+                <PencilIcon />
+                编辑配置
+              </DropdownMenuModalItem>
+            ) : null}
+            {canMutate && sandbox.spec.status === "running" && (
+              <DropdownMenuItem
+                disabled={busy}
+                onClick={() => void onAction(sandbox, "restart")}
+              >
+                <RotateCwIcon />
+                重启并应用配置
+              </DropdownMenuItem>
+            )}
+          </DropdownMenuGroup>
+          {canMutate ? (
+            <>
+              <DropdownMenuSeparator />
+              {cancellation !== "hidden" && (
+                <DropdownMenuModalItem
+                  disabled={busy || cancellation !== "available"}
+                  onOpen={() => onCancelInstall(sandbox)}
+                >
+                  {busy || cancellation === "cancelling" ? (
+                    <LoaderCircleIcon className="animate-spin" />
+                  ) : (
+                    <SquareIcon />
+                  )}
+                  <span>
+                    {cancellation === "cancelling" ? "正在取消" : "取消安装"}
+                    {cancellation === "unsupported" && (
+                      <span className="block text-xs text-muted-foreground">
+                        Worker 尚未确认取消能力
+                      </span>
+                    )}
+                  </span>
+                </DropdownMenuModalItem>
+              )}
+              <DropdownMenuModalItem
+                variant="destructive"
+                disabled={
+                  busy ||
+                  [
+                    "requested",
+                    "starting",
+                    "cancelling",
+                    "stopping",
+                    "restarting",
+                    "deleting",
+                  ].includes(String(sandbox.spec.status ?? ""))
+                }
+                onOpen={() => onDelete(sandbox)}
+              >
+                <Trash2Icon />
+                删除
+              </DropdownMenuModalItem>
+            </>
+          ) : null}
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  )
 }
 
 function sandboxFilterStatus(sandbox: ResourceOfKind<"sandbox">) {
@@ -1037,6 +1150,7 @@ function sandboxFilterStatus(sandbox: ResourceOfKind<"sandbox">) {
   return [
     "requested",
     "starting",
+    "cancelling",
     "stopping",
     "restarting",
     "deleting",
@@ -1100,14 +1214,29 @@ function SandboxDetailsDialog({
   environment,
   server,
   resources,
+  proxies,
+  canMutate,
   canOpenWorkspace,
+  busy,
+  onCancelInstall,
+  onApplyNetworkProxy,
+  onResourceChange,
   onOpenChange,
 }: {
   sandbox: ResourceOfKind<"sandbox">
   environment?: ResourceOfKind<"runtime">
   server?: ManagedServer
   resources: Resource[]
+  proxies: ManagedNetworkProxy[]
+  canMutate: boolean
   canOpenWorkspace: boolean
+  busy: boolean
+  onCancelInstall: () => Promise<void>
+  onApplyNetworkProxy: (
+    sandbox: ResourceOfKind<"sandbox">,
+    proxyId: string
+  ) => Promise<Resource>
+  onResourceChange: (resource: Resource) => void
   onOpenChange: (open: boolean) => void
 }) {
   const tools = stringList(
@@ -1140,7 +1269,8 @@ function SandboxDetailsDialog({
   const provisioning = provisioningResult.success
     ? provisioningResult.data
     : null
-  const isProvisioning = provisioning?.status === "running"
+  const isProvisioning =
+    provisioning?.status === "running" || provisioning?.status === "cancelling"
   const [now, setNow] = useState(() => Date.now())
 
   useEffect(() => {
@@ -1151,7 +1281,7 @@ function SandboxDetailsDialog({
 
   return (
     <Dialog open onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[calc(100dvh-2rem)] gap-3 overflow-y-auto sm:max-w-3xl">
+      <DialogContent className="max-h-[calc(100dvh-2rem)] grid-cols-[minmax(0,1fr)] gap-3 overflow-y-auto sm:max-w-3xl">
         <DialogHeader className="gap-1 pr-8">
           <DialogTitle>{sandbox.name}</DialogTitle>
           <DialogDescription>沙箱模板、运行位置与配置概览。</DialogDescription>
@@ -1202,6 +1332,16 @@ function SandboxDetailsDialog({
             )}
           </div>
 
+          <SandboxNetworkProxyPanel
+            key={`${sandbox.id}:${String(sandbox.spec.proxyId ?? environment?.spec.proxyId ?? "")}`}
+            sandbox={sandbox}
+            environment={environment}
+            proxies={proxies}
+            canMutate={canMutate}
+            onApply={onApplyNetworkProxy}
+            onResourceChange={onResourceChange}
+          />
+
           {tools.length > 0 && provisioning && (
             <AgentToolProgressPanel
               key={`${sandbox.id}:${provisioning.status}`}
@@ -1210,6 +1350,16 @@ function SandboxDetailsDialog({
               now={now}
             />
           )}
+
+          <ExtensionProgressPanel
+            progress={provisioning}
+            states={sandbox.spec.extensionStates}
+            snapshots={sandbox.spec.extensionSnapshots?.map((extension) => ({
+              id: extension.id,
+              name: extension.name,
+              version: extension.spec.version,
+            }))}
+          />
 
           {failureMessage && (
             <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-3">
@@ -1235,7 +1385,14 @@ function SandboxDetailsDialog({
           )}
         </div>
 
-        <DialogFooter className="p-3">
+        <DialogFooter className="mx-0 mb-0 min-w-0 p-3">
+          {canMutate && (
+            <SandboxInstallCancelButton
+              sandbox={sandbox}
+              busy={busy}
+              onCancel={onCancelInstall}
+            />
+          )}
           <Button variant="outline" onClick={() => onOpenChange(false)}>
             关闭
           </Button>
@@ -1253,8 +1410,221 @@ function SandboxDetailsDialog({
   )
 }
 
+function SandboxNetworkProxyPanel({
+  sandbox,
+  environment,
+  proxies,
+  canMutate,
+  onApply,
+  onResourceChange,
+}: {
+  sandbox: ResourceOfKind<"sandbox">
+  environment?: ResourceOfKind<"runtime">
+  proxies: ManagedNetworkProxy[]
+  canMutate: boolean
+  onApply: (
+    sandbox: ResourceOfKind<"sandbox">,
+    proxyId: string
+  ) => Promise<Resource>
+  onResourceChange: (resource: Resource) => void
+}) {
+  const inheritedProxyId =
+    typeof environment?.spec.proxyId === "string"
+      ? environment.spec.proxyId.trim()
+      : ""
+  const desiredProxyId = Object.hasOwn(sandbox.spec, "proxyId")
+    ? typeof sandbox.spec.proxyId === "string"
+      ? sandbox.spec.proxyId.trim()
+      : ""
+    : inheritedProxyId
+  const operationResult = sandboxProxyOperationSchema.safeParse(
+    sandbox.spec.proxyOperation
+  )
+  const operation = operationResult.success ? operationResult.data : null
+  const appliedProxyId = operation
+    ? operation.appliedProxyId
+    : typeof sandbox.spec.appliedProxyId === "string"
+      ? sandbox.spec.appliedProxyId.trim()
+      : desiredProxyId
+  const network =
+    typeof sandbox.spec.network === "string"
+      ? sandbox.spec.network
+      : String(environment?.spec.network ?? "")
+  const [selection, setSelection] = useState(
+    desiredProxyId === "" ? "__direct__" : desiredProxyId
+  )
+  const [applying, setApplying] = useState(false)
+  const operationActive =
+    operation?.status === "queued" || operation?.status === "running"
+  const sandboxTransitioning =
+    [
+      "requested",
+      "starting",
+      "cancelling",
+      "cancelled",
+      "stopping",
+      "restarting",
+      "deleting",
+    ].includes(String(sandbox.spec.status ?? "")) ||
+    Boolean(sandbox.spec.provisioning?.cancelRequested)
+  const selectedProxyId = selection === "__direct__" ? "" : selection
+  const selectedProxy = proxies.find((proxy) => proxy.id === selectedProxyId)
+  const desiredProxy = proxies.find((proxy) => proxy.id === desiredProxyId)
+  const appliedProxy = proxies.find((proxy) => proxy.id === appliedProxyId)
+  const options = proxies.filter(
+    (proxy) =>
+      proxy.enabled ||
+      proxy.id === desiredProxyId ||
+      proxy.id === appliedProxyId
+  )
+
+  let statusLabel = appliedProxyId === "" ? "直连" : "代理已应用"
+  let statusVariant: "default" | "secondary" | "destructive" | "outline" =
+    appliedProxyId === "" ? "secondary" : "default"
+  if (operationActive) {
+    statusLabel = "正在应用"
+    statusVariant = "outline"
+  } else if (operation?.status === "failed") {
+    statusLabel = "应用失败"
+    statusVariant = "destructive"
+  } else if (operation?.status === "pending-start") {
+    statusLabel = "等待下次启动"
+    statusVariant = "outline"
+  } else if (desiredProxyId !== appliedProxyId) {
+    statusLabel = "配置待同步"
+    statusVariant = "outline"
+  }
+
+  async function applyProxy() {
+    setApplying(true)
+    try {
+      const resource = await onApply(sandbox, selectedProxyId)
+      onResourceChange(resource)
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  return (
+    <div className="overflow-hidden rounded-xl border">
+      <div className="flex flex-col gap-3 p-3 sm:flex-row sm:items-start sm:justify-between">
+        <div className="flex min-w-0 items-start gap-3">
+          <div className="flex size-8 shrink-0 items-center justify-center rounded-lg border bg-muted/30">
+            <NetworkIcon className="size-4" aria-hidden="true" />
+          </div>
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-sm font-medium">网络出口</p>
+              <Badge variant={statusVariant}>{statusLabel}</Badge>
+            </div>
+            <p className="mt-1 text-xs leading-5 text-muted-foreground">
+              当前实际出口：
+              {appliedProxyId === ""
+                ? "直连"
+                : (appliedProxy?.name ?? appliedProxyId)}
+              {appliedProxy ? ` · ${appliedProxy.scheme.toUpperCase()}` : ""}
+            </p>
+          </div>
+        </div>
+
+        <div className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)] gap-2 sm:w-[24rem] sm:grid-cols-[minmax(0,1fr)_auto]">
+          <Select
+            value={selection}
+            disabled={
+              !canMutate ||
+              applying ||
+              operationActive ||
+              sandboxTransitioning ||
+              network === "none"
+            }
+            onValueChange={setSelection}
+          >
+            <SelectTrigger
+              aria-label="选择沙箱网络出口"
+              className="w-full min-w-0"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectGroup>
+                <SelectLabel>网络出口</SelectLabel>
+                <SelectItem value="__direct__">直连 · 不使用代理</SelectItem>
+                {options.map((proxy) => (
+                  <SelectItem
+                    key={proxy.id}
+                    value={proxy.id}
+                    disabled={!proxy.enabled}
+                  >
+                    {proxy.name} · {proxy.scheme.toUpperCase()}
+                    {proxy.enabled ? "" : " · 已停用"}
+                  </SelectItem>
+                ))}
+              </SelectGroup>
+            </SelectContent>
+          </Select>
+          {canMutate && (
+            <Button
+              variant="outline"
+              disabled={
+                applying ||
+                operationActive ||
+                sandboxTransitioning ||
+                network === "none" ||
+                (selectedProxyId !== "" && !selectedProxy?.enabled)
+              }
+              onClick={() => void applyProxy()}
+            >
+              {applying || operationActive ? (
+                <LoaderCircleIcon
+                  className="animate-spin"
+                  data-icon="inline-start"
+                />
+              ) : null}
+              {sandbox.spec.status === "running"
+                ? selectedProxyId === desiredProxyId
+                  ? "重新应用"
+                  : "立即应用"
+                : "保存配置"}
+            </Button>
+          )}
+        </div>
+      </div>
+
+      <div
+        className={cn(
+          "border-t bg-muted/20 px-3 py-2.5 text-xs leading-5 text-muted-foreground",
+          operation?.status === "failed" &&
+            "border-destructive/20 bg-destructive/5 text-destructive"
+        )}
+      >
+        {network === "none"
+          ? "当前沙箱完全隔离，不能配置网络代理。"
+          : operation?.message
+            ? operation.message
+            : "运行中切换会影响新启动的 Agent 和终端进程；已有进程与连接不会自动迁移。需要完全生效时请重启相关 Agent 或沙箱。"}
+        {selectedProxy?.scheme.startsWith("socks5") && (
+          <span className="block">
+            SOCKS5 通过 ALL_PROXY 同步；Node/npm
+            等程序是否支持取决于自身代理实现。
+          </span>
+        )}
+        {desiredProxy && !desiredProxy.enabled && (
+          <span className="block">
+            当前配置引用的代理已停用，只能切换到其他出口。
+          </span>
+        )}
+      </div>
+    </div>
+  )
+}
+
 const activeAgentToolStatuses = new Set(["running", "installed", "verifying"])
-const finishedAgentToolStatuses = new Set(["succeeded", "failed", "cached"])
+const finishedAgentToolStatuses = new Set([
+  "succeeded",
+  "failed",
+  "cached",
+  "cancelled",
+])
 const agentToolLabels = new Map<string, string>(
   agentToolOptions.map((option) => [option.value, option.label])
 )
@@ -1268,7 +1638,8 @@ function AgentToolProgressPanel({
   provisioning: ProvisioningProgress
   now: number
 }) {
-  const isProvisioning = provisioning.status === "running"
+  const isProvisioning =
+    provisioning.status === "running" || provisioning.status === "cancelling"
   const [open, setOpen] = useState(isProvisioning)
 
   const reported = new Map(
@@ -1286,13 +1657,22 @@ function AgentToolProgressPanel({
     } else if (!progress && provisioning.status === "succeeded") {
       status = provisioning.cacheStatus === "hit" ? "cached" : "succeeded"
     }
+    if (
+      provisioning.status === "cancelled" &&
+      !finishedAgentToolStatuses.has(status)
+    ) {
+      status = "cancelled"
+    }
     return { tool, progress, status }
   })
   const settled = items.filter((item) =>
     finishedAgentToolStatuses.has(item.status)
   ).length
   const installed = items.filter(
-    (item) => item.status !== "pending" && item.status !== "running"
+    (item) =>
+      item.status !== "pending" &&
+      item.status !== "running" &&
+      item.status !== "cancelled"
   ).length
   const failed = items.filter((item) => item.status === "failed").length
   const progressValue = tools.length > 0 ? (installed / tools.length) * 100 : 0
@@ -1309,11 +1689,15 @@ function AgentToolProgressPanel({
             <div className="flex items-center gap-2">
               <p className="text-sm font-medium">Agent 安装进度</p>
               <Badge variant={failed > 0 ? "destructive" : "outline"}>
-                {failed > 0
-                  ? `${failed} 个失败`
-                  : provisioning.status === "running"
-                    ? `${installed}/${tools.length} 已安装`
-                    : `${settled}/${tools.length}`}
+                {provisioning.status === "cancelled"
+                  ? "已取消"
+                  : provisioning.status === "cancelling"
+                    ? "正在取消"
+                    : failed > 0
+                      ? `${failed} 个失败`
+                      : provisioning.status === "running"
+                        ? `${installed}/${tools.length} 已安装`
+                        : `${settled}/${tools.length}`}
               </Badge>
             </div>
             <p className="mt-1 truncate text-xs text-muted-foreground">
@@ -1402,6 +1786,7 @@ function agentToolStatusBadge(status: string) {
 }
 
 function agentToolProgressMessage(message: string | undefined, status: string) {
+  if (status === "cancelled") return "本次创建已取消"
   if (message) return message
   if (status === "cached") return "由缓存镜像提供"
   if (status === "succeeded") return "旧任务未记录单项耗时"
@@ -1427,12 +1812,11 @@ function provisioningElapsedDuration(
 ) {
   const startedAt = progress.startedAt ? Date.parse(progress.startedAt) : NaN
   const liveDuration =
-    progress.status === "running" && Number.isFinite(startedAt)
+    ["running", "cancelling"].includes(progress.status) &&
+    Number.isFinite(startedAt)
       ? now - startedAt
       : 0
-  return provisioningDuration(
-    Math.max(0, progress.durationMs, liveDuration)
-  )
+  return provisioningDuration(Math.max(0, progress.durationMs, liveDuration))
 }
 
 function Detail({
@@ -1581,6 +1965,10 @@ function sandboxStatus(resource: ResourceOfKind<"sandbox">) {
       return "运行异常"
     case "starting":
       return "启动中"
+    case "cancelling":
+      return "正在取消"
+    case "cancelled":
+      return "已取消"
     case "stopping":
       return "停止中"
     case "restarting":

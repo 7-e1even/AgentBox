@@ -14,6 +14,7 @@ const stageLabels: Record<string, string> = {
   skills: "写入 Skills",
   mcp: "写入 MCP",
   "agent-wrappers": "安装 Agent 启动器",
+  extensions: "安装沙箱扩展",
   "setup-command": "执行初始化命令",
   "desktop-config": "配置桌面",
   "desktop-start": "启动桌面",
@@ -30,6 +31,9 @@ const stageLabels: Record<string, string> = {
   verify: "验证可用性",
   completed: "已完成",
   failed: "失败",
+  cancelling: "正在取消",
+  cancelled: "已取消",
+  cleanup_failed: "取消清理失败",
 }
 
 const cacheStatusLabels: Record<string, string> = {
@@ -60,6 +64,29 @@ const agentToolStatusLabels: Record<string, string> = {
   succeeded: "已完成",
   failed: "失败",
   cached: "缓存复用",
+  cancelling: "正在取消",
+  cancelled: "已取消",
+}
+
+export function sandboxInstallCancellation(spec: {
+  status?: string | null
+  provisioning?: {
+    status?: string
+    cancellationSupported?: boolean
+    cancelRequested?: boolean
+  } | null
+}): "available" | "unsupported" | "cancelling" | "hidden" {
+  if (spec.status === "cancelling") return "cancelling"
+  if (spec.status === "requested") return "available"
+  if (
+    spec.status !== "starting" ||
+    ["succeeded", "failed", "cancelled", "cleanup_failed"].includes(
+      spec.provisioning?.status ?? ""
+    )
+  ) {
+    return "hidden"
+  }
+  return spec.provisioning?.cancellationSupported ? "available" : "unsupported"
 }
 
 export function provisioningStageLabel(stage: string) {

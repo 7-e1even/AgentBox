@@ -28,6 +28,7 @@ type PlatformStore interface {
 	DeleteResource(context.Context, string) error
 	OperateSandbox(context.Context, string, string) (platform.Resource, error)
 	UpdateSandboxNetworkProxy(context.Context, string, string) (platform.Resource, error)
+	UpdateSandboxModelSource(context.Context, string, platform.SandboxModelSourceInput) (platform.Resource, error)
 	OperateSandboxAgentTools(context.Context, string, string, []string) (platform.Resource, error)
 	ListAutomations(context.Context, string) ([]platform.Automation, error)
 	GetAutomation(context.Context, string) (platform.Automation, error)
@@ -57,6 +58,7 @@ type PlatformStore interface {
 	DeleteNetworkProxy(context.Context, string) error
 	ResolveRuntimeLLMTarget(context.Context, string, string, string) (platform.RuntimeLLMTarget, error)
 	ClaimWorkerJob(context.Context, string, string) (platform.WorkerJob, error)
+	ControlWorkerJob(context.Context, string, string, string, platform.WorkerJobControlInput) (platform.WorkerJobControl, error)
 	ReportWorkerJobProgress(context.Context, string, string, string, platform.WorkerJobProgressInput) (platform.ProvisioningProgress, error)
 	CompleteWorkerJob(context.Context, string, string, string, platform.WorkerJobResult) error
 	ListServers(context.Context) ([]platform.ManagedServer, error)
@@ -172,6 +174,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	operator("GET /api/skills/search", server.searchSkills)
 	operator("POST /api/sandboxes/{id}/actions/{action}", server.operateSandbox)
 	operator("PATCH /api/sandboxes/{id}/network-proxy", server.updateSandboxNetworkProxy)
+	operator("PATCH /api/sandboxes/{id}/model-source", server.updateSandboxModelSource)
 	operator("POST /api/sandboxes/{id}/agent-tools/actions/{action}", server.operateSandboxAgentTools)
 	operator("POST /api/sandboxes/{id}/session-ticket", server.createSandboxSessionTicket)
 	operator("POST /api/sandboxes/{id}/desktop-ticket", server.createSandboxDesktopTicket)
@@ -210,6 +213,7 @@ func New(repository PlatformStore, catalog catalog.Catalog, logger *slog.Logger,
 	mux.HandleFunc("POST /api/servers/{id}/jobs/claim", server.claimWorkerJob)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/{jobId}/complete", server.completeWorkerJob)
 	mux.HandleFunc("POST /api/servers/{id}/jobs/{jobId}/progress", server.reportWorkerJobProgress)
+	mux.HandleFunc("POST /api/servers/{id}/jobs/{jobId}/control", server.controlWorkerJob)
 	mux.HandleFunc("POST /api/webhooks/{endpointId}", server.receiveAutomationWebhook)
 	mux.HandleFunc("GET /api/webhooks/{endpointId}/runs/{runId}", server.getPublicAutomationRun)
 	mux.HandleFunc("GET /api/servers/{id}/sessions/connect", server.connectWorkerSessions)

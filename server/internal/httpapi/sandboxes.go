@@ -65,6 +65,36 @@ func (s *Server) updateSandboxNetworkProxy(w http.ResponseWriter, request *http.
 	s.writeJSON(w, http.StatusAccepted, map[string]any{"resource": resource})
 }
 
+func (s *Server) updateSandboxModelSource(w http.ResponseWriter, request *http.Request) {
+	var input platform.SandboxModelSourceInput
+	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {
+		return
+	}
+	id := request.PathValue("id")
+	started := time.Now()
+	resource, err := s.store.UpdateSandboxModelSource(request.Context(), id, input)
+	entry := platform.LogEntry{
+		Category: platform.LogCategorySandbox, Action: "model-source-update",
+		ResourceKind: string(platform.KindSandbox), ResourceID: id,
+		DurationMS: time.Since(started).Milliseconds(),
+		Detail: map[string]any{
+			"slotCredentialId": input.SlotCredentialID,
+			"toCredentialId":   input.CredentialID,
+			"toModelId":        input.ModelID,
+		},
+	}
+	if err != nil {
+		entry.Level = platform.LogLevelWarn
+		entry.Status = platform.LogStatusFailed
+		entry.Message = fmt.Sprintf("沙箱 %s 切换模型源失败", id)
+		entry.Detail["error"] = err.Error()
+		s.recordLog(request, entry)
+		s.handleError(w, err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{"resource": resource})
+}
+
 func (s *Server) operateSandboxAgentTools(w http.ResponseWriter, request *http.Request) {
 	var input sandboxAgentToolActionInput
 	if !s.decodeJSONWithLimit(w, request, &input, 4<<10) {

@@ -1,6 +1,8 @@
 package workerscript
 
 import (
+	"crypto/sha256"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -389,7 +391,7 @@ func TestWorkerRestartsSandboxOnlyAfterInPlaceAgentUpdateRetryFails(t *testing.T
 }
 
 func TestWorkerConfirmsSelfUpdateBeforeSlowRuntimeDiscovery(t *testing.T) {
-	confirmation := strings.Index(workerDaemon, "  finalize_worker_update || true\n  prepare_boxlite_config")
+	confirmation := strings.Index(workerDaemon, "  finalize_worker_update || FINALIZE_STATUS=$?\n  [ \"$FINALIZE_STATUS\" -ne 75 ] || exit 0\n  prepare_boxlite_config")
 	imageRefresh := strings.Index(workerDaemon, "  refresh_boxlite_images || {")
 	if confirmation < 0 || imageRefresh < 0 || confirmation > imageRefresh {
 		t.Fatal("Worker self-update must be confirmed before BoxLite runtime discovery")
@@ -410,13 +412,30 @@ func TestWorkerClaimsJobsEverySecond(t *testing.T) {
 	}
 }
 
+func TestWorkerBlocksClaimsWhileUpdateJournalExists(t *testing.T) {
+	start := strings.Index(workerDaemon, "run_worker() {")
+	if start < 0 {
+		t.Fatal("Worker run loop was not found")
+	}
+	body := workerDaemon[start:]
+	finalize := strings.Index(body, "    finalize_worker_update || FINALIZE_STATUS=$?\n")
+	blocked := strings.Index(body, `    if [ -e "$STATE_DIR/worker-update.json" ]; then`)
+	claim := strings.Index(body, `"$SERVER_URL/api/servers/$SERVER_ID/jobs/claim"`)
+	if finalize < 0 || blocked < 0 || claim < 0 || finalize >= blocked || blocked >= claim {
+		t.Fatal("Worker must finalize or block on a durable update journal before claiming work")
+	}
+	if !strings.Contains(body[blocked:claim], "      sleep 2\n      continue\n") {
+		t.Fatal("unresolved Worker update journal does not skip the claim loop")
+	}
+}
+
 func TestWorkerEchoesLeaseGenerationOnProgressCompletionAndSelfUpdate(t *testing.T) {
 	for _, expected := range []string{
 		`.job.leaseGeneration // 0`,
 		`{leaseGeneration:$leaseGeneration,stage:$stage,message:$message`,
 		`{leaseGeneration:$leaseGeneration,success:$success,externalId:$externalId`,
 		`.leaseGeneration // 0`,
-		`{jobId:$jobId,leaseGeneration:$leaseGeneration`,
+		`jobId:$jobId,leaseGeneration:$leaseGeneration`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("Worker lease fencing is missing %q", expected)
@@ -525,8 +544,8 @@ func TestWorkerCachesLatestAgentRuntimeImage(t *testing.T) {
 		`RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")`,
 		`set -- "$@" "$RUNTIME_IMAGE"`,
 		`Agent runtime refresh failed; using the last working cached image`,
-		`BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY"`,
-		`docker stop --time 10 "$BUILD_CONTAINER"`,
+		`BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY-${JOB_ID:-manual}-${LEASE_GENERATION:-0}"`,
+		`docker rm -f -v "$BUILD_CONTAINER"`,
 		`command -v $COMMAND >/dev/null`,
 		`curl --connect-timeout 15 --max-time 300`,
 		`best_cached_agent_base()`,
@@ -802,6 +821,9 @@ func TestWorkerInstallerIncludesInteractiveSessionDaemon(t *testing.T) {
 		`systemctl restart agentbox-worker.service`,
 		`curl -fsSL -D "$worker_headers_tmp" "$SERVER_URL/api/worker/agentbox-worker?arch=$ARCH" -o "$worker_tmp"`,
 		`verify_worker_checksum "$worker_tmp" "$worker_headers_tmp"`,
+		`command -v flock >/dev/null`,
+		`command -v sync >/dev/null`,
+		`PACKAGES="ca-certificates jq util-linux"`,
 		`WARNING: $SERVER_URL uses plain HTTP.`,
 	} {
 		if !strings.Contains(workerInstall, expected) {
@@ -828,7 +850,8 @@ func TestWorkerSupervisesInteractiveSessionProcess(t *testing.T) {
 		`wait "$SESSION_PID" >/dev/null 2>&1 || true`,
 		`/usr/local/bin/agentbox-worker session "$CONFIG" &`,
 		`SESSION_PID=$!`,
-		"  while :; do\n    finalize_worker_update || true\n    ensure_session_worker",
+		`[ -e "$STATE_DIR/worker-update.json" ] || ensure_session_worker`,
+		"  while :; do\n    FINALIZE_STATUS=0\n    finalize_worker_update || FINALIZE_STATUS=$?\n    [ \"$FINALIZE_STATUS\" -ne 75 ] || exit 0\n    if [ -e \"$STATE_DIR/worker-update.json\" ]; then",
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("interactive session supervision is missing %q", expected)
@@ -842,7 +865,7 @@ func TestWorkerStartsInteractiveSessionBeforeSlowImageInventory(t *testing.T) {
 		t.Fatal("worker run loop was not found")
 	}
 	body := workerDaemon[start:]
-	sessionIndex := strings.Index(body, "  ensure_session_worker\n")
+	sessionIndex := strings.Index(body, `[ -e "$STATE_DIR/worker-update.json" ] || ensure_session_worker`)
 	inventoryIndex := strings.Index(body, "  refresh_boxlite_images || {")
 	if sessionIndex < 0 || inventoryIndex < 0 || sessionIndex > inventoryIndex {
 		t.Fatal("interactive sessions must start before the slow BoxLite image inventory refresh")
@@ -862,8 +885,22 @@ func TestWorkerSupportsVersionedAtomicSelfUpdate(t *testing.T) {
 		`export GOCACHE="$STATE_DIR/go-build-cache"`,
 		`DOWNLOADED_VERSION=$("$WORKER_TMP" version`,
 		`/usr/local/lib/agentbox/agentbox-worker.previous`,
+		`/usr/local/lib/agentbox/agentbox-microsandbox-driver.previous`,
 		`mv -f "$NEXT" /usr/local/bin/agentbox-worker`,
-		`systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=120s`,
+		`mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver`,
+		`formatVersion:2,phase:"prepared"`,
+		`driverUpdated:$driverUpdated,driverHadPrevious:$driverHadPrevious`,
+		`workerChecksum:$workerChecksum,workerPreviousChecksum:$workerPreviousChecksum`,
+		`driverPreviousChecksum:$driverPreviousChecksum`,
+		`OnActiveSec=120s`,
+		`WantedBy=timers.target`,
+		`systemctl enable --now "$GUARDIAN_TIMER"`,
+		`flock -x 9`,
+		`[ "${AGENTBOX_WORKER_VERSION:-unknown}" = "$TARGET_VERSION" ] || exit 0`,
+		`worker_update_lease_keepalive &`,
+		`.job.payload.previousVersion // empty`,
+		`ExecStartPre=/var/lib/agentbox-worker/worker-update-start-guard.sh`,
+		`refusing to start the previous job loop`,
 		`KillMode=control-group`,
 		`TimeoutStopSec=20s`,
 		`systemd-run --quiet --unit="agentbox-worker-restart-$JOB_ID" --on-active=1s`,
@@ -879,12 +916,27 @@ func TestWorkerSupportsVersionedAtomicSelfUpdate(t *testing.T) {
 	}
 }
 
+func TestWorkerRejectsQueuedPreviousVersionDriftBeforeActivation(t *testing.T) {
+	start := strings.Index(workerDaemon, "update_worker() (")
+	if start < 0 {
+		t.Fatal("Worker self-update function was not found")
+	}
+	body := workerDaemon[start:]
+	queued := strings.Index(body, `EXPECTED_PREVIOUS_VERSION=$(jq -r '.job.payload.previousVersion // empty'`)
+	check := strings.Index(body, `[ "$PREVIOUS_VERSION" != "$EXPECTED_PREVIOUS_VERSION" ]`)
+	backup := strings.Index(body, `install -m 0755 /usr/local/bin/agentbox-worker "$PREVIOUS_TMP"`)
+	activate := strings.Index(body, `mv -f "$NEXT" /usr/local/bin/agentbox-worker`)
+	if queued < 0 || check < 0 || backup < 0 || activate < 0 || queued >= check || check >= backup || backup >= activate {
+		t.Fatal("queued previousVersion must be checked before backing up or activating the Worker")
+	}
+}
+
 func TestWorkerSelfUpdateVerifiesChecksumBeforeExecutingDownload(t *testing.T) {
 	start := strings.Index(workerDaemon, "update_worker()")
 	if start < 0 {
 		t.Fatal("Worker self-update function was not found")
 	}
-	end := strings.Index(workerDaemon[start:], "refresh_microsandbox_driver ||")
+	end := strings.Index(workerDaemon[start:], `refresh_microsandbox_driver "$DRIVER_NEXT" ||`)
 	if end < 0 {
 		t.Fatal("Worker self-update download stage was not found")
 	}
@@ -892,14 +944,14 @@ func TestWorkerSelfUpdateVerifiesChecksumBeforeExecutingDownload(t *testing.T) {
 	for _, expected := range []string{
 		`curl -fsSL -D "$WORKER_HEADERS"`,
 		`EXPECTED_SHA256=$(tr -d '\r' < "$WORKER_HEADERS"`,
-		`ACTUAL_SHA256=$(sha256sum "$WORKER_TMP" | cut -d ' ' -f 1)`,
+		`ACTUAL_SHA256=$(worker_update_sha256 "$WORKER_TMP")`,
 		`downloaded Worker checksum mismatch`,
 	} {
 		if !strings.Contains(body, expected) {
 			t.Fatalf("Worker self-update checksum verification is missing %q", expected)
 		}
 	}
-	checksumIndex := strings.Index(body, `ACTUAL_SHA256=$(sha256sum "$WORKER_TMP"`)
+	checksumIndex := strings.Index(body, `ACTUAL_SHA256=$(worker_update_sha256 "$WORKER_TMP")`)
 	versionIndex := strings.Index(body, `DOWNLOADED_VERSION=$("$WORKER_TMP" version`)
 	if checksumIndex < 0 || versionIndex < 0 || checksumIndex >= versionIndex {
 		t.Fatal("Worker self-update must verify the checksum before executing the downloaded binary")
@@ -916,28 +968,757 @@ func TestWorkerSelfUpdateConfirmsOnlyAfterServerAcceptsReport(t *testing.T) {
 		t.Fatal("Worker update finalization function end was not found")
 	}
 	body := workerDaemon[start : start+end]
-	reportIndex := strings.Index(body, `if complete_job "$JOB_ID" true "" "Worker 已更新到 $TARGET_VERSION"; then`)
-	sealIndex := strings.Index(body, `/usr/local/lib/agentbox/agentbox-worker.previous || return 1`)
-	confirmIndex := strings.Index(body, `printf '%s\n' "$JOB_ID" > "$CONFIRMED"`)
-	if reportIndex < 0 || sealIndex < 0 || confirmIndex < 0 || reportIndex >= sealIndex || sealIndex >= confirmIndex {
-		t.Fatal("the accepted Worker binary must be sealed as the fallback before the confirmed marker is written")
+	reportIndex := strings.Index(body, `if ! complete_job "$JOB_ID" true "" "Worker 已更新到 $TARGET_VERSION"; then`)
+	confirmIndex := strings.Index(body, `mv -f "$CONFIRMED_TMP" "$CONFIRMED"`)
+	cancelIndex := strings.Index(body, `cleanup_worker_update_guardian "$JOB_ID" "$GUARDIAN_TIMER" "$GUARDIAN_SERVICE"`)
+	journalCleanupIndex := strings.Index(body, `rm -f "$MARKER" || exit 1`)
+	workerCommitIndex := strings.Index(body, `/usr/local/lib/agentbox/.agentbox-worker.previous &&`)
+	driverCommitIndex := strings.Index(body, `/usr/local/lib/agentbox/.agentbox-microsandbox-driver.previous &&`)
+	if reportIndex < 0 || confirmIndex < 0 || cancelIndex < 0 || journalCleanupIndex < 0 ||
+		workerCommitIndex < 0 || driverCommitIndex < 0 || reportIndex >= confirmIndex ||
+		confirmIndex >= journalCleanupIndex || journalCleanupIndex >= cancelIndex ||
+		cancelIndex >= workerCommitIndex || workerCommitIndex >= driverCommitIndex {
+		t.Fatal("Server confirmation, journal removal, guardian cleanup and fallback refresh are out of order")
 	}
-	cancelIndex := strings.Index(body, `systemctl stop "agentbox-worker-update-$JOB_ID.timer"`)
-	if cancelIndex < 0 || confirmIndex >= cancelIndex {
-		t.Fatal("the scheduled rollback units must be stopped after the update is confirmed")
-	}
-	successEnd := strings.Index(body[confirmIndex:], `elif complete_job`)
-	if successEnd < 0 {
-		t.Fatal("Worker update success branch end was not found")
-	}
-	successBody := body[confirmIndex : confirmIndex+successEnd]
-	cleanupIndex := strings.Index(successBody, `rm -f "$MARKER" "$CONFIRMED"`)
-	cancelSuccessIndex := strings.Index(successBody, `systemctl stop "agentbox-worker-update-$JOB_ID.timer"`)
-	if cleanupIndex >= 0 && (cancelSuccessIndex < 0 || cancelSuccessIndex >= cleanupIndex) {
-		t.Fatal("confirmation state may only be removed after the scheduled rollback units are stopped")
-	}
-	if !strings.Contains(workerDaemon, `rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed" "$0"`) {
+	if !strings.Contains(workerDaemon, `rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed"`) {
 		t.Fatal("the scheduled rollback check must clean confirmation state after accepting the update")
+	}
+}
+
+func TestWorkerRollbackReportsBeforeStartingPreviousBinary(t *testing.T) {
+	start := strings.Index(workerDaemon, "finalize_worker_update() (")
+	end := strings.Index(workerDaemon[start:], "restore_worker_binary()")
+	if start < 0 || end < 0 {
+		t.Fatal("Worker update finalizer was not found")
+	}
+	body := workerDaemon[start : start+end]
+	oldStart := strings.Index(body, "    old)\n")
+	mixedStart := strings.Index(body, "    mixed)\n")
+	if oldStart < 0 || mixedStart < 0 || oldStart >= mixedStart {
+		t.Fatal("Worker rollback branches were not found")
+	}
+	oldBody := body[oldStart:mixedStart]
+	report := strings.Index(oldBody, `complete_job_failure "$JOB_ID" worker_update_rolled_back`)
+	removeMarker := strings.Index(oldBody, `rm -f "$MARKER" || exit 1`)
+	exitForRestart := strings.Index(oldBody, `] || exit 75`)
+	if report < 0 || removeMarker < 0 || exitForRestart < 0 || report >= removeMarker || removeMarker >= exitForRestart {
+		t.Fatal("rollback must be accepted and its journal cleared before the new process exits into the previous binary")
+	}
+	if strings.Contains(body[mixedStart:], `schedule_worker_restart "$JOB_ID"`) {
+		t.Fatal("mixed-pair recovery must not start the previous binary before rollback reconciliation")
+	}
+}
+
+func TestWorkerSelfUpdateStagesAndRollsBackMicrosandboxDriverWithWorker(t *testing.T) {
+	for _, expected := range []string{
+		`refresh_microsandbox_driver "$DRIVER_NEXT"`,
+		`install -m 0755 "$BUILD_DIR/agentbox-microsandbox-driver" "$DRIVER_NEXT"`,
+		`--argjson driverUpdated "$DRIVER_UPDATED"`,
+		`--argjson driverHadPrevious "$DRIVER_HAD_PREVIOUS"`,
+		`--arg driverPrevious "$DRIVER_PREVIOUS"`,
+		`--arg driverChecksum "$DRIVER_CHECKSUM"`,
+		`restore_worker_update "$WORKER_PREVIOUS" "$DRIVER_PREVIOUS"`,
+		`restore_microsandbox_driver "$DRIVER_PREVIOUS" "$DRIVER_HAD_PREVIOUS"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("atomic Worker/driver update is missing %q", expected)
+		}
+	}
+
+	stageStart := strings.Index(workerDaemon, "refresh_microsandbox_driver() (")
+	updateStart := strings.Index(workerDaemon, "update_worker() (")
+	if stageStart < 0 || updateStart < 0 || stageStart >= updateStart {
+		t.Fatal("Microsandbox driver staging function boundary was not found")
+	}
+	stageBody := workerDaemon[stageStart:updateStart]
+	if strings.Contains(stageBody, `mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver`) {
+		t.Fatal("Microsandbox driver staging must not replace the active driver")
+	}
+
+	updateBody := workerDaemon[updateStart:]
+	guardianInstallIndex := strings.Index(updateBody, `systemctl enable --now "$GUARDIAN_TIMER"`)
+	markerPublishIndex := strings.Index(updateBody, `mv -f "$MARKER_TMP" "$MARKER"`)
+	rollbackIndex := strings.Index(updateBody, `! systemctl restart "$GUARDIAN_TIMER"`)
+	workerActivateIndex := strings.Index(updateBody, `mv -f "$NEXT" /usr/local/bin/agentbox-worker`)
+	driverActivateIndex := strings.Index(updateBody, `mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver`)
+	restartIndex := strings.Index(updateBody, `schedule_worker_restart "$JOB_ID"`)
+	if guardianInstallIndex < 0 || markerPublishIndex < 0 || rollbackIndex < 0 || workerActivateIndex < 0 ||
+		driverActivateIndex < 0 || restartIndex < 0 || guardianInstallIndex >= markerPublishIndex ||
+		markerPublishIndex >= rollbackIndex || rollbackIndex >= workerActivateIndex ||
+		workerActivateIndex >= driverActivateIndex || driverActivateIndex >= restartIndex {
+		t.Fatal("guardian installation, journal publication, arming, pair activation and restart are out of order")
+	}
+	if got := strings.Count(updateBody[:restartIndex+1], `abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS"`); got < 2 {
+		t.Fatalf("pre-restart activation failures covered by paired rollback = %d, want at least 2", got)
+	}
+	if !strings.Contains(updateBody, `if [ -x /usr/local/bin/agentbox-microsandbox-driver ]; then`) ||
+		!strings.Contains(updateBody, `rm -f "$DRIVER_PREVIOUS_TMP" "$DRIVER_PREVIOUS" || {`) {
+		t.Fatal("every update generation must record whether a previous Microsandbox driver existed")
+	}
+	abortStart := strings.Index(workerDaemon, "abort_worker_update() (")
+	recoverStart := strings.Index(workerDaemon, "recover_worker_update() (")
+	if abortStart < 0 || recoverStart < 0 || abortStart >= recoverStart {
+		t.Fatal("Worker update abort helper was not found")
+	}
+	abortBody := workerDaemon[abortStart:recoverStart]
+	validateFallback := strings.Index(abortBody, `worker_update_fallback_valid "$MARKER"`)
+	restoreFallback := strings.Index(abortBody, `restore_worker_update "$WORKER_PREVIOUS" "$DRIVER_PREVIOUS"`)
+	if validateFallback < 0 || restoreFallback < 0 || validateFallback >= restoreFallback {
+		t.Fatal("activation abort must validate the complete fallback pair before mutating either active path")
+	}
+}
+
+func TestWorkerUpdateJournalIsNeverPublishedWithInactiveGuardian(t *testing.T) {
+	updateStart := strings.Index(workerDaemon, "update_worker() (")
+	if updateStart < 0 {
+		t.Fatal("Worker self-update function was not found")
+	}
+	updateBody := workerDaemon[updateStart:]
+	startGuardian := strings.Index(updateBody, `systemctl enable --now "$GUARDIAN_TIMER"`)
+	publishJournal := strings.Index(updateBody, `mv -f "$MARKER_TMP" "$MARKER"`)
+	resetDeadline := strings.Index(updateBody, `systemctl restart "$GUARDIAN_TIMER"`)
+	if startGuardian < 0 || publishJournal < 0 || resetDeadline < 0 ||
+		startGuardian >= publishJournal || publishJournal >= resetDeadline {
+		t.Fatal("the rollback timer must already be active when the durable update journal is published")
+	}
+
+	const rollbackStart = "  cat > \"$ROLLBACK_SCRIPT\" <<'ROLLBACK'\n"
+	guardianStart := strings.Index(workerDaemon, rollbackStart)
+	if guardianStart < 0 {
+		t.Fatal("persistent rollback guardian was not found")
+	}
+	guardianStart += len(rollbackStart)
+	guardianEnd := strings.Index(workerDaemon[guardianStart:], "\nROLLBACK\n")
+	if guardianEnd < 0 {
+		t.Fatal("persistent rollback guardian end was not found")
+	}
+	guardian := workerDaemon[guardianStart : guardianStart+guardianEnd]
+	noMarkerStart := strings.Index(guardian, `[ -e "$MARKER" ] || {`)
+	noMarkerEnd := strings.Index(guardian[noMarkerStart:], "\n}\n[ -s \"$MARKER\" ]")
+	if noMarkerStart < 0 || noMarkerEnd < 0 {
+		t.Fatal("guardian no-journal failpoint branch was not found")
+	}
+	noMarker := guardian[noMarkerStart : noMarkerStart+noMarkerEnd]
+	if !strings.Contains(noMarker, "  cleanup_guardian") || !strings.Contains(noMarker, "  exit 0") ||
+		strings.Contains(noMarker, "systemctl start agentbox-worker.service") || strings.Contains(noMarker, `rm -f "$MARKER"`) {
+		t.Fatal("a guardian that owns an abandoned pre-publication update must clean up without starting or mutating the Worker")
+	}
+}
+
+func TestWorkerUpdatePersistsRecoveryBeforeActivePairMutation(t *testing.T) {
+	updateStart := strings.Index(workerDaemon, "update_worker() (")
+	updateEnd := strings.Index(workerDaemon[updateStart:], "\nagent_tool_command() {")
+	if updateStart < 0 || updateEnd < 0 {
+		t.Fatal("Worker self-update function boundary was not found")
+	}
+	updateBody := workerDaemon[updateStart : updateStart+updateEnd]
+	fallback := strings.Index(updateBody, `mv -f "$PREVIOUS_TMP" "$PREVIOUS"`)
+	persistFallback := strings.Index(updateBody, `worker_update_sync /usr/local/lib/agentbox`)
+	armGuardian := strings.Index(updateBody, `systemctl enable --now "$GUARDIAN_TIMER"`)
+	publishJournal := strings.Index(updateBody, `mv -f "$MARKER_TMP" "$MARKER"`)
+	persistGuardianRelative := -1
+	if armGuardian >= 0 {
+		persistGuardianRelative = strings.Index(updateBody[armGuardian:], `worker_update_sync /etc/systemd/system`)
+	}
+	if fallback < 0 || persistFallback < 0 || armGuardian < 0 || publishJournal < 0 || persistGuardianRelative < 0 ||
+		fallback >= persistFallback || persistFallback >= armGuardian ||
+		armGuardian+persistGuardianRelative >= publishJournal {
+		t.Fatal("fallback pair and active guardian must be durable before journal publication")
+	}
+	persistJournalRelative := strings.Index(updateBody[publishJournal:], `worker_update_sync "$STATE_DIR"`)
+	workerActivate := strings.Index(updateBody, `mv -f "$NEXT" /usr/local/bin/agentbox-worker`)
+	driverActivate := strings.Index(updateBody, `mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver`)
+	if persistJournalRelative < 0 || workerActivate < 0 || driverActivate < 0 {
+		t.Fatal("journal or active pair durability boundary was not found")
+	}
+	persistJournal := publishJournal + persistJournalRelative
+	persistActiveRelative := strings.Index(updateBody[driverActivate:], `worker_update_sync /usr/local/bin "$STATE_DIR"`)
+	restart := strings.Index(updateBody, `schedule_worker_restart "$JOB_ID"`)
+	if persistActiveRelative < 0 || restart < 0 || persistJournal >= workerActivate ||
+		workerActivate >= driverActivate || driverActivate+persistActiveRelative >= restart {
+		t.Fatal("journal must persist before pair mutation and the pair must persist before restart")
+	}
+	if !strings.Contains(workerDaemon, `sync -f "$SYNC_PATH" 2>/dev/null`) {
+		t.Fatal("Worker update durability helper must flush every referenced filesystem")
+	}
+}
+
+func TestWorkerUpdateFencesInteractiveSessionsDuringPairMutation(t *testing.T) {
+	updateStart := strings.Index(workerDaemon, "update_worker() (")
+	if updateStart < 0 {
+		t.Fatal("Worker self-update function was not found")
+	}
+	updateBody := workerDaemon[updateStart:]
+	pause := strings.Index(updateBody, `if ! pause_session_worker; then`)
+	workerActivate := strings.Index(updateBody, `mv -f "$NEXT" /usr/local/bin/agentbox-worker`)
+	driverActivate := strings.Index(updateBody, `mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver`)
+	if pause < 0 || workerActivate < 0 || driverActivate < 0 || pause >= workerActivate || workerActivate >= driverActivate {
+		t.Fatal("interactive sessions must stop before either active executable changes")
+	}
+	guardianStart := strings.Index(workerDaemon, `cat > "$ROLLBACK_SCRIPT" <<'ROLLBACK'`)
+	guardianEnd := strings.Index(workerDaemon[guardianStart:], "\nROLLBACK\n")
+	if guardianStart < 0 || guardianEnd < 0 {
+		t.Fatal("persistent rollback guardian was not found")
+	}
+	guardian := workerDaemon[guardianStart : guardianStart+guardianEnd]
+	stop := strings.Index(guardian, "systemctl stop agentbox-worker.service\n")
+	restore := strings.Index(guardian, `WORKER_RESTORE_TMP=/usr/local/bin/.agentbox-worker-restore`)
+	if stop < 0 || restore < 0 || stop >= restore {
+		t.Fatal("rollback guardian must stop the service cgroup before restoring the pair")
+	}
+}
+
+func TestWorkerManualRecoveryHandlesPhysicallyInvalidJournal(t *testing.T) {
+	recoveryStart := strings.Index(workerDaemon, "recover_worker_update() (")
+	recoveryEnd := strings.Index(workerDaemon[recoveryStart:], "\nrefresh_microsandbox_driver() (")
+	if recoveryStart < 0 || recoveryEnd < 0 {
+		t.Fatal("manual Worker recovery function was not found")
+	}
+	recovery := workerDaemon[recoveryStart : recoveryStart+recoveryEnd]
+	if !strings.Contains(recovery,
+		`if worker_update_marker_valid "$MARKER" && worker_update_fallback_valid "$MARKER"; then`) {
+		t.Fatal("shape-valid journals with impossible fallback checksums need a manual recovery path")
+	}
+	stop := strings.Index(recovery, `systemctl stop agentbox-worker.service`)
+	restore := strings.Index(recovery, `restore_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS"`)
+	if stop < 0 || restore < 0 || stop >= restore {
+		t.Fatal("manual recovery must stop sessions before restoring the fallback pair")
+	}
+}
+
+func TestWorkerRefreshesAnExistingMicrosandboxDriverWithoutKVM(t *testing.T) {
+	refreshStart := strings.Index(workerDaemon, "refresh_microsandbox_driver() (")
+	updateStart := strings.Index(workerDaemon, "update_worker() (")
+	if refreshStart < 0 || updateStart < 0 || refreshStart >= updateStart {
+		t.Fatal("Microsandbox driver refresh function was not found")
+	}
+	refresh := workerDaemon[refreshStart:updateStart]
+	for _, expected := range []string{
+		`[ ! -c /dev/kvm ]`,
+		`[ ! -e /usr/local/bin/agentbox-microsandbox-driver ]`,
+		`[ ! -L /usr/local/bin/agentbox-microsandbox-driver ]`,
+	} {
+		if !strings.Contains(refresh, expected) {
+			t.Fatalf("existing driver refresh without KVM is missing %q", expected)
+		}
+	}
+	if strings.Contains(refresh, `[ -c /dev/kvm ] || exit 0`) {
+		t.Fatal("temporary KVM loss must not silently retain an old installed driver")
+	}
+}
+
+func TestWorkerUpdateRecoveryOwnsCompletionWhileJournalExists(t *testing.T) {
+	start := strings.Index(workerDaemon, "    update-worker)\n")
+	if start < 0 {
+		t.Fatal("Worker update dispatch branch was not found")
+	}
+	end := strings.Index(workerDaemon[start:], "    configure-sandbox-proxy)\n")
+	if end < 0 {
+		t.Fatal("Worker update dispatch branch end was not found")
+	}
+	body := workerDaemon[start : start+end]
+	journal := strings.Index(body, `if [ -e "$STATE_DIR/worker-update.json" ]; then`)
+	genericCompletion := strings.Index(body, `complete_job_failure "$JOB_ID" worker_update_failed`)
+	if journal < 0 || genericCompletion < 0 || journal >= genericCompletion {
+		t.Fatal("a durable Worker update journal must suppress the generic failure completion")
+	}
+}
+
+func TestWorkerUpdateGuardianNeverStopsItselfWhileHoldingSharedLock(t *testing.T) {
+	start := strings.Index(workerDaemon, "cleanup_worker_update_guardian() {")
+	if start < 0 {
+		t.Fatal("Worker update guardian cleanup helper was not found")
+	}
+	end := strings.Index(workerDaemon[start:], "schedule_worker_restart() {")
+	if end < 0 {
+		t.Fatal("Worker update guardian cleanup helper end was not found")
+	}
+	body := workerDaemon[start : start+end]
+	if strings.Contains(body, `systemctl stop "$GUARDIAN_SERVICE"`) {
+		t.Fatal("Worker finalizer may deadlock by stopping a guardian waiting on its shared lock")
+	}
+	if !strings.Contains(body, `systemctl disable --now "$GUARDIAN_TIMER"`) {
+		t.Fatal("Worker finalizer must be able to disable the persistent rollback timer")
+	}
+	if !strings.Contains(body, `systemctl disable --now "$GUARDIAN_TIMER" >/dev/null 2>&1 || true`) ||
+		!strings.Contains(body, "  return 0\n") {
+		t.Fatal("Worker guardian cleanup must be idempotent when a unit was never installed")
+	}
+}
+
+func TestWorkerRecoversLegacyMixedWorkerDriverPair(t *testing.T) {
+	stateStart := strings.Index(workerDaemon, "worker_update_pair_state() (")
+	fallbackStart := strings.Index(workerDaemon, "worker_update_fallback_valid() (")
+	finalizeStart := strings.Index(workerDaemon, "finalize_worker_update() (")
+	if stateStart < 0 || fallbackStart < 0 || finalizeStart < 0 || stateStart >= fallbackStart {
+		t.Fatal("Worker update recovery functions were not found")
+	}
+	stateBody := workerDaemon[stateStart:fallbackStart]
+	for _, expected := range []string{
+		`worker_update_driver_matches_legacy "$DRIVER_UPDATED" "$DRIVER_CHECKSUM" && DRIVER_NEW=true`,
+		`worker_update_driver_previous_matches_legacy "$MARKER" && DRIVER_OLD=true`,
+		`[ "$WORKER_OLD" = true ] && [ "$DRIVER_OLD" = true ]`,
+	} {
+		if !strings.Contains(stateBody, expected) {
+			t.Fatalf("legacy physical pair classification is missing %q", expected)
+		}
+	}
+	finalizeBody := workerDaemon[finalizeStart:]
+	mixed := strings.Index(finalizeBody, "    mixed)\n")
+	if mixed < 0 {
+		t.Fatal("mixed Worker update recovery branch was not found")
+	}
+	mixedBody := finalizeBody[mixed:]
+	if !strings.Contains(mixedBody, `worker_update_fallback_valid "$MARKER"`) ||
+		!strings.Contains(mixedBody, `restore_worker_update "$WORKER_PREVIOUS" "$DRIVER_PREVIOUS"`) {
+		t.Fatal("legacy and current mixed pairs must validate their complete fallback before restoration")
+	}
+	mixedEnd := strings.Index(mixedBody, ";;\n")
+	if mixedEnd < 0 {
+		t.Fatal("mixed Worker update recovery branch end was not found")
+	}
+	if strings.Contains(mixedBody[:mixedEnd], `[ "$FORMAT_VERSION" = 2 ]`) {
+		t.Fatal("legacy mixed pairs must not be left unrecoverable by a format-2-only gate")
+	}
+}
+
+func TestWorkerExposesAndRepairsCorruptUpdateJournal(t *testing.T) {
+	for _, expected := range []string{
+		`worker-update-pending`,
+		`worker-update-degraded`,
+		`(.workerPreviousVersion | version)`,
+		`(.rollbackScript == "/var/lib/agentbox-worker/worker-update-rollback.sh")`,
+		`agentbox-worker recover-update --restore-previous`,
+		`recover-update) shift; recover_worker_update "$@"`,
+		`QUARANTINE="$STATE_DIR/worker-update.corrupt.$(date +%s).$$.json"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("corrupt Worker update recovery is missing %q", expected)
+		}
+	}
+	recoveryStart := strings.Index(workerDaemon, "recover_worker_update() (")
+	refreshStart := strings.Index(workerDaemon, "refresh_microsandbox_driver() (")
+	if recoveryStart < 0 || refreshStart < 0 || recoveryStart >= refreshStart {
+		t.Fatal("manual Worker update recovery function was not found")
+	}
+	body := workerDaemon[recoveryStart:refreshStart]
+	quarantine := strings.Index(body, `mv "$MARKER" "$QUARANTINE"`)
+	unlock := strings.Index(body, `flock -u 9`)
+	restart := strings.Index(body, `systemctl restart agentbox-worker.service`)
+	if quarantine < 0 || unlock < 0 || restart < 0 || quarantine >= unlock || unlock >= restart {
+		t.Fatal("manual recovery must quarantine the corrupt journal and release its lock before restart")
+	}
+	finalizeStart := strings.Index(workerDaemon, "finalize_worker_update() (")
+	finalizeEnd := strings.Index(workerDaemon[finalizeStart:], "restore_worker_binary()")
+	if finalizeStart < 0 || finalizeEnd < 0 {
+		t.Fatal("Worker update finalizer was not found")
+	}
+	finalizeBody := workerDaemon[finalizeStart : finalizeStart+finalizeEnd]
+	validate := strings.Index(finalizeBody, `worker_update_marker_valid "$MARKER" || exit 1`)
+	classify := strings.Index(finalizeBody, `PAIR_STATE=$(worker_update_pair_state "$MARKER")`)
+	if validate < 0 || classify < 0 || validate >= classify {
+		t.Fatal("corrupt Worker update journals must be rejected before physical pair classification")
+	}
+}
+
+func TestWorkerUpdateGuardianClearsJournalBeforeDisablingItself(t *testing.T) {
+	start := strings.Index(workerDaemon, `cat > "$ROLLBACK_SCRIPT" <<'ROLLBACK'`)
+	if start < 0 {
+		t.Fatal("persistent rollback guardian was not found")
+	}
+	end := strings.Index(workerDaemon[start:], "\nROLLBACK\n")
+	if end < 0 {
+		t.Fatal("persistent rollback guardian end was not found")
+	}
+	body := workerDaemon[start : start+end]
+	removeMarker := strings.Index(body, `rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed"`)
+	if removeMarker < 0 {
+		t.Fatal("confirmed rollback guardian marker cleanup was not found")
+	}
+	disableGuardian := strings.Index(body[removeMarker:], "  cleanup_guardian\n")
+	if disableGuardian < 0 {
+		t.Fatal("confirmed rollback guardian cleanup sequence was not found")
+	}
+	rollbackPhase := strings.Index(body, `PHASE_TMP="$MARKER.phase"`)
+	if rollbackPhase < 0 {
+		t.Fatal("rollback guardian phase journal was not found")
+	}
+	rollbackBody := body[rollbackPhase:]
+	report := strings.Index(rollbackBody, "report_rollback\n")
+	stopWorker := strings.Index(body, "systemctl stop agentbox-worker.service\n")
+	restoreWorker := strings.Index(body, `WORKER_RESTORE_TMP=/usr/local/bin/.agentbox-worker-restore`)
+	clearJournal := strings.Index(rollbackBody, `rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed"`)
+	unlock := strings.Index(rollbackBody, "flock -u 9\n")
+	startWorker := strings.Index(rollbackBody, "systemctl start agentbox-worker.service || exit 1\n")
+	if report < 0 || stopWorker < 0 || restoreWorker < 0 || clearJournal < 0 || unlock < 0 || startWorker < 0 ||
+		stopWorker >= restoreWorker || restoreWorker >= rollbackPhase || report >= clearJournal ||
+		clearJournal >= unlock || unlock >= startWorker {
+		t.Fatal("rollback guardian must stop, reconcile, clear, unlock and start the previous Worker in order")
+	}
+}
+
+func TestWorkerUpdateRollbackAttemptsBothBinaries(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available on this test host")
+	}
+	start := strings.Index(workerDaemon, "restore_worker_binary() {")
+	end := strings.Index(workerDaemon, "abort_worker_update() (")
+	if start < 0 || end < 0 || start >= end {
+		t.Fatal("Worker update restore helpers were not found")
+	}
+	restoreHelpers := workerDaemon[start:end]
+	mock := `install() {
+  printf 'install:%s\n' "$3"
+  [ "$FAIL_SOURCE" != "$3" ]
+}
+mv() { printf 'move:%s\n' "$2"; }
+rm() { printf 'remove:%s\n' "$*"; }
+worker_update_sync() { :; }
+`
+	for _, test := range []struct {
+		name, failSource, driverHadPrevious string
+		wantFailure                         bool
+	}{
+		{name: "both restored", driverHadPrevious: "true"},
+		{name: "worker restore fails", failSource: "worker.previous", driverHadPrevious: "true", wantFailure: true},
+		{name: "driver restore fails", failSource: "driver.previous", driverHadPrevious: "true", wantFailure: true},
+		{name: "new driver is removed", driverHadPrevious: "false"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			command := exec.CommandContext(t.Context(), sh, "-s")
+			command.Env = append(command.Environ(), "FAIL_SOURCE="+test.failSource,
+				"DRIVER_HAD_PREVIOUS="+test.driverHadPrevious)
+			command.Stdin = strings.NewReader("set -u\n" + mock + restoreHelpers +
+				`restore_worker_update worker.previous driver.previous true "$DRIVER_HAD_PREVIOUS"` + "\n")
+			output, err := command.CombinedOutput()
+			if test.wantFailure == (err == nil) {
+				t.Fatalf("restore result = (%q, %v), want failure %t", output, err, test.wantFailure)
+			}
+			if !strings.Contains(string(output), "install:worker.previous") {
+				t.Fatalf("Worker restore was not attempted: %q", output)
+			}
+			if test.driverHadPrevious == "true" && !strings.Contains(string(output), "install:driver.previous") {
+				t.Fatalf("driver restore was not attempted after Worker result: %q", output)
+			}
+			if test.driverHadPrevious == "false" && !strings.Contains(string(output), "agentbox-microsandbox-driver") {
+				t.Fatalf("new driver removal was not attempted: %q", output)
+			}
+		})
+	}
+}
+
+func TestWorkerUpdateClassifiesPhysicalWorkerDriverPair(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available on this test host")
+	}
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		t.Skip("sha256sum is not available on this test host")
+	}
+	start := strings.Index(workerDaemon, "worker_update_sha256() {")
+	end := strings.Index(workerDaemon, "update_worker_marker_phase() {")
+	if start < 0 || end < 0 || start >= end {
+		t.Fatal("Worker update pair classification helpers were not found")
+	}
+	helpers := workerDaemon[start:end]
+	helpers = strings.ReplaceAll(helpers, "/usr/local/bin/agentbox-worker", `"$TEST_WORKER_ACTIVE"`)
+	helpers = strings.ReplaceAll(helpers, "/usr/local/bin/agentbox-microsandbox-driver", `"$TEST_DRIVER_ACTIVE"`)
+	// Windows does not expose POSIX executable mode bits consistently to Git's
+	// shell, so this dynamic checksum/state test uses regular-file existence.
+	helpers = strings.ReplaceAll(helpers, `[ -x "$FILE" ]`, `[ -f "$FILE" ]`)
+	mock := `jq() {
+  case "$2" in
+    '.formatVersion // 1') printf 2 ;;
+    '.targetVersion // empty') printf v2 ;;
+    '.workerChecksum // empty') printf %s "$TEST_WORKER_CHECKSUM" ;;
+    '.workerPreviousChecksum // empty') printf %s "$TEST_WORKER_PREVIOUS_CHECKSUM" ;;
+    '.driverUpdated // false') printf true ;;
+    '.driverHadPrevious // false') printf %s "$DRIVER_HAD_PREVIOUS" ;;
+    '.driverChecksum // empty') printf %s "$TEST_DRIVER_CHECKSUM" ;;
+    '.driverPreviousChecksum // empty') printf %s "$TEST_DRIVER_PREVIOUS_CHECKSUM" ;;
+  esac
+}
+`
+	checksum := func(value string) string {
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+	}
+	for _, test := range []struct {
+		name, worker, driver, want string
+		driverHadPrevious          bool
+	}{
+		{name: "new pair", worker: "worker-new", driver: "driver-new", driverHadPrevious: true, want: "new"},
+		{name: "old pair", worker: "worker-old", driver: "driver-old", driverHadPrevious: true, want: "old"},
+		{name: "new Worker old driver", worker: "worker-new", driver: "driver-old", driverHadPrevious: true, want: "mixed"},
+		{name: "old Worker new driver", worker: "worker-old", driver: "driver-new", driverHadPrevious: true, want: "mixed"},
+		{name: "old Worker and absent former driver", worker: "worker-old", driverHadPrevious: false, want: "old"},
+		{name: "old Worker and unexpected new driver", worker: "worker-old", driver: "driver-new", driverHadPrevious: false, want: "mixed"},
+		{name: "unknown Worker", worker: "worker-damaged", driver: "driver-new", driverHadPrevious: true, want: "mixed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			workerActive := filepath.Join(dir, "agentbox-worker")
+			driverActive := filepath.Join(dir, "agentbox-microsandbox-driver")
+			marker := filepath.Join(dir, "marker.json")
+			if err := os.WriteFile(workerActive, []byte(test.worker), 0o755); err != nil {
+				t.Fatalf("write Worker: %v", err)
+			}
+			if test.driver != "" {
+				if err := os.WriteFile(driverActive, []byte(test.driver), 0o755); err != nil {
+					t.Fatalf("write driver: %v", err)
+				}
+			}
+			if err := os.WriteFile(marker, []byte("marker"), 0o600); err != nil {
+				t.Fatalf("write marker: %v", err)
+			}
+			command := exec.CommandContext(t.Context(), sh, "-s")
+			command.Env = append(command.Environ(),
+				"TEST_WORKER_ACTIVE="+filepath.ToSlash(workerActive),
+				"TEST_DRIVER_ACTIVE="+filepath.ToSlash(driverActive),
+				"TEST_WORKER_CHECKSUM="+checksum("worker-new"),
+				"TEST_WORKER_PREVIOUS_CHECKSUM="+checksum("worker-old"),
+				"TEST_DRIVER_CHECKSUM="+checksum("driver-new"),
+				"TEST_DRIVER_PREVIOUS_CHECKSUM="+checksum("driver-old"),
+				fmt.Sprintf("DRIVER_HAD_PREVIOUS=%t", test.driverHadPrevious),
+				"MARKER="+filepath.ToSlash(marker),
+			)
+			command.Stdin = strings.NewReader("set -eu\n" + mock + helpers + `worker_update_pair_state "$MARKER"` + "\n")
+			output, err := command.CombinedOutput()
+			if err != nil {
+				t.Fatalf("classify pair: %v: %s", err, output)
+			}
+			if got := string(output); got != test.want {
+				t.Fatalf("pair state = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestScheduledWorkerRollbackRestoresPairBeforeRestart(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available on this test host")
+	}
+	if _, err := exec.LookPath("sha256sum"); err != nil {
+		t.Skip("sha256sum is not available on this test host")
+	}
+	const rollbackStart = "  cat > \"$ROLLBACK_SCRIPT\" <<'ROLLBACK'\n"
+	start := strings.Index(workerDaemon, rollbackStart)
+	if start < 0 {
+		t.Fatal("scheduled Worker rollback script was not found")
+	}
+	start += len(rollbackStart)
+	end := strings.Index(workerDaemon[start:], "\nROLLBACK\n")
+	if end < 0 {
+		t.Fatal("scheduled Worker rollback script boundary was not found")
+	}
+	rollback := workerDaemon[start : start+end]
+	rollback = strings.Replace(rollback, "STATE_DIR=/var/lib/agentbox-worker", "STATE_DIR=$TEST_STATE_DIR", 1)
+	rollback = strings.Replace(rollback, "CONFIG=/etc/agentbox-worker.conf", "CONFIG=$TEST_CONFIG", 1)
+	rollback = strings.ReplaceAll(rollback, "/usr/local/bin/.agentbox-worker-restore", `"$TEST_WORKER_RESTORE_TMP"`)
+	rollback = strings.ReplaceAll(rollback, "/usr/local/bin/.agentbox-microsandbox-driver-restore", `"$TEST_DRIVER_RESTORE_TMP"`)
+	rollback = strings.ReplaceAll(rollback, "/usr/local/bin/agentbox-worker", `"$TEST_WORKER_ACTIVE"`)
+	rollback = strings.ReplaceAll(rollback, "/usr/local/bin/agentbox-microsandbox-driver", `"$TEST_DRIVER_ACTIVE"`)
+	rollback = strings.ReplaceAll(rollback, `[ -x "$1" ]`, `[ -f "$1" ]`)
+	mock := `jq() {
+  if [ "$1" != -r ]; then
+    printf '{}\n'
+    return
+  fi
+  case "$2" in
+    '.jobId // empty') printf job-one ;;
+    '.formatVersion // 1') printf 2 ;;
+	'.leaseGeneration // 0') printf 1 ;;
+    '.targetVersion // empty') printf v2 ;;
+	'.workerPreviousVersion // empty') printf v1 ;;
+    '.workerPrevious // empty') printf %s "$TEST_WORKER_PREVIOUS" ;;
+    '.workerChecksum // empty') printf %s "$TEST_WORKER_CHECKSUM" ;;
+    '.workerPreviousChecksum // empty') printf %s "$TEST_WORKER_PREVIOUS_CHECKSUM" ;;
+    '.driverUpdated // false') printf true ;;
+    '.driverHadPrevious // false') printf %s "$DRIVER_HAD_PREVIOUS" ;;
+    '.driverPrevious // empty') printf %s "$TEST_DRIVER_PREVIOUS" ;;
+    '.driverChecksum // empty') printf %s "$TEST_DRIVER_CHECKSUM" ;;
+    '.driverPreviousChecksum // empty') printf %s "$TEST_DRIVER_PREVIOUS_CHECKSUM" ;;
+  esac
+}
+install() {
+  printf 'install:%s\n' "$3"
+  [ "$FAIL_SOURCE" != "$3" ] || return 1
+  command cp "$3" "$4"
+  command chmod 0755 "$4"
+}
+mv() {
+  [ "$1" != -f ] || shift
+  printf 'move:%s\n' "$2"
+  command mv "$1" "$2"
+}
+flock() { printf 'flock:%s\n' "$*"; }
+systemctl() { printf 'systemctl:%s\n' "$*"; }
+curl() { printf 204; }
+`
+	checksum := func(value string) string {
+		return fmt.Sprintf("%x", sha256.Sum256([]byte(value)))
+	}
+	for _, test := range []struct {
+		name              string
+		fail              string
+		driverHadPrevious bool
+		corruptFallback   bool
+		wantFailure       bool
+	}{
+		{name: "pair restored", driverHadPrevious: true},
+		{name: "worker restore fails", fail: "worker", driverHadPrevious: true, wantFailure: true},
+		{name: "driver restore fails", fail: "driver", driverHadPrevious: true, wantFailure: true},
+		{name: "new driver removed", driverHadPrevious: false},
+		{name: "corrupt fallback rejected before mutation", driverHadPrevious: true, corruptFallback: true, wantFailure: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			stateDir := filepath.Join(dir, "state")
+			if err := os.Mkdir(stateDir, 0o755); err != nil {
+				t.Fatalf("create state directory: %v", err)
+			}
+			workerActive := filepath.Join(dir, "agentbox-worker")
+			workerPrevious := filepath.Join(dir, "worker.previous")
+			driverActive := filepath.Join(dir, "agentbox-microsandbox-driver")
+			driverPrevious := filepath.Join(dir, "driver.previous")
+			config := filepath.Join(dir, "agentbox-worker.conf")
+			marker := filepath.Join(stateDir, "worker-update.json")
+			for path, content := range map[string]string{
+				workerActive:   "worker-new",
+				workerPrevious: "worker-old",
+				driverActive:   "driver-new",
+				driverPrevious: "driver-old",
+				marker:         "marker",
+			} {
+				if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
+					t.Fatalf("write %s: %v", filepath.Base(path), err)
+				}
+			}
+			if err := os.WriteFile(config, []byte("http://agentbox.test\nserver-one\n"+strings.Repeat("c", 32)+"\n"), 0o600); err != nil {
+				t.Fatalf("write Worker config: %v", err)
+			}
+			if test.corruptFallback {
+				if err := os.WriteFile(driverPrevious, []byte("corrupt-driver"), 0o755); err != nil {
+					t.Fatalf("corrupt driver fallback: %v", err)
+				}
+			}
+			failSource := ""
+			switch test.fail {
+			case "worker":
+				failSource = filepath.ToSlash(workerPrevious)
+			case "driver":
+				failSource = filepath.ToSlash(driverPrevious)
+			}
+			command := exec.CommandContext(t.Context(), sh, "-s", "--", filepath.ToSlash(marker))
+			command.Env = append(command.Environ(),
+				"TEST_STATE_DIR="+filepath.ToSlash(stateDir),
+				"TEST_WORKER_ACTIVE="+filepath.ToSlash(workerActive),
+				"TEST_WORKER_PREVIOUS="+filepath.ToSlash(workerPrevious),
+				"TEST_WORKER_RESTORE_TMP="+filepath.ToSlash(filepath.Join(dir, "worker.restore")),
+				"TEST_DRIVER_ACTIVE="+filepath.ToSlash(driverActive),
+				"TEST_DRIVER_PREVIOUS="+filepath.ToSlash(driverPrevious),
+				"TEST_DRIVER_RESTORE_TMP="+filepath.ToSlash(filepath.Join(dir, "driver.restore")),
+				"TEST_WORKER_CHECKSUM="+checksum("worker-new"),
+				"TEST_WORKER_PREVIOUS_CHECKSUM="+checksum("worker-old"),
+				"TEST_DRIVER_CHECKSUM="+checksum("driver-new"),
+				"TEST_DRIVER_PREVIOUS_CHECKSUM="+checksum("driver-old"),
+				"TEST_CONFIG="+filepath.ToSlash(config),
+				fmt.Sprintf("DRIVER_HAD_PREVIOUS=%t", test.driverHadPrevious),
+				"FAIL_SOURCE="+failSource,
+			)
+			command.Stdin = strings.NewReader(mock + rollback + "\n")
+			output, err := command.CombinedOutput()
+			if test.wantFailure == (err == nil) {
+				t.Fatalf("scheduled rollback = (%q, %v), want failure %t", output, err, test.wantFailure)
+			}
+			outputText := string(output)
+			if test.corruptFallback {
+				if strings.Contains(outputText, "install:") {
+					t.Fatalf("corrupt pair was mutated before full fallback validation: %q", output)
+				}
+				return
+			}
+			if !strings.Contains(outputText, "install:"+filepath.ToSlash(workerPrevious)) {
+				t.Fatalf("scheduled rollback did not attempt Worker restore: %q", output)
+			}
+			if test.driverHadPrevious && !strings.Contains(outputText, "install:"+filepath.ToSlash(driverPrevious)) {
+				t.Fatalf("scheduled rollback did not attempt driver restore: %q", output)
+			}
+			if !test.wantFailure {
+				unlock := strings.Index(outputText, "flock:-u 9")
+				restart := strings.Index(outputText, "systemctl:start agentbox-worker.service")
+				if unlock < 0 || restart < 0 || unlock >= restart {
+					t.Fatalf("successful restore must release the shared lock before restart: %q", output)
+				}
+			} else if strings.Contains(outputText, "systemctl:start agentbox-worker.service") {
+				t.Fatalf("partial pair restore restarted Worker: %q", output)
+			}
+		})
+	}
+}
+
+func TestBackupRestoreGuideUsesQuiescedAtomicRecovery(t *testing.T) {
+	readmeBytes, err := os.ReadFile(filepath.Join("..", "..", "..", "README.md"))
+	if err != nil {
+		t.Fatalf("read README: %v", err)
+	}
+	_, guide, found := strings.Cut(string(readmeBytes), "## 备份与恢复")
+	if !found {
+		t.Fatal("README backup and restore guide was not found")
+	}
+	guide, _, _ = strings.Cut(guide, "## 核心能力")
+	for _, expected := range []string{
+		`set -eu`,
+		`backup_name=agentbox-backup-$(date -u +%Y%m%dT%H%M%SZ)`,
+		`backup_tmp=$(mktemp -d "./.${backup_name}.tmp.XXXXXX")`,
+		`sha256sum database.sql agentbox-secrets.tar.gz > SHA256SUMS`,
+		`mv "$backup_tmp" "$backup_final"`,
+		`backup_dir=./agentbox-backup-20260903T120000Z`,
+		`sha256sum -c SHA256SUMS`,
+		`docker compose stop app server`,
+		`pg_dump --format=plain --no-owner --no-privileges`,
+		`tar tzf /backup/agentbox-secrets.tar.gz`,
+		`/*|..|../*|*/../*|*/..)`,
+		`secret-key must be 43 raw or 44 padded base64 characters`,
+		`printf %s "$padded" | base64 -d`,
+		`test "$(wc -c < "$staging/decoded-key" | tr -d " ")" = 32`,
+		`find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} +`,
+		`cp -a "$staging/secret-key" /data/secret-key`,
+		`test -s /data/secret-key`,
+		`psql -v ON_ERROR_STOP=1`,
+		`--single-transaction`,
+		`DROP DATABASE IF EXISTS agentbox`,
+		`docker compose up -d --wait server app`,
+		`http://127.0.0.1:8091/healthz`,
+	} {
+		if !strings.Contains(guide, expected) {
+			t.Fatalf("safe backup/restore guide is missing %q", expected)
+		}
+	}
+	backupKeyValidation := strings.Index(guide, `test "$(wc -c < "$staging/decoded-key" | tr -d " ")" = 32`)
+	manifest := strings.Index(guide, `sha256sum database.sql agentbox-secrets.tar.gz > SHA256SUMS`)
+	publish := strings.Index(guide, `mv "$backup_tmp" "$backup_final"`)
+	if backupKeyValidation < 0 || manifest < 0 || publish < 0 ||
+		backupKeyValidation >= manifest || manifest >= publish {
+		t.Fatal("backup guide must validate the key and bind both artifacts before its atomic publish point")
+	}
+	restoreStart := strings.Index(guide, "恢复会替换目标实例")
+	if restoreStart < 0 {
+		t.Fatal("restore guide was not found")
+	}
+	restoreGuide := guide[restoreStart:]
+	databaseInputCheck := strings.Index(restoreGuide, `test -s "$backup_dir/database.sql"`)
+	archiveCheck := strings.Index(restoreGuide, `tar tzf /backup/agentbox-secrets.tar.gz > "$staging/archive.list"`)
+	keyValidation := strings.Index(restoreGuide, `test "$(wc -c < "$staging/decoded-key" | tr -d " ")" = 32`)
+	clearSecretVolume := strings.Index(restoreGuide, `find /data -mindepth 1 -maxdepth 1 -exec rm -rf {} +`)
+	databaseRestore := strings.Index(restoreGuide, `--single-transaction`)
+	restart := strings.Index(restoreGuide, `docker compose up -d --wait server app`)
+	if databaseInputCheck < 0 || archiveCheck < 0 || keyValidation < 0 || clearSecretVolume < 0 ||
+		databaseRestore < 0 || restart < 0 || databaseInputCheck >= archiveCheck ||
+		archiveCheck >= keyValidation || keyValidation >= clearSecretVolume ||
+		clearSecretVolume >= databaseRestore || databaseRestore >= restart {
+		t.Fatal("restore guide must validate both inputs and the complete key before destructive recovery or writer startup")
 	}
 }
 
@@ -1180,6 +1961,44 @@ func TestWorkerInjectsProxyBeforeAgentInstallationWithoutPersistingSecret(t *tes
 	clearExportIndex := strings.Index(configureBody, `'  set +a'`)
 	if setExportIndex < 0 || sourceIndex <= setExportIndex || clearExportIndex <= sourceIndex {
 		t.Fatal("Worker must export proxy variables while loading the proxy environment")
+	}
+}
+
+func TestWorkerNetworkPolicyDefaultsAreFailClosed(t *testing.T) {
+	for _, expected := range []string{
+		`effective_sandbox_network_policy()`,
+		`NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")`,
+		`restricted network is only supported by BoxLite`,
+		`unsupported network policy: $2`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker network policy guard is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerOwnsWorkspaceVolumesAndRemovesAnonymousVolumes(t *testing.T) {
+	for _, expected := range []string{
+		`docker volume create --label "agentbox.sandbox=$SANDBOX_ID" "$VOLUME"`,
+		`docker volume inspect -f '{{ index .Labels "agentbox.sandbox" }}' "$VOLUME"`,
+		`docker rm -f -v "$TARGET"`,
+		`docker rm -f -v "$BUILD_CONTAINER"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker Docker lifecycle is missing %q", expected)
+		}
+	}
+}
+
+func TestWorkerNormalizesEmptyNetworkPolicyBeforeValidation(t *testing.T) {
+	for _, expected := range []string{
+		`effective_sandbox_network_policy()`,
+		`elif [ "$1" = boxlite ]; then`,
+		`NETWORK=$(effective_sandbox_network_policy "$DRIVER"`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Worker network policy normalization is missing %q", expected)
+		}
 	}
 }
 

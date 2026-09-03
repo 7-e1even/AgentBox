@@ -50,6 +50,10 @@ func TestResourceGenerationsTrackDesiredAndObservedState(t *testing.T) {
 	if err != nil || job.ResourceGeneration != 1 {
 		t.Fatalf("job = %#v, error = %v", job, err)
 	}
+	firstTokenEpoch := job.ID
+	if job.Payload["runtimeTokenEpoch"] != firstTokenEpoch {
+		t.Fatalf("create job token epoch = %#v, want %q", job.Payload["runtimeTokenEpoch"], firstTokenEpoch)
+	}
 	if err := s.CompleteWorkerJob(ctx, serverID, credential, job.ID, platform.WorkerJobResult{
 		LeaseGeneration: job.LeaseGeneration, Success: true, ExternalID: "version-container",
 	}); err != nil {
@@ -58,6 +62,9 @@ func TestResourceGenerationsTrackDesiredAndObservedState(t *testing.T) {
 	sandbox, err = s.GetResource(ctx, sandbox.ID)
 	if err != nil || sandbox.ObservedGeneration != 1 {
 		t.Fatalf("completed resource = %#v, error = %v", sandbox, err)
+	}
+	if sandbox.Spec["runtimeModelTokenEpoch"] != firstTokenEpoch {
+		t.Fatalf("created sandbox token epoch = %#v, want %q", sandbox.Spec["runtimeModelTokenEpoch"], firstTokenEpoch)
 	}
 	if _, err := s.pool.Exec(ctx, `UPDATE control_resources SET spec = spec ||
     '{"automationRunId":"original-run","agentToolVersions":[{"tool":"codex","status":"ready"}]}'::jsonb WHERE id = $1`, sandbox.ID); err != nil {
@@ -71,7 +78,8 @@ func TestResourceGenerationsTrackDesiredAndObservedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Generation != 2 || updated.ObservedGeneration != 1 || updated.Spec["automationRunId"] != "original-run" || len(updated.Spec["agentToolVersions"].([]any)) != 1 {
+	if updated.Generation != 2 || updated.ObservedGeneration != 1 || updated.Spec["automationRunId"] != "original-run" ||
+		len(updated.Spec["agentToolVersions"].([]any)) != 1 || updated.Spec["runtimeModelTokenEpoch"] != firstTokenEpoch {
 		t.Fatalf("configuration update lost observations: %#v", updated)
 	}
 	if _, err := s.OperateSandbox(ctx, sandbox.ID, "restart"); err != nil {
@@ -81,12 +89,18 @@ func TestResourceGenerationsTrackDesiredAndObservedState(t *testing.T) {
 	if err != nil || job.ResourceGeneration != 2 {
 		t.Fatalf("new configuration job = %#v, error = %v", job, err)
 	}
+	if job.ID == firstTokenEpoch || job.Payload["runtimeTokenEpoch"] != job.ID {
+		t.Fatalf("restart job token epoch = %#v for job %q", job.Payload["runtimeTokenEpoch"], job.ID)
+	}
 	if err := s.CompleteWorkerJob(ctx, serverID, credential, job.ID, platform.WorkerJobResult{LeaseGeneration: job.LeaseGeneration, Success: true}); err != nil {
 		t.Fatal(err)
 	}
 	updated, err = s.GetResource(ctx, sandbox.ID)
 	if err != nil || updated.ObservedGeneration != 2 {
 		t.Fatalf("observed = %d, error = %v", updated.ObservedGeneration, err)
+	}
+	if updated.Spec["runtimeModelTokenEpoch"] != job.ID {
+		t.Fatalf("restarted sandbox token epoch = %#v, want %q", updated.Spec["runtimeModelTokenEpoch"], job.ID)
 	}
 }
 

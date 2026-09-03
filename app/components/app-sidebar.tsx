@@ -8,6 +8,7 @@ import {
   LayoutDashboardIcon,
   LayoutTemplateIcon,
   NetworkIcon,
+  PackageIcon,
   PlugZapIcon,
   ScrollTextIcon,
   ServerIcon,
@@ -22,7 +23,6 @@ import {
   Sidebar,
   SidebarContent,
   SidebarHeader,
-  SidebarRail,
 } from "@/components/ui/sidebar"
 import type { Resource } from "@/lib/platform-schema"
 import type { ManagedUser } from "@/lib/user-schema"
@@ -53,6 +53,7 @@ export function AppSidebar({
     {
       title: "配置",
       items: [
+        { title: "沙箱扩展", section: "extensions", icon: PackageIcon },
         ...(currentUser.preferences.showCapabilities
           ? ([
               { title: "模型服务", section: "access", icon: KeyRoundIcon },
@@ -88,7 +89,7 @@ export function AppSidebar({
   ]
 
   return (
-    <Sidebar collapsible="icon" variant="inset" {...props}>
+    <Sidebar collapsible="offcanvas" variant="inset" {...props}>
       <SidebarHeader>
         <TeamSwitcher
           projects={projects}
@@ -99,7 +100,6 @@ export function AppSidebar({
       <SidebarContent>
         <NavMain groups={groups} />
       </SidebarContent>
-      <SidebarRail />
     </Sidebar>
   )
 }

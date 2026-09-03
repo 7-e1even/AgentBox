@@ -35,6 +35,7 @@ const uploadChunkSize = 192 * 1024
 
 export const sandboxUploadMaxSize = 50 * 1024 * 1024
 export const sandboxFileReadMaxSize = 5 * 1024 * 1024
+export const sandboxSessionTicketTimeoutMs = 15_000
 
 export class SandboxSessionClient {
   private socket: WebSocket | null = null
@@ -42,6 +43,7 @@ export class SandboxSessionClient {
   private stateDetail: string | undefined
   private stopped = true
   private connectionGeneration = 0
+  private ticketRequestController: AbortController | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectResetTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectDelay = 1000
@@ -67,6 +69,7 @@ export class SandboxSessionClient {
     this.connectionGeneration += 1
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
+    this.abortTicketRequest()
     this.clearReconnectResetTimer()
     this.socket?.close(1000, "workspace closed")
     this.socket = null
@@ -82,6 +85,7 @@ export class SandboxSessionClient {
     this.connectionGeneration += 1
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.reconnectTimer = null
+    this.abortTicketRequest()
     this.clearReconnectResetTimer()
     const socket = this.socket
     this.socket = null
@@ -191,13 +195,24 @@ export class SandboxSessionClient {
   }
 
   private async connect() {
-    if (this.stopped || this.socket) return
+    if (this.stopped || this.socket || this.ticketRequestController) return
     const generation = this.connectionGeneration
+    const ticketRequestController = new AbortController()
+    let ticketRequestTimedOut = false
+    this.ticketRequestController = ticketRequestController
+    const ticketRequestTimeout = setTimeout(() => {
+      ticketRequestTimedOut = true
+      ticketRequestController.abort()
+    }, sandboxSessionTicketTimeoutMs)
     this.setState("connecting")
     try {
       const response = await fetch(
         `/api/sandboxes/${encodeURIComponent(this.sandboxId)}/session-ticket`,
-        { method: "POST", credentials: "include" }
+        {
+          method: "POST",
+          credentials: "include",
+          signal: ticketRequestController.signal,
+        }
       )
       const payload = await response.json().catch(() => null)
       const ticket =
@@ -212,7 +227,7 @@ export class SandboxSessionClient {
           payload,
           `无法创建沙箱会话（HTTP ${response.status}）`
         )
-        if (response.status === 401 || response.status === 403) {
+        if (!isRetryableSessionTicketFailure(payload, response.status)) {
           this.setState("error", detail)
           return
         }
@@ -222,9 +237,9 @@ export class SandboxSessionClient {
 
       const socket = new WebSocket(sessionURL(this.sandboxId, ticket))
       this.socket = socket
-      socket.addEventListener("message", (event) =>
-        this.handleMessage(event.data)
-      )
+      socket.addEventListener("message", (event) => {
+        if (this.socket === socket) this.handleMessage(event.data)
+      })
       socket.addEventListener("error", () => {
         if (this.socket === socket) this.setState("error", "实时会话连接失败")
       })
@@ -241,10 +256,20 @@ export class SandboxSessionClient {
         this.scheduleReconnect()
       })
     } catch (error) {
+      if (this.stopped || generation !== this.connectionGeneration) return
       this.socket = null
-      const detail = error instanceof Error ? error.message : "实时会话连接失败"
+      const detail = ticketRequestTimedOut
+        ? "创建沙箱会话超时"
+        : error instanceof Error
+          ? error.message
+          : "实时会话连接失败"
       this.setState("connecting", `${detail}，正在重试`)
       if (!this.stopped) this.scheduleReconnect()
+    } finally {
+      clearTimeout(ticketRequestTimeout)
+      if (this.ticketRequestController === ticketRequestController) {
+        this.ticketRequestController = null
+      }
     }
   }
 
@@ -363,6 +388,12 @@ export class SandboxSessionClient {
     this.reconnectResetTimer = null
   }
 
+  private abortTicketRequest() {
+    const controller = this.ticketRequestController
+    this.ticketRequestController = null
+    controller?.abort()
+  }
+
   private setState(state: SandboxSessionState, detail?: string) {
     if (this.state === state && this.stateDetail === detail) return
     this.state = state
@@ -392,6 +423,22 @@ function isRetryableSessionError(detail: string) {
     "transport error",
     "worker session unavailable",
   ].some((fragment) => normalized.includes(fragment))
+}
+
+function isRetryableSessionTicketFailure(payload: unknown, status: number) {
+  if (status === 401 || status === 403) return false
+  if (payload && typeof payload === "object" && "error" in payload) {
+    const error = payload.error
+    if (
+      error &&
+      typeof error === "object" &&
+      "retryable" in error &&
+      typeof error.retryable === "boolean"
+    ) {
+      return error.retryable
+    }
+  }
+  return status === 429 || status >= 500
 }
 
 function encodeBase64(bytes: Uint8Array) {

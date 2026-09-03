@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 
 	"agentbox/internal/platform"
 	"github.com/jackc/pgx/v5"
@@ -15,6 +16,7 @@ import (
 var sandboxCreationFields = []string{
 	"runtimeId", "serverId", "driver", "imageReference", "imageId", "cpu", "memory",
 	"desktop", "network", "workdir", "setup", "workspace",
+	"extensionIds",
 }
 
 func validateSandboxCreationSpec(ctx context.Context, tx pgx.Tx, id string, input map[string]any) error {
@@ -30,6 +32,15 @@ func validateSandboxCreationSpec(ctx context.Context, tx pgx.Tx, id string, inpu
 		return fmt.Errorf("decode sandbox creation configuration: %w", err)
 	}
 	for _, key := range sandboxCreationFields {
+		if key == "extensionIds" {
+			if !slices.Equal(specStringList(current, key), specStringList(input, key)) {
+				return &platform.ValidationError{Message: "沙箱创建后不能修改扩展；请创建新的沙箱"}
+			}
+			if _, exists := current[key]; !exists {
+				delete(input, key)
+			}
+			continue
+		}
 		if !reflect.DeepEqual(current[key], input[key]) {
 			return &platform.ValidationError{Message: fmt.Sprintf("沙箱创建后不能修改 %s；请创建新的沙箱", key)}
 		}
@@ -42,13 +53,17 @@ func validateSandboxCreationSpec(ctx context.Context, tx pgx.Tx, id string, inpu
 func persistSandboxCreationSpec(ctx context.Context, tx pgx.Tx, sandbox platform.Resource, payload map[string]any, driver, imageReference string) error {
 	snapshot := map[string]any{
 		"driver": driver, "imageReference": imageReference,
-		"cpu": "", "memory": "", "desktop": false, "network": "restricted",
+		"cpu": "", "memory": "", "desktop": false, "network": "egress",
 		"workdir": "/workspace", "setup": "", "workspace": "",
+		"extensionIds": []string{}, "extensionSnapshots": []platform.ExtensionDefinition{},
 	}
 	for key := range snapshot {
 		if value := payload[key]; value != nil {
 			snapshot[key] = value
 		}
+	}
+	if definitions := payload["extensions"]; definitions != nil {
+		snapshot["extensionSnapshots"] = definitions
 	}
 	if _, err := tx.Exec(ctx, `UPDATE control_resources SET spec = spec || $1::jsonb
     WHERE id = $2 AND kind = 'sandbox'`, mustMapJSON(snapshot), sandbox.ID); err != nil {

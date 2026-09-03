@@ -59,6 +59,7 @@ func TestViewerWriteRequestsAreForbidden(t *testing.T) {
 		{http.MethodDelete, "/api/resources/sandbox-one", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/actions/start", ""},
 		{http.MethodPatch, "/api/sandboxes/sandbox-one/network-proxy", `{"proxyId":"proxy-one"}`},
+		{http.MethodPatch, "/api/sandboxes/sandbox-one/model-source", `{"slotCredentialId":"primary","credentialId":"backup","modelId":"gpt-5.4","expectedCredentialId":"primary","expectedModelId":"gpt-5.3"}`},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/agent-tools/actions/update", `{"tools":["codex"]}`},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/session-ticket", ""},
 		{http.MethodPost, "/api/sandboxes/sandbox-one/desktop-ticket", ""},
@@ -119,6 +120,12 @@ func TestOperatorSandboxOperationsAreAllowed(t *testing.T) {
 		"/api/sandboxes/sandbox-one/network-proxy", `{"proxyId":"proxy-one"}`)
 	if response.Code != http.StatusAccepted {
 		t.Errorf("sandbox network proxy: status = %d, want %d (body = %s)", response.Code, http.StatusAccepted, response.Body.String())
+	}
+
+	response = rbacRequest(t, handler, http.MethodPatch,
+		"/api/sandboxes/sandbox-one/model-source", `{"slotCredentialId":"primary","credentialId":"backup","modelId":"gpt-5.4","expectedCredentialId":"primary","expectedModelId":"gpt-5.3"}`)
+	if response.Code != http.StatusOK {
+		t.Errorf("sandbox model source: status = %d, want %d (body = %s)", response.Code, http.StatusOK, response.Body.String())
 	}
 
 	response = rbacRequest(t, handler, http.MethodPost,

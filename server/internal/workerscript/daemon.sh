@@ -12,7 +12,7 @@ BOXLITE_SERVER_PID_FILE=$STATE_DIR/boxlite-serve.pid
 
 usage() {
   echo "usage: agentbox-worker setup --server <url> --token <pairing-token>" >&2
-  echo "       agentbox-worker run|status" >&2
+  echo "       agentbox-worker run|status|recover-update --restore-previous" >&2
   exit 2
 }
 
@@ -640,6 +640,14 @@ worker_capabilities() {
     [ -n "$CAPS" ] && CAPS="$CAPS,"
     CAPS="$CAPS\"interactive-session\""
   fi
+  [ -n "$CAPS" ] && CAPS="$CAPS,"
+  CAPS="$CAPS\"sandbox-extensions\""
+  if [ -e "$STATE_DIR/worker-update.json" ]; then
+    CAPS="$CAPS,\"worker-update-pending\""
+    if ! worker_update_marker_valid "$STATE_DIR/worker-update.json"; then
+      CAPS="$CAPS,\"worker-update-degraded\""
+    fi
+  fi
   printf '[%s]' "$CAPS"
 }
 
@@ -785,7 +793,9 @@ complete_job_failure() {
   ERROR_RETRYABLE=$4
   MESSAGE=$5
   ACTION=$6
-  ERROR_DETAILS=$(jq -cn --arg action "$ACTION" '{action:$action}')
+  WORKER_VERSION=${7:-}
+  ERROR_DETAILS=$(jq -cn --arg action "$ACTION" --arg workerVersion "$WORKER_VERSION" \
+    '{action:$action} + (if $workerVersion == "" then {} else {workerVersion:$workerVersion} end)')
   complete_job "$JOB_ID" false "" "$MESSAGE" "" /dev/null false false \
     "$ERROR_CODE" "$ERROR_STAGE" "$ERROR_RETRYABLE" "$ERROR_DETAILS"
 }
@@ -845,60 +855,476 @@ report_agent_tool_progress() {
   report_job_progress "$PROGRESS_STAGE" "$MESSAGE" "" "" "$TOOL" "$STATUS"
 }
 
-finalize_worker_update() {
+worker_update_lease_keepalive() {
+  while :; do
+    sleep 30
+    report_job_progress worker-update "Worker update is still in progress"
+  done
+}
+
+worker_update_marker_valid() {
+  MARKER=$1
+  [ -s "$MARKER" ] || return 1
+  jq -e '
+    def nonempty: type == "string" and length > 0;
+    def version: nonempty and startswith("v") and length <= 64;
+    def checksum: type == "string" and test("^[0-9A-Fa-f]{64}$");
+    (.jobId | nonempty) and
+    (.targetVersion | version) and
+    ((.formatVersion // 1) == 1 or (.formatVersion // 1) == 2) and
+    (if (.formatVersion // 1) == 2 then
+      (.leaseGeneration | type == "number" and . >= 0 and floor == .) and
+      ((.phase == "prepared") or (.phase == "worker-active") or
+       (.phase == "activated") or (.phase == "rolled-back")) and
+      (.workerPreviousVersion | version) and
+      (.rollbackScript == "/var/lib/agentbox-worker/worker-update-rollback.sh") and
+      (.workerPrevious == "/usr/local/lib/agentbox/agentbox-worker.previous") and
+      (.workerChecksum | checksum) and
+      (.workerPreviousChecksum | checksum) and
+      (.driverUpdated | type == "boolean") and
+      (.driverHadPrevious | type == "boolean") and
+      (.guardianTimer == "agentbox-worker-update-rollback.timer") and
+      (.guardianService == "agentbox-worker-update-rollback.service") and
+      (if .driverUpdated then
+        (.driverPrevious == "/usr/local/lib/agentbox/agentbox-microsandbox-driver.previous") and
+        (.driverChecksum | checksum) and
+        (if .driverHadPrevious then (.driverPreviousChecksum | checksum)
+         else .driverPreviousChecksum == "" end)
+       else true end)
+     else true end)
+  ' "$MARKER" >/dev/null 2>&1
+}
+
+worker_update_lock() {
+  command -v flock >/dev/null || {
+    echo "flock is required for crash-safe Worker updates" >&2
+    return 1
+  }
+  exec 9>"$STATE_DIR/worker-update.lock" || return 1
+  flock -x 9
+}
+
+worker_update_sync() {
+  command -v sync >/dev/null || {
+    echo "sync is required for crash-safe Worker updates" >&2
+    return 1
+  }
+  for SYNC_PATH in "$@"; do
+    [ -e "$SYNC_PATH" ] || return 1
+    if ! sync -f "$SYNC_PATH" 2>/dev/null; then
+      # BusyBox and older coreutils may not support -f. A full sync is slower,
+      # but still preserves the ordering contract before the next mutation.
+      sync
+      return
+    fi
+  done
+}
+
+worker_update_sha256() {
+  FILE=$1
+  [ -f "$FILE" ] || return 1
+  CHECKSUM=$(sha256sum "$FILE" 2>/dev/null | awk '{print $1}') || return 1
+  [ "${#CHECKSUM}" -eq 64 ] || return 1
+  case "$CHECKSUM" in *[!0-9A-Fa-f]*) return 1 ;; esac
+  printf '%s' "$CHECKSUM"
+}
+
+worker_update_file_matches() {
+  FILE=$1
+  EXPECTED_CHECKSUM=$2
+  [ -n "$EXPECTED_CHECKSUM" ] && [ -x "$FILE" ] || return 1
+  [ "$(worker_update_sha256 "$FILE" 2>/dev/null || true)" = "$EXPECTED_CHECKSUM" ]
+}
+
+worker_update_driver_absent() {
+  [ ! -e /usr/local/bin/agentbox-microsandbox-driver ] &&
+    [ ! -L /usr/local/bin/agentbox-microsandbox-driver ]
+}
+
+worker_update_driver_matches_legacy() {
+  DRIVER_UPDATED=$1
+  EXPECTED_CHECKSUM=$2
+  [ "$DRIVER_UPDATED" = true ] || return 0
+  [ -n "$EXPECTED_CHECKSUM" ] && [ -x /usr/local/bin/agentbox-microsandbox-driver ] || return 1
+  CURRENT_CHECKSUM=$(worker_update_legacy_checksum /usr/local/bin/agentbox-microsandbox-driver)
+  [ -n "$CURRENT_CHECKSUM" ] && [ "$CURRENT_CHECKSUM" = "$EXPECTED_CHECKSUM" ]
+}
+
+worker_update_legacy_checksum() {
+  [ -f "$1" ] || return 1
+  VALUE=$(cksum "$1" 2>/dev/null | awk '{print $1 ":" $2}') || return 1
+  [ -n "$VALUE" ] || return 1
+  printf '%s' "$VALUE"
+}
+
+worker_update_driver_previous_matches_legacy() (
+  MARKER=$1
+  DRIVER_UPDATED=$(jq -r '.driverUpdated // false' "$MARKER")
+  [ "$DRIVER_UPDATED" = true ] || exit 0
+  DRIVER_HAD_PREVIOUS=$(jq -r '.driverHadPrevious // false' "$MARKER")
+  if [ "$DRIVER_HAD_PREVIOUS" != true ]; then
+    worker_update_driver_absent
+    exit
+  fi
+  DRIVER_PREVIOUS=$(jq -r '.driverPrevious // "/usr/local/lib/agentbox/agentbox-microsandbox-driver.previous"' "$MARKER")
+  [ -x /usr/local/bin/agentbox-microsandbox-driver ] && [ -x "$DRIVER_PREVIOUS" ] || exit 1
+  CURRENT_CHECKSUM=$(worker_update_legacy_checksum /usr/local/bin/agentbox-microsandbox-driver)
+  PREVIOUS_CHECKSUM=$(worker_update_legacy_checksum "$DRIVER_PREVIOUS")
+  [ "$CURRENT_CHECKSUM" = "$PREVIOUS_CHECKSUM" ]
+)
+
+worker_update_pair_state() (
+  MARKER=$1
+  FORMAT_VERSION=$(jq -r '.formatVersion // 1' "$MARKER")
+  TARGET_VERSION=$(jq -r '.targetVersion // empty' "$MARKER")
+  DRIVER_UPDATED=$(jq -r '.driverUpdated // false' "$MARKER")
+  if [ "$FORMAT_VERSION" != 2 ]; then
+    CURRENT_VERSION=$(/usr/local/bin/agentbox-worker version 2>/dev/null || printf unknown)
+    PREVIOUS_VERSION=$(jq -r '.workerPreviousVersion // empty' "$MARKER")
+    DRIVER_CHECKSUM=$(jq -r '.driverChecksum // empty' "$MARKER")
+    WORKER_NEW=false
+    WORKER_OLD=false
+    [ "$CURRENT_VERSION" != "$TARGET_VERSION" ] || WORKER_NEW=true
+    if [ -n "$PREVIOUS_VERSION" ]; then
+      [ "$CURRENT_VERSION" != "$PREVIOUS_VERSION" ] || WORKER_OLD=true
+    elif [ "$CURRENT_VERSION" != unknown ] && [ "$CURRENT_VERSION" != "$TARGET_VERSION" ]; then
+      WORKER_OLD=true
+    fi
+    DRIVER_NEW=false
+    DRIVER_OLD=false
+    worker_update_driver_matches_legacy "$DRIVER_UPDATED" "$DRIVER_CHECKSUM" && DRIVER_NEW=true
+    worker_update_driver_previous_matches_legacy "$MARKER" && DRIVER_OLD=true
+    if [ "$WORKER_NEW" = true ] && [ "$DRIVER_NEW" = true ]; then
+      printf new
+    elif [ "$WORKER_OLD" = true ] && [ "$DRIVER_OLD" = true ]; then
+      printf old
+    else
+      printf mixed
+    fi
+    exit 0
+  fi
+
+  WORKER_CHECKSUM=$(jq -r '.workerChecksum // empty' "$MARKER")
+  WORKER_PREVIOUS_CHECKSUM=$(jq -r '.workerPreviousChecksum // empty' "$MARKER")
+  if worker_update_file_matches /usr/local/bin/agentbox-worker "$WORKER_CHECKSUM"; then
+    WORKER_STATE=new
+  elif worker_update_file_matches /usr/local/bin/agentbox-worker "$WORKER_PREVIOUS_CHECKSUM"; then
+    WORKER_STATE=old
+  else
+    WORKER_STATE=unknown
+  fi
+
+  if [ "$DRIVER_UPDATED" != true ]; then
+    DRIVER_NEW=true
+    DRIVER_OLD=true
+  else
+    DRIVER_CHECKSUM=$(jq -r '.driverChecksum // empty' "$MARKER")
+    DRIVER_HAD_PREVIOUS=$(jq -r '.driverHadPrevious // false' "$MARKER")
+    DRIVER_PREVIOUS_CHECKSUM=$(jq -r '.driverPreviousChecksum // empty' "$MARKER")
+    DRIVER_NEW=false
+    DRIVER_OLD=false
+    if worker_update_file_matches /usr/local/bin/agentbox-microsandbox-driver "$DRIVER_CHECKSUM"; then
+      DRIVER_NEW=true
+    fi
+    if [ "$DRIVER_HAD_PREVIOUS" = true ]; then
+      if worker_update_file_matches /usr/local/bin/agentbox-microsandbox-driver "$DRIVER_PREVIOUS_CHECKSUM"; then
+        DRIVER_OLD=true
+      fi
+    elif worker_update_driver_absent; then
+      DRIVER_OLD=true
+    fi
+  fi
+
+  if [ "$WORKER_STATE" = new ] && [ "$DRIVER_NEW" = true ]; then
+    printf new
+  elif [ "$WORKER_STATE" = old ] && [ "$DRIVER_OLD" = true ]; then
+    printf old
+  else
+    printf mixed
+  fi
+)
+
+worker_update_fallback_valid() (
+  MARKER=$1
+  FORMAT_VERSION=$(jq -r '.formatVersion // 1' "$MARKER")
+  WORKER_PREVIOUS=$(jq -r '.workerPrevious // "/usr/local/lib/agentbox/agentbox-worker.previous"' "$MARKER")
+  if [ "$FORMAT_VERSION" != 2 ]; then
+    [ -x "$WORKER_PREVIOUS" ] || exit 1
+    FALLBACK_VERSION=$("$WORKER_PREVIOUS" version 2>/dev/null || true)
+    PREVIOUS_VERSION=$(jq -r '.workerPreviousVersion // empty' "$MARKER")
+    TARGET_VERSION=$(jq -r '.targetVersion // empty' "$MARKER")
+    [ -n "$FALLBACK_VERSION" ] || exit 1
+    if [ -n "$PREVIOUS_VERSION" ]; then
+      [ "$FALLBACK_VERSION" = "$PREVIOUS_VERSION" ] || exit 1
+    else
+      [ "$FALLBACK_VERSION" != "$TARGET_VERSION" ] || exit 1
+    fi
+    DRIVER_UPDATED=$(jq -r '.driverUpdated // false' "$MARKER")
+    DRIVER_HAD_PREVIOUS=$(jq -r '.driverHadPrevious // false' "$MARKER")
+    if [ "$DRIVER_UPDATED" = true ] && [ "$DRIVER_HAD_PREVIOUS" = true ]; then
+      DRIVER_PREVIOUS=$(jq -r '.driverPrevious // "/usr/local/lib/agentbox/agentbox-microsandbox-driver.previous"' "$MARKER")
+      [ -x "$DRIVER_PREVIOUS" ] && worker_update_legacy_checksum "$DRIVER_PREVIOUS" >/dev/null
+    fi
+    exit
+  fi
+  WORKER_PREVIOUS_CHECKSUM=$(jq -r '.workerPreviousChecksum // empty' "$MARKER")
+  worker_update_file_matches "$WORKER_PREVIOUS" "$WORKER_PREVIOUS_CHECKSUM" || exit 1
+  DRIVER_UPDATED=$(jq -r '.driverUpdated // false' "$MARKER")
+  DRIVER_HAD_PREVIOUS=$(jq -r '.driverHadPrevious // false' "$MARKER")
+  if [ "$DRIVER_UPDATED" = true ] && [ "$DRIVER_HAD_PREVIOUS" = true ]; then
+    DRIVER_PREVIOUS=$(jq -r '.driverPrevious // empty' "$MARKER")
+    DRIVER_PREVIOUS_CHECKSUM=$(jq -r '.driverPreviousChecksum // empty' "$MARKER")
+    worker_update_file_matches "$DRIVER_PREVIOUS" "$DRIVER_PREVIOUS_CHECKSUM"
+  fi
+)
+
+update_worker_marker_phase() {
+  MARKER=$1
+  PHASE=$2
+  PHASE_TMP="$MARKER.phase"
+  jq --arg phase "$PHASE" '.phase = $phase' "$MARKER" > "$PHASE_TMP" &&
+    mv -f "$PHASE_TMP" "$MARKER" &&
+    worker_update_sync "$(dirname "$MARKER")"
+}
+
+cleanup_worker_update_guardian() {
+  JOB_ID=$1
+  GUARDIAN_TIMER=$2
+  GUARDIAN_SERVICE=$3
+  if [ -n "$GUARDIAN_TIMER" ]; then
+    [ "$GUARDIAN_TIMER" = agentbox-worker-update-rollback.timer ] &&
+      [ "$GUARDIAN_SERVICE" = agentbox-worker-update-rollback.service ] || return 1
+    systemctl disable --now "$GUARDIAN_TIMER" >/dev/null 2>&1 || true
+    # Do not synchronously stop the guardian while holding its shared lock. If
+    # it was already triggered, it will acquire the lock after this caller
+    # removes or updates the marker and then exit without touching the pair.
+    rm -f /etc/systemd/system/agentbox-worker-update-rollback.timer \
+      /etc/systemd/system/agentbox-worker-update-rollback.service \
+      /etc/systemd/system/agentbox-worker.service.d/agentbox-restart.conf \
+      "$STATE_DIR/worker-update-start-guard.sh"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    return 0
+  fi
+  systemctl stop "agentbox-worker-update-$JOB_ID.timer" \
+    "agentbox-worker-update-$JOB_ID.service" >/dev/null 2>&1 || true
+  return 0
+}
+
+schedule_worker_restart() {
+  JOB_ID=$1
+  if systemd-run --quiet --unit="agentbox-worker-restart-$JOB_ID" --on-active=1s \
+      /bin/systemctl restart agentbox-worker.service; then
+    return 0
+  fi
+  systemctl start "agentbox-worker-restart-$JOB_ID.service" >/dev/null 2>&1
+}
+
+finalize_worker_update() (
   MARKER="$STATE_DIR/worker-update.json"
-  [ -s "$MARKER" ] || return 0
+  [ -e "$MARKER" ] || exit 0
+  worker_update_lock || exit 1
+  [ -s "$MARKER" ] || exit 1
+  worker_update_marker_valid "$MARKER" || exit 1
   JOB_ID=$(jq -r '.jobId // empty' "$MARKER")
   LEASE_GENERATION=$(jq -r '.leaseGeneration // 0' "$MARKER")
   TARGET_VERSION=$(jq -r '.targetVersion // empty' "$MARKER")
+  PREVIOUS_VERSION=$(jq -r '.workerPreviousVersion // empty' "$MARKER")
   ROLLBACK_SCRIPT=$(jq -r '.rollbackScript // empty' "$MARKER")
-  [ -n "$JOB_ID" ] && [ -n "$TARGET_VERSION" ] || return 0
-  CURRENT_VERSION=$(/usr/local/bin/agentbox-worker version 2>/dev/null || printf unknown)
+  GUARDIAN_TIMER=$(jq -r '.guardianTimer // empty' "$MARKER")
+  GUARDIAN_SERVICE=$(jq -r '.guardianService // empty' "$MARKER")
+  DRIVER_UPDATED=$(jq -r '.driverUpdated // false' "$MARKER")
+  [ -n "$JOB_ID" ] && [ -n "$TARGET_VERSION" ] || exit 1
+  PAIR_STATE=$(worker_update_pair_state "$MARKER") || exit 1
   CONFIRMED="$STATE_DIR/worker-update-confirmed"
-  if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
-    # Confirm only after the Server has accepted the completion report: if this
-    # process is alive but cannot talk to the Server (protocol mismatch), the
-    # pending rollback must still fire.
-    if complete_job "$JOB_ID" true "" "Worker 已更新到 $TARGET_VERSION"; then
-      # The rollback script may have been generated by an older Worker and can
-      # race with this process. Once the Server accepts the new Worker, seal the
-      # accepted binary as the fallback so a late rollback cannot downgrade it.
-      install -m 0755 /usr/local/bin/agentbox-worker \
-        /usr/local/lib/agentbox/agentbox-worker.previous || return 1
-      printf '%s\n' "$JOB_ID" > "$CONFIRMED"
-      if systemctl stop "agentbox-worker-update-$JOB_ID.timer" \
-          "agentbox-worker-update-$JOB_ID.service" >/dev/null 2>&1; then
-        rm -f "$MARKER" "$CONFIRMED"
-        [ -z "$ROLLBACK_SCRIPT" ] || rm -f "$ROLLBACK_SCRIPT"
-      else
-        # If systemd could not cancel the scheduled check, keep the confirmed
-        # marker until that check observes it. Removing only the job marker also
-        # makes a not-yet-started check exit without restoring the old binary.
-        rm -f "$MARKER"
+  CONFIRMED_TMP="$STATE_DIR/.worker-update-confirmed"
+
+  case "$PAIR_STATE" in
+    new)
+      # Do not accept the on-disk pair from the old in-memory process before
+      # systemd has actually started the downloaded Worker.
+      [ "${AGENTBOX_WORKER_VERSION:-unknown}" = "$TARGET_VERSION" ] || exit 0
+      printf '%s\n' "$JOB_ID" > "$CONFIRMED_TMP" || exit 1
+      if ! complete_job "$JOB_ID" true "" "Worker 已更新到 $TARGET_VERSION"; then
+        rm -f "$CONFIRMED_TMP"
+        exit 1
       fi
-    fi
-  elif complete_job_failure "$JOB_ID" worker_update_rolled_back worker-update true \
-      "Worker 更新已回滚，当前版本 $CURRENT_VERSION" update-worker; then
-    rm -f "$MARKER" "$CONFIRMED"
-    [ -z "$ROLLBACK_SCRIPT" ] || rm -f "$ROLLBACK_SCRIPT"
-  fi
-}
+      mv -f "$CONFIRMED_TMP" "$CONFIRMED" || exit 1
+      # The missing journal is the guardian's idempotent stop condition. Remove
+      # it while holding the shared lock before disabling the timer, so a crash
+      # cannot leave a pending journal without a recovery owner.
+      rm -f "$MARKER" || exit 1
+      worker_update_sync "$STATE_DIR" || exit 1
+      cleanup_worker_update_guardian "$JOB_ID" "$GUARDIAN_TIMER" "$GUARDIAN_SERVICE" || true
+      rm -f "$CONFIRMED" "$ROLLBACK_SCRIPT"
+      # The update is now accepted and no rollback reader can depend on the old
+      # backup pair. Refresh the fallback used by the next update only after
+      # removing this update's journal.
+      COMMIT_OK=true
+      install -m 0755 /usr/local/bin/agentbox-worker \
+        /usr/local/lib/agentbox/.agentbox-worker.previous &&
+        mv -f /usr/local/lib/agentbox/.agentbox-worker.previous \
+          /usr/local/lib/agentbox/agentbox-worker.previous || COMMIT_OK=false
+      if [ "$DRIVER_UPDATED" = true ]; then
+        install -m 0755 /usr/local/bin/agentbox-microsandbox-driver \
+          /usr/local/lib/agentbox/.agentbox-microsandbox-driver.previous &&
+          mv -f /usr/local/lib/agentbox/.agentbox-microsandbox-driver.previous \
+            /usr/local/lib/agentbox/agentbox-microsandbox-driver.previous || COMMIT_OK=false
+      fi
+      if [ "$COMMIT_OK" != true ]; then
+        echo "warning: Worker update was accepted but its fallback pair could not be committed" >&2
+      fi
+      ;;
+    old)
+      CURRENT_VERSION=$(/usr/local/bin/agentbox-worker version 2>/dev/null || printf unknown)
+      [ -n "$PREVIOUS_VERSION" ] || PREVIOUS_VERSION=$CURRENT_VERSION
+      if complete_job_failure "$JOB_ID" worker_update_rolled_back worker-update true \
+          "Worker 更新已回滚，当前版本 $CURRENT_VERSION" update-worker "$CURRENT_VERSION"; then
+        rm -f "$MARKER" || exit 1
+        worker_update_sync "$STATE_DIR" || exit 1
+        cleanup_worker_update_guardian "$JOB_ID" "$GUARDIAN_TIMER" "$GUARDIAN_SERVICE" || true
+        rm -f "$CONFIRMED" "$CONFIRMED_TMP" "$ROLLBACK_SCRIPT"
+        # Exit the new in-memory process only after the rollback result is
+        # durable. Restart=always then execs the restored previous binary.
+        [ "${AGENTBOX_WORKER_VERSION:-unknown}" = "$PREVIOUS_VERSION" ] || exit 75
+      fi
+      ;;
+    mixed)
+      worker_update_fallback_valid "$MARKER" || exit 1
+      WORKER_PREVIOUS=$(jq -r '.workerPrevious // "/usr/local/lib/agentbox/agentbox-worker.previous"' "$MARKER")
+      DRIVER_PREVIOUS=$(jq -r '.driverPrevious // "/usr/local/lib/agentbox/agentbox-microsandbox-driver.previous"' "$MARKER")
+      DRIVER_HAD_PREVIOUS=$(jq -r '.driverHadPrevious // false' "$MARKER")
+      restore_worker_update "$WORKER_PREVIOUS" "$DRIVER_PREVIOUS" \
+        "$DRIVER_UPDATED" "$DRIVER_HAD_PREVIOUS" || exit 1
+      [ "$(worker_update_pair_state "$MARKER")" = old ] || exit 1
+      update_worker_marker_phase "$MARKER" rolled-back || exit 1
+      ;;
+  esac
+)
 
 restore_worker_binary() {
   PREVIOUS=$1
   RESTORE_TMP=/usr/local/bin/.agentbox-worker-restore
-  install -m 0755 "$PREVIOUS" "$RESTORE_TMP"
+  install -m 0755 "$PREVIOUS" "$RESTORE_TMP" || return 1
   mv -f "$RESTORE_TMP" /usr/local/bin/agentbox-worker
 }
 
-refresh_microsandbox_driver() {
-  [ -c /dev/kvm ] || return 0
+restore_microsandbox_driver() {
+  PREVIOUS=$1
+  HAD_PREVIOUS=$2
+  RESTORE_TMP=/usr/local/bin/.agentbox-microsandbox-driver-restore
+  if [ "$HAD_PREVIOUS" = true ]; then
+    install -m 0755 "$PREVIOUS" "$RESTORE_TMP" || return 1
+    mv -f "$RESTORE_TMP" /usr/local/bin/agentbox-microsandbox-driver
+  else
+    rm -f "$RESTORE_TMP" /usr/local/bin/agentbox-microsandbox-driver
+  fi
+}
+
+restore_worker_update() (
+  WORKER_PREVIOUS=$1
+  DRIVER_PREVIOUS=$2
+  DRIVER_UPDATED=$3
+  DRIVER_HAD_PREVIOUS=$4
+  RESTORE_FAILED=false
+  restore_worker_binary "$WORKER_PREVIOUS" || RESTORE_FAILED=true
+  if [ "$DRIVER_UPDATED" = true ]; then
+    restore_microsandbox_driver "$DRIVER_PREVIOUS" "$DRIVER_HAD_PREVIOUS" || RESTORE_FAILED=true
+  fi
+  [ "$RESTORE_FAILED" = false ] || exit 1
+  worker_update_sync /usr/local/bin
+)
+
+abort_worker_update() (
+  WORKER_PREVIOUS=$1
+  DRIVER_PREVIOUS=$2
+  DRIVER_UPDATED=$3
+  DRIVER_HAD_PREVIOUS=$4
+  JOB_ID=$5
+  MARKER=$6
+  CONFIRMED=$7
+  ROLLBACK_SCRIPT=$8
+  WORKER_TMP=$9
+  shift 9
+  WORKER_NEXT=$1
+  DRIVER_NEXT=$2
+  MARKER_TMP=$3
+  if ! worker_update_fallback_valid "$MARKER"; then
+    echo "previous Worker/driver pair failed validation; refusing a partial rollback" >&2
+    return 1
+  fi
+  if ! restore_worker_update "$WORKER_PREVIOUS" "$DRIVER_PREVIOUS" \
+      "$DRIVER_UPDATED" "$DRIVER_HAD_PREVIOUS"; then
+    echo "failed to restore the previous Worker and Microsandbox driver pair" >&2
+    return 1
+  fi
+  # Remove the marker before cancelling units. Even if systemd cannot stop a
+  # not-yet-started check, it will see no job id and leave the restored pair in place.
+  rm -f "$MARKER" "$CONFIRMED" "$MARKER_TMP" "$WORKER_TMP" "$WORKER_NEXT" "$DRIVER_NEXT"
+  worker_update_sync "$STATE_DIR" || return 1
+  cleanup_worker_update_guardian "$JOB_ID" agentbox-worker-update-rollback.timer \
+    agentbox-worker-update-rollback.service || true
+  rm -f "$ROLLBACK_SCRIPT"
+)
+
+recover_worker_update() (
+  [ "${1:-}" = --restore-previous ] || usage
+  [ "$(id -u)" = 0 ] || { echo "Worker update recovery must run as root" >&2; exit 1; }
+  MARKER="$STATE_DIR/worker-update.json"
+  [ -e "$MARKER" ] || { echo "No Worker update journal requires recovery."; exit 0; }
+  worker_update_lock || exit 1
+  [ -e "$MARKER" ] || exit 0
+  if worker_update_marker_valid "$MARKER" && worker_update_fallback_valid "$MARKER"; then
+    echo "Worker update journal is valid; automatic recovery is still active." >&2
+    exit 1
+  fi
+  PREVIOUS=/usr/local/lib/agentbox/agentbox-worker.previous
+  DRIVER_PREVIOUS=/usr/local/lib/agentbox/agentbox-microsandbox-driver.previous
+  [ -x "$PREVIOUS" ] || {
+    echo "Previous Worker backup is unavailable; reinstall the Worker before discarding the journal." >&2
+    exit 1
+  }
+  PREVIOUS_VERSION=$("$PREVIOUS" version 2>/dev/null || true)
+  case "$PREVIOUS_VERSION" in v*) ;; *) echo "Previous Worker backup is invalid." >&2; exit 1 ;; esac
+  DRIVER_HAD_PREVIOUS=false
+  [ ! -e "$DRIVER_PREVIOUS" ] && [ ! -L "$DRIVER_PREVIOUS" ] || {
+    [ -x "$DRIVER_PREVIOUS" ] || {
+      echo "Previous Microsandbox driver backup is invalid." >&2
+      exit 1
+    }
+    DRIVER_HAD_PREVIOUS=true
+  }
+  systemctl stop agentbox-worker.service
+  restore_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" true "$DRIVER_HAD_PREVIOUS" || {
+    echo "Failed to restore the previous Worker/driver pair; journal was retained." >&2
+    exit 1
+  }
+  QUARANTINE="$STATE_DIR/worker-update.corrupt.$(date +%s).$$.json"
+  mv "$MARKER" "$QUARANTINE" || exit 1
+  rm -f "$STATE_DIR/worker-update-confirmed" "$STATE_DIR/.worker-update-confirmed" \
+    "$STATE_DIR/worker-update.json.phase"
+  worker_update_sync "$STATE_DIR" || exit 1
+  cleanup_worker_update_guardian "manual" agentbox-worker-update-rollback.timer \
+    agentbox-worker-update-rollback.service || true
+  flock -u 9
+  exec 9>&-
+  systemctl restart agentbox-worker.service
+  echo "Restored Worker $PREVIOUS_VERSION; corrupt journal quarantined at $QUARANTINE"
+)
+
+refresh_microsandbox_driver() (
+  DRIVER_NEXT=$1
+  rm -f "$DRIVER_NEXT"
+  if [ ! -c /dev/kvm ] &&
+     [ ! -e /usr/local/bin/agentbox-microsandbox-driver ] &&
+     [ ! -L /usr/local/bin/agentbox-microsandbox-driver ]; then
+    exit 0
+  fi
   command -v go >/dev/null || { echo "Go is required to update the Microsandbox driver" >&2; return 1; }
   command -v gcc >/dev/null || { echo "a C compiler is required to update the Microsandbox driver" >&2; return 1; }
   install -d -m 0700 "$STATE_DIR/go" "$STATE_DIR/go-mod-cache" "$STATE_DIR/go-build-cache"
   BUILD_DIR=$(mktemp -d "$STATE_DIR/microsandbox-driver.XXXXXX") || return 1
+  trap 'rm -rf "$BUILD_DIR"' EXIT
   if ! curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$BUILD_DIR/main.go"; then
-    rm -rf "$BUILD_DIR"
     return 1
   fi
   cat > "$BUILD_DIR/go.mod" <<'EOF'
@@ -919,23 +1345,20 @@ EOF
     CGO_ENABLED=1 go build -tags agentbox_driver -trimpath -ldflags '-s -w' -o agentbox-microsandbox-driver .
     ./agentbox-microsandbox-driver probe >/dev/null
   ); then
-    rm -rf "$BUILD_DIR"
     return 1
   fi
-  DRIVER_NEXT=/usr/local/bin/.agentbox-microsandbox-driver-next
   install -m 0755 "$BUILD_DIR/agentbox-microsandbox-driver" "$DRIVER_NEXT" || {
-    rm -rf "$BUILD_DIR" "$DRIVER_NEXT"
+    rm -f "$DRIVER_NEXT"
     return 1
   }
-  mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver
-  rm -rf "$BUILD_DIR"
-}
+)
 
-update_worker() {
+update_worker() (
   JOB_FILE=$1
   JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
   LEASE_GENERATION=$(jq -r '.job.leaseGeneration // 0' "$JOB_FILE")
   TARGET_VERSION=$(jq -r '.job.payload.version // empty' "$JOB_FILE")
+  EXPECTED_PREVIOUS_VERSION=$(jq -r '.job.payload.previousVersion // empty' "$JOB_FILE")
   case "$TARGET_VERSION" in
     v[0-9A-Za-z]*) ;;
     *) echo "invalid Worker target version" >&2; return 1 ;;
@@ -948,6 +1371,24 @@ update_worker() {
     aarch64|arm64) ARCH=arm64 ;;
     *) echo "unsupported architecture: $(uname -m)" >&2; return 1 ;;
   esac
+  command -v sha256sum >/dev/null || {
+    echo "sha256sum is required for crash-safe Worker updates" >&2
+    return 1
+  }
+  command -v flock >/dev/null || {
+    echo "flock is required for crash-safe Worker updates" >&2
+    return 1
+  }
+
+  report_job_progress worker-update "Preparing Worker update"
+  worker_update_lease_keepalive &
+  LEASE_KEEPALIVE_PID=$!
+  cleanup_worker_update_lease() {
+    kill "$LEASE_KEEPALIVE_PID" >/dev/null 2>&1 || true
+    wait "$LEASE_KEEPALIVE_PID" >/dev/null 2>&1 || true
+  }
+  trap cleanup_worker_update_lease EXIT
+  trap 'exit 1' INT TERM
 
   WORKER_TMP=$(mktemp "$STATE_DIR/agentbox-worker.XXXXXX") || return 1
   WORKER_HEADERS=$(mktemp "$STATE_DIR/agentbox-worker-headers.XXXXXX") || { rm -f "$WORKER_TMP"; return 1; }
@@ -959,13 +1400,12 @@ update_worker() {
   EXPECTED_SHA256=$(tr -d '\r' < "$WORKER_HEADERS" |
     sed -n 's/^[Xx]-[Cc]hecksum-[Ss]ha256:[[:space:]]*\([0-9A-Fa-f]\{1,\}\).*/\1/p' | head -n 1)
   rm -f "$WORKER_HEADERS"
+  ACTUAL_SHA256=$(worker_update_sha256 "$WORKER_TMP") || {
+    echo "failed to checksum the downloaded Worker" >&2
+    rm -f "$WORKER_TMP"
+    return 1
+  }
   if [ -n "$EXPECTED_SHA256" ]; then
-    command -v sha256sum >/dev/null || {
-      echo "sha256sum is required to verify the downloaded Worker" >&2
-      rm -f "$WORKER_TMP"
-      return 1
-    }
-    ACTUAL_SHA256=$(sha256sum "$WORKER_TMP" | cut -d ' ' -f 1)
     if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
       echo "downloaded Worker checksum mismatch (expected $EXPECTED_SHA256, got $ACTUAL_SHA256)" >&2
       rm -f "$WORKER_TMP"
@@ -981,90 +1421,481 @@ update_worker() {
     rm -f "$WORKER_TMP"
     return 1
   }
-  refresh_microsandbox_driver || {
-    rm -f "$WORKER_TMP"
+  DRIVER_NEXT=/usr/local/bin/.agentbox-microsandbox-driver-next
+  refresh_microsandbox_driver "$DRIVER_NEXT" || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
     echo "failed to refresh the Microsandbox driver" >&2
     return 1
   }
 
-  install -d -m 0755 /usr/local/lib/agentbox
-  PREVIOUS=/usr/local/lib/agentbox/agentbox-worker.previous
-  PREVIOUS_TMP=/usr/local/lib/agentbox/.agentbox-worker.previous
-  install -m 0755 /usr/local/bin/agentbox-worker "$PREVIOUS_TMP" || { rm -f "$WORKER_TMP"; return 1; }
-  mv -f "$PREVIOUS_TMP" "$PREVIOUS" || { rm -f "$WORKER_TMP"; return 1; }
-  NEXT=/usr/local/bin/.agentbox-worker-next
-  install -m 0755 "$WORKER_TMP" "$NEXT" || { rm -f "$WORKER_TMP"; return 1; }
-  mv -f "$NEXT" /usr/local/bin/agentbox-worker || { rm -f "$WORKER_TMP" "$NEXT"; return 1; }
-  rm -f "$STATE_DIR/worker-update-confirmed"
-
-  MARKER="$STATE_DIR/worker-update.json"
-  ROLLBACK_SCRIPT="$STATE_DIR/worker-update-rollback-$JOB_ID.sh"
-  MARKER_TMP="$STATE_DIR/.worker-update.json"
-  jq -n --arg jobId "$JOB_ID" --argjson leaseGeneration "$LEASE_GENERATION" \
-	--arg targetVersion "$TARGET_VERSION" \
-    --arg rollbackScript "$ROLLBACK_SCRIPT" \
-	'{jobId:$jobId,leaseGeneration:$leaseGeneration,
-	  targetVersion:$targetVersion,rollbackScript:$rollbackScript}' > "$MARKER_TMP" || {
-      restore_worker_binary "$PREVIOUS"
-      rm -f "$WORKER_TMP"
+  DRIVER_UPDATED=false
+  DRIVER_HAD_PREVIOUS=false
+  DRIVER_CHECKSUM=
+  if [ -s "$DRIVER_NEXT" ]; then
+    DRIVER_UPDATED=true
+    DRIVER_CHECKSUM=$(worker_update_sha256 "$DRIVER_NEXT") || {
+      rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+      echo "failed to checksum the staged Microsandbox driver" >&2
       return 1
     }
-  mv -f "$MARKER_TMP" "$MARKER" || {
-    restore_worker_binary "$PREVIOUS"
-    rm -f "$WORKER_TMP" "$MARKER_TMP"
+  fi
+
+  worker_update_lock || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
     return 1
   }
+  MARKER="$STATE_DIR/worker-update.json"
+  if [ -e "$MARKER" ]; then
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+    echo "a previous Worker update still requires recovery" >&2
+    return 1
+  fi
+  systemctl disable --now agentbox-worker-update-rollback.timer >/dev/null 2>&1 || true
+
+  install -d -m 0755 /usr/local/lib/agentbox || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+    return 1
+  }
+  PREVIOUS=/usr/local/lib/agentbox/agentbox-worker.previous
+  PREVIOUS_TMP=/usr/local/lib/agentbox/.agentbox-worker.previous
+  DRIVER_PREVIOUS=/usr/local/lib/agentbox/agentbox-microsandbox-driver.previous
+  DRIVER_PREVIOUS_TMP=/usr/local/lib/agentbox/.agentbox-microsandbox-driver.previous
+  NEXT=/usr/local/bin/.agentbox-worker-next
+  PREVIOUS_VERSION=$(/usr/local/bin/agentbox-worker version 2>/dev/null || true)
+  [ -n "$PREVIOUS_VERSION" ] || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+    echo "current Worker version is unavailable" >&2
+    return 1
+  }
+  if [ -z "$EXPECTED_PREVIOUS_VERSION" ] || [ "$PREVIOUS_VERSION" != "$EXPECTED_PREVIOUS_VERSION" ]; then
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+    echo "current Worker version $PREVIOUS_VERSION does not match queued previous version $EXPECTED_PREVIOUS_VERSION" >&2
+    return 1
+  fi
+  install -m 0755 /usr/local/bin/agentbox-worker "$PREVIOUS_TMP" || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT" "$PREVIOUS_TMP"
+    return 1
+  }
+  mv -f "$PREVIOUS_TMP" "$PREVIOUS" || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT" "$PREVIOUS_TMP"
+    return 1
+  }
+  WORKER_PREVIOUS_CHECKSUM=$(worker_update_sha256 "$PREVIOUS") || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+    echo "failed to checksum the previous Worker" >&2
+    return 1
+  }
+  DRIVER_PREVIOUS_CHECKSUM=
+  # Always snapshot the current driver state, even when this release does not
+  # rebuild it. That keeps manual recovery unambiguous if the JSON journal is
+  # later damaged: a fixed backup exists exactly when a driver existed before
+  # this generation.
+  if [ -x /usr/local/bin/agentbox-microsandbox-driver ]; then
+    DRIVER_HAD_PREVIOUS=true
+    install -m 0755 /usr/local/bin/agentbox-microsandbox-driver "$DRIVER_PREVIOUS_TMP" || {
+      rm -f "$WORKER_TMP" "$DRIVER_NEXT" "$DRIVER_PREVIOUS_TMP"
+      return 1
+    }
+    mv -f "$DRIVER_PREVIOUS_TMP" "$DRIVER_PREVIOUS" || {
+      rm -f "$WORKER_TMP" "$DRIVER_NEXT" "$DRIVER_PREVIOUS_TMP"
+      return 1
+    }
+    DRIVER_PREVIOUS_CHECKSUM=$(worker_update_sha256 "$DRIVER_PREVIOUS") || {
+      rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+      echo "failed to checksum the previous Microsandbox driver" >&2
+      return 1
+    }
+  else
+    rm -f "$DRIVER_PREVIOUS_TMP" "$DRIVER_PREVIOUS" || {
+      rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+      echo "failed to record that the previous Microsandbox driver was absent" >&2
+      return 1
+    }
+  fi
+  worker_update_sync /usr/local/lib/agentbox || {
+    rm -f "$WORKER_TMP" "$DRIVER_NEXT"
+    echo "failed to persist the previous Worker/driver pair" >&2
+    return 1
+  }
+  install -m 0755 "$WORKER_TMP" "$NEXT" || {
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT"
+    return 1
+  }
+
+  CONFIRMED="$STATE_DIR/worker-update-confirmed"
+  CONFIRMED_TMP="$STATE_DIR/.worker-update-confirmed"
+  rm -f "$CONFIRMED" "$CONFIRMED_TMP"
+  START_GUARD="$STATE_DIR/worker-update-start-guard.sh"
+  START_GUARD_TMP="$STATE_DIR/.worker-update-start-guard.sh"
+  cat > "$START_GUARD_TMP" <<'START_GUARD'
+#!/bin/sh
+set -eu
+MARKER=/var/lib/agentbox-worker/worker-update.json
+[ -e "$MARKER" ] || exit 0
+[ -s "$MARKER" ] || exit 1
+FORMAT_VERSION=$(jq -r 'if type == "object" and has("formatVersion") then .formatVersion else 1 end' "$MARKER" 2>/dev/null) || exit 1
+[ "$FORMAT_VERSION" = 1 ] && exit 0
+[ "$FORMAT_VERSION" = 2 ] || exit 1
+EXPECTED_CHECKSUM=$(jq -r '.workerChecksum // empty' "$MARKER" 2>/dev/null) || exit 1
+CURRENT_CHECKSUM=$(sha256sum /usr/local/bin/agentbox-worker 2>/dev/null | awk '{print $1}') || exit 1
+if [ -z "$EXPECTED_CHECKSUM" ] || [ "$CURRENT_CHECKSUM" != "$EXPECTED_CHECKSUM" ]; then
+  echo "Worker rollback is awaiting Server reconciliation; refusing to start the previous job loop" >&2
+  exit 1
+fi
+START_GUARD
+  chmod 0700 "$START_GUARD_TMP" && mv -f "$START_GUARD_TMP" "$START_GUARD" || {
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$START_GUARD_TMP"
+    return 1
+  }
+  ROLLBACK_SCRIPT="$STATE_DIR/worker-update-rollback.sh"
+  MARKER_TMP="$STATE_DIR/.worker-update.json"
   cat > "$ROLLBACK_SCRIPT" <<'ROLLBACK'
 #!/bin/sh
 set -eu
-MARKER=$1
-PREVIOUS=$2
-TARGET_VERSION=$3
 STATE_DIR=/var/lib/agentbox-worker
+MARKER=${1:-$STATE_DIR/worker-update.json}
+LOCK=$STATE_DIR/worker-update.lock
+TIMER=agentbox-worker-update-rollback.timer
+
+cleanup_guardian() {
+  systemctl disable --now "$TIMER" >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/agentbox-worker-update-rollback.timer \
+    /etc/systemd/system/agentbox-worker-update-rollback.service \
+    /etc/systemd/system/agentbox-worker.service.d/agentbox-restart.conf \
+    "$STATE_DIR/worker-update-start-guard.sh" "$STATE_DIR/worker-update-rollback.sh"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+command -v flock >/dev/null || exit 1
+command -v sha256sum >/dev/null || exit 1
+command -v sync >/dev/null || exit 1
+exec 9>"$LOCK"
+flock -x 9
+[ -e "$MARKER" ] || {
+  # The timer is armed before the journal is published. If the updater exits
+  # in that short pre-publication window there is no state to recover. The
+  # shared lock proves the updater no longer owns this generation, so remove
+  # the otherwise persistent timer and start guard.
+  cleanup_guardian
+  exit 0
+}
+[ -s "$MARKER" ] || exit 1
 JOB_ID=$(jq -r '.jobId // empty' "$MARKER" 2>/dev/null || true)
-[ -n "$JOB_ID" ] || { rm -f "$STATE_DIR/worker-update-confirmed" "$0"; exit 0; }
+[ -n "$JOB_ID" ] || exit 1
+FORMAT_VERSION=$(jq -r '.formatVersion // 1' "$MARKER" 2>/dev/null || true)
+[ "$FORMAT_VERSION" = 2 ] || exit 1
+LEASE_GENERATION=$(jq -r '.leaseGeneration // 0' "$MARKER" 2>/dev/null || true)
+TARGET_VERSION=$(jq -r '.targetVersion // empty' "$MARKER" 2>/dev/null || true)
+PREVIOUS_VERSION=$(jq -r '.workerPreviousVersion // empty' "$MARKER" 2>/dev/null || true)
+WORKER_PREVIOUS=$(jq -r '.workerPrevious // empty' "$MARKER" 2>/dev/null || true)
+WORKER_CHECKSUM=$(jq -r '.workerChecksum // empty' "$MARKER" 2>/dev/null || true)
+WORKER_PREVIOUS_CHECKSUM=$(jq -r '.workerPreviousChecksum // empty' "$MARKER" 2>/dev/null || true)
+DRIVER_UPDATED=$(jq -r '.driverUpdated // false' "$MARKER" 2>/dev/null || true)
+DRIVER_HAD_PREVIOUS=$(jq -r '.driverHadPrevious // false' "$MARKER" 2>/dev/null || true)
+DRIVER_PREVIOUS=$(jq -r '.driverPrevious // empty' "$MARKER" 2>/dev/null || true)
+DRIVER_CHECKSUM=$(jq -r '.driverChecksum // empty' "$MARKER" 2>/dev/null || true)
+DRIVER_PREVIOUS_CHECKSUM=$(jq -r '.driverPreviousChecksum // empty' "$MARKER" 2>/dev/null || true)
+
+file_checksum() {
+  VALUE=$(sha256sum "$1" 2>/dev/null | awk '{print $1}') || return 1
+  [ "${#VALUE}" -eq 64 ] || return 1
+  case "$VALUE" in *[!0-9A-Fa-f]*) return 1 ;; esac
+  printf '%s' "$VALUE"
+}
+
+file_matches() {
+  [ -n "$2" ] && [ -x "$1" ] || return 1
+  [ "$(file_checksum "$1" 2>/dev/null || true)" = "$2" ]
+}
+
+sync_path() {
+  sync -f "$1" 2>/dev/null || sync
+}
+
+driver_absent() {
+  [ ! -e /usr/local/bin/agentbox-microsandbox-driver ] &&
+    [ ! -L /usr/local/bin/agentbox-microsandbox-driver ]
+}
+
+report_rollback() {
+  CONFIG=/etc/agentbox-worker.conf
+  [ -r "$CONFIG" ] && [ -n "$PREVIOUS_VERSION" ] || return 1
+  SERVER_URL=$(sed -n '1p' "$CONFIG")
+  SERVER_ID=$(sed -n '2p' "$CONFIG")
+  CREDENTIAL=$(sed -n '3p' "$CONFIG")
+  [ -n "$SERVER_URL" ] && [ -n "$SERVER_ID" ] && [ -n "$CREDENTIAL" ] || return 1
+  MESSAGE="Worker 更新已回滚，当前版本 $PREVIOUS_VERSION"
+  BODY=$(jq -n --argjson leaseGeneration "$LEASE_GENERATION" \
+    --arg message "$MESSAGE" --arg workerVersion "$PREVIOUS_VERSION" \
+    '{leaseGeneration:$leaseGeneration,success:false,externalId:"",message:$message,
+      exitCode:null,output:"",outputTruncated:false,timedOut:false,agentTools:[],
+      error:{code:"worker_update_rolled_back",stage:"worker-update",retryable:true,
+        details:{action:"update-worker",workerVersion:$workerVersion}}}') || return 1
+  STATUS=$(curl -sS --connect-timeout 10 --max-time 30 -o /dev/null -w '%{http_code}' \
+    -X POST "$SERVER_URL/api/servers/$SERVER_ID/jobs/$JOB_ID/complete" \
+    -H "Authorization: Bearer $CREDENTIAL" \
+    -H 'X-AgentBox-Worker-Protocol-Min: 1' \
+    -H 'X-AgentBox-Worker-Protocol-Max: 1' \
+    -H 'Content-Type: application/json' --data "$BODY") || return 1
+  [ "$STATUS" = 204 ]
+}
+
+NEW_PAIR=true
+file_matches /usr/local/bin/agentbox-worker "$WORKER_CHECKSUM" || NEW_PAIR=false
+if [ "$DRIVER_UPDATED" = true ]; then
+  file_matches /usr/local/bin/agentbox-microsandbox-driver "$DRIVER_CHECKSUM" || NEW_PAIR=false
+fi
 if [ -s "$STATE_DIR/worker-update-confirmed" ] &&
    [ "$(cat "$STATE_DIR/worker-update-confirmed")" = "$JOB_ID" ] &&
    systemctl is-active --quiet agentbox-worker.service &&
+   [ "$NEW_PAIR" = true ] &&
    [ "$(/usr/local/bin/agentbox-worker version 2>/dev/null || true)" = "$TARGET_VERSION" ]; then
-  rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed" "$0"
+  rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed"
+  sync_path "$STATE_DIR"
+  cleanup_guardian
   exit 0
 fi
-RESTORE_TMP=/usr/local/bin/.agentbox-worker-restore
-install -m 0755 "$PREVIOUS" "$RESTORE_TMP"
-mv -f "$RESTORE_TMP" /usr/local/bin/agentbox-worker
-systemctl restart agentbox-worker.service
-rm -f "$0"
+
+# Validate the entire fallback before changing either active path. A failed
+# validation leaves the durable marker and guardian in place for inspection.
+file_matches "$WORKER_PREVIOUS" "$WORKER_PREVIOUS_CHECKSUM"
+if [ "$DRIVER_UPDATED" = true ] && [ "$DRIVER_HAD_PREVIOUS" = true ]; then
+  file_matches "$DRIVER_PREVIOUS" "$DRIVER_PREVIOUS_CHECKSUM"
+fi
+
+# Stop the whole service cgroup before changing either active executable. This
+# also fences the independently supervised interactive session daemon.
+systemctl stop agentbox-worker.service
+
+RESTORE_FAILED=false
+WORKER_RESTORE_TMP=/usr/local/bin/.agentbox-worker-restore
+if install -m 0755 "$WORKER_PREVIOUS" "$WORKER_RESTORE_TMP"; then
+  mv -f "$WORKER_RESTORE_TMP" /usr/local/bin/agentbox-worker || RESTORE_FAILED=true
+else
+  RESTORE_FAILED=true
+fi
+if [ "$DRIVER_UPDATED" = true ]; then
+  DRIVER_RESTORE_TMP=/usr/local/bin/.agentbox-microsandbox-driver-restore
+  if [ "$DRIVER_HAD_PREVIOUS" = true ]; then
+    if install -m 0755 "$DRIVER_PREVIOUS" "$DRIVER_RESTORE_TMP"; then
+      mv -f "$DRIVER_RESTORE_TMP" /usr/local/bin/agentbox-microsandbox-driver || RESTORE_FAILED=true
+    else
+      RESTORE_FAILED=true
+    fi
+  else
+    rm -f "$DRIVER_RESTORE_TMP" /usr/local/bin/agentbox-microsandbox-driver || RESTORE_FAILED=true
+  fi
+fi
+[ "$RESTORE_FAILED" = false ] || exit 1
+file_matches /usr/local/bin/agentbox-worker "$WORKER_PREVIOUS_CHECKSUM"
+if [ "$DRIVER_UPDATED" = true ]; then
+  if [ "$DRIVER_HAD_PREVIOUS" = true ]; then
+    file_matches /usr/local/bin/agentbox-microsandbox-driver "$DRIVER_PREVIOUS_CHECKSUM"
+  else
+    driver_absent
+  fi
+fi
+sync_path /usr/local/bin
+PHASE_TMP="$MARKER.phase"
+jq '.phase = "rolled-back"' "$MARKER" > "$PHASE_TMP"
+mv -f "$PHASE_TMP" "$MARKER"
+sync_path "$STATE_DIR"
+# Do not let a pre-protocol previous Worker observe the still-pending journal.
+# The ExecStartPre guard also fences an unexpected service restart in this
+# window. Only clear the journal after the Server accepts the bound rollback.
+report_rollback
+rm -f "$MARKER" "$STATE_DIR/worker-update-confirmed"
+sync_path "$STATE_DIR"
+flock -u 9
+exec 9>&-
+systemctl start agentbox-worker.service || exit 1
+cleanup_guardian
 ROLLBACK
   chmod 0700 "$ROLLBACK_SCRIPT" || {
-    restore_worker_binary "$PREVIOUS"
-    rm -f "$WORKER_TMP" "$MARKER" "$ROLLBACK_SCRIPT"
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$ROLLBACK_SCRIPT"
     return 1
   }
-  install -d -m 0755 /etc/systemd/system/agentbox-worker.service.d
-  cat > /etc/systemd/system/agentbox-worker.service.d/agentbox-restart.conf <<'UNIT'
+  GUARDIAN_SERVICE=agentbox-worker-update-rollback.service
+  GUARDIAN_TIMER=agentbox-worker-update-rollback.timer
+  jq -n --arg jobId "$JOB_ID" --argjson leaseGeneration "$LEASE_GENERATION" \
+    --arg targetVersion "$TARGET_VERSION" --arg previousVersion "$PREVIOUS_VERSION" \
+    --arg rollbackScript "$ROLLBACK_SCRIPT" --arg workerPrevious "$PREVIOUS" \
+    --arg workerChecksum "$ACTUAL_SHA256" --arg workerPreviousChecksum "$WORKER_PREVIOUS_CHECKSUM" \
+    --argjson driverUpdated "$DRIVER_UPDATED" \
+    --argjson driverHadPrevious "$DRIVER_HAD_PREVIOUS" --arg driverPrevious "$DRIVER_PREVIOUS" \
+    --arg driverChecksum "$DRIVER_CHECKSUM" --arg driverPreviousChecksum "$DRIVER_PREVIOUS_CHECKSUM" \
+    --arg guardianService "$GUARDIAN_SERVICE" --arg guardianTimer "$GUARDIAN_TIMER" \
+    '{formatVersion:2,phase:"prepared",jobId:$jobId,leaseGeneration:$leaseGeneration,
+      targetVersion:$targetVersion,workerPreviousVersion:$previousVersion,
+      rollbackScript:$rollbackScript,workerPrevious:$workerPrevious,
+      workerChecksum:$workerChecksum,workerPreviousChecksum:$workerPreviousChecksum,
+      driverUpdated:$driverUpdated,driverHadPrevious:$driverHadPrevious,
+      driverPrevious:$driverPrevious,driverChecksum:$driverChecksum,
+      driverPreviousChecksum:$driverPreviousChecksum,
+      guardianService:$guardianService,guardianTimer:$guardianTimer}' > "$MARKER_TMP" || {
+      rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT"
+      return 1
+    }
+  install -d -m 0755 /etc/systemd/system/agentbox-worker.service.d || {
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT"
+    return 1
+  }
+  if ! cat > /etc/systemd/system/agentbox-worker.service.d/agentbox-restart.conf <<'UNIT'
 [Service]
+ExecStartPre=/var/lib/agentbox-worker/worker-update-start-guard.sh
 RestartSec=2
 KillMode=control-group
 TimeoutStopSec=20s
 UNIT
-  systemctl daemon-reload
-  if ! systemd-run --quiet --unit="agentbox-worker-update-$JOB_ID" --on-active=120s \
-      "$ROLLBACK_SCRIPT" "$MARKER" "$PREVIOUS" "$TARGET_VERSION"; then
-    restore_worker_binary "$PREVIOUS"
-    rm -f "$WORKER_TMP" "$MARKER" "$ROLLBACK_SCRIPT"
-    echo "failed to schedule Worker rollback" >&2
+  then
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT"
     return 1
   fi
-  if ! systemd-run --quiet --unit="agentbox-worker-restart-$JOB_ID" --on-active=1s \
-      /bin/systemctl restart agentbox-worker.service; then
-    restore_worker_binary "$PREVIOUS"
-    rm -f "$WORKER_TMP" "$MARKER"
+  GUARDIAN_SERVICE_FILE=/etc/systemd/system/agentbox-worker-update-rollback.service
+  GUARDIAN_TIMER_FILE=/etc/systemd/system/agentbox-worker-update-rollback.timer
+  GUARDIAN_SERVICE_TMP=$GUARDIAN_SERVICE_FILE.tmp
+  GUARDIAN_TIMER_TMP=$GUARDIAN_TIMER_FILE.tmp
+  if ! cat > "$GUARDIAN_SERVICE_TMP" <<'UNIT'
+[Unit]
+Description=Rollback an unconfirmed AgentBox Worker update
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/agentbox-worker/worker-update-rollback.sh /var/lib/agentbox-worker/worker-update.json
+Restart=on-failure
+RestartSec=10s
+UNIT
+  then
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT" \
+      "$GUARDIAN_SERVICE_TMP" "$GUARDIAN_TIMER_TMP"
+    return 1
+  fi
+  if ! cat > "$GUARDIAN_TIMER_TMP" <<'UNIT'
+[Unit]
+Description=Guard an AgentBox Worker update across restarts
+
+[Timer]
+OnActiveSec=120s
+AccuracySec=1s
+Unit=agentbox-worker-update-rollback.service
+
+[Install]
+WantedBy=timers.target
+UNIT
+  then
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT" \
+      "$GUARDIAN_SERVICE_TMP" "$GUARDIAN_TIMER_TMP"
+    return 1
+  fi
+  if ! mv -f "$GUARDIAN_SERVICE_TMP" "$GUARDIAN_SERVICE_FILE" ||
+     ! mv -f "$GUARDIAN_TIMER_TMP" "$GUARDIAN_TIMER_FILE"; then
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT" \
+      "$GUARDIAN_SERVICE_TMP" "$GUARDIAN_TIMER_TMP" \
+      "$GUARDIAN_SERVICE_FILE" "$GUARDIAN_TIMER_FILE"
+    return 1
+  fi
+  if ! worker_update_sync "$STATE_DIR" /etc/systemd/system \
+      /etc/systemd/system/agentbox-worker.service.d; then
+    cleanup_worker_update_guardian "$JOB_ID" "$GUARDIAN_TIMER" "$GUARDIAN_SERVICE" || true
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT"
+    echo "failed to persist Worker update recovery assets" >&2
+    return 1
+  fi
+  if ! systemctl daemon-reload; then
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT" \
+      "$GUARDIAN_SERVICE_FILE" "$GUARDIAN_TIMER_FILE"
+    return 1
+  fi
+  if ! systemctl enable --now "$GUARDIAN_TIMER" >/dev/null 2>&1; then
+    cleanup_worker_update_guardian "$JOB_ID" "$GUARDIAN_TIMER" "$GUARDIAN_SERVICE" || true
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT"
+    echo "failed to install the persistent Worker rollback guardian" >&2
+    return 1
+  fi
+  if ! worker_update_sync /etc/systemd/system; then
+    cleanup_worker_update_guardian "$JOB_ID" "$GUARDIAN_TIMER" "$GUARDIAN_SERVICE" || true
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT"
+    echo "failed to persist the enabled Worker rollback guardian" >&2
+    return 1
+  fi
+  # Publish the recovery journal only after the guardian timer is both enabled
+  # across boots and active in this boot. The restart below merely resets its
+  # deadline; it is no longer the first point at which rollback is protected.
+  if ! mv -f "$MARKER_TMP" "$MARKER"; then
+    cleanup_worker_update_guardian "$JOB_ID" "$GUARDIAN_TIMER" "$GUARDIAN_SERVICE" || true
+    rm -f "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" "$ROLLBACK_SCRIPT"
+    return 1
+  fi
+  if ! worker_update_sync "$STATE_DIR"; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to persist the Worker update journal" >&2
+    return 1
+  fi
+  if ! systemctl restart "$GUARDIAN_TIMER"; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to arm the persistent Worker rollback guardian" >&2
+    return 1
+  fi
+  # The session daemon can start the Microsandbox driver independently of the
+  # job loop. Stop it before either active path changes so no request can see a
+  # mixed Worker/driver generation.
+  if ! pause_session_worker; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to stop the interactive session daemon before Worker activation" >&2
+    return 1
+  fi
+  if ! mv -f "$NEXT" /usr/local/bin/agentbox-worker; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to activate the new Worker" >&2
+    return 1
+  fi
+  if ! update_worker_marker_phase "$MARKER" worker-active; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to journal Worker activation" >&2
+    return 1
+  fi
+  if [ "$DRIVER_UPDATED" = true ] &&
+      ! mv -f "$DRIVER_NEXT" /usr/local/bin/agentbox-microsandbox-driver; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to activate the new Microsandbox driver" >&2
+    return 1
+  fi
+  if ! update_worker_marker_phase "$MARKER" activated; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to journal Worker/driver activation" >&2
+    return 1
+  fi
+  if ! worker_update_sync /usr/local/bin "$STATE_DIR"; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
+    echo "failed to persist the active Worker/driver pair" >&2
+    return 1
+  fi
+  if ! schedule_worker_restart "$JOB_ID"; then
+    abort_worker_update "$PREVIOUS" "$DRIVER_PREVIOUS" "$DRIVER_UPDATED" \
+      "$DRIVER_HAD_PREVIOUS" "$JOB_ID" "$MARKER" "$CONFIRMED" "$ROLLBACK_SCRIPT" \
+      "$WORKER_TMP" "$NEXT" "$DRIVER_NEXT" "$MARKER_TMP" || true
     echo "failed to schedule Worker restart" >&2
     return 1
   fi
   rm -f "$WORKER_TMP"
-}
+)
 
 agent_tool_command() {
   case "$1" in
@@ -2218,7 +3049,7 @@ prepare_agent_image() {
 	CACHE_KEY=$(printf '%s\n%s\n%s\n%s\n' "$BASE_IMAGE" "$TOOL_SET" "$DESKTOP" "$INSTALLER_REVISION" | sha256sum | cut -c1-16)
   CACHE_IMAGE="agentbox/runtime-$CACHE_KEY:latest"
   REFRESH_IMAGE="agentbox/runtime-$CACHE_KEY:refresh-$$"
-  BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY"
+  BUILD_CONTAINER="agentbox-runtime-build-$CACHE_KEY-${JOB_ID:-manual}-${LEASE_GENERATION:-0}"
   NOW=$(date +%s)
   TTL_HOURS=${AGENTBOX_AGENT_IMAGE_TTL_HOURS:-168}
   case "$TTL_HOURS" in ''|*[!0-9]*) TTL_HOURS=168 ;; esac
@@ -2250,15 +3081,23 @@ prepare_agent_image() {
   fi
 
   if docker inspect "$BUILD_CONTAINER" >/dev/null 2>&1; then
-    docker start "$BUILD_CONTAINER" >/dev/null
-  else
-    docker run -d --name "$BUILD_CONTAINER" \
-      --label "agentbox.runtime.build=$CACHE_KEY" \
-      "$BUILD_BASE_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait' >/dev/null
+    BUILD_OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.runtime.build" }}' "$BUILD_CONTAINER")
+    [ "$BUILD_OWNER" = "$CACHE_KEY" ] || { echo "runtime build container name collision: $BUILD_CONTAINER" >&2; return 1; }
+    docker rm -f -v "$BUILD_CONTAINER" >/dev/null || return 1
   fi
+  record_create_resource docker-build-delete "$BUILD_CONTAINER" "$CACHE_KEY"
+  [ -z "${CREATE_STATE_DIR:-}" ] || : > "$CREATE_STATE_DIR/build-create-pending"
+  if ! docker run -d --name "$BUILD_CONTAINER" \
+    --label "agentbox.runtime.build=$CACHE_KEY" \
+    "$BUILD_BASE_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait' >/dev/null; then
+    [ -z "${CREATE_STATE_DIR:-}" ] || rm -f "$CREATE_STATE_DIR/build-create-pending"
+    return 1
+  fi
+  [ -z "${CREATE_STATE_DIR:-}" ] || rm -f "$CREATE_STATE_DIR/build-create-pending"
+  record_create_resource docker-image "$REFRESH_IMAGE"
   if ! configure_proxy "$BUILD_CONTAINER" "$JOB_FILE"; then
     echo "Agent runtime build could not apply the selected network proxy" >&2
-    docker stop --time 10 "$BUILD_CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f -v "$BUILD_CONTAINER" >/dev/null 2>&1 || echo "Agent runtime build container cleanup failed: $BUILD_CONTAINER" >&2
     return 1
   fi
   if AGENTBOX_AGENT_TOOL_PROGRESS_STAGE=agent-image install_agent_tools "$BUILD_CONTAINER" "$JOB_FILE" &&
@@ -2273,7 +3112,10 @@ prepare_agent_image() {
        --change "LABEL agentbox.runtime.installer-revision=$INSTALLER_REVISION" \
        "$BUILD_CONTAINER" "$REFRESH_IMAGE" >/dev/null &&
      docker tag "$REFRESH_IMAGE" "$CACHE_IMAGE"; then
-    docker rm -f "$BUILD_CONTAINER" >/dev/null 2>&1 || true
+    if ! docker rm -f -v "$BUILD_CONTAINER" >/dev/null; then
+      echo "Agent runtime build container cleanup failed: $BUILD_CONTAINER" >&2
+      return 1
+    fi
     docker image rm "$REFRESH_IMAGE" >/dev/null 2>&1 || true
     report_job_progress agent-image "Agent 工具镜像缓存已更新" refreshed cache-created
     printf '%s' "$CACHE_IMAGE"
@@ -2281,7 +3123,10 @@ prepare_agent_image() {
   fi
 
   remove_proxy "$BUILD_CONTAINER"
-  docker stop --time 10 "$BUILD_CONTAINER" >/dev/null 2>&1 || true
+  if ! docker rm -f -v "$BUILD_CONTAINER" >/dev/null; then
+    echo "Agent runtime build container cleanup failed: $BUILD_CONTAINER" >&2
+    return 1
+  fi
   docker image rm "$REFRESH_IMAGE" >/dev/null 2>&1 || true
   if docker image inspect "$CACHE_IMAGE" >/dev/null 2>&1; then
     echo "Agent runtime refresh failed; using the last working cached image" >&2
@@ -3037,8 +3882,209 @@ memory_mib() {
   esac
 }
 
+redact_extension_output() (
+  if [ "$(wc -c < "$2")" -ge 1048576 ]; then
+    printf '%s' '[extension output exceeded 1 MiB; log withheld]'
+    return 0
+  fi
+  # Redact before truncation so the tail never exposes part of a cut secret.
+  if ! jq -nr --slurpfile job "$1" --rawfile output "$2" '
+    def redact_pending_secret($secret):
+      . as $text |
+      if length == 0 then . else
+        (first(($secret | indices($text[-1:]) | reverse[]) as $index |
+          select($index < ($text | length)) |
+          select($text | endswith($secret[:($index + 1)])) | $index + 1) // 0) as $length |
+        if $length > 0 then .[:-$length] + "[REDACTED]" else . end
+      end;
+    if ($output | utf8bytelength) >= 1048576 then
+      "[extension output exceeded 1 MiB; log withheld]"
+    else
+    $job[0].job.payload as $payload |
+    ([ $payload.environmentVariables[]?.value,
+       ($payload | del(.extensions) | .. | objects | to_entries[] |
+         select(.key | test("secret|token|password|authorization|api.?key"; "i")) | .value),
+       $payload.proxy.redactionValues[]?, $payload.proxy.url,
+       ($payload.proxy.url? // "" | try capture("^[^:]+://(?<auth>[^@]+)@").auth catch empty |
+         ., (split(":")[])) ] |
+      map(select(type == "string" and length > 0)) |
+      map(., @uri, @base64, (@json | .[1:-1]), @sh) | unique | sort_by(length) | reverse) as $secrets |
+    reduce $secrets[] as $secret ($output; split($secret) | join("[REDACTED]")) |
+    reduce $secrets[] as $secret (.; redact_pending_secret($secret)) |
+    gsub("[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]"; "") |
+    .[-4096:] | until(utf8bytelength <= 4096; .[1:])
+    end
+  ' 2>/dev/null; then
+    printf '%s' '[extension log unavailable: redaction failed]'
+  fi
+)
+
+report_extension_progress() (
+  [ -n "${JOB_ID:-}" ] || return 0
+  case "$2" in
+    installing) EXTENSION_MESSAGE='正在安装沙箱扩展' ;;
+    verifying) EXTENSION_MESSAGE='正在验证沙箱扩展' ;;
+    succeeded) EXTENSION_MESSAGE='沙箱扩展安装验证完成' ;;
+    failed) EXTENSION_MESSAGE='沙箱扩展安装或验证失败' ;;
+    *) return 1 ;;
+  esac
+  EXTENSION_BODY=$(jq -n --argjson leaseGeneration "${LEASE_GENERATION:-0}" \
+    --arg extensionId "$1" --arg extensionStatus "$2" --arg extensionOutput "${3:-}" \
+    --arg message "$EXTENSION_MESSAGE" \
+    '{leaseGeneration:$leaseGeneration,stage:"extensions",message:$message,
+      extensionId:$extensionId,extensionStatus:$extensionStatus,extensionOutput:$extensionOutput}') || return 1
+  EXTENSION_HTTP_STATUS=$(worker_request /dev/null -X POST \
+    "$SERVER_URL/api/servers/$SERVER_ID/jobs/$JOB_ID/progress" \
+    -H "Authorization: Bearer $CREDENTIAL" -H 'Content-Type: application/json' \
+    --data "$EXTENSION_BODY" 2>/dev/null) || return 1
+  [ "$EXTENSION_HTTP_STATUS" = 200 ]
+)
+
+run_extension_step() (
+  EXTENSION_CONTAINER=$1
+  EXTENSION_JOB=$2
+  EXTENSION_ID=$3
+  EXTENSION_STATUS=$4
+  EXTENSION_SCRIPT=$5
+  EXTENSION_LOG=$6
+  EXTENSION_TIMEOUT=$7
+  EXTENSION_WORKDIR=$8
+  EXTENSION_CONTROL=$(basename "$(dirname "$EXTENSION_SCRIPT")")-$EXTENSION_STATUS
+  EXTENSION_EXIT_FILE=$EXTENSION_SCRIPT.exit
+  : >> "$EXTENSION_LOG"
+  EXTENSION_REMAINING=$((1048576 - $(wc -c < "$EXTENSION_LOG")))
+  [ "$EXTENSION_REMAINING" -gt 0 ] || return 1
+  rm -f "$EXTENSION_EXIT_FILE"
+  # GNU timeout runs in the guest and kills the step process group, including
+  # ordinary child processes. Timing out only the host exec client is unsafe.
+  # head bounds collection on the host even if a script produces endless output.
+  (if docker exec -i -w "$EXTENSION_WORKDIR" "$EXTENSION_CONTAINER" sh -c '
+    set -eu
+    if ! command -v timeout >/dev/null 2>&1 ||
+       ! timeout --version 2>/dev/null | head -n 1 | grep -q "GNU coreutils"; then
+      printf "%s\n" "GNU coreutils timeout is required inside the sandbox" >&2
+      exit 125
+    fi
+    umask 077
+    STEP_SCRIPT=$(mktemp)
+    STEP_CONTROL="/tmp/agentbox-extension-$2"
+    trap '\''rm -f "$STEP_SCRIPT" "$STEP_CONTROL"'\'' EXIT
+    cat > "$STEP_SCRIPT"
+    set -a
+    [ ! -r /opt/agentbox/secrets/agentbox.env ] || . /opt/agentbox/secrets/agentbox.env
+    [ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env
+    set +a
+    timeout --signal=KILL "$1" sh -eu "$STEP_SCRIPT" &
+    STEP_PID=$!
+    printf "%s\n" "$STEP_PID" > "$STEP_CONTROL"
+    wait "$STEP_PID"
+  ' agentbox "$EXTENSION_TIMEOUT" "$EXTENSION_CONTROL" < "$EXTENSION_SCRIPT"; then
+    printf '0' > "$EXTENSION_EXIT_FILE"
+  else
+    printf '%s' "$?" > "$EXTENSION_EXIT_FILE"
+  fi) 2>&1 | head -c "$EXTENSION_REMAINING" >> "$EXTENSION_LOG" &
+  EXTENSION_PID=$!
+  while kill -0 "$EXTENSION_PID" 2>/dev/null; do
+    [ "$(wc -c < "$EXTENSION_LOG")" -lt 1048576 ] || break
+    report_extension_progress "$EXTENSION_ID" "$EXTENSION_STATUS" \
+      "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_LOG")" || true
+    sleep 2
+  done
+  if [ "$(wc -c < "$EXTENSION_LOG")" -ge 1048576 ]; then
+    docker exec "$EXTENSION_CONTAINER" sh -c '
+      STEP_CONTROL="/tmp/agentbox-extension-$1"
+      [ -f "$STEP_CONTROL" ] || exit 0
+      STEP_PID=$(cat "$STEP_CONTROL")
+      case "$STEP_PID" in ""|*[!0-9]*|0|1) exit 1 ;; esac
+      kill -KILL -"$STEP_PID" 2>/dev/null || true
+    ' agentbox "$EXTENSION_CONTROL" >/dev/null 2>&1 || true
+    wait "$EXTENSION_PID" || true
+    return 1
+  fi
+  wait "$EXTENSION_PID" || true
+  [ -f "$EXTENSION_EXIT_FILE" ] && [ "$(cat "$EXTENSION_EXIT_FILE")" = 0 ]
+)
+
+install_sandbox_extensions() (
+  EXTENSION_CONTAINER=$1
+  EXTENSION_JOB=$2
+  EXTENSION_COUNT=$(jq -er '.job.payload.extensions // [] | length' "$EXTENSION_JOB" 2>/dev/null) || return 1
+  [ "$EXTENSION_COUNT" -gt 0 ] || return 0
+  EXTENSION_DIR=$(mktemp -d) || return 1
+  trap 'rm -rf "$EXTENSION_DIR"' EXIT
+  EXTENSION_WORKDIR=$(jq -r '.job.payload.workdir // "/workspace"' "$EXTENSION_JOB")
+  EXTENSION_INDEX=0
+  while [ "$EXTENSION_INDEX" -lt "$EXTENSION_COUNT" ]; do
+    if ! jq -e --argjson index "$EXTENSION_INDEX" '.job.payload.extensions[$index] |
+      select((.id | type == "string" and length > 0) and
+        (.spec.installScript | type == "string" and length > 0) and
+        (.spec.verifyScript | type == "string" and length > 0) and
+        ((.spec.timeoutSeconds // 600) | type == "number" and . == floor and . >= 30 and . <= 1800))
+    ' "$EXTENSION_JOB" > "$EXTENSION_DIR/definition.json" 2>/dev/null; then
+      echo 'stage extensions failed: invalid extension snapshot' >&2
+      return 1
+    fi
+    EXTENSION_ID=$(jq -r '.id' "$EXTENSION_DIR/definition.json")
+    EXTENSION_TIMEOUT=$(jq -r '.spec.timeoutSeconds // 600' "$EXTENSION_DIR/definition.json")
+    : > "$EXTENSION_DIR/output.log"
+    for EXTENSION_STATUS in installing verifying; do
+      if [ "$EXTENSION_STATUS" = installing ]; then
+        EXTENSION_SCRIPT_KEY=installScript
+      else
+        EXTENSION_SCRIPT_KEY=verifyScript
+      fi
+      jq -r --arg key "$EXTENSION_SCRIPT_KEY" '.spec[$key]' "$EXTENSION_DIR/definition.json" > "$EXTENSION_DIR/step.sh" || return 1
+      report_extension_progress "$EXTENSION_ID" "$EXTENSION_STATUS" \
+        "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log")" || true
+      if ! run_extension_step "$EXTENSION_CONTAINER" "$EXTENSION_JOB" "$EXTENSION_ID" "$EXTENSION_STATUS" \
+        "$EXTENSION_DIR/step.sh" "$EXTENSION_DIR/output.log" "$EXTENSION_TIMEOUT" "$EXTENSION_WORKDIR"; then
+        report_extension_progress "$EXTENSION_ID" failed \
+          "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log")" || true
+        echo 'stage extensions failed: extension installation or verification failed; inspect redacted extension progress' >&2
+        return 1
+      fi
+    done
+    if ! report_extension_progress "$EXTENSION_ID" succeeded \
+      "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log")"; then
+      echo 'stage extensions failed: Server did not acknowledge extension verification' >&2
+      return 1
+    fi
+    EXTENSION_INDEX=$((EXTENSION_INDEX + 1))
+  done
+)
+
+validate_sandbox_network_policy() {
+  case "$2" in
+    none|egress) ;;
+    restricted)
+      if [ "$1" != boxlite ]; then
+        echo "stage network-policy failed: restricted network is only supported by BoxLite" >&2
+        return 1
+      fi
+      ;;
+    *)
+      echo "stage network-policy failed: unsupported network policy: $2" >&2
+      return 1
+      ;;
+  esac
+}
+
+effective_sandbox_network_policy() {
+  if [ -n "$2" ]; then
+    printf '%s' "$2"
+  elif [ "$1" = boxlite ]; then
+    printf restricted
+  else
+    printf egress
+  fi
+}
+
 create_sandbox() {
   JOB_FILE=$1
+  if jq -e '(.job.payload.extensions // [] | length) > 0 and .job.action != "create-sandbox"' "$JOB_FILE" >/dev/null; then
+    echo 'stage extensions failed: extensions can only run in a new create-sandbox job; create a new sandbox' >&2
+    return 1
+  fi
   SANDBOX_ID=$(jq -r '.job.payload.sandboxId' "$JOB_FILE")
   DRIVER=$(jq -r '.job.payload.driver' "$JOB_FILE")
   case "$DRIVER" in docker|boxlite|microsandbox) ;; *) echo "unsupported runtime driver: $DRIVER" >&2; return 1 ;; esac
@@ -3048,19 +4094,32 @@ create_sandbox() {
   WORKDIR=$(jq -r '.job.payload.workdir // "/workspace"' "$JOB_FILE")
   CPU=$(jq -r '.job.payload.cpu // empty' "$JOB_FILE")
   MEMORY_VALUE=$(jq -r '.job.payload.memory // empty' "$JOB_FILE")
-  NETWORK=$(jq -r '.job.payload.network // "restricted"' "$JOB_FILE")
+  NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
   SETUP=$(jq -r '.job.payload.setup // empty' "$JOB_FILE")
   TARGET="agentbox-$SANDBOX_ID"
   VOLUME="agentbox-$SANDBOX_ID-workspace"
   SANDBOX_PREEXISTED=false
+  SANDBOX_VOLUME_PREEXISTED=false
+
+  validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
 
   report_job_progress runtime-check "正在检查 $DRIVER 运行时"
 
   cleanup_failed_create() {
     [ "$SANDBOX_PREEXISTED" = false ] || return 0
     if [ "$DRIVER" = docker ]; then
-      command docker rm -f "$TARGET" >/dev/null 2>&1 || true
-      command docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+      FOUND=$(command docker container ls -a --filter "name=^/$TARGET$" --format '{{.Names}}' 2>/dev/null) || return 0
+      if [ "$FOUND" = "$TARGET" ]; then
+        OWNER=$(command docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET" 2>/dev/null) || OWNER=
+        [ "$OWNER" != "$SANDBOX_ID" ] || command docker rm -f -v "$TARGET" >/dev/null 2>&1 || true
+      fi
+      if [ "$SANDBOX_VOLUME_PREEXISTED" = false ]; then
+        FOUND=$(command docker volume ls --filter "name=^$VOLUME$" --format '{{.Name}}' 2>/dev/null) || return 0
+        if [ "$FOUND" = "$VOLUME" ]; then
+          VOLUME_OWNER=$(command docker volume inspect -f '{{ index .Labels "agentbox.sandbox" }}' "$VOLUME" 2>/dev/null) || VOLUME_OWNER=
+          [ "$VOLUME_OWNER" != "$SANDBOX_ID" ] || command docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+        fi
+      fi
     else
       runtime_call "$DRIVER" delete "$TARGET" >/dev/null 2>&1 || true
     fi
@@ -3074,11 +4133,28 @@ create_sandbox() {
       SANDBOX_PREEXISTED=true
       OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET")
       [ "$OWNER" = "$SANDBOX_ID" ] || { echo "container name collision: $TARGET" >&2; return 1; }
+      record_create_resource docker-stop "$TARGET" "$SANDBOX_ID"
       report_job_progress runtime-create "正在启动已有沙箱实例"
       docker start "$TARGET" >/dev/null
     else
       RUNTIME_IMAGE=$(prepare_agent_image "$IMAGE" "$JOB_FILE")
       report_job_progress runtime-create "正在创建 Docker 沙箱实例"
+      if ! FOUND=$(command docker volume ls --filter "name=^$VOLUME$" --format '{{.Name}}'); then
+        echo "Docker could not inspect sandbox volume $VOLUME" >&2
+        return 1
+      fi
+      if [ -n "$FOUND" ]; then
+        [ "$FOUND" = "$VOLUME" ] || { echo "Docker returned an unexpected sandbox volume: $FOUND" >&2; return 1; }
+        VOLUME_OWNER=$(command docker volume inspect -f '{{ index .Labels "agentbox.sandbox" }}' "$VOLUME") || return 1
+        [ "$VOLUME_OWNER" = "$SANDBOX_ID" ] || { echo "workspace volume name collision: $VOLUME" >&2; return 1; }
+        SANDBOX_VOLUME_PREEXISTED=true
+      else
+        record_create_resource docker-volume "$VOLUME" "$SANDBOX_ID"
+        command docker volume create --label "agentbox.sandbox=$SANDBOX_ID" "$VOLUME" >/dev/null || return 1
+        VOLUME_OWNER=$(command docker volume inspect -f '{{ index .Labels "agentbox.sandbox" }}' "$VOLUME") || return 1
+        [ "$VOLUME_OWNER" = "$SANDBOX_ID" ] || { echo "workspace volume ownership was not applied: $VOLUME" >&2; return 1; }
+      fi
+      record_create_resource docker-delete "$TARGET" "$SANDBOX_ID"
       set -- docker run -d --name "$TARGET" \
         --label "agentbox.sandbox=$SANDBOX_ID" \
         --restart unless-stopped --user 0:0 --workdir "$WORKDIR" \
@@ -3087,7 +4163,14 @@ create_sandbox() {
       [ -n "$MEMORY" ] && set -- "$@" --memory "$MEMORY"
       [ "$NETWORK" = none ] && set -- "$@" --network none
       set -- "$@" "$RUNTIME_IMAGE" sh -lc 'trap : TERM INT; sleep infinity & wait'
-      "$@" >/dev/null
+      [ -z "${CREATE_STATE_DIR:-}" ] || : > "$CREATE_STATE_DIR/runtime-create-pending"
+      if ! "$@" >/dev/null; then
+        [ -z "${CREATE_STATE_DIR:-}" ] || rm -f "$CREATE_STATE_DIR/runtime-create-pending"
+        cleanup_failed_create
+        echo "stage runtime-create failed: Docker could not create the sandbox" >&2
+        return 1
+      fi
+      [ -z "${CREATE_STATE_DIR:-}" ] || rm -f "$CREATE_STATE_DIR/runtime-create-pending"
     fi
     if ! configure_proxy "$TARGET" "$JOB_FILE"; then
       cleanup_failed_create
@@ -3098,6 +4181,9 @@ create_sandbox() {
     runtime_probe "$DRIVER" || { echo "stage runtime-probe failed: $DRIVER self-test failed" >&2; return 1; }
     if runtime_call "$DRIVER" inspect "$TARGET" >/dev/null 2>&1; then
       SANDBOX_PREEXISTED=true
+      record_create_resource "$DRIVER-stop" "$TARGET"
+    else
+      record_create_resource "$DRIVER-delete" "$TARGET"
     fi
     CPU_COUNT=$(printf '%s' "${CPU:-2}" | sed 's/\..*$//')
     case "$CPU_COUNT" in ''|*[!0-9]*) CPU_COUNT=2 ;; esac
@@ -3141,11 +4227,14 @@ create_sandbox() {
         set -- "$@" --allow-net "$ALLOWED_HOST"
       done
     fi
+    [ -z "${CREATE_STATE_DIR:-}" ] || : > "$CREATE_STATE_DIR/runtime-create-pending"
     if ! "$@" >/dev/null; then
+      [ -z "${CREATE_STATE_DIR:-}" ] || rm -f "$CREATE_STATE_DIR/runtime-create-pending"
       cleanup_failed_create
       echo "stage runtime-create failed: $DRIVER could not create the sandbox" >&2
       return 1
     fi
+    [ -z "${CREATE_STATE_DIR:-}" ] || rm -f "$CREATE_STATE_DIR/runtime-create-pending"
     if ! runtime_call "$DRIVER" fs-mkdir "$TARGET" "$WORKDIR" >/dev/null; then
       cleanup_failed_create
       echo "stage workspace-init failed: $DRIVER could not prepare $WORKDIR" >&2
@@ -3208,6 +4297,11 @@ create_sandbox() {
     echo "stage agent-wrappers failed: image $IMAGE could not install Agent wrappers" >&2
     return 1
   fi
+  if ! install_sandbox_extensions "$TARGET" "$JOB_FILE"; then
+    cleanup_failed_create
+    echo 'stage extensions failed: sandbox extension provisioning did not complete' >&2
+    return 1
+  fi
   if [ -n "$SETUP" ]; then
     report_job_progress setup "正在执行模板初始化命令"
     if ! docker exec "$TARGET" sh -lc "$SETUP" >&2; then
@@ -3246,6 +4340,8 @@ sandbox_container_name() {
 start_sandbox() {
   JOB_FILE=$1
   DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
+  validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
   EXTERNAL_ID=$(jq -r '.job.payload.externalId // empty' "$JOB_FILE")
   if [ -z "$EXTERNAL_ID" ]; then
     create_sandbox "$JOB_FILE"
@@ -3289,6 +4385,9 @@ start_sandbox() {
 
 restart_sandbox() {
   JOB_FILE=$1
+  DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
+  NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
+  validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
   stop_sandbox "$JOB_FILE" >/dev/null || return 1
   start_sandbox "$JOB_FILE"
 }
@@ -3340,8 +4439,99 @@ delete_sandbox() {
   AGENTBOX_RUNTIME_DRIVER=$DRIVER
   export AGENTBOX_RUNTIME_DRIVER
   if [ "$DRIVER" = docker ]; then
-    docker rm -f "$TARGET" >/dev/null 2>&1 || true
-    docker volume rm "agentbox-$SANDBOX_ID-workspace" >/dev/null 2>&1 || true
+    VOLUME="agentbox-$SANDBOX_ID-workspace"
+    VOLUME_OWNERSHIP_DIR="$STATE_DIR/docker-volume-ownership"
+    VOLUME_OWNERSHIP_MARKER="$VOLUME_OWNERSHIP_DIR/$SANDBOX_ID"
+    mkdir -p "$VOLUME_OWNERSHIP_DIR" || return 1
+    chmod 700 "$VOLUME_OWNERSHIP_DIR" || return 1
+    if ! timeout 10 docker info >/dev/null 2>&1; then
+      echo "Docker daemon is unavailable" >&2
+      return 1
+    fi
+    if ! FOUND=$(docker container ls -a --filter "name=^/$TARGET$" --format '{{.Names}}'); then
+      echo "Docker could not inspect sandbox container $TARGET" >&2
+      return 1
+    fi
+    if [ -n "$FOUND" ]; then
+      if [ "$FOUND" != "$TARGET" ]; then
+        echo "Docker returned an unexpected sandbox container: $FOUND" >&2
+        return 1
+      fi
+      if ! OWNER=$(docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET"); then
+        echo "Docker could not inspect sandbox ownership for $TARGET" >&2
+        return 1
+      fi
+      if [ "$OWNER" != "$SANDBOX_ID" ]; then
+        echo "refusing to delete container $TARGET owned by ${OWNER:-unknown}" >&2
+        return 1
+      fi
+      if ! MOUNTS=$(docker inspect -f '{{ range .Mounts }}{{ println .Name }}{{ end }}' "$TARGET"); then
+        echo "Docker could not inspect sandbox mounts for $TARGET" >&2
+        return 1
+      fi
+      if printf '%s\n' "$MOUNTS" | grep -Fx "$VOLUME" >/dev/null; then
+        if ! VOLUME_FINGERPRINT=$(docker volume inspect -f '{{.Mountpoint}}|{{.CreatedAt}}' "$VOLUME"); then
+          echo "Docker could not fingerprint sandbox volume $VOLUME before deleting its container" >&2
+          return 1
+        fi
+        VOLUME_MARKER_TMP=$(mktemp "$VOLUME_OWNERSHIP_DIR/$SANDBOX_ID.XXXXXX") || return 1
+        if ! printf '%s\t%s\n' "$VOLUME" "$VOLUME_FINGERPRINT" > "$VOLUME_MARKER_TMP" ||
+           ! mv "$VOLUME_MARKER_TMP" "$VOLUME_OWNERSHIP_MARKER"; then
+          rm -f "$VOLUME_MARKER_TMP"
+          echo "Docker could not persist sandbox volume ownership for $VOLUME" >&2
+          return 1
+        fi
+      fi
+      if ! docker rm -f -v "$TARGET" >/dev/null; then
+        echo "Docker could not delete sandbox container $TARGET" >&2
+        return 1
+      fi
+    fi
+    if ! FOUND=$(docker volume ls --filter "name=^$VOLUME$" --format '{{.Name}}'); then
+      echo "Docker could not inspect sandbox volume $VOLUME" >&2
+      return 1
+    fi
+    if [ -n "$FOUND" ]; then
+      if [ "$FOUND" != "$VOLUME" ]; then
+        echo "Docker returned an unexpected sandbox volume: $FOUND" >&2
+        return 1
+      fi
+      if ! VOLUME_OWNER=$(docker volume inspect -f '{{ index .Labels "agentbox.sandbox" }}' "$VOLUME"); then
+        echo "Docker could not inspect sandbox volume ownership for $VOLUME" >&2
+        return 1
+      fi
+      if ! VOLUME_FINGERPRINT=$(docker volume inspect -f '{{.Mountpoint}}|{{.CreatedAt}}' "$VOLUME"); then
+        echo "Docker could not fingerprint sandbox volume $VOLUME" >&2
+        return 1
+      fi
+      MARKER_OWNED_VOLUME=false
+      if [ -f "$VOLUME_OWNERSHIP_MARKER" ]; then
+        TAB=$(printf '\t')
+        MARKER_VOLUME=
+        MARKER_FINGERPRINT=
+        IFS="$TAB" read -r MARKER_VOLUME MARKER_FINGERPRINT < "$VOLUME_OWNERSHIP_MARKER" || true
+        if [ "$MARKER_VOLUME" = "$VOLUME" ] && [ "$MARKER_FINGERPRINT" = "$VOLUME_FINGERPRINT" ]; then
+          MARKER_OWNED_VOLUME=true
+        else
+          rm -f "$VOLUME_OWNERSHIP_MARKER"
+        fi
+      fi
+      if [ -n "$VOLUME_OWNER" ] && [ "$VOLUME_OWNER" != "$SANDBOX_ID" ]; then
+        echo "refusing to delete workspace volume $VOLUME owned by $VOLUME_OWNER" >&2
+        return 1
+      fi
+      if [ -z "$VOLUME_OWNER" ] && [ "$MARKER_OWNED_VOLUME" != true ]; then
+        echo "warning: leaving unverifiable legacy workspace volume $VOLUME for manual cleanup" >&2
+        return 0
+      fi
+      if ! docker volume rm "$VOLUME" >/dev/null; then
+        echo "Docker could not delete sandbox volume $VOLUME" >&2
+        return 1
+      fi
+      rm -f "$VOLUME_OWNERSHIP_MARKER"
+    else
+      rm -f "$VOLUME_OWNERSHIP_MARKER"
+    fi
   else
     runtime_call "$DRIVER" delete "$TARGET"
   fi
@@ -3397,6 +4587,348 @@ check_network_proxy() {
       statusCode:(if $statusCode == "" or $statusCode == "000" then null else ($statusCode | tonumber) end),
       error:(if $error == "" then null else $error end),checkedAt:$checkedAt}'
 }
+
+record_create_resource() {
+  [ -n "${CREATE_STATE_DIR:-}" ] || return 0
+  printf '%s\t%s\t%s\n' "$1" "$2" "${3:-}" >> "$CREATE_STATE_DIR/resources"
+}
+
+settle_create_pending_marker() {
+  PENDING_MARKER=$1
+  RESET_SETTLE=${2:-false}
+  SETTLE_MARKER="$PENDING_MARKER.settling"
+  if [ ! -f "$PENDING_MARKER" ]; then
+    rm -f "$SETTLE_MARKER"
+    return 0
+  fi
+  SETTLE_SECONDS=${AGENTBOX_CREATE_PENDING_SETTLE_SECONDS:-30}
+  case "$SETTLE_SECONDS" in ''|*[!0-9]*) SETTLE_SECONDS=30 ;; esac
+  if [ "$RESET_SETTLE" = true ]; then
+    date +%s > "$SETTLE_MARKER" || return 1
+    return 1
+  fi
+  if [ ! -f "$SETTLE_MARKER" ]; then
+    date +%s > "$SETTLE_MARKER" || return 1
+    return 1
+  fi
+  SETTLE_STARTED=$(cat "$SETTLE_MARKER") || return 1
+  case "$SETTLE_STARTED" in
+    ''|*[!0-9]*) rm -f "$SETTLE_MARKER"; return 1 ;;
+  esac
+  SETTLE_NOW=$(date +%s) || return 1
+  [ "$SETTLE_NOW" -ge "$SETTLE_STARTED" ] || return 1
+  [ "$((SETTLE_NOW - SETTLE_STARTED))" -ge "$SETTLE_SECONDS" ] || return 1
+  rm -f "$PENDING_MARKER" "$SETTLE_MARKER"
+}
+
+# Freeze parents before walking their children so an installer cannot spawn a
+# retry while cancellation is killing its processes. Runtime exec processes are
+# stopped separately by removing/stopping the recorded container or VM.
+kill_create_process_tree() (
+  TREE_PID=$1
+  # A create operation may have restarted the shared BoxLite service. It and
+  # its other sandboxes are not part of this installation's process tree.
+  SHARED_PID=$(cat "${BOXLITE_SERVER_PID_FILE:-/nonexistent}" 2>/dev/null || true)
+  [ "$TREE_PID" != "$SHARED_PID" ] || return 0
+  kill -STOP "$TREE_PID" 2>/dev/null || return 0
+  for CHILD_PID in $(ps -eo pid=,ppid= | awk -v parent="$TREE_PID" '$2 == parent { print $1 }'); do
+    kill_create_process_tree "$CHILD_PID"
+  done
+  kill -KILL "$TREE_PID" 2>/dev/null || true
+)
+
+poll_create_control() (
+  CONTROL_BODY=$(jq -cn --argjson leaseGeneration "$LEASE_GENERATION" '{leaseGeneration:$leaseGeneration}')
+  CONTROL_STATUS=$(worker_request "$CREATE_STATE_DIR/control" --max-time 5 -X POST \
+    "$SERVER_URL/api/servers/$SERVER_ID/jobs/$JOB_ID/control" \
+    -H "Authorization: Bearer $CREDENTIAL" -H 'Content-Type: application/json' \
+    --data "$CONTROL_BODY") || { printf unavailable; return; }
+  case "$CONTROL_STATUS" in
+    200)
+      if jq -e '.cancelRequested == true' "$CREATE_STATE_DIR/control" >/dev/null 2>&1; then
+        printf cancel
+      elif jq -e '.cancelRequested == false' "$CREATE_STATE_DIR/control" >/dev/null 2>&1; then
+        printf continue
+      else
+        printf unavailable
+      fi
+      ;;
+    404) printf unsupported ;;
+    401|403|409) printf rejected ;;
+    *) printf unavailable ;;
+  esac
+)
+
+cleanup_cancelled_create() (
+  CLEANUP_FAILED=false
+  RUNTIME_RESOURCE_OBSERVED=false
+  BUILD_RESOURCE_OBSERVED=false
+  # Reverse creation order: remove containers before their new workspace
+  # volumes. Never remove a pre-existing workspace, sandbox or successful cache.
+  awk '{ lines[NR] = $0 } END { for (i = NR; i > 0; i--) print lines[i] }' \
+    "$CREATE_STATE_DIR/resources" > "$CREATE_STATE_DIR/cleanup"
+  TAB=$(printf '\t')
+  while IFS="$TAB" read -r KIND TARGET EXPECTED_OWNER; do
+    [ -n "$TARGET" ] || continue
+    case "$KIND" in
+      docker-delete|docker-stop)
+        if ! FOUND=$(command docker container ls -a --filter "name=^/$TARGET$" --format '{{.Names}}'); then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        [ "$FOUND" = "$TARGET" ] || continue
+        [ "$KIND" != docker-delete ] || RUNTIME_RESOURCE_OBSERVED=true
+        if ! OWNER=$(command docker inspect -f '{{ index .Config.Labels "agentbox.sandbox" }}' "$TARGET"); then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        if [ -z "$EXPECTED_OWNER" ] || [ "$OWNER" != "$EXPECTED_OWNER" ]; then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        if [ "$KIND" = docker-delete ]; then
+          command docker rm -f -v "$TARGET" >/dev/null || CLEANUP_FAILED=true
+        else
+          command docker stop --time 10 "$TARGET" >/dev/null || CLEANUP_FAILED=true
+        fi
+        ;;
+      docker-build-delete)
+        if ! FOUND=$(command docker container ls -a --filter "name=^/$TARGET$" --format '{{.Names}}'); then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        [ "$FOUND" = "$TARGET" ] || continue
+        BUILD_RESOURCE_OBSERVED=true
+        if ! OWNER=$(command docker inspect -f '{{ index .Config.Labels "agentbox.runtime.build" }}' "$TARGET"); then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        if [ -z "$EXPECTED_OWNER" ] || [ "$OWNER" != "$EXPECTED_OWNER" ]; then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        command docker rm -f -v "$TARGET" >/dev/null || CLEANUP_FAILED=true
+        ;;
+      docker-volume)
+        if ! FOUND=$(command docker volume ls --filter "name=^$TARGET$" --format '{{.Name}}'); then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        [ "$FOUND" = "$TARGET" ] || continue
+        RUNTIME_RESOURCE_OBSERVED=true
+        if ! OWNER=$(command docker volume inspect -f '{{ index .Labels "agentbox.sandbox" }}' "$TARGET"); then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        if [ -z "$EXPECTED_OWNER" ] || [ "$OWNER" != "$EXPECTED_OWNER" ]; then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        command docker volume rm "$TARGET" >/dev/null || CLEANUP_FAILED=true
+        ;;
+      docker-image)
+        if ! FOUND=$(command docker image ls --filter "reference=$TARGET" --format '{{.ID}}'); then
+          CLEANUP_FAILED=true
+          continue
+        fi
+        [ -n "$FOUND" ] || continue
+        BUILD_RESOURCE_OBSERVED=true
+        command docker image rm "$TARGET" >/dev/null || CLEANUP_FAILED=true
+        ;;
+      boxlite-delete|microsandbox-delete)
+        RUNTIME_DRIVER=${KIND%-delete}
+        RUNTIME_WAS_PRESENT=false
+        if runtime_call "$RUNTIME_DRIVER" inspect "$TARGET" >/dev/null 2>&1; then
+          RUNTIME_WAS_PRESENT=true
+        fi
+        if ! runtime_call "$RUNTIME_DRIVER" delete "$TARGET" >/dev/null; then
+          CLEANUP_FAILED=true
+        elif runtime_call "$RUNTIME_DRIVER" inspect "$TARGET" >/dev/null 2>&1; then
+          RUNTIME_RESOURCE_OBSERVED=true
+          CLEANUP_FAILED=true
+        elif [ "$RUNTIME_WAS_PRESENT" = true ]; then
+          RUNTIME_RESOURCE_OBSERVED=true
+        fi
+        ;;
+      boxlite-stop|microsandbox-stop)
+        runtime_call "${KIND%-stop}" stop "$TARGET" >/dev/null || CLEANUP_FAILED=true
+        ;;
+      *) CLEANUP_FAILED=true ;;
+    esac
+  done < "$CREATE_STATE_DIR/cleanup"
+  # A detached runtime create RPC may still be finishing after its client dies.
+  # Keep retrying through a quiet period, then allow the journal to converge.
+  settle_create_pending_marker "$CREATE_STATE_DIR/runtime-create-pending" "$RUNTIME_RESOURCE_OBSERVED" || CLEANUP_FAILED=true
+  settle_create_pending_marker "$CREATE_STATE_DIR/build-create-pending" "$BUILD_RESOURCE_OBSERVED" || CLEANUP_FAILED=true
+  [ "$CLEANUP_FAILED" = false ]
+)
+
+complete_cancelled_create() {
+  if cleanup_cancelled_create 2>>"$CREATE_STATE_DIR/log"; then
+    CLEANUP_CONFIRMED=true
+    CANCEL_ERROR=job_cancelled
+    CANCEL_MESSAGE='安装已取消，已清理本次创建的临时资源'
+  else
+    CLEANUP_CONFIRMED=false
+    : > "$CREATE_STATE_DIR/cleanup-required"
+    CANCEL_ERROR=cancellation_cleanup_failed
+    CANCEL_MESSAGE='安装已中断，但未能确认临时资源清理完成，请检查 Worker 后删除沙箱'
+  fi
+  # Keep the lease and retry the acknowledgement after a transient network
+  # failure. The Server must not release this job before cleanup is confirmed.
+  while ! complete_job_failure "$JOB_ID" "$CANCEL_ERROR" cancel false "$CANCEL_MESSAGE" create-sandbox; do
+    CONTROL=$(poll_create_control)
+    case "$CONTROL" in rejected|unsupported) return 1 ;; esac
+    sleep 2
+  done
+  if [ "$CLEANUP_CONFIRMED" = true ]; then
+    CREATE_FINISHED=true
+  fi
+}
+
+process_create_job() (
+  CREATE_STATE_DIR=$(mktemp -d "$STATE_DIR/create-$JOB_ID.XXXXXX")
+  chmod 700 "$CREATE_STATE_DIR"
+  : > "$CREATE_STATE_DIR/resources"
+  cp "$JOB_FILE" "$CREATE_STATE_DIR/job.json"
+  CREATE_FINISHED=false
+  CREATE_PID=
+  cleanup_create_supervisor() {
+    if [ -n "$CREATE_PID" ]; then
+      kill_create_process_tree "$CREATE_PID"
+      wait "$CREATE_PID" 2>/dev/null || true
+      cleanup_cancelled_create 2>/dev/null || true
+    fi
+    # Keep the root-only journal until Server acknowledgement. A restarted
+    # Worker can finish cancellation, including after cleanup but before ACK.
+    [ "$CREATE_FINISHED" != true ] || rm -rf "$CREATE_STATE_DIR"
+  }
+  trap cleanup_create_supervisor EXIT
+  trap 'exit 1' INT TERM
+  CONTROL_SUPPORTED=false
+  CONTROL=$(poll_create_control)
+  [ "$CONTROL" != rejected ] || return 1
+  [ "$CONTROL" != continue ] || CONTROL_SUPPORTED=true
+  if [ "$CONTROL" = cancel ]; then
+    complete_cancelled_create
+    return
+  fi
+  create_sandbox "$JOB_FILE" >"$CREATE_STATE_DIR/output" 2>"$CREATE_STATE_DIR/log" &
+  CREATE_PID=$!
+  while kill -0 "$CREATE_PID" 2>/dev/null; do
+    CONTROL=$(poll_create_control)
+    [ "$CONTROL" != continue ] || CONTROL_SUPPORTED=true
+    if [ "$CONTROL" = unsupported ] && [ "$CONTROL_SUPPORTED" = true ]; then CONTROL=rejected; fi
+    if [ "$CONTROL" = cancel ] || [ "$CONTROL" = rejected ]; then
+      kill_create_process_tree "$CREATE_PID"
+      wait "$CREATE_PID" 2>/dev/null || true
+      CREATE_PID=
+      if [ "$CONTROL" = cancel ]; then
+        complete_cancelled_create
+      else
+        cleanup_cancelled_create
+      fi
+      return
+    fi
+    sleep 1
+  done
+  CREATE_SUCCESS=true
+  wait "$CREATE_PID" || CREATE_SUCCESS=false
+  CREATE_PID=
+  EXTERNAL_ID=$(cat "$CREATE_STATE_DIR/output")
+  MESSAGE='Sandbox created'
+  ERROR_CODE=
+  ERROR_STAGE=
+  ERROR_RETRYABLE=false
+  CLEANUP_CONFIRMED=true
+  if [ "$CREATE_SUCCESS" = false ]; then
+    EXTERNAL_ID=
+    MESSAGE=$(tail -c 3500 "$CREATE_STATE_DIR/log")
+    ERROR_STAGE=$(worker_error_stage "$MESSAGE")
+    [ -n "$ERROR_STAGE" ] || ERROR_STAGE=create
+    ERROR_CODE=sandbox_create_failed
+    ERROR_RETRYABLE=$(worker_error_retryable "$ERROR_STAGE")
+    if ! cleanup_cancelled_create 2>>"$CREATE_STATE_DIR/log"; then
+      CLEANUP_CONFIRMED=false
+      : > "$CREATE_STATE_DIR/cleanup-required"
+      ERROR_CODE=sandbox_create_cleanup_failed
+      ERROR_STAGE=cleanup
+      ERROR_RETRYABLE=false
+      MESSAGE="$MESSAGE
+Worker could not confirm cleanup of temporary create resources; cleanup will be retried from the journal."
+    fi
+  fi
+  while ! complete_job "$JOB_ID" "$CREATE_SUCCESS" "$EXTERNAL_ID" "$MESSAGE" "" /dev/null false false \
+      "$ERROR_CODE" "$ERROR_STAGE" "$ERROR_RETRYABLE" '{"action":"create-sandbox"}'; do
+    # Cancellation may win the transaction just as installation finishes.
+    CONTROL=$(poll_create_control)
+    if [ "$CONTROL" = cancel ]; then
+      complete_cancelled_create
+      return
+    fi
+    case "$CONTROL" in rejected|unsupported) return 1 ;; esac
+    sleep 2
+  done
+  if [ "$CREATE_SUCCESS" = true ] || [ "$CLEANUP_CONFIRMED" = true ]; then
+    CREATE_FINISHED=true
+  fi
+)
+
+recover_create_jobs() (
+  for CREATE_STATE_DIR in "$STATE_DIR"/create-*; do
+    [ -f "$CREATE_STATE_DIR/job.json" ] || continue
+    JOB_FILE="$CREATE_STATE_DIR/job.json"
+    JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
+    LEASE_GENERATION=$(jq -r '.job.leaseGeneration' "$JOB_FILE")
+    CREATE_FINISHED=false
+    CONTROL=$(poll_create_control)
+    case "$CONTROL" in
+      cancel) complete_cancelled_create || true ;;
+      continue)
+        # The service process group was stopped, but detached runtime execs
+        # may remain. Clean them before failing this interrupted creation.
+        if cleanup_cancelled_create; then
+          RECOVERY_CLEANUP_CONFIRMED=true
+          RECOVERY_ERROR=worker_interrupted
+          RECOVERY_MESSAGE='Worker 重启中断了安装，已清理本次临时资源，请重新创建沙箱'
+        else
+          RECOVERY_CLEANUP_CONFIRMED=false
+          : > "$CREATE_STATE_DIR/cleanup-required"
+          RECOVERY_ERROR=worker_interrupted_cleanup_failed
+          RECOVERY_MESSAGE='Worker 重启中断了安装，未能确认清理完成，请检查 Worker 后删除沙箱'
+        fi
+        if complete_job_failure "$JOB_ID" "$RECOVERY_ERROR" create false "$RECOVERY_MESSAGE" create-sandbox; then
+          if [ "$RECOVERY_CLEANUP_CONFIRMED" = true ]; then
+            CREATE_FINISHED=true
+          fi
+        elif [ "$(poll_create_control)" = cancel ]; then
+          complete_cancelled_create || true
+        fi
+        ;;
+      rejected|unsupported)
+        if [ -f "$CREATE_STATE_DIR/cleanup-required" ]; then
+          if cleanup_cancelled_create; then
+            rm -f "$CREATE_STATE_DIR/cleanup-required"
+            CREATE_FINISHED=true
+          elif [ ! -f "$CREATE_STATE_DIR/recovery-warned" ]; then
+            echo "warning: creation $JOB_ID cleanup is still incomplete" >&2
+            : > "$CREATE_STATE_DIR/recovery-warned"
+          fi
+        elif [ ! -f "$CREATE_STATE_DIR/recovery-warned" ]; then
+          echo "warning: creation $JOB_ID is no longer active; retaining its unclassified journal" >&2
+          : > "$CREATE_STATE_DIR/recovery-warned"
+        fi
+        ;;
+      *)
+        if [ ! -f "$CREATE_STATE_DIR/recovery-warned" ]; then
+          echo "warning: creation $JOB_ID awaits lease verification before recovery" >&2
+          : > "$CREATE_STATE_DIR/recovery-warned"
+        fi
+        ;;
+    esac
+    [ "$CREATE_FINISHED" != true ] || rm -rf "$CREATE_STATE_DIR"
+  done
+)
 
 process_job() {
   JOB_FILE=$1
@@ -3479,7 +5011,14 @@ process_job() {
       LOG_FILE=$(mktemp)
       if ! update_worker "$JOB_FILE" 2>"$LOG_FILE"; then
         MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        complete_job_failure "$JOB_ID" worker_update_failed worker-update true "$MESSAGE" "$ACTION"
+        if [ -e "$STATE_DIR/worker-update.json" ]; then
+          # Activation may have failed after the durable journal was created.
+          # Leave the lease unresolved so the finalizer can restore and report
+          # the exact rollback result instead of racing a generic completion.
+          printf '%s\n' "$MESSAGE" >&2
+        else
+          complete_job_failure "$JOB_ID" worker_update_failed worker-update true "$MESSAGE" "$ACTION"
+        fi
       fi
       rm -f "$LOG_FILE"
       ;;
@@ -3500,18 +5039,7 @@ process_job() {
       rm -f "$LOG_FILE"
       ;;
     create-sandbox)
-      LOG_FILE=$(mktemp)
-      if EXTERNAL_ID=$(create_sandbox "$JOB_FILE" 2>"$LOG_FILE"); then
-        complete_job "$JOB_ID" true "$EXTERNAL_ID" "Sandbox created"
-      else
-        MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        ERROR_STAGE=$(worker_error_stage "$MESSAGE")
-        [ -n "$ERROR_STAGE" ] || ERROR_STAGE=create
-        ERROR_RETRYABLE=$(worker_error_retryable "$ERROR_STAGE")
-        complete_job_failure "$JOB_ID" sandbox_create_failed "$ERROR_STAGE" \
-          "$ERROR_RETRYABLE" "$MESSAGE" "$ACTION"
-      fi
-      rm -f "$LOG_FILE"
+      process_create_job
       ;;
     start-sandbox|stop-sandbox|restart-sandbox|delete-sandbox)
       LOG_FILE=$(mktemp)
@@ -3522,7 +5050,9 @@ process_job() {
         delete-sandbox) OPERATION=delete_sandbox ;;
       esac
       if EXTERNAL_ID=$($OPERATION "$JOB_FILE" 2>"$LOG_FILE"); then
-        complete_job "$JOB_ID" true "$EXTERNAL_ID" "Sandbox operation completed"
+        MESSAGE=$(tail -c 3500 "$LOG_FILE")
+        [ -n "$MESSAGE" ] || MESSAGE="Sandbox operation completed"
+        complete_job "$JOB_ID" true "$EXTERNAL_ID" "$MESSAGE"
       else
         MESSAGE=$(tail -c 3500 "$LOG_FILE")
         ERROR_STAGE=${ACTION%-sandbox}
@@ -3591,7 +5121,9 @@ run_worker() {
   # Confirm a freshly installed Worker before any potentially slow runtime
   # discovery. The rollback timer is intentionally short so a broken binary
   # cannot leave the server unmanaged.
-  finalize_worker_update || true
+  FINALIZE_STATUS=0
+  finalize_worker_update || FINALIZE_STATUS=$?
+  [ "$FINALIZE_STATUS" -ne 75 ] || exit 0
   prepare_boxlite_config
   AGENTBOX_BOXLITE_SERVER_MODE=1
   export AGENTBOX_BOXLITE_SERVER_MODE
@@ -3622,13 +5154,38 @@ run_worker() {
   pause_session_worker() {
     [ -n "$SESSION_PID" ] || return 0
     kill "$SESSION_PID" >/dev/null 2>&1 || true
+    SESSION_STOP_ATTEMPTS=0
+    while [ "$SESSION_STOP_ATTEMPTS" -lt 50 ]; do
+      SESSION_STATE=$(ps -o stat= -p "$SESSION_PID" 2>/dev/null | tr -d ' ' || true)
+      case "$SESSION_STATE" in
+        ''|Z*) break ;;
+      esac
+      SESSION_STOP_ATTEMPTS=$((SESSION_STOP_ATTEMPTS + 1))
+      sleep 0.1
+    done
+    case "$SESSION_STATE" in
+      ''|Z*) ;;
+      *)
+        kill -KILL "$SESSION_PID" >/dev/null 2>&1 || true
+        SESSION_STOP_ATTEMPTS=0
+        while [ "$SESSION_STOP_ATTEMPTS" -lt 20 ]; do
+          SESSION_STATE=$(ps -o stat= -p "$SESSION_PID" 2>/dev/null | tr -d ' ' || true)
+          case "$SESSION_STATE" in
+            ''|Z*) break ;;
+          esac
+          SESSION_STOP_ATTEMPTS=$((SESSION_STOP_ATTEMPTS + 1))
+          sleep 0.1
+        done
+        case "$SESSION_STATE" in ''|Z*) ;; *) return 1 ;; esac
+        ;;
+    esac
     wait "$SESSION_PID" >/dev/null 2>&1 || true
     SESSION_PID=
   }
   resume_session_worker() {
     ensure_session_worker
   }
-  ensure_session_worker
+  [ -e "$STATE_DIR/worker-update.json" ] || ensure_session_worker
   cleanup_worker() {
     kill "$HEARTBEAT_PID" >/dev/null 2>&1 || true
     [ -z "$SESSION_PID" ] || kill "$SESSION_PID" >/dev/null 2>&1 || true
@@ -3638,6 +5195,8 @@ run_worker() {
   }
   trap cleanup_worker EXIT
   trap 'exit 0' INT TERM
+  recover_create_jobs
+  CREATE_RECOVERY_AT=$(date +%s)
   # Image discovery can take tens of seconds on a busy BoxLite host. Keep the
   # heartbeat and interactive session available while the inventory refreshes.
   refresh_boxlite_images || {
@@ -3646,9 +5205,27 @@ run_worker() {
   }
   mark_worker_inventory_dirty || true
   while :; do
-    finalize_worker_update || true
+    FINALIZE_STATUS=0
+    finalize_worker_update || FINALIZE_STATUS=$?
+    [ "$FINALIZE_STATUS" -ne 75 ] || exit 0
+    if [ -e "$STATE_DIR/worker-update.json" ]; then
+      # Heartbeats run independently, but no new job may cross an unresolved
+      # update journal or observe a mixed Worker/driver generation.
+      if ! worker_update_marker_valid "$STATE_DIR/worker-update.json" &&
+          [ ! -e "$STATE_DIR/worker-update-degraded-warned" ]; then
+        echo "ERROR: Worker update journal is corrupt; claims are blocked. Inspect it, then run: agentbox-worker recover-update --restore-previous" >&2
+        : > "$STATE_DIR/worker-update-degraded-warned"
+      fi
+      sleep 2
+      continue
+    fi
+    rm -f "$STATE_DIR/worker-update-degraded-warned"
     ensure_session_worker
     [ "${AGENTBOX_BOXLITE_SERVER_MODE:-}" != 1 ] || ensure_boxlite_server || true
+    if [ "$(($(date +%s) - CREATE_RECOVERY_AT))" -ge 15 ]; then
+      recover_create_jobs
+      CREATE_RECOVERY_AT=$(date +%s)
+    fi
     JOB_FILE=$(mktemp)
     HTTP_STATUS=$(worker_request "$JOB_FILE" -X POST \
       "$SERVER_URL/api/servers/$SERVER_ID/jobs/claim" \
@@ -3669,5 +5246,6 @@ case "${1:-}" in
   setup) setup_worker "$@" ;;
   run) run_worker ;;
   status) systemctl status agentbox-worker.service ;;
+  recover-update) shift; recover_worker_update "$@" ;;
   *) usage ;;
 esac

@@ -53,17 +53,18 @@ verify_worker_checksum "$worker_tmp" "$worker_headers_tmp"
 curl -fsSL "$SERVER_URL/api/worker/agentbox-microsandbox-driver.go" -o "$microsandbox_source_tmp"
 
 install_host_dependencies() {
-  if command -v jq >/dev/null &&
+  if command -v jq >/dev/null && command -v flock >/dev/null && command -v sync >/dev/null &&
      { ! command -v docker >/dev/null || command -v skopeo >/dev/null; }; then
     return 0
   fi
   if ! command -v apt-get >/dev/null; then
-    echo "jq is required; automatic installation currently supports apt-based Linux" >&2
+    echo "jq, flock, and sync are required; automatic installation currently supports apt-based Linux" >&2
     exit 1
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
-  PACKAGES="ca-certificates jq"
+  PACKAGES="ca-certificates jq util-linux"
+  command -v sync >/dev/null || PACKAGES="$PACKAGES coreutils"
   command -v docker >/dev/null && PACKAGES="$PACKAGES skopeo"
   apt-get install -y $PACKAGES
 }

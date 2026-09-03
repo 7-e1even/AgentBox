@@ -37,6 +37,35 @@ func TestValidateServerRegistration(t *testing.T) {
 	}
 }
 
+func TestSandboxModelSourceInputNormalizationAndValidation(t *testing.T) {
+	input := SandboxModelSourceInput{
+		SlotCredentialID:     " Primary-Slot ",
+		CredentialID:         " Target-Source ",
+		ModelID:              " gpt-5.4 ",
+		ExpectedCredentialID: " Current-Source ",
+		ExpectedModelID:      " gpt-5.3 ",
+	}
+	NormalizeSandboxModelSourceInput(&input)
+	if input.SlotCredentialID != "primary-slot" || input.CredentialID != "target-source" || input.ModelID != "gpt-5.4" ||
+		input.ExpectedCredentialID != "current-source" || input.ExpectedModelID != "gpt-5.3" {
+		t.Fatalf("normalized input = %#v", input)
+	}
+	if err := ValidateSandboxModelSourceInput(input); err != nil {
+		t.Fatalf("ValidateSandboxModelSourceInput() returned error: %v", err)
+	}
+
+	for _, invalid := range []SandboxModelSourceInput{
+		{SlotCredentialID: "../slot", CredentialID: "target-source", ModelID: "gpt-5.4", ExpectedCredentialID: "current-source", ExpectedModelID: "gpt-5.3"},
+		{SlotCredentialID: "primary-slot", CredentialID: "target-source", ModelID: "bad\nmodel", ExpectedCredentialID: "current-source", ExpectedModelID: "gpt-5.3"},
+		{SlotCredentialID: "primary-slot", CredentialID: "target-source", ModelID: "gpt-5.4", ExpectedCredentialID: "", ExpectedModelID: "gpt-5.3"},
+		{SlotCredentialID: "primary-slot", CredentialID: "target-source", ModelID: "gpt-5.4", ExpectedCredentialID: "current-source", ExpectedModelID: ""},
+	} {
+		if err := ValidateSandboxModelSourceInput(invalid); !IsValidationError(err) {
+			t.Fatalf("ValidateSandboxModelSourceInput(%#v) error = %v, want validation error", invalid, err)
+		}
+	}
+}
+
 func TestValidateServerInventoryRejectsOversizedValues(t *testing.T) {
 	inventory := ServerInventory{
 		DockerImages: []ServerImage{{Reference: strings.Repeat("x", 1001)}},
@@ -93,6 +122,34 @@ func TestEnvironmentTemplateRequiresServerInventorySelection(t *testing.T) {
 	input.Spec["driver"] = "unknown"
 	if err := Validate(input); !IsValidationError(err) {
 		t.Fatalf("Validate() error = %v, want unknown driver rejection", err)
+	}
+}
+
+func TestValidateNetworkPolicyForDriver(t *testing.T) {
+	if err := ValidateNetworkPolicyForDriver("boxlite", "restricted"); err != nil {
+		t.Fatalf("ValidateNetworkPolicyForDriver() rejected BoxLite restricted network: %v", err)
+	}
+	for _, driver := range []string{"docker", "microsandbox", "vm"} {
+		if err := ValidateNetworkPolicyForDriver(driver, "restricted"); !IsValidationError(err) {
+			t.Fatalf("ValidateNetworkPolicyForDriver(%q, restricted) error = %v, want validation error", driver, err)
+		}
+	}
+}
+
+func TestEffectiveNetworkPolicyUsesDriverDefault(t *testing.T) {
+	for _, test := range []struct {
+		driver  string
+		network string
+		want    string
+	}{
+		{driver: "docker", want: "egress"},
+		{driver: "microsandbox", want: "egress"},
+		{driver: "boxlite", want: "restricted"},
+		{driver: "docker", network: "none", want: "none"},
+	} {
+		if got := EffectiveNetworkPolicy(test.driver, test.network); got != test.want {
+			t.Fatalf("EffectiveNetworkPolicy(%q, %q) = %q, want %q", test.driver, test.network, got, test.want)
+		}
 	}
 }
 

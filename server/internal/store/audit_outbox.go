@@ -58,6 +58,7 @@ func auditMetadata(input map[string]any) map[string]any {
 		"projectId", "templateId", "serverId", "jobId", "runId", "driver", "action",
 		"role", "status", "enabled", "passwordChanged", "sessionsRevoked", "sessionPreserved",
 		"leaseGeneration", "resourceVersion", "generation", "triggerSource", "errorCode", "count",
+		"slotCredentialId", "fromCredentialId", "fromModelId", "toCredentialId", "toModelId",
 	} {
 		switch value := input[key].(type) {
 		case string:

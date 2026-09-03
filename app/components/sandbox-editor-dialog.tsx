@@ -35,6 +35,7 @@ import {
 } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
+import { ExtensionSelector } from "@/components/extension-selector"
 import { RuntimeImageCombobox } from "@/components/runtime-image-combobox"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -136,6 +137,23 @@ export function SandboxEditorDialog({
     stringValue(input.spec.imageReference)
   )
   const credentialIds = stringList(input.spec.credentialIds)
+  const extensionIds = stringList(input.spec.extensionIds)
+  const extensionResources: Resource[] =
+    resource?.kind === "sandbox"
+      ? (resource.spec.extensionSnapshots ?? []).map((snapshot) => ({
+          ...snapshot,
+          kind: "extension" as const,
+          projectId: resource.projectId,
+          enabled: true,
+          specVersion: 1 as const,
+          observedGeneration: snapshot.generation,
+          createdAt: resource.createdAt,
+          updatedAt: resource.createdAt,
+        }))
+      : resources.filter((item) => item.projectId === projectId)
+  const extensionsSupported =
+    !extensionIds.length ||
+    Boolean(server?.capabilities.includes("sandbox-extensions"))
   const modelBindings = stringRecord(input.spec.modelBindings)
   const selectedCredentials = credentialIds.map((id) => ({
     id,
@@ -275,6 +293,10 @@ export function SandboxEditorDialog({
     }
     if (!configurationReady) {
       setError("运行服务器当前不可用，或所选隔离驱动尚未通过 Worker 自检")
+      return
+    }
+    if (!resource && !extensionsSupported) {
+      setError("所选 Worker 尚不支持沙箱扩展，请先更新 Worker 或取消选择扩展")
       return
     }
     if (input.spec.network === "none" && stringValue(input.spec.proxyId)) {
@@ -609,7 +631,11 @@ export function SandboxEditorDialog({
                         <SelectGroup>
                           <SelectLabel>网络策略</SelectLabel>
                           <SelectItem value="none">完全隔离</SelectItem>
-                          <SelectItem value="restricted">受限网络</SelectItem>
+                          {driver === "boxlite" && (
+                            <SelectItem value="restricted">
+                              受限网络（BoxLite）
+                            </SelectItem>
+                          )}
                           <SelectItem value="egress">允许出站</SelectItem>
                         </SelectGroup>
                       </SelectContent>
@@ -655,10 +681,9 @@ export function SandboxEditorDialog({
                     <FieldDescription>
                       {input.spec.network === "none"
                         ? "完全隔离时不能使用代理。"
-                        : driver === "boxlite" &&
-                            input.spec.network === "restricted"
-                          ? "只放行代理、直连地址和控制面。"
-                          : "向环境内程序注入标准 HTTP(S) 与 ALL_PROXY 变量。"}
+                        : input.spec.network === "restricted"
+                          ? "只放行代理、直连地址和控制面；当前仅 BoxLite 支持。"
+                          : "允许直接出站；选择代理时会向环境内程序注入标准 HTTP(S) 与 ALL_PROXY 变量。"}
                     </FieldDescription>
                   </Field>
                   <Field>
@@ -930,6 +955,21 @@ export function SandboxEditorDialog({
               </FieldDescription>
             </FieldSet>
 
+            <div className="flex flex-col gap-3">
+              <ExtensionSelector
+                resources={extensionResources}
+                selectedIds={extensionIds}
+                onChange={(ids) => updateSpec("extensionIds", ids)}
+                disabled={Boolean(resource)}
+                network={stringValue(input.spec.network)}
+              />
+              {!resource && !extensionsSupported && (
+                <FieldError>
+                  请先更新所选 Worker，使其支持沙箱扩展，或取消选择扩展。
+                </FieldError>
+              )}
+            </div>
+
             {resource && (
               <Alert>
                 <LoaderCircleIcon />
@@ -1047,6 +1087,7 @@ function sandboxInputFromResource(
       ...templateDefaults(template),
       ...input.spec,
       agentTools: supportedAgentToolList(input.spec.agentTools),
+      extensionIds: stringList(input.spec.extensionIds),
       modelBindings: reconcileModelBindings(
         stringList(input.spec.credentialIds),
         credentials,
@@ -1063,9 +1104,11 @@ function sandboxInputFromResource(
 }
 
 function templateDefaults(template?: ResourceOfKind<"runtime">) {
+  const driver = stringValue(template?.spec.driver)
+  const configuredNetwork = stringValue(template?.spec.network)
   return {
     serverId: stringValue(template?.spec.serverId),
-    driver: stringValue(template?.spec.driver),
+    driver,
     imageReference: stringValue(template?.spec.imageReference),
     imageId: stringValue(template?.spec.imageId),
     workdir: stringValue(template?.spec.workdir) || "/workspace",
@@ -1073,12 +1116,16 @@ function templateDefaults(template?: ResourceOfKind<"runtime">) {
     cpu: stringValue(template?.spec.cpu) || "2",
     memory: stringValue(template?.spec.memory) || "4 GiB",
     desktop: template?.spec.desktop,
-    network: stringValue(template?.spec.network) || "restricted",
+    network:
+      configuredNetwork === "restricted" && driver !== "boxlite"
+        ? "egress"
+        : configuredNetwork || (driver === "boxlite" ? "restricted" : "egress"),
     proxyId: stringValue(template?.spec.proxyId),
     agentTools: supportedAgentToolList(template?.spec.agentTools),
     skillIds: stringList(template?.spec.skillIds),
     mcpServerIds: stringList(template?.spec.mcpServerIds),
     variableIds: stringList(template?.spec.variableIds),
+    extensionIds: stringList(template?.spec.extensionIds),
     environmentVariables: sandboxEnvironmentVariables(
       template?.spec.environmentVariables
     ),

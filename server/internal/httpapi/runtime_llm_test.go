@@ -8,8 +8,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
@@ -20,6 +23,45 @@ type runtimeLLMTestStore struct {
 	fakeStore
 	target    platform.RuntimeLLMTarget
 	wantToken string
+}
+
+type runtimeLLMHotSwitchStore struct {
+	fakeStore
+	mu     sync.RWMutex
+	slotID string
+	token  string
+	target platform.RuntimeLLMTarget
+	next   platform.RuntimeLLMTarget
+}
+
+func (s *runtimeLLMHotSwitchStore) ResolveRuntimeLLMTarget(
+	_ context.Context, sandboxID, credentialID, token string,
+) (platform.RuntimeLLMTarget, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if sandboxID != s.target.SandboxID || credentialID != s.slotID || token != s.token {
+		return platform.RuntimeLLMTarget{}, store.ErrRuntimeUnauthorized
+	}
+	return s.target, nil
+}
+
+func (s *runtimeLLMHotSwitchStore) UpdateSandboxModelSource(
+	_ context.Context, id string, input platform.SandboxModelSourceInput,
+) (platform.Resource, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if id != s.target.SandboxID || input.SlotCredentialID != s.slotID ||
+		input.CredentialID != s.next.CredentialID || input.ModelID != s.next.ModelID ||
+		input.ExpectedCredentialID != s.target.CredentialID || input.ExpectedModelID != s.target.ModelID {
+		return platform.Resource{}, &platform.ValidationError{Message: "invalid test model source"}
+	}
+	s.target = s.next
+	return platform.Resource{Input: platform.Input{
+		ID: id, Kind: platform.KindSandbox, Name: "hot switch",
+		Spec: map[string]any{"runtimeModelSources": map[string]any{
+			s.slotID: map[string]any{"credentialId": input.CredentialID, "modelId": input.ModelID},
+		}},
+	}}, nil
 }
 
 func (s runtimeLLMTestStore) ResolveRuntimeLLMTarget(
@@ -41,6 +83,201 @@ func runtimeLLMHandler(t *testing.T, target platform.RuntimeLLMTarget) http.Hand
 		nil,
 		Config{},
 	)
+}
+
+func TestRuntimeLLMHotSwitchKeepsInflightTargetAndRoutesLaterRequestsToNewSource(t *testing.T) {
+	t.Setenv("AGENTBOX_ALLOW_PRIVATE_PROVIDER_ENDPOINTS", "true")
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	firstModel := make(chan string, 1)
+	secondModel := make(chan string, 1)
+	var releaseOnce sync.Once
+	releaseFirst := func() { releaseOnce.Do(func() { close(firstRelease) }) }
+	defer releaseFirst()
+
+	writeChatResponse := func(w http.ResponseWriter, model, content string) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"id":"chat","object":"chat.completion","created":1,"model":%q,"choices":[{"index":0,"message":{"role":"assistant","content":%q},"finish_reason":"stop"}]}`, model, content)
+	}
+	firstUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Errorf("decode first upstream request: %v", err)
+		}
+		firstModel <- fmt.Sprint(payload["model"])
+		close(firstStarted)
+		<-firstRelease
+		writeChatResponse(w, "model-a", "source-a")
+	}))
+	defer firstUpstream.Close()
+	secondUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
+			t.Errorf("decode second upstream request: %v", err)
+		}
+		secondModel <- fmt.Sprint(payload["model"])
+		writeChatResponse(w, "model-b", "source-b")
+	}))
+	defer secondUpstream.Close()
+
+	storage := &runtimeLLMHotSwitchStore{
+		slotID: "slot-one", token: "sandbox-token",
+		target: platform.RuntimeLLMTarget{
+			SandboxID: "sandbox-one", CredentialID: "source-a", ProviderID: "openai",
+			Protocol: "openai-chat", Endpoint: firstUpstream.URL + "/v1", ModelID: "model-a", Secret: "secret-a",
+		},
+		next: platform.RuntimeLLMTarget{
+			SandboxID: "sandbox-one", CredentialID: "source-b", ProviderID: "openai",
+			Protocol: "openai-chat", Endpoint: secondUpstream.URL + "/v1", ModelID: "model-b", Secret: "secret-b",
+		},
+	}
+	handler := New(
+		storage, catalog.BuiltinCatalog,
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
+		Config{DisableAuth: true},
+	)
+	requestForRuntime := func() *http.Request {
+		request := httptest.NewRequest(
+			http.MethodPost,
+			"/api/runtime/sandboxes/sandbox-one/llm/slot-one/openai/v1/chat/completions",
+			strings.NewReader(`{"model":"client-model","messages":[{"role":"user","content":"hi"}]}`),
+		)
+		request.Header.Set("Authorization", "Bearer sandbox-token")
+		return request
+	}
+
+	firstResponse := httptest.NewRecorder()
+	firstDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(firstResponse, requestForRuntime())
+		close(firstDone)
+	}()
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		releaseFirst()
+		t.Fatal("first request did not reach its original upstream")
+	}
+
+	switchResponse := httptest.NewRecorder()
+	handler.ServeHTTP(switchResponse, httptest.NewRequest(
+		http.MethodPatch,
+		"/api/sandboxes/sandbox-one/model-source",
+		strings.NewReader(`{"slotCredentialId":"slot-one","credentialId":"source-b","modelId":"model-b","expectedCredentialId":"source-a","expectedModelId":"model-a"}`),
+	))
+	if switchResponse.Code != http.StatusOK {
+		releaseFirst()
+		t.Fatalf("switch status = %d body = %s", switchResponse.Code, switchResponse.Body.String())
+	}
+
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, requestForRuntime())
+	if secondResponse.Code != http.StatusOK || !strings.Contains(secondResponse.Body.String(), "source-b") {
+		releaseFirst()
+		t.Fatalf("second response status = %d body = %s", secondResponse.Code, secondResponse.Body.String())
+	}
+	releaseFirst()
+	select {
+	case <-firstDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first request did not finish after its upstream was released")
+	}
+	if firstResponse.Code != http.StatusOK || !strings.Contains(firstResponse.Body.String(), "source-a") {
+		t.Fatalf("first response status = %d body = %s", firstResponse.Code, firstResponse.Body.String())
+	}
+	if got := <-firstModel; got != "model-a" {
+		t.Fatalf("first upstream model = %q", got)
+	}
+	if got := <-secondModel; got != "model-b" {
+		t.Fatalf("second upstream model = %q", got)
+	}
+}
+
+func TestRuntimeLLMGeminiURLRewritesBoundModelAndPreservesOperationAndQuery(t *testing.T) {
+	target := platform.RuntimeLLMTarget{
+		Protocol: "gemini", Endpoint: "https://generativelanguage.example.test/gateway/v1beta",
+		ModelID: "team/model:preview ?", Secret: "upstream&secret",
+	}
+	upstream, err := runtimeLLMGeminiURL(
+		target,
+		"v1beta/models/old-model:streamGenerateContent",
+		url.Values{"alt": {"sse"}, "trace": {"one", "two"}, "key": {"untrusted"}},
+	)
+	if err != nil {
+		t.Fatalf("runtimeLLMGeminiURL() error = %v", err)
+	}
+	parsed, err := url.Parse(upstream)
+	if err != nil {
+		t.Fatalf("parse Gemini upstream URL: %v", err)
+	}
+	if got, want := parsed.EscapedPath(), "/gateway/v1beta/models/team%2Fmodel%3Apreview%20%3F:streamGenerateContent"; got != want {
+		t.Fatalf("escaped path = %q, want %q", got, want)
+	}
+	if strings.Contains(parsed.EscapedPath(), "old-model") {
+		t.Fatalf("escaped path retained client model: %q", parsed.EscapedPath())
+	}
+	if parsed.Query().Get("key") != target.Secret || parsed.Query().Get("alt") != "sse" ||
+		len(parsed.Query()["trace"]) != 2 {
+		t.Fatalf("forwarded query = %#v", parsed.Query())
+	}
+}
+
+func TestRuntimeLLMGeminiURLUsesEndpointVersionWhenClientVersionDiffers(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		endpoint    string
+		requestPath string
+		wantPath    string
+	}{
+		{
+			name:        "v1 endpoint with v1beta client path",
+			endpoint:    "https://generativelanguage.example.test/gateway/v1",
+			requestPath: "v1beta/models/client-model:generateContent",
+			wantPath:    "/gateway/v1/models/bound-model:generateContent",
+		},
+		{
+			name:        "v1beta endpoint with v1 client path",
+			endpoint:    "https://generativelanguage.example.test/gateway/v1beta",
+			requestPath: "v1/models/client-model:streamGenerateContent",
+			wantPath:    "/gateway/v1beta/models/bound-model:streamGenerateContent",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			upstream, err := runtimeLLMGeminiURL(platform.RuntimeLLMTarget{
+				Protocol: "gemini", Endpoint: test.endpoint, ModelID: "bound-model", Secret: "secret",
+			}, test.requestPath, nil)
+			if err != nil {
+				t.Fatalf("runtimeLLMGeminiURL() error = %v", err)
+			}
+			parsed, err := url.Parse(upstream)
+			if err != nil {
+				t.Fatalf("parse Gemini upstream URL: %v", err)
+			}
+			if parsed.Path != test.wantPath {
+				t.Fatalf("path = %q, want %q", parsed.Path, test.wantPath)
+			}
+		})
+	}
+}
+
+func TestRuntimeLLMGeminiURLRejectsInvalidModelPaths(t *testing.T) {
+	target := platform.RuntimeLLMTarget{
+		Protocol: "gemini", Endpoint: "https://generativelanguage.example.test/v1beta",
+		ModelID: "gemini-bound", Secret: "secret",
+	}
+	for _, requestPath := range []string{
+		"v1beta/files/file-one",
+		"v1beta/models/model-without-operation",
+		"v1beta/models/:generateContent",
+		"v1beta/models/client:generateContent/extra",
+		"v2/models/client:generateContent",
+	} {
+		t.Run(requestPath, func(t *testing.T) {
+			if _, err := runtimeLLMGeminiURL(target, requestPath, nil); err == nil {
+				t.Fatal("runtimeLLMGeminiURL() accepted an invalid model path")
+			}
+		})
+	}
 }
 
 func TestRuntimeLLMConvertsAnthropicToResponses(t *testing.T) {
