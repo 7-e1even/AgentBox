@@ -3959,9 +3959,12 @@ managed_paths_reconcile() {
       if [ "$MANAGED_ACTION" = put ]; then
         case "$MANAGED_SOURCE" in /*) ;; *) echo "invalid AgentBox managed source" >&2; exit 1 ;; esac
         case "$MANAGED_SOURCE" in *"$MANAGED_NEWLINE"*) echo "unsafe AgentBox managed source" >&2; exit 1 ;; esac
-        if printf '%s' "$MANAGED_SOURCE" | LC_ALL=C grep -q '[[:cntrl:]]' ||
-           ! managed_no_symlink_chain "$MANAGED_SOURCE"; then
+        if printf '%s' "$MANAGED_SOURCE" | LC_ALL=C grep -q '[[:cntrl:]]'; then
           echo "unsafe AgentBox managed source" >&2
+          exit 1
+        fi
+        if ! managed_no_symlink_chain "$MANAGED_SOURCE"; then
+          echo "AgentBox managed source has a symlink ancestor" >&2
           exit 1
         fi
         if [ -d "$MANAGED_SOURCE" ]; then

@@ -189,8 +189,11 @@ docker() {
 managed_paths_reconcile fixture "$TEST_OPERATIONS"
 `)
 			output, err := command.CombinedOutput()
-			if err == nil || !strings.Contains(string(output), "symlink") {
+			if err == nil {
 				t.Fatalf("symlinked managed path was accepted: (%q, %v)", output, err)
+			}
+			if !strings.Contains(string(output), "symlink") {
+				t.Fatalf("symlinked managed path returned an ambiguous error: (%q, %v)", output, err)
 			}
 			if _, err := os.Stat(target); !os.IsNotExist(err) {
 				t.Fatalf("symlinked managed path changed target: %v", err)
