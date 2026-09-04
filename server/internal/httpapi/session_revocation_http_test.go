@@ -63,7 +63,7 @@ func TestLogoutClosesCurrentBrowserSessionAndKeepsWorker(t *testing.T) {
 	server, handler := newAuthenticatedSessionTestServer(t, sessionTestStore{})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	worker := connectAuditTestWorker(t, ctx, server)
+	worker := connectAuditTestWorker(t, ctx, server, handler)
 	ticket := issueAuthenticatedTicket(t, ctx, server, "login-one")
 	browser := connectAuthenticatedBrowser(t, ctx, server, ticket)
 	if _, _, err := worker.Read(ctx); err != nil {
@@ -92,7 +92,7 @@ func TestRejectedBrowserHandshakeReleasesPendingClaim(t *testing.T) {
 	server, handler := newAuthenticatedSessionTestServer(t, sessionTestStore{})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	connectAuditTestWorker(t, ctx, server)
+	connectAuditTestWorker(t, ctx, server, handler)
 	ticket := issueAuthenticatedTicket(t, ctx, server, "login-one")
 
 	connection, response, err := websocket.Dial(
@@ -125,10 +125,10 @@ func (selfPasswordSessionStore) UpdateUserPreservingSession(_ context.Context, i
 }
 
 func TestSelfPasswordChangeClosesOldChannelButKeepsHTTPLoginUsable(t *testing.T) {
-	server, _ := newAuthenticatedSessionTestServer(t, selfPasswordSessionStore{})
+	server, handler := newAuthenticatedSessionTestServer(t, selfPasswordSessionStore{})
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	worker := connectAuditTestWorker(t, ctx, server)
+	worker := connectAuditTestWorker(t, ctx, server, handler)
 	ticket := issueAuthenticatedTicket(t, ctx, server, "login-one")
 	browser := connectAuthenticatedBrowser(t, ctx, server, ticket)
 	if _, _, err := worker.Read(ctx); err != nil {

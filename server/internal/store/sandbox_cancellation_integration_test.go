@@ -263,21 +263,25 @@ func TestInstallationCancellationAndCompletionRaceHasOneWinner(t *testing.T) {
 }
 
 func TestWorkerControlCannotReviveUncancelledExpiredOrChangedResourceLease(t *testing.T) {
-	f := newCancellationFixture(t)
-	f.claim(t, true)
-	if _, err := f.store.pool.Exec(t.Context(), `UPDATE worker_jobs SET lease_until = NOW() - INTERVAL '1 minute' WHERE id=$1`, f.jobID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.ControlWorkerJob(t.Context(), f.serverID, f.credential, f.jobID, platform.WorkerJobControlInput{LeaseGeneration: 1}); !errors.Is(err, ErrResourceNotFound) {
-		t.Fatalf("expired normal lease was revived: %v", err)
-	}
-	if _, err := f.store.pool.Exec(t.Context(), `UPDATE worker_jobs SET lease_until = NOW() + INTERVAL '1 minute' WHERE id=$1`, f.jobID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.pool.Exec(t.Context(), `UPDATE control_resources SET generation = generation + 1 WHERE id=$1`, f.sandboxID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.store.ControlWorkerJob(t.Context(), f.serverID, f.credential, f.jobID, platform.WorkerJobControlInput{LeaseGeneration: 1}); !errors.Is(err, ErrConflict) {
-		t.Fatalf("changed resource lease was accepted: %v", err)
-	}
+	t.Run("expired lease", func(t *testing.T) {
+		f := newCancellationFixture(t)
+		f.claim(t, true)
+		if _, err := f.store.pool.Exec(t.Context(), `UPDATE worker_jobs SET lease_until = NOW() - INTERVAL '1 minute' WHERE id=$1`, f.jobID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.ControlWorkerJob(t.Context(), f.serverID, f.credential, f.jobID, platform.WorkerJobControlInput{LeaseGeneration: 1}); !errors.Is(err, ErrResourceNotFound) {
+			t.Fatalf("expired normal lease was revived: %v", err)
+		}
+	})
+
+	t.Run("changed resource", func(t *testing.T) {
+		f := newCancellationFixture(t)
+		f.claim(t, true)
+		if _, err := f.store.pool.Exec(t.Context(), `UPDATE control_resources SET generation = generation + 1 WHERE id=$1`, f.sandboxID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.ControlWorkerJob(t.Context(), f.serverID, f.credential, f.jobID, platform.WorkerJobControlInput{LeaseGeneration: 1}); !errors.Is(err, ErrConflict) {
+			t.Fatalf("changed resource lease was accepted: %v", err)
+		}
+	})
 }
