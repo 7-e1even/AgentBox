@@ -57,6 +57,7 @@ func TestSandboxModelSourceSwitchKeepsRuntimeTokenAndProtectsTarget(t *testing.T
 	  VALUES ($1, 'sandbox', 'default', 'Runtime model source sandbox', '', TRUE,
 	    jsonb_build_object(
 	      'status', 'running',
+	      'appliedProxyId', '',
 	      'credentialIds', jsonb_build_array($2::text),
 	      'modelBindings', jsonb_build_object($2::text, $3::text),
 	      'runtimeModelSources', jsonb_build_object(
@@ -80,9 +81,8 @@ func TestSandboxModelSourceSwitchKeepsRuntimeTokenAndProtectsTarget(t *testing.T
 		_, _ = s.pool.Exec(cleanupCtx, "DELETE FROM provider_credentials WHERE id = ANY($1)", []string{originalCredentialID, targetCredentialID})
 	})
 
-	issuedAt := time.Now().UTC().Add(-31 * 24 * time.Hour)
 	token, err := s.issueRuntimeLLMTokenForEpoch(
-		sandboxID, originalCredentialID, originalModelID, initialTokenEpoch, issuedAt.Add(runtimeLLMTokenTTL),
+		sandboxID, originalCredentialID, originalModelID, initialTokenEpoch, time.Now().UTC().Add(runtimeLLMTokenTTL),
 	)
 	if err != nil {
 		t.Fatalf("issue runtime model source token: %v", err)
@@ -339,6 +339,7 @@ func TestLegacySandboxModelSourceSwitchKeepsOtherSignedSlots(t *testing.T) {
 	  VALUES ($1, 'sandbox', 'default', 'Legacy model source sandbox', '', TRUE,
 	    jsonb_build_object(
 	      'status', 'running',
+	      'appliedProxyId', '',
 	      'credentialIds', jsonb_build_array($2::text),
 	      'modelBindings', jsonb_build_object($2::text, $3::text)
 	    ), NOW(), NOW(), 3, 2)`, sandboxID, firstCredentialID, firstModelID); err != nil {
@@ -433,6 +434,7 @@ func TestUnknownLegacySandboxBlocksSourceSwitchAndCredentialRemoval(t *testing.T
 	  VALUES ($1, 'sandbox', 'default', 'Unknown legacy model source sandbox', '', TRUE,
 	    jsonb_build_object(
 	      'status', 'running',
+	      'appliedProxyId', '',
 	      'credentialIds', '[]'::jsonb,
 	      'modelBindings', '{}'::jsonb
 	    ), NOW(), NOW(), 8, 7)`, sandboxID); err != nil {
@@ -492,10 +494,10 @@ func TestSuccessfulSandboxRestartSnapshotsAppliedModelSources(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_jobs
 	  (id, server_id, resource_id, action, status, payload, resource_generation,
 	   lease_until, attempts, created_at, updated_at)
-	  VALUES ($1, $2, $3, 'restart-sandbox', 'leased', jsonb_build_object(
+	  VALUES ($1::uuid, $2, $3, 'restart-sandbox', 'leased', jsonb_build_object(
 	    'credentialIds', jsonb_build_array($4::text, $5::text),
 	    'modelBindings', jsonb_build_object($4::text, 'first-model', $5::text, 'second-model'),
-	    'desktop', FALSE, 'proxyId', '', 'runtimeTokenEpoch', $1::text
+	    'desktop', FALSE, 'proxyId', '', 'runtimeTokenEpoch', $1::uuid::text
 	  ), 4, NOW() + INTERVAL '10 minutes', 1, NOW(), NOW())`,
 		jobID, serverID, sandboxID, firstSlot, secondSlot); err != nil {
 		t.Fatalf("insert model source snapshot job: %v", err)
@@ -608,10 +610,10 @@ func TestPendingLifecycleTokenWorksOnlyForItsActiveLease(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_jobs
 	  (id, server_id, resource_id, action, status, payload, resource_generation,
 	   lease_until, attempts, created_at, updated_at)
-	  VALUES ($1, $2, $3, 'restart-sandbox', 'leased', jsonb_build_object(
+	  VALUES ($1::uuid, $2, $3, 'restart-sandbox', 'leased', jsonb_build_object(
 	    'credentialIds', jsonb_build_array($4::text),
 	    'modelBindings', jsonb_build_object($4::text, $5::text),
-	    'runtimeTokenEpoch', $1::text
+	    'runtimeTokenEpoch', $1::uuid::text
 	  ), 2, NOW() + INTERVAL '10 minutes', 1, NOW(), NOW())`,
 		jobID, serverID, sandboxID, newCredentialID, newModelID); err != nil {
 		t.Fatalf("insert pending-token job: %v", err)

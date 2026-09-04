@@ -64,6 +64,7 @@ export function incompatibleAgentTools(
   tools: unknown,
   protocols: readonly AgentProtocol[]
 ) {
+  if (protocols.length === 0) return []
   const available = new Set(protocols)
   return supportedAgentToolList(tools).filter(
     (tool) =>

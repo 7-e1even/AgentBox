@@ -25,7 +25,7 @@ func TestSkillsSearchUsesOperatorRoleAndValidatesQuery(t *testing.T) {
 }
 
 func TestSkillImportPreviewUsesExistingRoleGate(t *testing.T) {
-	document := "---\nname: test-skill\ndescription: Test import\n---\n\nReview project files.\n"
+	document := "---\nname: test-skill\ndescription: Test import\nlicense: MIT\ncompatibility: Requires git\n---\n\nReview project files.\n"
 	body, err := json.Marshal(map[string]string{"filename": "SKILL.md", "content": base64.StdEncoding.EncodeToString([]byte(document))})
 	if err != nil {
 		t.Fatal(err)
@@ -49,6 +49,10 @@ func TestSkillImportPreviewUsesExistingRoleGate(t *testing.T) {
 		}
 		if result.Skill.Name != "test-skill" || result.Skill.Spec.Instructions != document || result.Skill.Spec.Path != "SKILL.md" {
 			t.Fatalf("preview lost imported content: %#v", result)
+		}
+		if result.Skill.Description != "Test import" || result.Skill.Spec.License != "MIT" ||
+			result.Skill.Spec.Compatibility != "Requires git" || !strings.HasPrefix(result.Skill.Spec.BundleDigest, "sha256:") {
+			t.Fatalf("preview did not derive canonical metadata: %#v", result.Skill)
 		}
 	}
 }

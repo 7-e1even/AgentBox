@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"slices"
 	"strings"
@@ -65,6 +66,9 @@ func persistSandboxCreationSpec(ctx context.Context, tx pgx.Tx, sandbox platform
 		"cpu": "", "memory": "", "desktop": false,
 		"network": platform.EffectiveNetworkPolicy(driver, ""),
 		"workdir": "/workspace", "setup": "", "workspace": "",
+		"agentTools": []string{}, "skillIds": []string{}, "mcpServerIds": []string{},
+		"variableIds": []string{}, "environmentVariables": []any{},
+		"credentialIds": []string{}, "modelBindings": map[string]string{},
 		"extensionIds": []string{}, "extensionSnapshots": []platform.ExtensionDefinition{},
 	}
 	for key := range snapshot {
@@ -83,9 +87,7 @@ func persistSandboxCreationSpec(ctx context.Context, tx pgx.Tx, sandbox platform
     WHERE id = $2 AND kind = 'sandbox'`, mustMapJSON(snapshot), sandbox.ID); err != nil {
 		return fmt.Errorf("persist sandbox creation configuration: %w", err)
 	}
-	for key, value := range snapshot {
-		sandbox.Spec[key] = value
-	}
+	maps.Copy(sandbox.Spec, snapshot)
 	return nil
 }
 

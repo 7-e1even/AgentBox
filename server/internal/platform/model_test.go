@@ -8,13 +8,67 @@ import (
 
 func TestValidateControlPlaneResource(t *testing.T) {
 	projectID := "default"
-	valid := Input{ID: "custom-api-token", Kind: KindVariable, ProjectID: &projectID, Name: "Custom API Token", Enabled: true, Spec: map[string]any{"key": "CUSTOM_API_TOKEN", "reference": "env://CUSTOM_API_TOKEN"}}
+	valid := Input{ID: "custom-api-token", Kind: KindVariable, ProjectID: &projectID, Name: "Custom API Token", Enabled: true, Spec: map[string]any{"key": "CUSTOM_API_TOKEN", "mode": "value-ref", "reference": "env://CUSTOM_API_TOKEN"}}
 	if err := Validate(valid); err != nil {
 		t.Fatalf("Validate() returned error: %v", err)
 	}
 	valid.Spec["reference"] = ""
 	if err := Validate(valid); !IsValidationError(err) {
 		t.Fatalf("Validate() error = %v, want validation error", err)
+	}
+}
+
+func TestVariableModeAndReferenceSchemeMustMatch(t *testing.T) {
+	projectID := "default"
+	base := Input{ID: "custom-token", Kind: KindVariable, ProjectID: &projectID, Name: "Custom Token", Enabled: true}
+	legacy := base
+	legacy.Spec = map[string]any{"key": "CUSTOM_TOKEN", "reference": "env://SOURCE_TOKEN"}
+	Normalize(&legacy)
+	if legacy.Spec["mode"] != "value-ref" || Validate(legacy) != nil {
+		t.Fatalf("legacy Variable was not canonicalized: %#v", legacy.Spec)
+	}
+	for name, spec := range map[string]map[string]any{
+		"value as secret":    {"key": "CUSTOM_TOKEN", "mode": "value-ref", "reference": "secret://SOURCE_TOKEN"},
+		"secret as value":    {"key": "CUSTOM_TOKEN", "mode": "secret-ref", "reference": "env://SOURCE_TOKEN"},
+		"literal":            {"key": "CUSTOM_TOKEN", "mode": "secret-ref", "reference": "plaintext"},
+		"reserved key":       {"key": "AGENTBOX_TOKEN", "mode": "value-ref", "reference": "env://SOURCE_TOKEN"},
+		"invalid source key": {"key": "CUSTOM_TOKEN", "mode": "value-ref", "reference": "env://bad-key"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := base
+			input.Spec = spec
+			if err := Validate(input); !IsValidationError(err) {
+				t.Fatalf("Validate() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestNormalizeCapabilityReferencesDeduplicatesAndMCPNeedsSupportedAgent(t *testing.T) {
+	projectID := "default"
+	input := Input{ID: "runtime-one", Kind: KindRuntime, ProjectID: &projectID, Name: "Runtime One", Enabled: true,
+		Spec: map[string]any{
+			"serverId":       "7b20f83b-6418-4a9f-8477-3dc7c35d6310",
+			"driver":         "docker",
+			"imageReference": "ubuntu:24.04",
+			"agentTools":     []any{"pi"},
+			"skillIds":       []any{"review", "review", "planner"},
+			"mcpServerIds":   []any{"filesystem", "filesystem"},
+		},
+	}
+	Normalize(&input)
+	if got := stringList(input.Spec["skillIds"]); !reflect.DeepEqual(got, []string{"review", "planner"}) {
+		t.Fatalf("skillIds = %#v", got)
+	}
+	if got := stringList(input.Spec["mcpServerIds"]); !reflect.DeepEqual(got, []string{"filesystem"}) {
+		t.Fatalf("mcpServerIds = %#v", got)
+	}
+	if err := Validate(input); !IsValidationError(err) {
+		t.Fatalf("MCP without supported Agent error = %v", err)
+	}
+	input.Spec["agentTools"] = []any{"pi", "codex"}
+	if err := Validate(input); err != nil {
+		t.Fatalf("mixed supported Agent set rejected: %v", err)
 	}
 }
 

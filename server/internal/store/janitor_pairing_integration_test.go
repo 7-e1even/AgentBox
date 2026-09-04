@@ -50,6 +50,7 @@ func testServerRegistration(serverID, pairingToken string) platform.ServerRegist
 		Hostname:     "edge-01.internal",
 		OS:           "linux",
 		Arch:         "amd64",
+		Capabilities: []string{workerFailClosedJobOutputCapability},
 	}
 }
 

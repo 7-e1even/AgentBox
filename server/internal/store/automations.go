@@ -427,6 +427,7 @@ func (s *Store) triggerAutomation(
 		buildErr = s.ensureAutomatedSandboxReferences(ctx, tx, sandboxInput)
 	}
 	if buildErr == nil {
+		sandboxInput.Spec["capabilityRevision"] = int64(1)
 		buildErr = s.encryptSpecEnvironmentVariables(sandboxInput.Spec)
 	}
 	if buildErr != nil {
@@ -775,6 +776,9 @@ func (s *Store) ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx,
 		return fmt.Errorf("decode automated sandbox environment: %w", err)
 	}
 	effectiveSpec := effectiveSandboxSpec(runtimeSpec, input.Spec)
+	driver, _ := effectiveSpec["driver"].(string)
+	network, _ := effectiveSpec["network"].(string)
+	effectiveSpec["network"] = platform.EffectiveNetworkPolicy(driver, network)
 	if err := s.validateNetworkProxyBinding(ctx, tx, effectiveSpec, "自动化沙箱"); err != nil {
 		return err
 	}
@@ -782,7 +786,6 @@ func (s *Store) ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx,
 		return err
 	}
 	serverID, _ := effectiveSpec["serverId"].(string)
-	driver, _ := effectiveSpec["driver"].(string)
 	requiredCapability := driver
 	if driver == "vm" {
 		requiredCapability = "kvm"
@@ -819,19 +822,8 @@ func (s *Store) ensureAutomatedSandboxReferences(ctx context.Context, tx pgx.Tx,
 	if !runtimeImageIsAvailable(driver, inventory, imageReference, serverArch) {
 		return &platform.ValidationError{Message: "沙箱使用的镜像已不在目标服务器上"}
 	}
-	for kind, key := range map[platform.Kind]string{
-		platform.KindSkill: "skillIds", platform.KindMCP: "mcpServerIds", platform.KindVariable: "variableIds",
-	} {
-		for _, resourceID := range specStringList(effectiveSpec, key) {
-			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM control_resources
-          WHERE id = $1 AND kind = $2 AND enabled = TRUE)`, resourceID, kind).Scan(&exists); err != nil {
-				return fmt.Errorf("check automated sandbox binding: %w", err)
-			}
-			if !exists {
-				return &platform.ValidationError{Message: "沙箱包含不存在或已停用的能力配置"}
-			}
-		}
+	if _, err := ensureCapabilityReferences(ctx, tx, input.ProjectID, effectiveSpec, "自动化沙箱"); err != nil {
+		return err
 	}
 	allowedCredentialIDs := specStringList(effectiveSpec, "credentialIds")
 	modelBindings := specStringMap(effectiveSpec, "modelBindings")

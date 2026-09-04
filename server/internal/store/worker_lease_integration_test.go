@@ -2,6 +2,7 @@ package store
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,108 @@ func TestWorkerJobLeaseDurationsKeepUpdateBuildsAlive(t *testing.T) {
 		t.Fatalf("Worker update lease = %v, want %v", got, workerUpdateJobLeaseDuration)
 	} else if got <= 5*time.Minute {
 		t.Fatalf("Worker update lease = %v, too short for a cold driver build", got)
+	}
+}
+
+func TestLegacyWorkerCanOnlyClaimItsUpdateJob(t *testing.T) {
+	s := newIntegrationTestStore(t)
+	ctx := t.Context()
+	serverID := uuid.NewString()
+	_, credential, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.HeartbeatServer(ctx, serverID, credential, []string{"docker"}, nil, "legacy"); err != nil {
+		t.Fatal(err)
+	}
+	protectedJobID := uuid.NewString()
+	updateJobID := uuid.NewString()
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_jobs
+	  (id, server_id, action, status, payload, created_at, updated_at)
+	  VALUES
+	    ($1, $3, 'check-network-proxy', 'pending', '{}'::jsonb, NOW() - INTERVAL '1 minute', NOW()),
+	    ($2, $3, 'update-worker', 'pending', '{"version":"v2","previousVersion":"v1"}'::jsonb, NOW(), NOW())`,
+		protectedJobID, updateJobID, serverID); err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.ClaimWorkerJob(ctx, serverID, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.ID != updateJobID || job.Action != "update-worker" {
+		t.Fatalf("legacy Worker claimed %#v, want only update-worker", job)
+	}
+	if _, err := s.pool.Exec(ctx, `UPDATE worker_jobs SET status = 'succeeded', lease_until = NULL WHERE id = $1`, updateJobID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimWorkerJob(ctx, serverID, credential); !errors.Is(err, ErrNoJob) {
+		t.Fatalf("legacy Worker claimed protected job: %v", err)
+	}
+	if err := s.HeartbeatServer(ctx, serverID, credential,
+		[]string{"docker", workerFailClosedJobOutputCapability}, nil, "current"); err != nil {
+		t.Fatal(err)
+	}
+	job, err = s.ClaimWorkerJob(ctx, serverID, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.ID != protectedJobID {
+		t.Fatalf("upgraded Worker claimed %s, want %s", job.ID, protectedJobID)
+	}
+}
+
+func TestWorkerCompletionPersistsOnlyTrustedSandboxIdentityAndSafeDiagnostics(t *testing.T) {
+	s := newIntegrationTestStore(t)
+	ctx := t.Context()
+	serverID := uuid.NewString()
+	_, credential, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sandboxID = "safe-sandbox"
+	if _, err := s.pool.Exec(ctx, `INSERT INTO control_resources
+	  (id, kind, name, spec, created_at, updated_at)
+	  VALUES ($1, 'sandbox', 'Safe sandbox',
+	    '{"status":"restarting","externalId":"agentbox-safe-sandbox","capabilityRevision":0}'::jsonb,
+	    NOW(), NOW())`, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	jobID := uuid.NewString()
+	const progressSecret = "leased-progress-plaintext-secret"
+	if _, err := s.pool.Exec(ctx, `INSERT INTO worker_jobs
+	  (id, server_id, resource_id, action, status, payload, progress, lease_until,
+	   attempts, resource_generation, created_at, updated_at)
+	  VALUES ($1, $2, $3, 'restart-sandbox', 'leased',
+	    '{"externalId":"agentbox-safe-sandbox","capabilityRevision":0}'::jsonb,
+	    '{"stage":"runtime-start","status":"running","message":"`+progressSecret+`","extensions":[{"id":"example","status":"running","message":"`+progressSecret+`","output":"`+progressSecret+`"}]}'::jsonb,
+	    NOW() + INTERVAL '5 minutes', 1, 1, NOW(), NOW())`, jobID, serverID, sandboxID); err != nil {
+		t.Fatal(err)
+	}
+	const completionSecret = "completion-plaintext-secret"
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, jobID, platform.WorkerJobResult{
+		LeaseGeneration: 1,
+		Success:         true,
+		ExternalID:      completionSecret,
+		Message:         completionSecret,
+		Output:          completionSecret,
+		OutputTruncated: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var persisted, jobExternalID, sandboxExternalID string
+	if err := s.pool.QueryRow(ctx, `SELECT
+	    job.result_message || job.result_output || job.progress::text || sandbox.spec::text,
+	    job.external_id, sandbox.spec->>'externalId'
+	  FROM worker_jobs job
+	  JOIN control_resources sandbox ON sandbox.id = job.resource_id
+	  WHERE job.id = $1`, jobID).Scan(&persisted, &jobExternalID, &sandboxExternalID); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(persisted, completionSecret) || strings.Contains(persisted, progressSecret) {
+		t.Fatalf("Worker-controlled diagnostics remained persisted: %s", persisted)
+	}
+	if jobExternalID != "agentbox-safe-sandbox" || sandboxExternalID != "agentbox-safe-sandbox" {
+		t.Fatalf("trusted external IDs = job %q sandbox %q", jobExternalID, sandboxExternalID)
 	}
 }
 

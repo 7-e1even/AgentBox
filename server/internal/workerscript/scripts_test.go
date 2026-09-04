@@ -141,7 +141,6 @@ func TestWorkerPreconfiguresClaudeCodeOnboarding(t *testing.T) {
 		`jq '.hasCompletedOnboarding = true' "$CLAUDE_CURRENT"`,
 		`test ! -s /root/.claude.json || cat /root/.claude.json`,
 		`cat > /root/.claude.json`,
-		`jq -s '.[0] * .[1] | .hasCompletedOnboarding = true'`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("Claude Code onboarding config is missing %q", expected)
@@ -177,12 +176,12 @@ func TestWorkerInstallsExtendedAgentTools(t *testing.T) {
 		`cursor) printf '%s' cursor-agent`,
 		`deepseek-harness) printf '%s' dsh`,
 		`omp) printf '%s' omp`,
-		`/root/.pi/agent/skills/$ID`,
-		`/root/.omp/agent/skills/$ID`,
-		`/root/.copilot/skills/$ID`,
-		`/root/.qwen/skills/$ID`,
-		`/root/.qwenpaw/skill_pool/$ID`,
-		`/root/.agents/skills/$ID`,
+		`/root/.pi/agent/skills`,
+		`/root/.omp/agent/skills`,
+		`/root/.copilot/skills`,
+		`/root/.qwen/skills`,
+		`/root/.qwenpaw/skill_pool`,
+		`codex) printf '%s\n' /root/.agents/skills`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("extended Agent support is missing %q", expected)
@@ -381,8 +380,8 @@ func TestWorkerRestartsSandboxOnlyAfterInPlaceAgentUpdateRetryFails(t *testing.T
 		`recover_boxlite_agent_tool_install "$CONTAINER" || return 1`,
 		`! docker exec "$CONTAINER" true >/dev/null 2>&1`,
 		`正在恢复 BoxLite Agent 更新连接`,
-		`VERSION_ATTEMPT=1`,
-		`while [ "$VERSION_ATTEMPT" -le 3 ]`,
+		`PROBE_ATTEMPT=1`,
+		`while [ "$PROBE_ATTEMPT" -le 3 ]`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("stable in-place Agent update is missing %q", expected)
@@ -446,8 +445,7 @@ func TestWorkerEchoesLeaseGenerationOnProgressCompletionAndSelfUpdate(t *testing
 func TestWorkerKeepsPiInstallerAndCredentialSyntaxCompatible(t *testing.T) {
 	for _, expected := range []string{
 		`if [ "$MODE" = ensure ] && [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc '`,
-		`VERSION=$(timeout 20 "$1" --version 2>&1 | head -n 1)`,
-		`[ -n "$VERSION" ]`,
+		`timeout 20 "$1" --version >/dev/null 2>&1`,
 		`pi) INSTALL_PI=true; continue ;;`,
 		`npm uninstall -g @mariozechner/pi-coding-agent`,
 		`npm install -g --force @earendil-works/pi-coding-agent@latest`,
@@ -475,10 +473,9 @@ func TestWorkerChecksAndUpdatesSandboxAgentToolsInPlace(t *testing.T) {
 		`AGENTBOX_AGENT_TOOL_MODE=upgrade`,
 		`-name '\''.codex-*'\'' -exec rm -rf -- {} +`,
 		`npm install -g "$@" || { npm cache clean --force`,
-		`agent_tool_detect_version "$TARGET" "$TOOL_ID"`,
-		`https://registry.npmjs.org/$PACKAGE`,
-		`updated "Agent 工具已更新"`,
-		`unchanged "更新命令已完成，但版本没有变化"`,
+		`agent_tool_probe_usable "$TARGET" "$TOOL_ID"`,
+		`timeout 20 "$1" --version >/dev/null 2>&1`,
+		`updated "Agent 工具更新命令已完成`,
 		`complete_agent_tool_job`,
 		`agentTools:($agentTools[0] // [])`,
 		`ERROR_DETAILS=${12:-}`,
@@ -497,6 +494,54 @@ func TestWorkerChecksAndUpdatesSandboxAgentToolsInPlace(t *testing.T) {
 	if strings.Contains(workerDaemon, `docker rm -f "$TARGET"`) &&
 		!strings.Contains(workerDaemon, `prepare_agent_tool_operation()`) {
 		t.Fatal("Agent tool lifecycle must operate on the existing sandbox")
+	}
+}
+
+func TestWorkerNeverPersistsGuestAgentToolVersionOutput(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available")
+	}
+	_, probe, found := strings.Cut(workerDaemon, "\nagent_tool_probe_usable() {")
+	if !found {
+		t.Fatal("Agent tool availability probe is missing")
+	}
+	probe, _, found = strings.Cut(probe, "\nappend_agent_tool_state() {")
+	if !found {
+		t.Fatal("Agent tool availability probe boundary is missing")
+	}
+	command := exec.CommandContext(t.Context(), sh, "-s")
+	command.Env = append(command.Environ(), "GUEST_VERSION=1.2.3-rc.4")
+	command.Stdin = strings.NewReader("set -eu\n" + `
+agent_tool_command() { printf codex; }
+docker() { printf '%s' "$GUEST_VERSION"; }
+` + "agent_tool_probe_usable() {" + probe + `
+agent_tool_probe_usable fixture codex
+`)
+	output, err := command.CombinedOutput()
+	if err != nil || len(output) != 0 {
+		t.Fatalf("guest version output escaped availability probe: (%q, %v)", output, err)
+	}
+	for _, forbidden := range []string{
+		`RAW_VERSION=`,
+		`CURRENT_VERSION=$(agent_tool_`,
+		`BEFORE_VERSION=$(agent_tool_`,
+		`AFTER_VERSION=$(agent_tool_`,
+		`agent_tool_latest_version()`,
+	} {
+		if strings.Contains(workerDaemon, forbidden) {
+			t.Fatalf("guest Agent version can reach persisted state through %q", forbidden)
+		}
+	}
+	for _, expected := range []string{
+		`. + {($tool): "installed"}`,
+		`with_entries(.value = "installed")`,
+		`append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "" ""`,
+		`NORMALIZED_LATEST=$(printf '%s' "$LATEST" | normalize_trusted_agent_tool_version)`,
+	} {
+		if !strings.Contains(workerDaemon, expected) {
+			t.Fatalf("Agent version boundary is missing %q", expected)
+		}
 	}
 }
 
@@ -593,7 +638,7 @@ func TestWorkerReportsStructuredFailureMetadata(t *testing.T) {
 		`complete_job_failure()`,
 		`error:(if $success or $errorCode == "" then null else`,
 		`{code:$errorCode,retryable:$errorRetryable,details:$errorDetails}`,
-		`worker_error_stage()`,
+		`worker_error_stage_from_log()`,
 		`runtime-probe|runtime-image|image-prepare|runtime-create`,
 		`sandbox_create_failed`,
 		`worker_update_rolled_back`,
@@ -651,8 +696,7 @@ func TestWorkerWritesSmallRuntimeFilesThroughStdin(t *testing.T) {
 	for _, expected := range []string{
 		`agent_tool_exec "$CONTAINER" rm -rf /opt/agentbox/agent-versions.json`,
 		`agent_tool_exec_stdin "$CONTAINER" "$VERSION_FILE" sh -c 'cat > /opt/agentbox/agent-versions.json'`,
-		`docker exec "$TARGET" rm -rf /opt/agentbox/manifest.json`,
-		`docker exec -i "$TARGET" sh -c 'cat > /opt/agentbox/manifest.json' < "$MANIFEST"`,
+		`write_container_file_atomic "$TARGET" /opt/agentbox/manifest.json 600 "$MANIFEST"`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("runtime file provisioning is missing %q", expected)
@@ -674,8 +718,8 @@ func TestWorkerRestartReappliesSandboxConfiguration(t *testing.T) {
 	for _, expected := range []string{
 		`restart_sandbox()`,
 		`restart-sandbox) OPERATION=restart_sandbox`,
-		`configure_credentials "$TARGET" "$JOB_FILE"`,
-		`install_agent_wrappers "$TARGET" "$JOB_FILE"`,
+		`configure_sandbox_agent_config "$TARGET" "$JOB_FILE"`,
+		`resolve_worker_variables "$CONFIG_JOB_FILE" "$CONFIG_VARIABLES"`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("sandbox restart support is missing %q", expected)
@@ -765,7 +809,7 @@ func TestWorkerConfiguresDeepSeekHarnessMCPBeforeLaunch(t *testing.T) {
 		`DSH MCP server names collide after normalization`,
 		`name: \"@deepseek-ai/dsh-mcp-client\"`,
 		`transport: streamable-http`,
-		`cat > /opt/agentbox/dsh-mcp.patch.yml`,
+		`put\t/opt/agentbox/dsh-mcp.patch.yml`,
 		`exec /usr/bin/dsh --patch /opt/agentbox/dsh-mcp.patch.yml "$@"`,
 		`plugin|-V|--version|-h|--help|--dump-default-config`,
 	} {
@@ -790,10 +834,10 @@ func TestWorkerInjectsSandboxEnvironmentVariables(t *testing.T) {
 
 func TestWorkerSkillInstallDoesNotReuseRuntimeTargetVariable(t *testing.T) {
 	for _, expected := range []string{
-		`for SKILL_TARGET do`,
-		`cp -R "$SKILL_SOURCE/." "$SKILL_TARGET/"`,
-		`' agentbox "/opt/agentbox/skills/$ID"`,
-		`sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/SKILL.md"`,
+		`skill_target_for_tool()`,
+		`managed_paths_reconcile "$SKILL_CONTAINER" "$SKILL_OPERATIONS"`,
+		`"$SKILL_STAGE/skills/$SKILL_ID/SKILL.md"`,
+		`printf 'put\t/opt/agentbox/skills\t%s/skills\t1\t-\n'`,
 	} {
 		if !strings.Contains(workerDaemon, expected) {
 			t.Fatalf("sandbox skill installation is missing %q", expected)
@@ -1929,8 +1973,9 @@ func TestWorkerInjectsProxyBeforeAgentInstallationWithoutPersistingSecret(t *tes
 		`append_env "$PROXY_ENV" CLAUDE_CODE_PROXY_RESOLVES_HOSTS 1`,
 		`HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy`,
 		`"$(sandbox_control_plane_host "$DRIVER")" host.boxlite.internal`,
-		`del(.credentials, .proxy)`,
-		`.job.payload.controlPlane.allowNet[]?, .job.payload.proxy.allowNet[]?`,
+		`build_sandbox_manifest()`,
+		`variables: [($payload.variables // [])[] | {id: .id, key: .spec.key}]`,
+		`.job.payload.controlPlane.allowNet[]?, .job.payload.proxy.allowNet[]?, .job.payload.mcpAllowNet[]?`,
 		`--allow-net "$ALLOWED_HOST"`,
 		`network: {mode: $network, allow_net: $allowNet}`,
 	} {
@@ -2074,6 +2119,22 @@ func TestWorkerNetworkProxyCheckRunsOnWorkerWithoutCommandLineSecret(t *testing.
 	}
 	if strings.Contains(workerDaemon, `--proxy "$PROXY_URL"`) {
 		t.Fatal("Worker proxy check must not expose proxy credentials in curl command arguments")
+	}
+}
+
+func TestWorkerInstallerProtectsHostSecretSources(t *testing.T) {
+	for _, expected := range []string{
+		`install -d -m 0700 /var/lib/agentbox-worker`,
+		`[ -L /etc/agentbox-worker-secrets ]`,
+		`install -d -o root -g root -m 0700 /etc/agentbox-worker-secrets`,
+		`[ -L /etc/agentbox-worker-runtime.env ]`,
+		`install -m 0600 /dev/null /etc/agentbox-worker-runtime.env`,
+		`chown root:root /etc/agentbox-worker-runtime.env`,
+		`chmod 0600 /etc/agentbox-worker-runtime.env`,
+	} {
+		if !strings.Contains(workerInstall, expected) {
+			t.Fatalf("Worker installer secret-source permissions are missing %q", expected)
+		}
 	}
 }
 

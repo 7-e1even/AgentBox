@@ -86,7 +86,7 @@ sudo systemctl restart agentbox-worker
 
 完成标志：服务显示“连接正常”，至少有一个可选模型。
 
-## 4. 准备 Skills 和 MCP Servers（可选）
+## 4. 准备 Skills、Variables 和 MCP Servers（可选）
 
 如果只想先启动一个 CLI Agent，可以跳到下一节。需要让新沙箱自动带上工作方法或外部工具时，再配置 Skills 和 MCP Servers。
 
@@ -107,20 +107,31 @@ sudo systemctl restart agentbox-worker
 
 ![创建 Skill](images/user-guide/07-create-skill.png)
 
+### Variables
+
+进入“设置 → 环境变量”创建项目级 Variable。`key` 是注入沙箱的环境变量名，`reference` 是 Worker 主机上的值来源；控制面只保存引用：
+
+- `value-ref` + `env://NAME`：从 Worker 服务环境读取 `NAME`。安装脚本会创建 `/etc/agentbox-worker-runtime.env`，修改后重启 `agentbox-worker` 才会生效；
+- `secret-ref` + `secret://NAME`：从 Worker 主机的 `/etc/agentbox-worker-secrets/NAME` 读取。文件必须是 root 所有、不能让 group/other 读取、不能是符号链接，且不超过 16 KiB。
+
+例如，Variable 的 `key` 为 `GITHUB_TOKEN`、引用为 `secret://github_token` 时，Worker 读取 `/etc/agentbox-worker-secrets/github_token`，再把值注入沙箱的 `GITHUB_TOKEN`。不要把宿主机路径或 Token 本身填进 `key`、名称或简介。Variable 必须与使用它的模板或沙箱属于同一项目并一同选中；引用不存在、权限过宽或解析失败时，任务会失败，不会把引用字符串当成真实值。
+
 ### MCP Servers
 
 进入“配置 → MCP Servers”。AgentBox 不预置 MCP Server；创建并绑定后，系统可以把 STDIO 命令或 HTTP 服务声明注入新沙箱。
 
 新建时选择 Transport：
 
-- STDIO：填写启动命令和参数，例如通过 `npx` 启动 MCP Server；
-- HTTP：填写服务 URL；需要 Header 时使用密钥引用，不要把 Token 写进名称、简介或普通变量。
+- STDIO：分别填写可执行命令、参数列表和可选工作目录，例如通过 `npx` 启动 MCP Server；参数按数组保存，不经过 shell 再拆分；
+- HTTP：填写服务 URL；需要 Header 时从当前项目的 Variable 中选择，配置只保存 `env://KEY` 或 `secret://KEY`，不保存 Header 明文。
 
-DeepSeek Harness 使用随 DSH 固定版本安装的官方 MCP Client：STDIO 会映射为 `stdio`，HTTP 会映射为 `streamable-http`，并在 Agent 首轮交互前加载。DSH `0.1.0-rc.7` 的原生 MCP Client 不提供逐工具审批；在模板中选中某个 MCP Server，等同于信任它暴露的工具及其副作用。
+AgentBox 当前会为 Claude Code、Codex、DeepSeek Harness、Gemini CLI 和 OpenCode 生成各自的原生 MCP 配置；同一沙箱可以同时选择其他 Agent，但 Pi、Grok、Kimi 和 Reasonix 不会收到 MCP 配置。如果所选 Agent 全部不支持 MCP，保存会被拒绝。DeepSeek Harness 使用随 DSH 固定版本安装的官方 MCP Client：STDIO 会映射为 `stdio`，HTTP 会映射为 `streamable-http`。DSH `0.1.0-rc.7` 的原生 MCP Client 不提供逐工具审批；在模板中选中某个 MCP Server，等同于信任它暴露的工具及其副作用。
+
+HTTP MCP 的远程主机会在创建时加入 BoxLite `restricted` 网络的允许列表；`none` 网络只允许 loopback HTTP MCP。BoxLite 的允许列表不能在实例创建后修改，因此已有沙箱若增删 HTTP MCP 主机，或把 MCP URL 改到另一主机，服务端会要求新建沙箱；不会把普通重启误报成网络策略已更新。同一主机下的路径、Header 或 STDIO 配置变化仍可重启应用。STDIO 命令所需的软件包仍必须已在镜像中，或由初始化命令在允许的网络策略下安装。升级后先确认服务器已重新连接并发布新的受管配置与 `fail-closed-job-output` 能力；未发布输出安全能力的旧 Worker 只能领取自身升级任务，不会继续执行沙箱业务任务。通过安全门禁但缺少某项受管配置能力时，也只有服务端确认可无损降级的初次配置可以执行；清理旧配置、Variable 注入及其他不能证明等价的任务会明确要求先升级 Worker。
 
 ![创建 MCP Server](images/user-guide/09-create-mcp-server.png)
 
-完成标志：所需 Skill 或 MCP Server 状态为“已启用”。只有在模板或沙箱中选中它们，创建时才会真正注入。
+“已启用”只表示资源可以被选择，不代表已经进入某个沙箱。完成标志是：模板或沙箱已选中所需 Skill、Variable 与 MCP，创建或重启任务成功，并在沙箱详情看到 `Desired = Applied`。Worker 会按受管清单精确同步；取消选择后再次重启，会移除上一次由 AgentBox 写入的对应 Skill、Variable 或 MCP 配置，同时保留同名空间中的非受管配置。
 
 ## 5. 创建沙箱模板
 
@@ -149,7 +160,7 @@ DeepSeek Harness 使用随 DSH 固定版本安装的官方 MCP Client：STDIO �
 
 ![模板高级配置](images/user-guide/12-template-advanced.png)
 
-这里的普通环境变量会明文保存，适合 `NODE_ENV`、功能开关等非敏感配置。API Key 应继续放在“模型服务”中。BoxLite 新模板默认受限网络；Docker 与 Microsandbox 新模板默认完全隔离，只有显式选择后才允许出站。BoxLite 的受限网络只控制沙箱内安装和运行流量；宿主机拉取镜像不使用这里的代理。restricted 当前仍仅由 BoxLite 强制执行。
+这里直接填写的环境变量会在数据库中加密、在读取 API 中遮罩，但仍属于控制面托管的敏感数据；适合 `NODE_ENV`、功能开关等普通配置。模型 API Key 应继续放在“模型服务”中，需要由 Worker 主机托管和轮换的其他密钥应使用 Variable 引用。BoxLite 新模板默认受限网络；Docker 与 Microsandbox 新模板默认完全隔离，只有显式选择后才允许出站。BoxLite 的受限网络只控制沙箱内安装和运行流量；宿主机拉取镜像不使用这里的代理。restricted 当前仍仅由 BoxLite 强制执行。
 
 含密码的网络代理会在运行时向沙箱进程提供可复用的上游凭据，因此只有管理员可以在创建新模板或新沙箱时选定它，并启动、操作或进入对应工作负载。公开 Webhook 不具备管理员身份，不能从含密码代理的模板创建沙箱；无密码代理仍可由 Operator 和自动化使用。沙箱创建时会冻结实际代理选择，后续模板修改不会改变已有沙箱；已有沙箱也不能后绑定或切换到含密码代理，必须用目标代理新建沙箱。被模板、沙箱或进行中任务引用的代理不能在“无密码”和“含密码”之间切换。升级到包含该边界的版本后，应轮换所有曾绑定到沙箱的代理密码；代码升级不能撤销此前已进入沙箱文件或进程环境的历史凭据。旧版本沙箱没有可信的创建来源证明，不能通过重启或 Agent 工具任务新注入代理密码，应新建沙箱完成迁移。
 

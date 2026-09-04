@@ -160,6 +160,7 @@ func TestReferencedProxyCannotBecomeCredentialed(t *testing.T) {
 	if _, err := s.UpdateResource(adminCtx, template.ID, template.Input); err != nil {
 		t.Fatal(err)
 	}
+	proxyInput.Username = "transition-user"
 	proxyInput.Password = "new reusable password"
 	if _, err := s.UpdateNetworkProxy(adminCtx, proxy.ID, proxyInput); !errors.Is(err, ErrConflict) {
 		t.Fatalf("referenced proxy credential transition error = %v, want ErrConflict", err)

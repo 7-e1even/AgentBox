@@ -29,7 +29,7 @@ func extensionShellFunctions(t *testing.T) (string, string) {
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq is not available")
 	}
-	_, functions, found := strings.Cut(workerDaemon, "\nredact_extension_output() (")
+	_, functions, found := strings.Cut(workerDaemon, "\nprepare_job_variable_snapshot() (")
 	if !found {
 		t.Fatal("extension functions are missing")
 	}
@@ -37,7 +37,15 @@ func extensionShellFunctions(t *testing.T) (string, string) {
 	if !found {
 		t.Fatal("extension function boundary is missing")
 	}
-	return sh, "redact_extension_output() (" + functions
+	_, errorHelpers, found := strings.Cut(workerDaemon, "\nworker_error_stage_from_log() {")
+	if !found {
+		t.Fatal("safe error helpers are missing")
+	}
+	errorHelpers, _, found = strings.Cut(errorHelpers, "\nreport_job_progress() {")
+	if !found {
+		t.Fatal("safe error helper boundary is missing")
+	}
+	return sh, "worker_error_stage_from_log() {" + errorHelpers + "\nprepare_job_variable_snapshot() (" + functions
 }
 
 func writeExtensionTestJob(t *testing.T, root string, extensions []map[string]any) string {
@@ -95,6 +103,7 @@ worker_request() {
   done
   return 95
 }
+resolve_worker_variables() { printf '{"RESOLVED_SECRET":"resolved-worker-secret"}\n' > "$2"; }
 sleep() { command sleep 0.05; }
 JOB_ID=fixture-job
 LEASE_GENERATION=1
@@ -140,7 +149,7 @@ func TestExtensionsInstallAndVerifyInOrderWithoutExposingSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	firstInstall := `printf 'first-install\n' >> "$TEST_ROOT/order"
-printf '%s\n' "$API_SECRET" 'credential-secret' 'credential-token' 'proxy-user' 'proxy-pass!' 'proxy-pass%21' '代理密码'
+printf '%s\n' "$API_SECRET" 'credential-secret' 'credential-token' 'proxy-user' 'proxy-pass!' 'proxy-pass%21' '代理密码' 'resolved-worker-secret'
 printf '%s\n' 'literal-$(touch host-leak)' > "$TEST_ROOT/literal"
 `
 	job := writeExtensionTestJob(t, root, []map[string]any{
@@ -165,13 +174,13 @@ if result=$(install_sandbox_extensions fixture "$TEST_JOB"); then printf success
 		t.Fatalf("script was interpolated by the host shell: %v", err)
 	}
 	completed := 0
-	foundRedacted := false
+	foundWithheld := false
 	for _, report := range reports {
 		if report.Status == "succeeded" {
 			completed++
 		}
-		foundRedacted = foundRedacted || strings.Contains(report.Output, "[REDACTED]")
-		for _, secret := range []string{"env-secret-'$-value", "credential-secret", "credential-token", "proxy-user", "proxy-pass!", "proxy-pass%21", "代理密码"} {
+		foundWithheld = foundWithheld || report.Output == "[extension output withheld: Worker does not export sandbox output]"
+		for _, secret := range []string{"env-secret-'$-value", "credential-secret", "credential-token", "proxy-user", "proxy-pass!", "proxy-pass%21", "代理密码", "resolved-worker-secret"} {
 			if strings.Contains(report.Output, secret) {
 				t.Fatalf("progress exposed a sensitive value: %s", report.ID)
 			}
@@ -180,8 +189,8 @@ if result=$(install_sandbox_extensions fixture "$TEST_JOB"); then printf success
 			t.Fatalf("extension output exceeds its byte limit: %d", len(report.Output))
 		}
 	}
-	if completed != 2 || !foundRedacted {
-		t.Fatalf("missing completions or sanitized output: %#v", reports)
+	if completed != 2 || !foundWithheld {
+		t.Fatalf("missing completions or protected output withholding: %#v", reports)
 	}
 }
 
@@ -265,7 +274,7 @@ else
   exit 1
 fi
 `, false)
-	if err == nil || !strings.Contains(string(output), "output exceeded 1 MiB; log withheld") || strings.Contains(string(output), "credential-") {
+	if err == nil || !strings.Contains(string(output), "does not export sandbox output") || strings.Contains(string(output), "credential-") {
 		t.Fatalf("output cap did not safely fail: %q, %v", output, err)
 	}
 	info, err := os.Stat(filepath.Join(root, "output.log"))
@@ -357,11 +366,11 @@ docker exec -i -w '/workspace with spaces' fixture sh -c 'literal $(must-not-exe
 	}
 }
 
-func TestExtensionRedactionPrecedesByteBoundedTail(t *testing.T) {
+func TestProtectedJobOutputIsWithheldAcrossEncodingsPrefixesAndControls(t *testing.T) {
 	root := t.TempDir()
-	secret := strings.Repeat("sensitive", 600)
+	secret := "token +/value"
 	encoded, err := json.Marshal(map[string]any{"job": map[string]any{"payload": map[string]any{
-		"environmentVariables": []map[string]string{{"value": secret}, {"value": "token +/value"}},
+		"environmentVariables": []map[string]string{{"name": "TOKEN", "value": secret}},
 	}}})
 	if err != nil {
 		t.Fatal(err)
@@ -370,25 +379,301 @@ func TestExtensionRedactionPrecedesByteBoundedTail(t *testing.T) {
 	if err := os.WriteFile(job, encoded, 0600); err != nil {
 		t.Fatal(err)
 	}
-	uriSecret := strings.ReplaceAll(url.PathEscape("token +/value"), "+", "%2B")
-	base64Secret := base64.StdEncoding.EncodeToString([]byte("token +/value"))
-	log := strings.Repeat("界", 3000) + secret + " " + uriSecret + " " + base64Secret
+	uriSecret := strings.ReplaceAll(url.PathEscape(secret), "+", "%2B")
+	formSecret := url.QueryEscape(secret)
+	base64Secret := base64.StdEncoding.EncodeToString([]byte(secret))
+	base64URLSecret := base64.RawURLEncoding.EncodeToString([]byte(secret))
+	log := strings.Join([]string{
+		secret,
+		uriSecret,
+		strings.ReplaceAll(strings.ReplaceAll(uriSecret, "%2B", "%2b"), "%2F", "%2f"),
+		formSecret,
+		strings.ToLower(formSecret),
+		base64Secret,
+		base64URLSecret,
+		"token +/\n",
+		"token +/\x00value",
+	}, " | ")
 	if err := os.WriteFile(filepath.Join(root, "output.log"), []byte(log), 0600); err != nil {
 		t.Fatal(err)
 	}
 	output, err, _ := runExtensionFixture(t, root, job, `redact_extension_output "$TEST_JOB" "$TEST_ROOT/output.log"`, false)
-	result := strings.TrimSuffix(string(output), "\n")
-	if err != nil || len(result) > 4096 || strings.Contains(result, "sensitive") ||
-		strings.Contains(result, uriSecret) || strings.Contains(result, base64Secret) || !strings.Contains(result, "[REDACTED]") {
-		t.Fatalf("unsafe or missing bounded redaction: length=%d, error=%v", len(result), err)
+	result := strings.TrimSpace(string(output))
+	if err != nil || result != "[extension output withheld: Worker does not export sandbox output]" {
+		t.Fatalf("protected output was not withheld: %q, %v", output, err)
 	}
-	// A progress poll can race a command that has written only part of its token.
-	if err := os.WriteFile(filepath.Join(root, "output.log"), []byte("prefix "+secret[:5000]), 0600); err != nil {
+	for _, variant := range []string{secret, uriSecret, formSecret, base64Secret, base64URLSecret, "token +/"} {
+		if strings.Contains(result, variant) {
+			t.Fatalf("protected output exposed variant %q", variant)
+		}
+	}
+}
+
+func TestJobOutputIsWithheldEvenWithoutKnownPayloadSecrets(t *testing.T) {
+	root := t.TempDir()
+	job := filepath.Join(root, "job.json")
+	snapshot := filepath.Join(root, "snapshot.json")
+	if err := os.WriteFile(job, []byte(`{"job":{"payload":{}}}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	output, err, _ = runExtensionFixture(t, root, job, `redact_extension_output "$TEST_JOB" "$TEST_ROOT/output.log"`, false)
-	if err != nil || strings.TrimSpace(string(output)) != "prefix [REDACTED]" {
-		t.Fatalf("an unfinished secret leaked through progress: length=%d, error=%v", len(output), err)
+	if err := os.WriteFile(snapshot, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(root, "output.log")
+	if err := os.WriteFile(logPath, []byte(strings.Repeat("safe-output-", 500)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err, _ := runExtensionFixture(t, root, job,
+		`redact_job_output "$TEST_JOB" "$TEST_ROOT/output.log" "$TEST_ROOT/snapshot.json" 3500 true`, false)
+	if err != nil || strings.TrimSpace(string(output)) != "[job output withheld: Worker does not export command output]" {
+		t.Fatalf("nonsensitive-looking output crossed the Worker boundary: (%q, %v)", output, err)
+	}
+	if err := os.WriteFile(logPath, []byte("token-prefix\x00secret-suffix"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err, _ = runExtensionFixture(t, root, job,
+		`redact_job_output "$TEST_JOB" "$TEST_ROOT/output.log" "$TEST_ROOT/snapshot.json" 3500 true`, false)
+	if err != nil || strings.TrimSpace(string(output)) != "[job output withheld: Worker does not export command output]" {
+		t.Fatalf("control-bearing output was not withheld: %q, %v", output, err)
+	}
+}
+
+func TestBuiltInSandboxMarkerDoesNotEnableRawDiagnostics(t *testing.T) {
+	root := t.TempDir()
+	job := filepath.Join(root, "job.json")
+	snapshot := filepath.Join(root, "snapshot.json")
+	if err := os.WriteFile(job, []byte(`{"job":{"payload":{"environmentVariables":[{"name":"IS_SANDBOX","value":"1"}]}}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshot, []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	const diagnostic = "stage runtime-probe failed: runtime executable is unavailable"
+	if err := os.WriteFile(filepath.Join(root, "output.log"), []byte(diagnostic), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err, _ := runExtensionFixture(t, root, job,
+		`redact_job_output "$TEST_JOB" "$TEST_ROOT/output.log" "$TEST_ROOT/snapshot.json" 3500 true`, false)
+	if err != nil || strings.TrimSpace(string(output)) != "[job output withheld: Worker does not export command output]" {
+		t.Fatalf("built-in sandbox marker enabled raw diagnostics: (%q, %v)", output, err)
+	}
+}
+
+func TestExtensionRedactionUsesProvisioningSnapshotAcrossRotation(t *testing.T) {
+	root := t.TempDir()
+	job := writeExtensionTestJob(t, root, nil)
+	const oldSecret = "old-provisioned-worker-secret"
+	if err := os.WriteFile(filepath.Join(root, "snapshot.json"), []byte(`{"TOKEN":"`+oldSecret+`"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "output.log"), []byte("prefix "+oldSecret+" suffix"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err, _ := runExtensionFixture(t, root, job,
+		`redact_extension_output "$TEST_JOB" "$TEST_ROOT/output.log" "$TEST_ROOT/snapshot.json"`, false)
+	if err != nil || strings.Contains(string(output), oldSecret) || !strings.Contains(string(output), "does not export sandbox output") {
+		t.Fatalf("rotated Variable snapshot redaction = (%q, %v)", output, err)
+	}
+}
+
+func TestJobOutputRedactionProtectsCompletionMessagesAcrossRotation(t *testing.T) {
+	root := t.TempDir()
+	job := writeExtensionTestJob(t, root, nil)
+	const variableSecret = "old-provisioned-worker-secret"
+	if err := os.WriteFile(filepath.Join(root, "snapshot.json"), []byte(`{"TOKEN":"`+variableSecret+`"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	log := strings.Repeat("safe-prefix-", 400) + " env-secret-'$-value credential-secret credential-token " + variableSecret
+	if err := os.WriteFile(filepath.Join(root, "output.log"), []byte(log), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err, _ := runExtensionFixture(t, root, job,
+		`redact_job_output "$TEST_JOB" "$TEST_ROOT/output.log" "$TEST_ROOT/snapshot.json" 3500 true`, false)
+	if err != nil || len(output) > 3500 || !strings.Contains(string(output), "does not export command output") {
+		t.Fatalf("completion redaction = (%q, %v)", output, err)
+	}
+	for _, secret := range []string{"env-secret-'$-value", "credential-secret", "credential-token", variableSecret} {
+		if strings.Contains(string(output), secret) {
+			t.Fatalf("completion message exposed %q: %q", secret, output)
+		}
+	}
+}
+
+func TestJobCompletionLogsAlwaysUseUnifiedRedaction(t *testing.T) {
+	_, create, found := strings.Cut(workerDaemon, "\nprocess_create_job() (")
+	if !found {
+		t.Fatal("create job supervisor is missing")
+	}
+	create, process, found := strings.Cut(create, "\nprocess_job() {")
+	if !found {
+		t.Fatal("generic job processor is missing")
+	}
+	process, _, found = strings.Cut(process, "\nmark_worker_inventory_dirty() {")
+	if !found {
+		t.Fatal("generic job processor boundary is missing")
+	}
+	if strings.Contains(create, `tail -c 3500`) || strings.Contains(create, `redact_job_output "$JOB_FILE" "$CREATE_STATE_DIR/log"`) ||
+		!strings.Contains(create, `MESSAGE=$(worker_safe_stage_message "$ERROR_STAGE")`) {
+		t.Fatal("create completion can export free-form sandbox output")
+	}
+	if strings.Contains(process, `tail -c 3500`) || strings.Count(process, `redact_job_output "$JOB_FILE" "$LOG_FILE"`) < 5 {
+		t.Fatal("sandbox/configuration job logs can bypass unified redaction")
+	}
+	if !strings.Contains(workerDaemon, `redact_extension_output "$EXTENSION_JOB"`) ||
+		!strings.Contains(workerDaemon, `[extension output withheld: Worker does not export sandbox output]`) {
+		t.Fatal("extension progress and final errors can export free-form sandbox output")
+	}
+}
+
+func TestProcessJobFailureCompletionWithholdsUnverifiableRotatedGuestSecrets(t *testing.T) {
+	sh, functions := extensionShellFunctions(t)
+	_, process, found := strings.Cut(workerDaemon, "\nprocess_job() {")
+	if !found {
+		t.Fatal("generic job processor is missing")
+	}
+	process, _, found = strings.Cut(process, "\nmark_worker_inventory_dirty() {")
+	if !found {
+		t.Fatal("generic job processor boundary is missing")
+	}
+	mock := `
+resolve_worker_variables() { printf '{"TOKEN":"new-worker-secret"}\n' > "$2"; }
+emit_stale_guest_log() {
+  printf '%s\n' "env-secret-'\$-value" credential-secret credential-token old-provisioned-worker-secret >&2
+  return 1
+}
+start_sandbox() { emit_stale_guest_log; }
+restart_sandbox() { emit_stale_guest_log; }
+stop_sandbox() { emit_stale_guest_log; }
+delete_sandbox() { emit_stale_guest_log; }
+apply_sandbox_proxy() { emit_stale_guest_log; }
+sandbox_container_name() { printf fixture; }
+update_agent_tools() { printf '[]\n' > "$2"; emit_stale_guest_log; }
+complete_job_failure() { printf '%s' "$5" > "$TEST_RESULT"; }
+complete_agent_tool_job() { printf '%s' "$3" > "$TEST_RESULT"; }
+complete_job() { :; }
+mark_worker_inventory_dirty() { :; }
+`
+	if runtime.GOOS == "windows" {
+		mock = "jq() { command jq.exe -b \"$@\"; }\n" + mock
+	}
+	for _, action := range []string{
+		"start-sandbox", "restart-sandbox", "stop-sandbox", "delete-sandbox",
+		"configure-sandbox-proxy", "update-sandbox-agent-tools",
+	} {
+		t.Run(action, func(t *testing.T) {
+			root := t.TempDir()
+			job := writeExtensionTestJob(t, root, nil)
+			encoded, err := os.ReadFile(job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document map[string]any
+			if err := json.Unmarshal(encoded, &document); err != nil {
+				t.Fatal(err)
+			}
+			jobObject := document["job"].(map[string]any)
+			jobObject["id"] = "job-one"
+			jobObject["leaseGeneration"] = 1
+			jobObject["action"] = action
+			jobObject["payload"].(map[string]any)["driver"] = "docker"
+			jobObject["payload"].(map[string]any)["requestedAgentTools"] = []string{"codex"}
+			encoded, err = json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(job, encoded, 0600); err != nil {
+				t.Fatal(err)
+			}
+			result := filepath.Join(root, "completion.txt")
+			command := exec.CommandContext(t.Context(), sh, "-s")
+			command.Env = append(command.Environ(), "TEST_RESULT="+filepath.ToSlash(result), "TMPDIR="+filepath.ToSlash(root))
+			command.Stdin = strings.NewReader("set -eu\n" + mock + functions + "\nprocess_job() {" + process + "\nprocess_job " + shellPath(job) + "\n")
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("process job: %v\n%s", err, output)
+			}
+			completion, err := os.ReadFile(result)
+			if err != nil || (!strings.Contains(string(completion), "仅保留在 Worker 本机") &&
+				!strings.Contains(string(completion), "detailed output was withheld")) {
+				t.Fatalf("completion = (%q, %v)", completion, err)
+			}
+			for _, secret := range []string{"env-secret-'$-value", "credential-secret", "credential-token", "old-provisioned-worker-secret", "new-worker-secret"} {
+				if strings.Contains(string(completion), secret) {
+					t.Fatalf("completion exposed %q: %q", secret, completion)
+				}
+			}
+		})
+	}
+}
+
+func TestProcessJobSuccessIgnoresOperationStdoutForExternalID(t *testing.T) {
+	sh, functions := extensionShellFunctions(t)
+	_, process, found := strings.Cut(workerDaemon, "\nprocess_job() {")
+	if !found {
+		t.Fatal("generic job processor is missing")
+	}
+	process, _, found = strings.Cut(process, "\nmark_worker_inventory_dirty() {")
+	if !found {
+		t.Fatal("generic job processor boundary is missing")
+	}
+	mock := `
+resolve_worker_variables() { printf '{}\n' > "$2"; }
+start_sandbox() { printf 'successful-guest-stdout-secret'; }
+stop_sandbox() { printf 'successful-guest-stdout-secret'; }
+restart_sandbox() { printf 'successful-guest-stdout-secret'; }
+delete_sandbox() { printf 'successful-guest-stdout-secret'; }
+apply_sandbox_proxy() { printf 'successful-guest-stdout-secret'; }
+sandbox_container_name() { printf agentbox-fixed; }
+complete_job() { printf '%s|%s' "$3" "$4" > "$TEST_RESULT"; }
+complete_job_failure() { printf failure > "$TEST_RESULT"; }
+mark_worker_inventory_dirty() { :; }
+`
+	if runtime.GOOS == "windows" {
+		mock = "jq() { command jq.exe -b \"$@\"; }\n" + mock
+	}
+	for _, test := range []struct {
+		action, want string
+	}{
+		{"start-sandbox", "agentbox-fixed|Sandbox started"},
+		{"stop-sandbox", "agentbox-fixed|Sandbox stopped"},
+		{"restart-sandbox", "agentbox-fixed|Sandbox restarted"},
+		{"delete-sandbox", "|Sandbox deleted"},
+		{"configure-sandbox-proxy", "agentbox-fixed|沙箱网络代理已应用；新的 Agent 和终端进程将使用该代理"},
+	} {
+		t.Run(test.action, func(t *testing.T) {
+			root := t.TempDir()
+			job := writeExtensionTestJob(t, root, nil)
+			encoded, err := os.ReadFile(job)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var document map[string]any
+			if err := json.Unmarshal(encoded, &document); err != nil {
+				t.Fatal(err)
+			}
+			jobObject := document["job"].(map[string]any)
+			jobObject["id"] = "job-one"
+			jobObject["leaseGeneration"] = 1
+			jobObject["action"] = test.action
+			encoded, err = json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(job, encoded, 0600); err != nil {
+				t.Fatal(err)
+			}
+			result := filepath.Join(root, "completion.txt")
+			command := exec.CommandContext(t.Context(), sh, "-s")
+			command.Env = append(command.Environ(), "TEST_RESULT="+filepath.ToSlash(result), "TMPDIR="+filepath.ToSlash(root))
+			command.Stdin = strings.NewReader("set -eu\n" + mock + functions + "\nprocess_job() {" + process + "\nprocess_job " + shellPath(job) + "\n")
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("process job: %v\n%s", err, output)
+			}
+			completion, err := os.ReadFile(result)
+			if err != nil || string(completion) != test.want ||
+				strings.Contains(string(completion), "successful-guest-stdout-secret") {
+				t.Fatalf("completion trusted operation stdout: %q, %v", completion, err)
+			}
+		})
 	}
 }
 
@@ -401,13 +686,13 @@ func TestExtensionsAreOnlyInstalledDuringCreation(t *testing.T) {
 	if !found {
 		t.Fatal("sandbox lifecycle boundary is missing")
 	}
-	wrappers := strings.Index(create, `install_agent_wrappers "$TARGET" "$JOB_FILE"`)
+	wrappers := strings.Index(create, `configure_sandbox_agent_config "$TARGET" "$JOB_FILE"`)
 	extensions := strings.Index(create, `install_sandbox_extensions "$TARGET" "$JOB_FILE"`)
 	setup := strings.Index(create, `if [ -n "$SETUP" ]`)
 	if wrappers < 0 || extensions <= wrappers || setup <= extensions || strings.Contains(lifecycle, "install_sandbox_extensions") {
 		t.Fatal("extensions must run once during creation after credentials/wrappers and before setup")
 	}
-	if !strings.Contains(workerDaemon, `CAPS="$CAPS\"sandbox-extensions\""`) {
+	if !strings.Contains(workerDaemon, `\"sandbox-extensions\",\"mcp-managed-config\",\"managed-capability-config\",\"fail-closed-job-output\"`) {
 		t.Fatal("Worker does not advertise sandbox extension execution")
 	}
 }

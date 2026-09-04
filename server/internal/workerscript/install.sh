@@ -118,8 +118,22 @@ install_host_dependencies
 install -m 0755 "$worker_tmp" /usr/local/bin/agentbox-worker
 install -d -m 0755 /usr/local/lib/agentbox
 install -d -m 0700 /var/lib/agentbox-worker
+if [ -L /etc/agentbox-worker-secrets ] ||
+   { [ -e /etc/agentbox-worker-secrets ] && [ ! -d /etc/agentbox-worker-secrets ]; }; then
+  echo "/etc/agentbox-worker-secrets must be a real directory" >&2
+  exit 1
+fi
+install -d -o root -g root -m 0700 /etc/agentbox-worker-secrets
+if [ -L /etc/agentbox-worker-runtime.env ] ||
+   { [ -e /etc/agentbox-worker-runtime.env ] && [ ! -f /etc/agentbox-worker-runtime.env ]; }; then
+  echo "/etc/agentbox-worker-runtime.env must be a regular file" >&2
+  exit 1
+fi
 if [ ! -e /etc/agentbox-worker-runtime.env ]; then
   install -m 0600 /dev/null /etc/agentbox-worker-runtime.env
+else
+  chown root:root /etc/agentbox-worker-runtime.env
+  chmod 0600 /etc/agentbox-worker-runtime.env
 fi
 rm -f /usr/local/bin/agentbox-session-worker
 rm -f /usr/local/lib/agentbox/session_worker.py /usr/local/lib/agentbox/runtime_driver.py

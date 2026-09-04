@@ -26,7 +26,11 @@ import { observePollingVisibility, usePolling } from "@/hooks/use-polling"
 import { PollingController } from "@/lib/polling-controller"
 import { LoadState } from "@/components/load-state"
 import { Button } from "@/components/ui/button"
-import { domainsForEditor, domainsForSection } from "@/lib/console-domains"
+import {
+  domainsForEditor,
+  domainsForSection,
+  editorNeedsAllProjectResources,
+} from "@/lib/console-domains"
 import {
   credentialModelsResponseSchema,
   credentialsResponseSchema,
@@ -265,6 +269,10 @@ export function ControlPlaneShell({
     resource: Resource | null
     initialSpec?: Record<string, unknown>
   } | null>(null)
+  const [resourceDetailLoadingId, setResourceDetailLoadingId] = useState<
+    string | null
+  >(null)
+  const resourceDetailRequestRef = useRef(0)
   const [sandboxEditor, setSandboxEditor] = useState<{
     resource: Resource | null
     initialRuntimeId?: string
@@ -298,7 +306,10 @@ export function ControlPlaneShell({
   })
   const projectResources = projectsDomain.items
   const projectId = resolveProjectId(projectsDomain.data, selectedProjectId)
-  const allProjects = section === "projects" || section === "servers"
+  const allProjects =
+    section === "projects" ||
+    section === "servers" ||
+    editorNeedsAllProjectResources(resourceEditor?.kind)
   const resourcesDomain = useListPolling({
     queryKey: `resources:${allProjects ? "all" : projectId}`,
     enabled: needs.has("resources"),
@@ -543,9 +554,45 @@ export function ControlPlaneShell({
     const project = projectResources.find((item) => item.id === nextProjectId)
     if (!project || project.id === projectId) return
     if (!confirmNavigation()) return
+    resourceDetailRequestRef.current += 1
+    setResourceDetailLoadingId(null)
+    setResourceEditor(null)
+    setSandboxEditor(null)
     setProjectId(project.id)
     if (notify) {
       toast.success("已切换项目", { description: project.name })
+    }
+  }
+
+  async function openResourceEditor(resource: Resource) {
+    if (resource.kind !== "skill") {
+      resourceDetailRequestRef.current += 1
+      setResourceDetailLoadingId(null)
+      setResourceEditor({ kind: resource.kind, resource })
+      return
+    }
+    if (resourceDetailLoadingId === resource.id) return
+    const requestId = resourceDetailRequestRef.current + 1
+    resourceDetailRequestRef.current = requestId
+    setResourceDetailLoadingId(resource.id)
+    try {
+      const result = resourceResponseSchema.parse(
+        await requestJson<unknown>(
+          `/api/resources/${encodeURIComponent(resource.id)}`
+        )
+      )
+      if (result.resource.kind !== "skill") {
+        throw new Error("服务端返回了错误的资源类型")
+      }
+      if (resourceDetailRequestRef.current !== requestId) return
+      setResourceEditor({ kind: "skill", resource: result.resource })
+    } catch (error) {
+      if (resourceDetailRequestRef.current !== requestId) return
+      toast.error("无法加载完整 Skill", { description: errorMessage(error) })
+    } finally {
+      if (resourceDetailRequestRef.current === requestId) {
+        setResourceDetailLoadingId(null)
+      }
     }
   }
 
@@ -563,12 +610,13 @@ export function ControlPlaneShell({
         }
       )
     )
+    const listedResource = resourceForList(result.resource)
     setResources((current) =>
       editing
         ? current.map((item) =>
-            item.id === result.resource.id ? result.resource : item
+            item.id === listedResource.id ? listedResource : item
           )
-        : [...current, result.resource]
+        : [...current, listedResource]
     )
     if (result.resource.kind === "project") {
       projectsDomain.setItems((current) =>
@@ -1182,9 +1230,7 @@ export function ControlPlaneShell({
         servers={servers}
         canMutate={canMutateResources}
         onCreate={() => setResourceEditor({ kind: "mcp", resource: null })}
-        onEdit={(resource) =>
-          setResourceEditor({ kind: resource.kind, resource })
-        }
+        onEdit={(resource) => void openResourceEditor(resource)}
         onDelete={setDeletingResource}
       />
     ) : section === "logs" ? (
@@ -1241,9 +1287,7 @@ export function ControlPlaneShell({
         servers={servers}
         canMutate={canMutateResources}
         onCreate={() => setResourceEditor({ kind, resource: null })}
-        onEdit={(resource) =>
-          setResourceEditor({ kind: resource.kind, resource })
-        }
+        onEdit={(resource) => void openResourceEditor(resource)}
         onDelete={setDeletingResource}
       />
     ) : null
@@ -1408,6 +1452,14 @@ export function ControlPlaneShell({
       </SectionRendererContext.Provider>
     </NavigationBlockerContext.Provider>
   )
+}
+
+function resourceForList(resource: Resource): Resource {
+  if (resource.kind !== "skill") return resource
+  const spec = { ...resource.spec }
+  delete spec.instructions
+  delete spec.files
+  return { ...resource, spec }
 }
 
 type BrowserNavigateEvent = Event & {

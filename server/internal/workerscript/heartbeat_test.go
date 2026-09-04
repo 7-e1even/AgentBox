@@ -91,6 +91,7 @@ curl() {
     legacy-server:0) [ "$FIXTURE_ATTEMPT" -ne 1 ] ;;
   esac
 }
+worker_origin_curl() { curl "$@"; }
 sleep() {
   [ "$1" = 15 ] || exit 92
   FIXTURE_ROUND=$((FIXTURE_ROUND + 1))
@@ -181,6 +182,7 @@ func TestWorkerInventoryReusesDockerCapabilityProbe(t *testing.T) {
 		t.Run(strconv.FormatBool(available), func(t *testing.T) {
 			stateDir := t.TempDir()
 			fixture := `
+STATE_DIR=$TEST_STATE_DIR
 BOXLITE_IMAGES_FILE=$TEST_STATE_DIR/no-boxlite-images
 AGENTBOX_VM_IMAGE_DIR=$TEST_STATE_DIR/no-vm-images
 if command -v jq.exe >/dev/null 2>&1; then
@@ -202,7 +204,7 @@ docker() {
 			command := exec.CommandContext(t.Context(), sh, "-s")
 			command.Env = append(command.Environ(), "TEST_STATE_DIR="+filepath.ToSlash(stateDir),
 				"TEST_DOCKER_AVAILABLE="+strconv.FormatBool(available))
-			command.Stdin = strings.NewReader("set -eu\n" + fixture + discovery + "\nCAPS=$(worker_capabilities)\nworker_inventory \"$CAPS\"\n")
+			command.Stdin = strings.NewReader("set -eu\n" + fixture + discovery + "\nCAPS=$(worker_capabilities)\nprintf '%s\\n' \"$CAPS\" > \"$TEST_STATE_DIR/capabilities\"\nworker_inventory \"$CAPS\"\n")
 			output, err := command.CombinedOutput()
 			if err != nil {
 				t.Fatalf("inventory fixture: %v\n%s", err, output)
@@ -219,6 +221,19 @@ docker() {
 			}
 			if len(inventory.DockerImages) != wantImageCount {
 				t.Fatalf("Docker image count = %d, want %d", len(inventory.DockerImages), wantImageCount)
+			}
+			encodedCapabilities, err := os.ReadFile(filepath.Join(stateDir, "capabilities"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var capabilities []string
+			if err := json.Unmarshal(encodedCapabilities, &capabilities); err != nil {
+				t.Fatalf("decode capabilities: %v: %s", err, encodedCapabilities)
+			}
+			for _, capability := range []string{"mcp-managed-config", "managed-capability-config", "fail-closed-job-output"} {
+				if !slices.Contains(capabilities, capability) {
+					t.Fatalf("Worker capabilities %v do not include %q", capabilities, capability)
+				}
 			}
 			calls, err := os.ReadFile(filepath.Join(stateDir, "docker-calls"))
 			if err != nil {

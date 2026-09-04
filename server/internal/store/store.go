@@ -25,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"agentbox/internal/catalog"
 	"agentbox/internal/platform"
@@ -59,7 +60,7 @@ const (
 	// references live in JSONB and therefore cannot be protected by foreign keys.
 	controlPlaneMutationLockKey int64 = 0x4147424d55544154
 	resourceUpdateSpecSQL             = `CASE WHEN kind = 'sandbox' THEN
-		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation' - 'agentToolVersions' - 'agentToolOperation' - 'automationId' - 'automationRunId' - 'extensionSnapshots' - 'extensionStates' - 'runtimeModelSources' - 'runtimeModelSourcesComplete' - 'runtimeModelTokenEpoch' - 'credentialedProxyIdAtCreation') || jsonb_build_object(
+		($5::jsonb - 'status' - 'message' - 'externalId' - 'provisioning' - 'proxyId' - 'appliedProxyId' - 'proxyOperation' - 'agentToolVersions' - 'agentToolOperation' - 'automationId' - 'automationRunId' - 'extensionSnapshots' - 'extensionStates' - 'runtimeModelSources' - 'runtimeModelSourcesComplete' - 'runtimeModelTokenEpoch' - 'credentialedProxyIdAtCreation' - 'capabilitiesPendingRestart' - 'capabilityDigest' - 'capabilitiesAppliedAt' - 'capabilityRevision') || jsonb_build_object(
 			'status', spec->'status',
 			'message', spec->'message',
 			'externalId', spec->'externalId',
@@ -72,7 +73,11 @@ const (
 			'extensionSnapshots', spec->'extensionSnapshots',
 			'extensionStates', spec->'extensionStates',
 			'automationId', spec->'automationId',
-			'automationRunId', spec->'automationRunId'
+			'automationRunId', spec->'automationRunId',
+			'capabilitiesPendingRestart', spec->'capabilitiesPendingRestart',
+			'capabilityDigest', spec->'capabilityDigest',
+			'capabilitiesAppliedAt', spec->'capabilitiesAppliedAt',
+			'capabilityRevision', COALESCE(spec->'capabilityRevision', '0'::jsonb)
 		)
 		|| CASE WHEN spec ? 'runtimeModelSources'
 			THEN jsonb_build_object('runtimeModelSources', spec->'runtimeModelSources')
@@ -2404,10 +2409,15 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
 		return platform.WorkerJob{}, fmt.Errorf("begin claim worker job: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	var authenticated bool
+	var authenticated, supportsFailClosedJobOutput bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS(
     SELECT 1 FROM managed_servers WHERE id = $1 AND credential_hash = $2
-  )`, serverID, hashToken(credential)).Scan(&authenticated); err != nil {
+  ), EXISTS(
+    SELECT 1 FROM managed_servers WHERE id = $1
+      AND capabilities ? $3
+  )`, serverID, hashToken(credential), workerFailClosedJobOutputCapability).Scan(
+		&authenticated, &supportsFailClosedJobOutput,
+	); err != nil {
 		return platform.WorkerJob{}, fmt.Errorf("authenticate worker job claim: %w", err)
 	}
 	if !authenticated {
@@ -2424,17 +2434,18 @@ func (s *Store) ClaimWorkerJob(ctx context.Context, serverID, credential string)
     FROM worker_jobs
     WHERE server_id = $1
 	  AND cancel_requested_at IS NULL
+	  AND (action = 'update-worker' OR $5::boolean)
 	  AND (
 	    (status = 'pending' AND attempts = 0)
 	    OR (
 	      status = 'leased' AND lease_until < $2 AND attempts < $3
-	      AND action = ANY($4::text[])
+			AND action = ANY($4::text[])
 	    )
 	  )
     ORDER BY created_at
     FOR UPDATE SKIP LOCKED
 	LIMIT 1`, serverID, now, workerJobAutomaticRetryLimit,
-		automaticallyRetryableWorkerJobActions).Scan(
+		automaticallyRetryableWorkerJobActions, supportsFailClosedJobOutput).Scan(
 		&job.ID, &resourceID, &job.Action, &payloadJSON, &job.ResourceGeneration,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -3009,6 +3020,9 @@ func sandboxRuntimeModelSourcesForUpdate(
 func advanceProvisioningProgress(current platform.ProvisioningProgress, input platform.WorkerJobProgressInput, now time.Time) platform.ProvisioningProgress {
 	if current.CancelRequested {
 		// Late installation reports may renew the lease, but cannot undo a cancel.
+		current.Stage = "cancelling"
+		current.Message = sandboxCancellationMessage
+		current.Status = "cancelling"
 		current.UpdatedAt = &now
 		if current.StartedAt != nil {
 			current.DurationMS = now.Sub(*current.StartedAt).Milliseconds()
@@ -3170,6 +3184,7 @@ func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credentia
 	if err := validateExtensionProgressPayload(input, action, payloadJSON); err != nil {
 		return platform.ProvisioningProgress{}, err
 	}
+	sanitizeWorkerJobProgress(action, &input)
 	if resourceID.Valid {
 		if err := ensureWorkerResourceGeneration(ctx, tx, resourceID.String, resourceGeneration); err != nil {
 			return platform.ProvisioningProgress{}, err
@@ -3182,6 +3197,7 @@ func (s *Store) ReportWorkerJobProgress(ctx context.Context, serverID, credentia
 	if err := json.Unmarshal(progressJSON, &progress); err != nil {
 		return platform.ProvisioningProgress{}, fmt.Errorf("decode worker job progress: %w", err)
 	}
+	sanitizeWorkerProvisioningProgress(action, &progress)
 	progress = advanceProvisioningProgress(progress, input, now)
 	encoded, err := json.Marshal(progress)
 	if err != nil {
@@ -3257,6 +3273,33 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if !authenticated {
 		return ErrWorkerUnauthorized
 	}
+	// Serialize successful application of a payload with capability mutations.
+	// Lifecycle generation still fences desired Sandbox edits. Capability content
+	// uses a separate revision so an already-created external instance can always
+	// converge its status while retaining a truthful pending-restart marker.
+	if err := lockControlPlaneReferences(ctx, tx); err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	var completionResourceID pgtype.Text
+	var completionAction string
+	var completionPayloadJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT resource_id, action, payload FROM worker_jobs
+	    WHERE id = $1 AND server_id = $2 FOR UPDATE`, jobID, serverID).Scan(
+		&completionResourceID, &completionAction, &completionPayloadJSON,
+	); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("load trusted Worker job completion identity: %w", err)
+	} else if err == nil {
+		resourceID := ""
+		if completionResourceID.Valid {
+			resourceID = completionResourceID.String
+		}
+		if err := sanitizeWorkerJobCompletion(
+			completionAction, resourceID, completionPayloadJSON, &result, now,
+		); err != nil {
+			return err
+		}
+	}
 	status := "failed"
 	if result.Success {
 		status = "succeeded"
@@ -3271,7 +3314,6 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	var progressJSON []byte
 	var jobPayloadJSON []byte
 	var resourceGeneration int64
-	now := time.Now().UTC()
 	err = tx.QueryRow(ctx, `UPDATE worker_jobs SET
 		status = $1, lease_until = NULL, result_message = $2, external_id = $3,
 		result_exit_code = $4, result_output = $5, result_truncated = $6,
@@ -3355,7 +3397,12 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if result.Success {
 		audit.Status = platform.LogStatusSuccess
 	}
-	commitCompletion := func() error { return s.commitAudit(ctx, tx, audit) }
+	commitCompletion := func() error {
+		if err := compactTerminalWorkerJobPayload(ctx, tx, jobID, jobPayloadJSON); err != nil {
+			return err
+		}
+		return s.commitAudit(ctx, tx, audit)
+	}
 	if resourceID.Valid {
 		if err := ensureWorkerResourceGeneration(ctx, tx, resourceID.String, resourceGeneration); err != nil {
 			if !errors.Is(err, ErrConflict) {
@@ -3376,6 +3423,7 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	if err := json.Unmarshal(progressJSON, &progress); err != nil {
 		return fmt.Errorf("decode completed worker job progress: %w", err)
 	}
+	sanitizeWorkerProvisioningProgress(action, &progress)
 	progress = finishProvisioningProgress(progress, result, now)
 	hasProgress := progress.Stage != ""
 	progressJSON, err = json.Marshal(progress)
@@ -3526,16 +3574,20 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	appliedProxyID := ""
 	persistProxySnapshot := false
 	proxySnapshotMessage := ""
+	capabilityDigest := ""
+	capabilityRevisionMatches := false
 	if result.Success {
 		switch action {
 		case "create-sandbox", "start-sandbox", "restart-sandbox":
 			sandboxStatus = "running"
 			var jobPayload struct {
-				Desktop           *bool             `json:"desktop"`
-				ProxyID           string            `json:"proxyId"`
-				CredentialIDs     []string          `json:"credentialIds"`
-				ModelBindings     map[string]string `json:"modelBindings"`
-				RuntimeTokenEpoch string            `json:"runtimeTokenEpoch"`
+				Desktop            *bool             `json:"desktop"`
+				ProxyID            string            `json:"proxyId"`
+				CredentialIDs      []string          `json:"credentialIds"`
+				ModelBindings      map[string]string `json:"modelBindings"`
+				RuntimeTokenEpoch  string            `json:"runtimeTokenEpoch"`
+				CapabilityDigest   string            `json:"capabilityDigest"`
+				CapabilityRevision int64             `json:"capabilityRevision"`
 			}
 			if err := json.Unmarshal(jobPayloadJSON, &jobPayload); err != nil {
 				return fmt.Errorf("decode completed sandbox job payload: %w", err)
@@ -3551,6 +3603,19 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 			}
 			persistRuntimeModelSources = true
 			runtimeModelTokenEpoch = strings.TrimSpace(jobPayload.RuntimeTokenEpoch)
+			capabilityDigest = strings.TrimSpace(jobPayload.CapabilityDigest)
+			if capabilityDigest == "" {
+				var rawPayload map[string]any
+				if err := json.Unmarshal(jobPayloadJSON, &rawPayload); err == nil {
+					capabilityDigest = sandboxCapabilityDigest(rawPayload)
+				}
+			}
+			capabilityRevisionMatches, err = currentSandboxCapabilityRevisionMatches(
+				ctx, tx, resourceIDValue, jobPayload.CapabilityRevision,
+			)
+			if err != nil {
+				return err
+			}
 			appliedProxyID = strings.TrimSpace(jobPayload.ProxyID)
 			persistProxySnapshot = true
 			if appliedProxyID == "" {
@@ -3591,8 +3656,17 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 	  ELSE '{}'::jsonb END
 	|| CASE WHEN $15::text <> ''
 	    THEN jsonb_build_object('runtimeModelTokenEpoch', $15::text)
+	    ELSE '{}'::jsonb END
+	|| CASE WHEN $16::boolean
+	    THEN jsonb_build_object(
+	      'capabilityDigest', $17::text,
+	      'capabilitiesAppliedAt', $11::timestamptz
+	    )
+	    ELSE '{}'::jsonb END
+	|| CASE WHEN $18::boolean
+	    THEN jsonb_build_object('capabilitiesPendingRestart', FALSE)
 	    ELSE '{}'::jsonb END,
-	observed_generation = CASE WHEN $16::boolean THEN generation ELSE observed_generation END,
+	observed_generation = CASE WHEN $18::boolean THEN generation ELSE observed_generation END,
 	updated_at = $11
 	WHERE id = $12 AND kind = 'sandbox'`, sandboxStatus, result.ExternalID,
 		result.Message, persistDesktopSnapshot, desktopSnapshot, hasProgress, progressJSON,
@@ -3600,6 +3674,8 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		persistRuntimeModelSources, runtimeModelSourcesJSON,
 		runtimeModelTokenEpoch,
 		result.Success && (action == "create-sandbox" || action == "start-sandbox" || action == "restart-sandbox"),
+		capabilityDigest,
+		capabilityRevisionMatches,
 	); err != nil {
 		return fmt.Errorf("update sandbox status: %w", err)
 	}
@@ -3649,6 +3725,72 @@ func (s *Store) CompleteWorkerJob(ctx context.Context, serverID, credential, job
 		return fmt.Errorf("commit worker job completion: %w", err)
 	}
 	return nil
+}
+
+func compactTerminalWorkerJobPayload(ctx context.Context, tx pgx.Tx, jobID string, payloadJSON []byte) error {
+	encoded, err := compactWorkerJobPayload(payloadJSON)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE worker_jobs SET payload = $1::jsonb WHERE id = $2`, encoded, jobID); err != nil {
+		return fmt.Errorf("compact terminal Worker payload: %w", err)
+	}
+	return nil
+}
+
+func compactWorkerJobPayload(payloadJSON []byte) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+		return nil, fmt.Errorf("decode terminal Worker payload: %w", err)
+	}
+	delete(payload, "environmentVariables")
+	if skills, ok := payload["skills"].([]any); ok {
+		summaries := make([]any, 0, len(skills))
+		for _, raw := range skills {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			summary := map[string]any{"id": entry["id"]}
+			if spec, ok := entry["spec"].(map[string]any); ok {
+				if digest, ok := spec["bundleDigest"].(string); ok && digest != "" {
+					summary["bundleDigest"] = digest
+				}
+			}
+			summaries = append(summaries, summary)
+		}
+		payload["skills"] = summaries
+	}
+	if servers, ok := payload["mcpServers"].([]any); ok {
+		summaries := make([]any, 0, len(servers))
+		for _, raw := range servers {
+			entry, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			summary := map[string]any{"id": entry["id"]}
+			if spec, ok := entry["spec"].(map[string]any); ok {
+				summary["transport"] = spec["transport"]
+			}
+			summaries = append(summaries, summary)
+		}
+		payload["mcpServers"] = summaries
+	}
+	if variables, ok := payload["variables"].([]any); ok {
+		summaries := make([]any, 0, len(variables))
+		for _, raw := range variables {
+			entry, ok := raw.(map[string]any)
+			if ok {
+				summaries = append(summaries, map[string]any{"id": entry["id"]})
+			}
+		}
+		payload["variables"] = summaries
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode terminal Worker payload: %w", err)
+	}
+	return encoded, nil
 }
 
 func reconcileCompletedWorkerUpdateRollback(
@@ -3808,7 +3950,7 @@ func (s *Store) ListResourcesFiltered(ctx context.Context, filter platform.Resou
 		if err != nil {
 			return nil, fmt.Errorf("scan resource: %w", err)
 		}
-		maskResourceEnvironmentVariables(&resource)
+		prepareResourceForAPI(&resource, true)
 		resources = append(resources, resource)
 	}
 	return resources, rows.Err()
@@ -3823,18 +3965,35 @@ func (s *Store) GetResource(ctx context.Context, id string) (platform.Resource, 
 	if err != nil {
 		return platform.Resource{}, fmt.Errorf("get resource: %w", err)
 	}
-	maskResourceEnvironmentVariables(&resource)
+	prepareResourceForAPI(&resource, false)
 	return resource, nil
+}
+
+func prepareResourceForAPI(resource *platform.Resource, summarizeSkill bool) {
+	maskResourceEnvironmentVariables(resource)
+	if resource.Kind == platform.KindSandbox {
+		delete(resource.Spec, "capabilityRevision")
+	}
+	if resource.Kind == platform.KindMCP {
+		resource.Spec = platform.MCPReadSpec(resource.Spec)
+	}
+	if summarizeSkill && resource.Kind == platform.KindSkill {
+		resource.Spec = platform.SkillListSpec(resource.Spec)
+	}
 }
 
 func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platform.Resource, error) {
 	input.Spec = platform.DesiredResourceSpec(input.Kind, input.Spec)
 	platform.Normalize(&input)
+	if err := platform.CanonicalizeResourceSpec(&input); err != nil {
+		return platform.Resource{}, err
+	}
 	if err := platform.Validate(input); err != nil {
 		return platform.Resource{}, err
 	}
 	if input.Kind == platform.KindSandbox {
 		input.Spec["status"] = "requested"
+		input.Spec["capabilityRevision"] = int64(1)
 	}
 	if input.Kind == platform.KindRuntime || input.Kind == platform.KindSandbox {
 		if err := s.encryptSpecEnvironmentVariables(input.Spec); err != nil {
@@ -3875,7 +4034,7 @@ func (s *Store) CreateResource(ctx context.Context, input platform.Input) (platf
 	}); err != nil {
 		return platform.Resource{}, mapResourceError(err)
 	}
-	maskResourceEnvironmentVariables(&result)
+	prepareResourceForAPI(&result, false)
 	return result, nil
 }
 
@@ -3900,10 +4059,14 @@ func enqueueSandboxJob(ctx context.Context, tx pgx.Tx, sandbox platform.Resource
 }
 
 func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Resource, creating bool) (map[string]any, string, string, error) {
+	if sandbox.ProjectID == nil {
+		return nil, "", "", &platform.ValidationError{Message: "沙箱缺少所属 Project"}
+	}
+	projectID := *sandbox.ProjectID
 	runtimeID, _ := sandbox.Spec["runtimeId"].(string)
 	var runtimeSpecJSON []byte
 	if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
-    WHERE id = $1 AND kind = 'runtime'`, runtimeID).Scan(&runtimeSpecJSON); err != nil {
+	    WHERE id = $1 AND kind = 'runtime' AND project_id = $2 AND enabled = TRUE`, runtimeID, projectID).Scan(&runtimeSpecJSON); err != nil {
 		return nil, "", "", fmt.Errorf("load sandbox environment template: %w", err)
 	}
 	var runtimeSpec map[string]any
@@ -3911,6 +4074,9 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		return nil, "", "", fmt.Errorf("decode sandbox environment template: %w", err)
 	}
 	effectiveSpec := effectiveSandboxSpec(runtimeSpec, sandbox.Spec)
+	if pending, ok := sandbox.Spec["capabilitiesPendingRestart"].(bool); ok {
+		effectiveSpec["capabilitiesPendingRestart"] = pending
+	}
 	if !creating {
 		proxyID, _ := effectiveSpec["proxyId"].(string)
 		if err := validateSandboxProxyCreationProvenance(ctx, tx, sandbox.Spec, proxyID); err != nil {
@@ -3931,6 +4097,11 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 	}
 	network, _ := effectiveSpec["network"].(string)
 	network = platform.EffectiveNetworkPolicy(driver, network)
+	effectiveSpec["network"] = network
+	mcpAllowNet, err := ensureCapabilityReferences(ctx, tx, sandbox.ProjectID, effectiveSpec, "沙箱任务")
+	if err != nil {
+		return nil, "", "", err
+	}
 	payload := map[string]any{
 		"sandboxId":            sandbox.ID,
 		"name":                 sandbox.Name,
@@ -3951,7 +4122,21 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		"credentialIds":        effectiveSpec["credentialIds"],
 		"modelBindings":        effectiveSpec["modelBindings"],
 		"workspace":            effectiveSpec["workspace"],
+		"mcpAllowNet":          mcpAllowNet,
+		"capabilityRevision":   sandboxCapabilityRevision(sandbox.Spec),
 	}
+	var supportsManagedCapabilities, supportsManagedMCP bool
+	if err := tx.QueryRow(ctx, `SELECT capabilities ? 'managed-capability-config',
+	    capabilities ? 'mcp-managed-config'
+	    FROM managed_servers WHERE id = $1`, effectiveSpec["serverId"]).Scan(
+		&supportsManagedCapabilities, &supportsManagedMCP,
+	); err != nil {
+		return nil, "", "", fmt.Errorf("check Worker managed capability support: %w", err)
+	}
+	if err := validateManagedCapabilitySupport(effectiveSpec, creating, supportsManagedCapabilities); err != nil {
+		return nil, "", "", err
+	}
+	supportsManagedMCP = supportsManagedMCP || supportsManagedCapabilities
 	for _, definitions := range []struct {
 		payloadKey string
 		kind       platform.Kind
@@ -3961,9 +4146,14 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 		{payloadKey: "mcpServers", kind: platform.KindMCP, ids: specStringList(effectiveSpec, "mcpServerIds")},
 		{payloadKey: "variables", kind: platform.KindVariable, ids: specStringList(effectiveSpec, "variableIds")},
 	} {
-		resources, err := loadWorkerResourceDefinitions(ctx, tx, definitions.kind, definitions.ids)
+		resources, err := loadWorkerResourceDefinitions(ctx, tx, sandbox.ProjectID, definitions.kind, definitions.ids)
 		if err != nil {
 			return nil, "", "", err
+		}
+		if definitions.kind == platform.KindMCP {
+			if err := prepareMCPWorkerDefinitions(resources, supportsManagedMCP, creating); err != nil {
+				return nil, "", "", err
+			}
 		}
 		payload[definitions.payloadKey] = resources
 	}
@@ -3973,7 +4163,111 @@ func buildSandboxJobPayload(ctx context.Context, tx pgx.Tx, sandbox platform.Res
 	}
 	payload["extensions"] = extensions
 	payload["extensionIds"] = extensionIDs(extensions)
+	payload["capabilityDigest"] = sandboxCapabilityDigest(payload)
 	return payload, driver, imageReference, nil
+}
+
+func sandboxCapabilityDigest(payload map[string]any) string {
+	capabilities := map[string]any{
+		"agentTools": payload["agentTools"],
+		"skills":     payload["skills"],
+		"mcpServers": payload["mcpServers"],
+		"variables":  payload["variables"],
+	}
+	encoded, err := json.Marshal(capabilities)
+	if err != nil {
+		return ""
+	}
+	digest := sha256.Sum256(encoded)
+	return fmt.Sprintf("sha256:%x", digest)
+}
+
+func sandboxCapabilityRevision(spec map[string]any) int64 {
+	encoded, err := json.Marshal(spec["capabilityRevision"])
+	if err != nil {
+		return 0
+	}
+	revision, err := strconv.ParseInt(string(encoded), 10, 64)
+	if err != nil || revision < 0 {
+		return 0
+	}
+	return revision
+}
+
+func currentSandboxCapabilityRevisionMatches(ctx context.Context, tx pgx.Tx, id string, expected int64) (bool, error) {
+	var encoded []byte
+	if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+	    WHERE id = $1 AND kind = 'sandbox'`, id).Scan(&encoded); errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrResourceNotFound
+	} else if err != nil {
+		return false, fmt.Errorf("load current sandbox capability revision: %w", err)
+	}
+	var spec map[string]any
+	if err := json.Unmarshal(encoded, &spec); err != nil {
+		return false, fmt.Errorf("decode current sandbox capability revision: %w", err)
+	}
+	return sandboxCapabilityRevision(spec) == expected, nil
+}
+
+func validateManagedCapabilitySupport(spec map[string]any, creating, supported bool) error {
+	if supported {
+		return nil
+	}
+	if len(specStringList(spec, "variableIds")) > 0 {
+		return &platform.ValidationError{Message: "Variable 注入需要目标 Worker 先升级到受管能力配置版本"}
+	}
+	pending, _ := spec["capabilitiesPendingRestart"].(bool)
+	if !creating && pending {
+		return &platform.ValidationError{Message: "当前能力配置需要精确同步，目标 Worker 必须先升级到受管能力配置版本"}
+	}
+	return nil
+}
+
+func prepareMCPWorkerDefinitions(definitions []map[string]any, supportsManagedMCP, allowLegacyCreate bool) error {
+	if len(definitions) > 0 && !supportsManagedMCP && !allowLegacyCreate {
+		return &platform.ValidationError{Message: "已有沙箱的 MCP 配置需要目标 Worker 先升级到受管 MCP 配置版本"}
+	}
+	for _, definition := range definitions {
+		rawSpec, _ := definition["spec"].(map[string]any)
+		encoded, err := json.Marshal(rawSpec)
+		if err != nil {
+			return fmt.Errorf("encode MCP Worker definition: %w", err)
+		}
+		var spec platform.MCPSpec
+		if err := json.Unmarshal(encoded, &spec); err != nil {
+			return &platform.ValidationError{Message: "MCP Server 配置无法发送给 Worker"}
+		}
+		workerSpec := map[string]any{
+			"transport": spec.Transport,
+			"command":   spec.Command,
+			"url":       spec.URL,
+			"cwd":       spec.Cwd,
+		}
+		if supportsManagedMCP {
+			workerSpec["arguments"] = spec.Args
+			workerSpec["headers"] = spec.Headers
+		} else {
+			if len(spec.Headers) > 0 {
+				return &platform.ValidationError{Message: "MCP Header 引用需要目标 Worker 先升级到受管 MCP 配置版本"}
+			}
+			if spec.Cwd != "" {
+				return &platform.ValidationError{Message: "MCP cwd 需要目标 Worker 先升级到受管 MCP 配置版本"}
+			}
+			legacySafe := true
+			for _, arg := range spec.Args {
+				if strings.IndexFunc(arg, unicode.IsSpace) >= 0 {
+					legacySafe = false
+					break
+				}
+			}
+			if !legacySafe {
+				return &platform.ValidationError{Message: "MCP 参数包含空白字符，目标 Worker 需要先升级以支持 args 数组"}
+			}
+			workerSpec["args"] = strings.Join(spec.Args, " ")
+		}
+		definition["spec"] = workerSpec
+	}
+	return nil
 }
 
 func effectiveSandboxSpec(runtimeSpec, sandboxSpec map[string]any) map[string]any {
@@ -4005,21 +4299,189 @@ func effectiveSandboxSpec(runtimeSpec, sandboxSpec map[string]any) map[string]an
 			result[key] = value
 		}
 	}
+	for _, key := range []string{"agentTools", "skillIds", "mcpServerIds", "variableIds"} {
+		seen := make(map[string]struct{})
+		ids := make([]string, 0)
+		for _, id := range specStringList(result, key) {
+			if _, duplicate := seen[id]; duplicate {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+		result[key] = ids
+	}
 	return result
+}
+
+func ensureCapabilityReferences(
+	ctx context.Context,
+	tx pgx.Tx,
+	projectID *string,
+	spec map[string]any,
+	subject string,
+) ([]string, error) {
+	if projectID == nil {
+		return nil, &platform.ValidationError{Message: subject + "缺少所属 Project"}
+	}
+	projectIDValue := *projectID
+	if len(specStringList(spec, "skillIds")) > platform.MaxSkillBindings {
+		return nil, &platform.ValidationError{Message: "一个环境最多绑定 32 个 Skill"}
+	}
+	if len(specStringList(spec, "mcpServerIds")) > platform.MaxMCPBindings {
+		return nil, &platform.ValidationError{Message: "一个环境最多绑定 32 个 MCP Server"}
+	}
+	if len(specStringList(spec, "variableIds")) > platform.MaxVariableBindings {
+		return nil, &platform.ValidationError{Message: "一个环境最多绑定 100 个 Variable"}
+	}
+	type variableBinding struct {
+		scheme string
+	}
+	variables := make(map[string]variableBinding)
+	environmentNames := make(map[string]struct{})
+	if rawVariables, ok := spec["environmentVariables"].([]any); ok {
+		for _, raw := range rawVariables {
+			if entry, ok := raw.(map[string]any); ok {
+				if name, ok := entry["name"].(string); ok {
+					environmentNames[name] = struct{}{}
+				}
+			}
+		}
+	}
+	for _, id := range specStringList(spec, "variableIds") {
+		var specJSON []byte
+		err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+	      WHERE id = $1 AND kind = 'variable' AND project_id = $2 AND enabled = TRUE`, id, projectIDValue).Scan(&specJSON)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, &platform.ValidationError{Message: subject + "包含不存在、已停用或属于其他 Project 的 Variable: " + id}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("check %s variable binding: %w", subject, err)
+		}
+		var variable platform.VariableSpec
+		if err := json.Unmarshal(specJSON, &variable); err != nil {
+			return nil, &platform.ValidationError{Message: subject + "引用的 Variable 格式无效: " + id}
+		}
+		if err := platform.ValidateVariableSpec(variable); err != nil {
+			return nil, &platform.ValidationError{Message: subject + "引用的 Variable 无法解析: " + id + "；" + err.Error()}
+		}
+		if _, duplicate := variables[variable.Key]; duplicate {
+			return nil, &platform.ValidationError{Message: subject + "选择了多个相同 key 的 Variable: " + variable.Key}
+		}
+		if _, collision := environmentNames[variable.Key]; collision {
+			return nil, &platform.ValidationError{Message: "Variable key 与环境变量重复，无法确定覆盖顺序: " + variable.Key}
+		}
+		scheme, _, _ := platform.ParseMCPValueReference(variable.Reference)
+		variables[variable.Key] = variableBinding{scheme: scheme}
+	}
+
+	totalSkillBytes := 0
+	seenSkills := make(map[string]struct{})
+	for _, id := range specStringList(spec, "skillIds") {
+		if _, duplicate := seenSkills[id]; duplicate {
+			continue
+		}
+		seenSkills[id] = struct{}{}
+		var specJSON []byte
+		err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+	      WHERE id = $1 AND kind = 'skill' AND project_id = $2 AND enabled = TRUE`, id, projectIDValue).Scan(&specJSON)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, &platform.ValidationError{Message: subject + "包含不存在、已停用或属于其他 Project 的 Skill: " + id}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("check %s skill binding: %w", subject, err)
+		}
+		var skill platform.SkillSpec
+		if err := json.Unmarshal(specJSON, &skill); err != nil {
+			return nil, &platform.ValidationError{Message: subject + "引用的 Skill 格式无效: " + id}
+		}
+		_, _, decodedBytes, err := platform.SkillBundleSummary(skill)
+		if err != nil {
+			return nil, &platform.ValidationError{Message: subject + "引用的 Skill bundle 无法读取: " + id}
+		}
+		totalSkillBytes += decodedBytes
+		if totalSkillBytes > platform.MaxSandboxSkillBundleBytes {
+			return nil, &platform.ValidationError{Message: "所选 Skill 解压后总大小不能超过 16 MiB"}
+		}
+	}
+
+	mcpIDs := specStringList(spec, "mcpServerIds")
+	if len(mcpIDs) > 0 {
+		supported := false
+		for _, tool := range specStringList(spec, "agentTools") {
+			if platform.SupportsMCPAgentTool(tool) {
+				supported = true
+				break
+			}
+		}
+		if !supported {
+			return nil, &platform.ValidationError{Message: "已选择 MCP Server，但当前 Agent 均不支持 MCP"}
+		}
+	}
+	network, _ := spec["network"].(string)
+	driver, _ := spec["driver"].(string)
+	network = platform.EffectiveNetworkPolicy(driver, network)
+	seenHosts := make(map[string]struct{}, len(mcpIDs))
+	for _, id := range mcpIDs {
+		var specJSON []byte
+		err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+	      WHERE id = $1 AND kind = 'mcp' AND project_id = $2 AND enabled = TRUE`, id, projectIDValue).Scan(&specJSON)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, &platform.ValidationError{Message: subject + "包含不存在、已停用或属于其他 Project 的 MCP Server: " + id}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("check %s MCP binding: %w", subject, err)
+		}
+		var mcp platform.MCPSpec
+		if err := json.Unmarshal(specJSON, &mcp); err != nil {
+			return nil, &platform.ValidationError{Message: subject + "引用的 MCP Server 格式无效: " + id}
+		}
+		if err := platform.ValidateMCPSpec(mcp); err != nil {
+			return nil, &platform.ValidationError{Message: subject + "引用的 MCP Server 无效: " + id + "；" + err.Error()}
+		}
+		for _, header := range mcp.Headers {
+			scheme, key, _ := platform.ParseMCPValueReference(header.ValueFrom)
+			variable, exists := variables[key]
+			if !exists {
+				return nil, &platform.ValidationError{Message: "MCP Server " + id + " 的 Header 引用了未选择的 Variable: " + key}
+			}
+			if variable.scheme != scheme {
+				return nil, &platform.ValidationError{Message: "MCP Server " + id + " 的 Header 引用 scheme 与 Variable mode 不匹配: " + key}
+			}
+		}
+		host := platform.MCPURLHost(mcp)
+		if host == "" {
+			continue
+		}
+		if network == "none" && !platform.IsLoopbackMCPHost(host) {
+			return nil, &platform.ValidationError{Message: "完全隔离的环境不能访问远程 HTTP MCP Server: " + id}
+		}
+		host = strings.ToLower(host)
+		if _, duplicate := seenHosts[host]; duplicate {
+			continue
+		}
+		seenHosts[host] = struct{}{}
+	}
+	return slices.Sorted(maps.Keys(seenHosts)), nil
 }
 
 func loadWorkerResourceDefinitions(
 	ctx context.Context,
 	tx pgx.Tx,
+	projectID *string,
 	kind platform.Kind,
 	ids []string,
 ) ([]map[string]any, error) {
+	if projectID == nil {
+		return nil, &platform.ValidationError{Message: "环境缺少所属 Project"}
+	}
+	projectIDValue := *projectID
 	definitions := make([]map[string]any, 0, len(ids))
 	for _, id := range ids {
 		var name, description string
 		var specJSON []byte
 		err := tx.QueryRow(ctx, `SELECT name, description, spec
-      FROM control_resources WHERE id = $1 AND kind = $2 AND enabled = TRUE`, id, kind).Scan(
+	      FROM control_resources WHERE id = $1 AND kind = $2 AND project_id = $3 AND enabled = TRUE`, id, kind, projectIDValue).Scan(
 			&name, &description, &specJSON,
 		)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -4031,6 +4493,11 @@ func loadWorkerResourceDefinitions(
 		var spec map[string]any
 		if err := json.Unmarshal(specJSON, &spec); err != nil {
 			return nil, fmt.Errorf("decode worker %s definition: %w", kind, err)
+		}
+		if kind == platform.KindVariable {
+			compatibilityInput := platform.Input{Kind: platform.KindVariable, Spec: spec}
+			platform.Normalize(&compatibilityInput)
+			spec = compatibilityInput.Spec
 		}
 		definitions = append(definitions, map[string]any{
 			"id": id, "name": name, "description": description, "spec": spec,
@@ -4044,6 +4511,9 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	platform.Normalize(&input)
 	if input.ID != id {
 		return platform.Resource{}, &platform.ValidationError{Message: "资源标识不能修改"}
+	}
+	if err := platform.CanonicalizeResourceSpec(&input); err != nil {
+		return platform.Resource{}, err
 	}
 	if err := platform.Validate(input); err != nil {
 		return platform.Resource{}, err
@@ -4082,6 +4552,44 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	if err := s.ensureResourceReferences(ctx, tx, input, false); err != nil {
 		return platform.Resource{}, err
 	}
+	var changedRuntimeCapabilityKeys []string
+	var currentRuntimeSpec map[string]any
+	changedSandboxCapabilities := false
+	sandboxDesiredSpecUnchanged := false
+	if input.Kind == platform.KindRuntime {
+		var currentSpecJSON []byte
+		if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+	      WHERE id = $1 AND kind = 'runtime'`, id).Scan(&currentSpecJSON); err != nil {
+			return platform.Resource{}, fmt.Errorf("load Runtime capability bindings: %w", err)
+		}
+		if err := json.Unmarshal(currentSpecJSON, &currentRuntimeSpec); err != nil {
+			return platform.Resource{}, fmt.Errorf("decode Runtime capability bindings: %w", err)
+		}
+		if err := validateRuntimeFrozenCreationFields(ctx, tx, id, currentRuntimeSpec, input.Spec); err != nil {
+			return platform.Resource{}, err
+		}
+		for _, key := range []string{"agentTools", "skillIds", "mcpServerIds", "variableIds"} {
+			if !slices.Equal(specStringList(currentRuntimeSpec, key), specStringList(input.Spec, key)) {
+				changedRuntimeCapabilityKeys = append(changedRuntimeCapabilityKeys, key)
+			}
+		}
+		if slices.Contains(changedRuntimeCapabilityKeys, "mcpServerIds") {
+			if err := validateRuntimeFrozenMCPHosts(ctx, tx, id, currentRuntimeSpec, input.Spec); err != nil {
+				return platform.Resource{}, err
+			}
+		}
+	}
+	if input.Kind == platform.KindSandbox {
+		changedSandboxCapabilities, err = validateSandboxFrozenMCPHosts(ctx, tx, id, input.Spec)
+		if err != nil {
+			return platform.Resource{}, err
+		}
+	}
+	if input.Kind == platform.KindMCP {
+		if err := validateMCPResourceFrozenHostUpdate(ctx, tx, id, input.Spec); err != nil {
+			return platform.Resource{}, err
+		}
+	}
 	if input.Kind == platform.KindRuntime || input.Kind == platform.KindSandbox {
 		if err := s.preserveMaskedEnvironmentVariables(ctx, tx, id, input.Spec); err != nil {
 			return platform.Resource{}, err
@@ -4090,19 +4598,82 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 			return platform.Resource{}, err
 		}
 	}
+	if input.Kind == platform.KindRuntime {
+		for _, key := range []string{"environmentVariables", "credentialIds", "modelBindings", "proxyId"} {
+			equal, err := s.runtimeRestartValuesEqual(key, currentRuntimeSpec, input.Spec)
+			if err != nil {
+				return platform.Resource{}, fmt.Errorf("compare Runtime %s: %w", key, err)
+			}
+			if !equal {
+				changedRuntimeCapabilityKeys = append(changedRuntimeCapabilityKeys, key)
+			}
+		}
+	}
+	if input.Kind == platform.KindSandbox {
+		sandboxDesiredSpecUnchanged, err = s.storedSandboxDesiredSpecMatches(
+			ctx, tx, id, input.ProjectID, input.Enabled, input.Spec,
+		)
+		if err != nil {
+			return platform.Resource{}, err
+		}
+	}
 	result, err := scanResource(tx.QueryRow(ctx, `UPDATE control_resources SET
 		project_id = $1, name = $2, description = $3, enabled = $4,
 		spec = `+resourceUpdateSpecSQL+`,
 		generation = generation + 1,
-		observed_generation = CASE WHEN kind = 'sandbox' THEN observed_generation ELSE generation + 1 END,
+		observed_generation = CASE
+		  WHEN kind = 'sandbox' AND $9::boolean THEN generation + 1
+		  WHEN kind = 'sandbox' THEN observed_generation
+		  ELSE generation + 1 END,
 		updated_at = $6 WHERE id = $7 AND kind = $8 RETURNING `+resourceColumns,
 		input.ProjectID, input.Name, input.Description, input.Enabled, mustMapJSON(input.Spec),
-		time.Now().UTC(), id, input.Kind))
+		time.Now().UTC(), id, input.Kind, sandboxDesiredSpecUnchanged))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return platform.Resource{}, ErrResourceNotFound
 	}
 	if err != nil {
 		return platform.Resource{}, mapResourceError(err)
+	}
+	if changedSandboxCapabilities {
+		if _, err := tx.Exec(ctx, `UPDATE control_resources
+	      SET spec = jsonb_set(
+	        jsonb_set(spec, '{capabilitiesPendingRestart}', 'true'::jsonb, TRUE),
+	        '{capabilityRevision}',
+	        to_jsonb((CASE
+	          WHEN COALESCE(spec->>'capabilityRevision', '') ~ '^[0-9]+$'
+	            THEN (spec->>'capabilityRevision')::bigint
+	          ELSE 0
+	        END) + 1), TRUE
+	      )
+	      WHERE id = $1 AND kind = 'sandbox'`, id); err != nil {
+			return platform.Resource{}, fmt.Errorf("mark sandbox pending capability restart: %w", err)
+		}
+		result.Spec["capabilitiesPendingRestart"] = true
+	}
+	if input.Kind == platform.KindSkill || input.Kind == platform.KindMCP || input.Kind == platform.KindVariable {
+		if err := validateCapabilityConsumers(ctx, tx, input.Kind, id); err != nil {
+			return platform.Resource{}, err
+		}
+		if err := markCapabilityPendingRestart(ctx, tx, input.Kind, id); err != nil {
+			return platform.Resource{}, err
+		}
+	}
+	if len(changedRuntimeCapabilityKeys) > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE control_resources
+	      SET spec = jsonb_set(
+	            jsonb_set(spec, '{capabilitiesPendingRestart}', 'true'::jsonb, TRUE),
+	            '{capabilityRevision}',
+	            to_jsonb((CASE
+	              WHEN COALESCE(spec->>'capabilityRevision', '') ~ '^[0-9]+$'
+	                THEN (spec->>'capabilityRevision')::bigint
+	              ELSE 0
+	            END) + 1), TRUE
+	          ),
+	          updated_at = NOW()
+	      WHERE kind = 'sandbox' AND spec->>'runtimeId' = $1
+	        AND NOT (spec ?& $2::text[])`, id, changedRuntimeCapabilityKeys); err != nil {
+			return platform.Resource{}, fmt.Errorf("mark legacy Runtime sandboxes pending capability restart: %w", err)
+		}
 	}
 	if err := s.commitAudit(ctx, tx, platform.LogEntry{
 		Category: platform.LogCategoryResource, Action: "update", ResourceKind: string(input.Kind), ResourceID: id,
@@ -4110,8 +4681,499 @@ func (s *Store) UpdateResource(ctx context.Context, id string, input platform.In
 	}); err != nil {
 		return platform.Resource{}, mapResourceError(err)
 	}
-	maskResourceEnvironmentVariables(&result)
+	prepareResourceForAPI(&result, false)
 	return result, nil
+}
+
+func validateCapabilityConsumers(ctx context.Context, tx pgx.Tx, kind platform.Kind, id string) error {
+	key := map[platform.Kind]string{
+		platform.KindSkill: "skillIds", platform.KindMCP: "mcpServerIds", platform.KindVariable: "variableIds",
+	}[kind]
+	type consumer struct {
+		id          string
+		kind        platform.Kind
+		projectID   string
+		spec        map[string]any
+		runtimeSpec map[string]any
+	}
+	rows, err := tx.Query(ctx, `SELECT subject.id, subject.kind, subject.project_id,
+      subject.spec, COALESCE(runtime.spec, '{}'::jsonb)
+    FROM control_resources subject
+    LEFT JOIN control_resources runtime ON subject.kind = 'sandbox'
+      AND runtime.id = subject.spec->>'runtimeId' AND runtime.kind = 'runtime'
+    WHERE subject.kind IN ('runtime', 'sandbox') AND (
+      subject.spec->($2::text) ? $1 OR runtime.spec->($2::text) ? $1
+    )`, id, key)
+	if err != nil {
+		return fmt.Errorf("list capability consumers: %w", err)
+	}
+	var consumers []consumer
+	for rows.Next() {
+		var item consumer
+		var specJSON, runtimeSpecJSON []byte
+		if err := rows.Scan(&item.id, &item.kind, &item.projectID, &specJSON, &runtimeSpecJSON); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan capability consumer: %w", err)
+		}
+		if err := json.Unmarshal(specJSON, &item.spec); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode capability consumer: %w", err)
+		}
+		if err := json.Unmarshal(runtimeSpecJSON, &item.runtimeSpec); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode capability consumer runtime: %w", err)
+		}
+		consumers = append(consumers, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list capability consumers: %w", err)
+	}
+	rows.Close()
+	for _, item := range consumers {
+		spec := item.spec
+		if item.kind == platform.KindSandbox {
+			spec = effectiveSandboxSpec(item.runtimeSpec, item.spec)
+		}
+		if _, err := ensureCapabilityReferences(ctx, tx, &item.projectID, spec, string(item.kind)+" "+item.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) storedSandboxDesiredSpecMatches(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+	nextProjectID *string,
+	nextEnabled bool,
+	nextSpec map[string]any,
+) (bool, error) {
+	if nextProjectID == nil {
+		return false, nil
+	}
+	var currentProjectID string
+	var currentEnabled bool
+	var currentGeneration, currentObservedGeneration int64
+	var currentSpecJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT project_id, enabled, generation, observed_generation, spec FROM control_resources
+	    WHERE id = $1 AND kind = 'sandbox'`, id).Scan(
+		&currentProjectID, &currentEnabled, &currentGeneration, &currentObservedGeneration, &currentSpecJSON,
+	); errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrResourceNotFound
+	} else if err != nil {
+		return false, fmt.Errorf("load sandbox desired configuration: %w", err)
+	}
+	var currentSpec map[string]any
+	if err := json.Unmarshal(currentSpecJSON, &currentSpec); err != nil {
+		return false, fmt.Errorf("decode sandbox desired configuration: %w", err)
+	}
+	if currentGeneration != currentObservedGeneration ||
+		currentProjectID != *nextProjectID || currentEnabled != nextEnabled {
+		return false, nil
+	}
+	equal, err := s.sandboxDesiredSpecsSemanticallyEqual(currentSpec, nextSpec)
+	if err != nil {
+		return false, fmt.Errorf("compare sandbox desired configuration: %w", err)
+	}
+	return equal, nil
+}
+
+func (s *Store) sandboxDesiredSpecsSemanticallyEqual(currentSpec, nextSpec map[string]any) (bool, error) {
+	currentDesired := platform.DesiredResourceSpec(platform.KindSandbox, currentSpec)
+	nextDesired := platform.DesiredResourceSpec(platform.KindSandbox, nextSpec)
+	for _, desired := range []map[string]any{currentDesired, nextDesired} {
+		value, exists := desired["environmentVariables"]
+		if !exists {
+			continue
+		}
+		plaintext, err := decryptEnvironmentVariableSpec(s.secretKey, value)
+		if err != nil {
+			return false, err
+		}
+		desired["environmentVariables"] = plaintext
+	}
+	currentJSON, err := json.Marshal(currentDesired)
+	if err != nil {
+		return false, err
+	}
+	nextJSON, err := json.Marshal(nextDesired)
+	if err != nil {
+		return false, err
+	}
+	return string(currentJSON) == string(nextJSON), nil
+}
+
+func sandboxDesiredSpecsEqual(currentSpec, nextSpec map[string]any) bool {
+	currentJSON, err := json.Marshal(platform.DesiredResourceSpec(platform.KindSandbox, currentSpec))
+	if err != nil {
+		return false
+	}
+	nextJSON, err := json.Marshal(platform.DesiredResourceSpec(platform.KindSandbox, nextSpec))
+	return err == nil && string(currentJSON) == string(nextJSON)
+}
+
+func markCapabilityPendingRestart(ctx context.Context, tx pgx.Tx, kind platform.Kind, id string) error {
+	key := map[platform.Kind]string{
+		platform.KindSkill: "skillIds", platform.KindMCP: "mcpServerIds", platform.KindVariable: "variableIds",
+	}[kind]
+	if key == "" {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE control_resources sandbox
+	    SET spec = jsonb_set(
+	          jsonb_set(spec, '{capabilitiesPendingRestart}', 'true'::jsonb, TRUE),
+	          '{capabilityRevision}',
+	          to_jsonb((CASE
+	            WHEN COALESCE(spec->>'capabilityRevision', '') ~ '^[0-9]+$'
+	              THEN (spec->>'capabilityRevision')::bigint
+	            ELSE 0
+	          END) + 1), TRUE
+	        ),
+	        updated_at = NOW()
+    WHERE sandbox.kind = 'sandbox' AND (
+      sandbox.spec->($2::text) ? $1 OR (
+        NOT (sandbox.spec ? ($2::text)) AND EXISTS (
+        SELECT 1 FROM control_resources runtime
+        WHERE runtime.id = sandbox.spec->>'runtimeId' AND runtime.kind = 'runtime'
+          AND runtime.spec->($2::text) ? $1
+      )
+      )
+    )`, id, key); err != nil {
+		return fmt.Errorf("mark sandboxes pending capability restart: %w", err)
+	}
+	return nil
+}
+
+const frozenBoxLiteMCPHostsMessage = "BoxLite restricted 网络白名单在创建沙箱时冻结，HTTP MCP 主机变化无法通过重启应用；请新建沙箱"
+
+func validateRuntimeFrozenCreationFields(
+	ctx context.Context,
+	tx pgx.Tx,
+	runtimeID string,
+	currentRuntimeSpec, nextRuntimeSpec map[string]any,
+) error {
+	rows, err := tx.Query(ctx, `SELECT id, spec FROM control_resources
+	    WHERE kind = 'sandbox' AND spec->>'runtimeId' = $1`, runtimeID)
+	if err != nil {
+		return fmt.Errorf("list legacy Runtime sandboxes for creation configuration validation: %w", err)
+	}
+	type legacySandbox struct {
+		id   string
+		spec map[string]any
+	}
+	var sandboxes []legacySandbox
+	for rows.Next() {
+		var item legacySandbox
+		var encoded []byte
+		if err := rows.Scan(&item.id, &encoded); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan legacy Runtime sandbox creation configuration: %w", err)
+		}
+		if err := json.Unmarshal(encoded, &item.spec); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode legacy Runtime sandbox %s creation configuration: %w", item.id, err)
+		}
+		sandboxes = append(sandboxes, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list legacy Runtime sandbox creation configurations: %w", err)
+	}
+	rows.Close()
+
+	for _, sandbox := range sandboxes {
+		currentEffective := effectiveSandboxSpec(currentRuntimeSpec, sandbox.spec)
+		nextEffective := effectiveSandboxSpec(nextRuntimeSpec, sandbox.spec)
+		for _, key := range sandboxCreationFields {
+			if key == "runtimeId" || key == "extensionIds" {
+				continue
+			}
+			if _, frozen := sandbox.spec[key]; frozen {
+				continue
+			}
+			if sandboxCreationValuesEqual(key, currentEffective, nextEffective) {
+				continue
+			}
+			return &platform.ValidationError{Message: fmt.Sprintf(
+				"Runtime 的 %s 是已有沙箱 %s 尚未快照的创建期配置，无法通过重启应用；请新建沙箱",
+				key, sandbox.id,
+			)}
+		}
+	}
+	return nil
+}
+
+func sandboxCreationValuesEqual(key string, current, next map[string]any) bool {
+	if key == "imageReference" || key == "imageId" {
+		return sandboxImageSelector(current) == sandboxImageSelector(next)
+	}
+	if key == "network" {
+		currentDriver, _ := current["driver"].(string)
+		nextDriver, _ := next["driver"].(string)
+		currentNetwork, _ := current["network"].(string)
+		nextNetwork, _ := next["network"].(string)
+		return platform.EffectiveNetworkPolicy(currentDriver, currentNetwork) ==
+			platform.EffectiveNetworkPolicy(nextDriver, nextNetwork)
+	}
+	return resourceSpecValuesEqual(key, current, next)
+}
+
+func resourceSpecValuesEqual(key string, current, next map[string]any) bool {
+	currentJSON, currentErr := json.Marshal(current[key])
+	nextJSON, nextErr := json.Marshal(next[key])
+	return currentErr == nil && nextErr == nil && string(currentJSON) == string(nextJSON)
+}
+
+func (s *Store) runtimeRestartValuesEqual(key string, current, next map[string]any) (bool, error) {
+	if key != "environmentVariables" {
+		return resourceSpecValuesEqual(key, current, next), nil
+	}
+	currentValue, err := decryptEnvironmentVariableSpec(s.secretKey, current[key])
+	if err != nil {
+		return false, err
+	}
+	nextValue, err := decryptEnvironmentVariableSpec(s.secretKey, next[key])
+	if err != nil {
+		return false, err
+	}
+	currentJSON, currentErr := json.Marshal(currentValue)
+	nextJSON, nextErr := json.Marshal(nextValue)
+	return currentErr == nil && nextErr == nil && string(currentJSON) == string(nextJSON), nil
+}
+
+func decryptEnvironmentVariableSpec(secretKey []byte, value any) (any, error) {
+	variables, ok := value.([]any)
+	if !ok {
+		return value, nil
+	}
+	result := make([]any, len(variables))
+	for index, variable := range variables {
+		entry, ok := variable.(map[string]any)
+		if !ok {
+			result[index] = variable
+			continue
+		}
+		resultEntry := maps.Clone(entry)
+		if encrypted, ok := resultEntry["value"].(string); ok {
+			plaintext, err := decryptEnvironmentValue(secretKey, encrypted)
+			if err != nil {
+				return nil, err
+			}
+			resultEntry["value"] = plaintext
+		}
+		result[index] = resultEntry
+	}
+	return result, nil
+}
+
+func sandboxImageSelector(spec map[string]any) string {
+	if reference, _ := spec["imageReference"].(string); strings.TrimSpace(reference) != "" {
+		return "reference:" + strings.TrimSpace(reference)
+	}
+	imageID, _ := spec["imageId"].(string)
+	return "id:" + strings.TrimSpace(imageID)
+}
+
+func validateSandboxFrozenMCPHosts(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+	nextSpec map[string]any,
+) (bool, error) {
+	var currentSpecJSON, runtimeSpecJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT sandbox.spec, COALESCE(runtime.spec, '{}'::jsonb)
+	    FROM control_resources sandbox
+	    LEFT JOIN control_resources runtime ON runtime.id = sandbox.spec->>'runtimeId'
+	      AND runtime.kind = 'runtime'
+	    WHERE sandbox.id = $1 AND sandbox.kind = 'sandbox'`, id).Scan(&currentSpecJSON, &runtimeSpecJSON); errors.Is(err, pgx.ErrNoRows) {
+		return false, ErrResourceNotFound
+	} else if err != nil {
+		return false, fmt.Errorf("load sandbox capability bindings: %w", err)
+	}
+	var currentSpec, runtimeSpec map[string]any
+	if err := json.Unmarshal(currentSpecJSON, &currentSpec); err != nil {
+		return false, fmt.Errorf("decode sandbox capability bindings: %w", err)
+	}
+	if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
+		return false, fmt.Errorf("decode sandbox Runtime capability bindings: %w", err)
+	}
+	currentEffective := effectiveSandboxSpec(runtimeSpec, currentSpec)
+	nextEffective := effectiveSandboxSpec(runtimeSpec, nextSpec)
+	if err := validateFrozenBoxLiteMCPHostSets(ctx, tx, currentEffective, nextEffective); err != nil {
+		return false, err
+	}
+	for _, key := range []string{"agentTools", "skillIds", "mcpServerIds", "variableIds"} {
+		if !slices.Equal(specStringList(currentEffective, key), specStringList(nextEffective, key)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func validateRuntimeFrozenMCPHosts(
+	ctx context.Context,
+	tx pgx.Tx,
+	runtimeID string,
+	currentRuntimeSpec, nextRuntimeSpec map[string]any,
+) error {
+	rows, err := tx.Query(ctx, `SELECT id, spec FROM control_resources
+	    WHERE kind = 'sandbox' AND spec->>'runtimeId' = $1
+	      AND NOT (spec ? 'mcpServerIds')`, runtimeID)
+	if err != nil {
+		return fmt.Errorf("list legacy Runtime sandboxes for MCP network validation: %w", err)
+	}
+	type legacySandbox struct {
+		id   string
+		spec map[string]any
+	}
+	var sandboxes []legacySandbox
+	for rows.Next() {
+		var item legacySandbox
+		var sandboxSpecJSON []byte
+		if err := rows.Scan(&item.id, &sandboxSpecJSON); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan legacy Runtime sandbox: %w", err)
+		}
+		if err := json.Unmarshal(sandboxSpecJSON, &item.spec); err != nil {
+			rows.Close()
+			return fmt.Errorf("decode legacy Runtime sandbox %s: %w", item.id, err)
+		}
+		sandboxes = append(sandboxes, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("list legacy Runtime sandboxes for MCP network validation: %w", err)
+	}
+	rows.Close()
+	for _, sandbox := range sandboxes {
+		currentEffective := effectiveSandboxSpec(currentRuntimeSpec, sandbox.spec)
+		nextEffective := effectiveSandboxSpec(nextRuntimeSpec, sandbox.spec)
+		if err := validateFrozenBoxLiteMCPHostSets(ctx, tx, currentEffective, nextEffective); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateMCPResourceFrozenHostUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+	nextSpec map[string]any,
+) error {
+	var currentSpecJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+	    WHERE id = $1 AND kind = 'mcp'`, id).Scan(&currentSpecJSON); errors.Is(err, pgx.ErrNoRows) {
+		return ErrResourceNotFound
+	} else if err != nil {
+		return fmt.Errorf("load current MCP Server host: %w", err)
+	}
+	var currentSpec map[string]any
+	if err := json.Unmarshal(currentSpecJSON, &currentSpec); err != nil {
+		return fmt.Errorf("decode current MCP Server host: %w", err)
+	}
+	if mcpHTTPHost(currentSpec) == mcpHTTPHost(nextSpec) {
+		return nil
+	}
+	rows, err := tx.Query(ctx, `SELECT sandbox.spec, COALESCE(runtime.spec, '{}'::jsonb)
+	    FROM control_resources sandbox
+	    LEFT JOIN control_resources runtime ON runtime.id = sandbox.spec->>'runtimeId'
+	      AND runtime.kind = 'runtime'
+	    WHERE sandbox.kind = 'sandbox' AND (
+	      sandbox.spec->'mcpServerIds' ? $1 OR (
+	        NOT (sandbox.spec ? 'mcpServerIds') AND runtime.spec->'mcpServerIds' ? $1
+	      )
+	    )`, id)
+	if err != nil {
+		return fmt.Errorf("list MCP Server sandbox consumers: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sandboxSpecJSON, runtimeSpecJSON []byte
+		if err := rows.Scan(&sandboxSpecJSON, &runtimeSpecJSON); err != nil {
+			return fmt.Errorf("scan MCP Server sandbox consumer: %w", err)
+		}
+		var sandboxSpec, runtimeSpec map[string]any
+		if err := json.Unmarshal(sandboxSpecJSON, &sandboxSpec); err != nil {
+			return fmt.Errorf("decode MCP Server sandbox consumer: %w", err)
+		}
+		if err := json.Unmarshal(runtimeSpecJSON, &runtimeSpec); err != nil {
+			return fmt.Errorf("decode MCP Server sandbox Runtime: %w", err)
+		}
+		if isFrozenBoxLiteMCPNetwork(effectiveSandboxSpec(runtimeSpec, sandboxSpec)) {
+			return &platform.ValidationError{Message: frozenBoxLiteMCPHostsMessage}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("list MCP Server sandbox consumers: %w", err)
+	}
+	return nil
+}
+
+func validateFrozenBoxLiteMCPHostSets(
+	ctx context.Context,
+	tx pgx.Tx,
+	currentSpec, nextSpec map[string]any,
+) error {
+	if !isFrozenBoxLiteMCPNetwork(currentSpec) {
+		return nil
+	}
+	currentHosts, err := mcpHTTPHostsForSpec(ctx, tx, currentSpec)
+	if err != nil {
+		return err
+	}
+	nextHosts, err := mcpHTTPHostsForSpec(ctx, tx, nextSpec)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(currentHosts, nextHosts) {
+		return &platform.ValidationError{Message: frozenBoxLiteMCPHostsMessage}
+	}
+	return nil
+}
+
+func isFrozenBoxLiteMCPNetwork(spec map[string]any) bool {
+	driver, _ := spec["driver"].(string)
+	driver = strings.ToLower(strings.TrimSpace(driver))
+	network, _ := spec["network"].(string)
+	return driver == "boxlite" && platform.EffectiveNetworkPolicy(driver, strings.TrimSpace(network)) == "restricted"
+}
+
+func mcpHTTPHostsForSpec(ctx context.Context, tx pgx.Tx, spec map[string]any) ([]string, error) {
+	seen := make(map[string]struct{})
+	for _, id := range specStringList(spec, "mcpServerIds") {
+		var encoded []byte
+		if err := tx.QueryRow(ctx, `SELECT spec FROM control_resources
+	      WHERE id = $1 AND kind = 'mcp'`, id).Scan(&encoded); errors.Is(err, pgx.ErrNoRows) {
+			return nil, &platform.ValidationError{Message: "沙箱引用的 MCP Server 不存在: " + id}
+		} else if err != nil {
+			return nil, fmt.Errorf("load MCP Server network host: %w", err)
+		}
+		var mcpSpec map[string]any
+		if err := json.Unmarshal(encoded, &mcpSpec); err != nil {
+			return nil, fmt.Errorf("decode MCP Server network host: %w", err)
+		}
+		host := mcpHTTPHost(mcpSpec)
+		if host == "" {
+			continue
+		}
+		if _, duplicate := seen[host]; duplicate {
+			continue
+		}
+		seen[host] = struct{}{}
+	}
+	return slices.Sorted(maps.Keys(seen)), nil
+}
+
+func mcpHTTPHost(spec map[string]any) string {
+	transport, _ := spec["transport"].(string)
+	address, _ := spec["url"].(string)
+	return strings.ToLower(platform.MCPURLHost(platform.MCPSpec{
+		Transport: strings.ToLower(strings.TrimSpace(transport)),
+		URL:       strings.TrimSpace(address),
+	}))
 }
 
 func (s *Store) OperateSandbox(ctx context.Context, id, action string) (platform.Resource, error) {
@@ -4668,6 +5730,34 @@ func (s *Store) ensureProject(ctx context.Context, tx pgx.Tx, input platform.Inp
 }
 
 func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input platform.Input, requireOnlineServer bool) error {
+	if input.Kind == platform.KindSkill || input.Kind == platform.KindMCP || input.Kind == platform.KindVariable {
+		var currentProject pgtype.Text
+		err := tx.QueryRow(ctx, `SELECT project_id FROM control_resources
+      WHERE id = $1 AND kind = $2`, input.ID, input.Kind).Scan(&currentProject)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("load referenced capability project: %w", err)
+		}
+		if err == nil {
+			key := map[platform.Kind]string{
+				platform.KindSkill: "skillIds", platform.KindMCP: "mcpServerIds", platform.KindVariable: "variableIds",
+			}[input.Kind]
+			var referenced bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM control_resources
+		  WHERE kind IN ('runtime', 'sandbox') AND spec->($2::text) ? $1)`, input.ID, key).Scan(&referenced); err != nil {
+				return fmt.Errorf("check capability references: %w", err)
+			}
+			newProject := ""
+			if input.ProjectID != nil {
+				newProject = *input.ProjectID
+			}
+			if referenced && currentProject.String != newProject {
+				return fmt.Errorf("%w: 被引用的 %s 不能移动到其他 Project", ErrConflict, input.Kind)
+			}
+			if referenced && !input.Enabled {
+				return &platform.ValidationError{Message: fmt.Sprintf("%s 仍被环境引用，不能停用", input.Kind)}
+			}
+		}
+	}
 	if input.Kind == platform.KindExtension {
 		var crossProject bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM control_resources
@@ -4744,23 +5834,10 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 		if !runtimeImageIsAvailable(driver, inventory, imageReference, serverArch) {
 			return &platform.ValidationError{Message: "所选镜像已不在运行服务器上，请刷新后重新选择"}
 		}
-		for kind, key := range map[platform.Kind]string{
-			platform.KindSkill:    "skillIds",
-			platform.KindMCP:      "mcpServerIds",
-			platform.KindVariable: "variableIds",
-		} {
-			for _, resourceID := range specStringList(input.Spec, key) {
-				var exists bool
-				if err := tx.QueryRow(ctx, `SELECT EXISTS(
-            SELECT 1 FROM control_resources
-            WHERE id = $1 AND kind = $2 AND enabled = TRUE
-          )`, resourceID, kind).Scan(&exists); err != nil {
-					return fmt.Errorf("check environment binding: %w", err)
-				}
-				if !exists {
-					return &platform.ValidationError{Message: "环境模板包含不存在或已停用的能力配置"}
-				}
-			}
+		capabilitySpec := maps.Clone(input.Spec)
+		capabilitySpec["network"] = platform.EffectiveNetworkPolicy(driver, network)
+		if _, err := ensureCapabilityReferences(ctx, tx, input.ProjectID, capabilitySpec, "环境模板"); err != nil {
+			return err
 		}
 		for _, credentialID := range specStringList(input.Spec, "credentialIds") {
 			var exists bool
@@ -4799,6 +5876,7 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 	if err := platform.ValidateNetworkPolicyForDriver(driver, network); err != nil {
 		return err
 	}
+	effectiveSpec["network"] = platform.EffectiveNetworkPolicy(driver, network)
 	if requireOnlineServer {
 		if err := ensureExtensionReferences(ctx, tx, input.ProjectID, effectiveSpec, true); err != nil {
 			return err
@@ -4849,23 +5927,8 @@ func (s *Store) ensureResourceReferences(ctx context.Context, tx pgx.Tx, input p
 	if !runtimeImageIsAvailable(driver, inventory, imageReference, serverArch) {
 		return &platform.ValidationError{Message: "沙箱使用的镜像已不在目标服务器上"}
 	}
-	for kind, key := range map[platform.Kind]string{
-		platform.KindSkill:    "skillIds",
-		platform.KindMCP:      "mcpServerIds",
-		platform.KindVariable: "variableIds",
-	} {
-		for _, resourceID := range specStringList(effectiveSpec, key) {
-			var exists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(
-            SELECT 1 FROM control_resources
-            WHERE id = $1 AND kind = $2 AND enabled = TRUE
-          )`, resourceID, kind).Scan(&exists); err != nil {
-				return fmt.Errorf("check sandbox binding: %w", err)
-			}
-			if !exists {
-				return &platform.ValidationError{Message: "沙箱包含不存在或已停用的能力配置"}
-			}
-		}
+	if _, err := ensureCapabilityReferences(ctx, tx, input.ProjectID, effectiveSpec, "沙箱"); err != nil {
+		return err
 	}
 	allowedCredentialIDs := specStringList(effectiveSpec, "credentialIds")
 	modelBindings := specStringMap(effectiveSpec, "modelBindings")
@@ -4978,20 +6041,26 @@ func (s *Store) authorizeSandboxCredentialedProxy(
 	query networkProxyQueryRow,
 	sandboxID string,
 ) error {
-	var desiredProxyID, appliedProxyID string
-	var hasAppliedProxySnapshot bool
+	var desiredProxyID, appliedProxyID, creationCredentialedProxyID string
+	var hasAppliedProxySnapshot, hasTrustedCreationSnapshot bool
 	err := query.QueryRow(ctx, `SELECT
       CASE WHEN sandbox.spec ? 'proxyId'
         THEN COALESCE(sandbox.spec->>'proxyId', '')
         ELSE COALESCE(runtime.spec->>'proxyId', '')
       END,
       COALESCE(sandbox.spec->>'appliedProxyId', ''),
-      sandbox.spec ? 'appliedProxyId'
+      sandbox.spec ? 'appliedProxyId',
+      COALESCE(sandbox.spec->>'credentialedProxyIdAtCreation', ''),
+      COALESCE(
+        jsonb_typeof(sandbox.spec->'credentialedProxyIdAtCreation') = 'string',
+        FALSE
+      )
     FROM control_resources sandbox
     LEFT JOIN control_resources runtime
       ON runtime.id = sandbox.spec->>'runtimeId' AND runtime.kind = 'runtime'
     WHERE sandbox.id = $1 AND sandbox.kind = 'sandbox'`, sandboxID).Scan(
 		&desiredProxyID, &appliedProxyID, &hasAppliedProxySnapshot,
+		&creationCredentialedProxyID, &hasTrustedCreationSnapshot,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrResourceNotFound
@@ -5000,7 +6069,12 @@ func (s *Store) authorizeSandboxCredentialedProxy(
 		return fmt.Errorf("load sandbox credentialed proxy state: %w", err)
 	}
 	if !credentialedProxyActorAllowed(ctx) && !hasAppliedProxySnapshot {
-		return fmt.Errorf("%w: 旧版沙箱的已应用代理凭据状态未知，仅限管理员操作", ErrForbidden)
+		if !hasTrustedCreationSnapshot {
+			return fmt.Errorf("%w: 旧版沙箱的已应用代理凭据状态未知，仅限管理员操作", ErrForbidden)
+		}
+		if creationCredentialedProxyID != "" {
+			return fmt.Errorf("%w: 含密码的网络代理工作负载仅限管理员操作", ErrForbidden)
+		}
 	}
 	return s.authorizeCredentialedProxyIDs(ctx, query, desiredProxyID, appliedProxyID)
 }
@@ -5032,6 +6106,9 @@ func credentialedProxyActorAllowed(ctx context.Context) bool {
 }
 
 func incompatibleAgentTools(agentTools []string, protocols map[string]bool) []string {
+	if len(protocols) == 0 {
+		return nil
+	}
 	compatibility := map[string][]string{
 		"claude-code":      {"anthropic", "openai-responses", "openai-chat"},
 		"codex":            {"openai-responses", "anthropic", "openai-chat"},

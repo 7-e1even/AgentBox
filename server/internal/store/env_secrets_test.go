@@ -66,6 +66,37 @@ func TestDecryptEnvironmentValueRejectsWrongKey(t *testing.T) {
 	}
 }
 
+func TestRuntimeRestartValuesEqualComparesEnvironmentPlaintext(t *testing.T) {
+	key := testEnvironmentSecretKey()
+	s := &Store{secretKey: key}
+	encrypt := func(value string) string {
+		t.Helper()
+		encrypted, err := encryptEnvironmentValue(key, value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return encrypted
+	}
+	current := testEnvironmentSpec("IS_SANDBOX", encrypt("1"))
+	next := testEnvironmentSpec("IS_SANDBOX", encrypt("1"))
+	equal, err := s.runtimeRestartValuesEqual("environmentVariables", current, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !equal {
+		t.Fatal("equal plaintext values with different ciphertexts were treated as a Runtime change")
+	}
+
+	next = testEnvironmentSpec("IS_SANDBOX", encrypt("0"))
+	equal, err = s.runtimeRestartValuesEqual("environmentVariables", current, next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if equal {
+		t.Fatal("different environment plaintext values were treated as equal")
+	}
+}
+
 func TestEncryptSpecEnvironmentVariablesEncryptsAndIsIdempotent(t *testing.T) {
 	s := &Store{secretKey: testEnvironmentSecretKey()}
 	spec := testEnvironmentSpec("API_KEY", "s3cr3t")

@@ -37,3 +37,9 @@ export function domainsForEditor(kind: string | undefined): ConsoleDomain[] {
     ? ["resources", "servers", "credentials", "proxies"]
     : ["resources"]
 }
+
+export function editorNeedsAllProjectResources(kind: string | undefined) {
+  return Boolean(
+    kind && !["project", "image", "runtime", "sandbox"].includes(kind)
+  )
+}

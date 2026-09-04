@@ -59,5 +59,18 @@ func (s *Server) previewSkillImport(w http.ResponseWriter, request *http.Request
 		s.handleError(w, err)
 		return
 	}
+	if err := platform.CanonicalizeSkillSpec(draft.Name, &draft.Spec); err != nil {
+		s.handleError(w, err)
+		return
+	}
+	draft.Description, err = platform.SkillCatalogDescription(draft.Spec)
+	if err != nil {
+		s.handleError(w, err)
+		return
+	}
+	if err := platform.ValidateSkillResource(draft.Name, draft.Description, draft.Spec); err != nil {
+		s.handleError(w, err)
+		return
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{"skill": draft})
 }

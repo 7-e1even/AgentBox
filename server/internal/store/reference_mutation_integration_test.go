@@ -74,7 +74,7 @@ func TestControlPlaneMutationLockSerializesResourceCredentialReferences(t *testi
 	if err != nil {
 		t.Fatalf("register reference test Worker: %v", err)
 	}
-	if err := s.HeartbeatServer(ctx, serverID, workerCredential, []string{"docker"}, &platform.ServerInventory{}, ""); err != nil {
+	if err := s.HeartbeatServer(ctx, serverID, workerCredential, []string{"docker", workerFailClosedJobOutputCapability}, &platform.ServerInventory{}, ""); err != nil {
 		t.Fatalf("heartbeat reference test Worker: %v", err)
 	}
 
@@ -161,7 +161,7 @@ func TestControlPlaneMutationLockSerializesSandboxProxyReferences(t *testing.T) 
 	if _, err := s.pool.Exec(ctx, `INSERT INTO control_resources
 	  (id, kind, project_id, name, description, enabled, spec, created_at, updated_at)
 	  VALUES ($1, 'sandbox', 'default', 'Reference mutation sandbox', '', TRUE,
-	    '{"status":"stopped","network":"bridge"}'::jsonb, NOW(), NOW())`, sandboxID); err != nil {
+	    '{"status":"stopped","network":"bridge","appliedProxyId":""}'::jsonb, NOW(), NOW())`, sandboxID); err != nil {
 		t.Fatalf("insert reference test sandbox: %v", err)
 	}
 	t.Cleanup(func() {
@@ -217,7 +217,7 @@ func TestControlPlaneMutationLockSerializesNetworkProxyChecks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("register concurrent check Worker: %v", err)
 	}
-	if err := s.HeartbeatServer(ctx, serverID, workerCredential, []string{"docker"}, &platform.ServerInventory{}, ""); err != nil {
+	if err := s.HeartbeatServer(ctx, serverID, workerCredential, []string{"docker", workerFailClosedJobOutputCapability}, &platform.ServerInventory{}, ""); err != nil {
 		t.Fatalf("heartbeat concurrent check Worker: %v", err)
 	}
 	var checkID string
@@ -306,7 +306,7 @@ func TestControlPlaneMutationLockSerializesSandboxOperations(t *testing.T) {
 	if _, err := s.pool.Exec(ctx, `INSERT INTO control_resources
 	  (id, kind, project_id, name, description, enabled, spec, created_at, updated_at)
 	  VALUES ($1, 'sandbox', 'default', 'Mutation lock sandbox', '', TRUE,
-	    '{"status":"stopped"}'::jsonb, NOW(), NOW())`, sandboxID); err != nil {
+	    '{"status":"stopped","appliedProxyId":""}'::jsonb, NOW(), NOW())`, sandboxID); err != nil {
 		t.Fatalf("insert mutation lock sandbox: %v", err)
 	}
 	t.Cleanup(func() {

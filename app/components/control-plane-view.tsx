@@ -25,6 +25,10 @@ import { DataTable, DataTableColumnHeader } from "@/components/data-table"
 import { SiteHeader } from "@/components/site-header"
 import type { Resource } from "@/lib/platform-schema"
 import { getProjectEmoji } from "@/lib/project-emoji"
+import {
+  capabilityUsage,
+  capabilityUsageLabel,
+} from "@/lib/resource-capabilities"
 import type { ManagedServer } from "@/lib/server-schema"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -423,16 +427,8 @@ function resourceColumnValues(
   const imageRuntimes = resources.filter(
     (item) => item.kind === "runtime" && item.spec.imageId === resource.id
   )
-  const skillRuntimes = resources.filter(
-    (item) =>
-      item.kind === "runtime" &&
-      stringArray(item.spec.skillIds).includes(resource.id)
-  )
-  const mcpRuntimes = resources.filter(
-    (item) =>
-      item.kind === "runtime" &&
-      stringArray(item.spec.mcpServerIds).includes(resource.id)
-  )
+  const skillUsage = capabilityUsage(resources, resource.id, "skillIds")
+  const mcpUsage = capabilityUsage(resources, resource.id, "mcpServerIds")
   const server = servers.find(
     (item) => item.id === stringValue(resource.spec, "serverId")
   )
@@ -463,20 +459,19 @@ function resourceColumnValues(
           ]
         : resource.kind === "skill"
           ? [
-              skillRuntimes.length > 0
-                ? `${skillRuntimes.length} 个沙箱模板`
-                : "未使用",
+              capabilityUsageLabel(skillUsage),
               text(resource.spec, "source"),
               `v${text(resource.spec, "version")}`,
             ]
           : [
-              mcpRuntimes.length > 0
-                ? `${mcpRuntimes.length} 个沙箱模板`
-                : "未使用",
+              capabilityUsageLabel(mcpUsage),
               text(resource.spec, "transport").toUpperCase(),
               text(resource.spec, "transport") === "http"
                 ? text(resource.spec, "url")
-                : [text(resource.spec, "command"), text(resource.spec, "args")]
+                : [
+                    text(resource.spec, "command"),
+                    arrayOrString(specValue(resource.spec, "args")),
+                  ]
                     .filter((value) => value !== "—")
                     .join(" ") || "—",
             ]
@@ -555,6 +550,17 @@ function stringArray(value: unknown) {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === "string")
     : []
+}
+
+function arrayOrString(value: unknown) {
+  if (Array.isArray(value)) {
+    return value.filter((item) => typeof item === "string").join(" ") || "—"
+  }
+  return typeof value === "string" && value ? value : "—"
+}
+
+function specValue(spec: object, key: string) {
+  return (spec as Record<string, unknown>)[key]
 }
 
 function summary(resource: Resource) {

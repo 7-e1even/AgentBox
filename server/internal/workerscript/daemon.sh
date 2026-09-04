@@ -707,7 +707,7 @@ worker_capabilities() {
     CAPS="$CAPS\"interactive-session\""
   fi
   [ -n "$CAPS" ] && CAPS="$CAPS,"
-  CAPS="$CAPS\"sandbox-extensions\""
+  CAPS="$CAPS\"sandbox-extensions\",\"mcp-managed-config\",\"managed-capability-config\",\"fail-closed-job-output\""
   if [ -e "$STATE_DIR/worker-update.json" ]; then
     CAPS="$CAPS,\"worker-update-pending\""
     if ! worker_update_marker_valid "$STATE_DIR/worker-update.json"; then
@@ -878,8 +878,32 @@ complete_agent_tool_job() {
     "$ERROR_CODE" agent-tools false "$ERROR_DETAILS" "$RESULT_FILE"
 }
 
-worker_error_stage() {
-  printf '%s' "$1" | sed -n 's/.*stage \([a-z0-9_-]*\) failed:.*/\1/p' | head -n 1
+worker_error_stage_from_log() {
+  WORKER_ERROR_LOG=$1
+  [ -f "$WORKER_ERROR_LOG" ] || return 1
+  WORKER_ERROR_STAGE=$(sed -n 's/.*stage \([a-z0-9_-]*\) failed:.*/\1/p' \
+    "$WORKER_ERROR_LOG" | tail -n 1)
+  case "$WORKER_ERROR_STAGE" in
+    agent-tools|agent-wrappers|cleanup|create|create-result|credentials|\
+    delete|desktop-config|desktop-start|extensions|image-prepare|\
+    manifest-write|mcp|network-policy|proxy-check|proxy-config|restart|\
+    runtime-create|runtime-image|runtime-probe|setup-command|skills|start|\
+    stop|variables|worker-update|workspace-init)
+      printf '%s' "$WORKER_ERROR_STAGE"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+worker_output_was_withheld() {
+  case "$1" in
+    "[job output withheld:"*|"[job log unavailable:"*|"[job output exceeded "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+worker_safe_stage_message() {
+  printf 'Sandbox operation failed during stage %s; detailed output was withheld' "$1"
 }
 
 worker_error_retryable() {
@@ -2372,6 +2396,11 @@ install_boxlite_codex() {
     return 1
   fi
   LATEST=$(jq -r '.version // empty' "$LATEST_META")
+  NORMALIZED_LATEST=$(printf '%s' "$LATEST" | normalize_trusted_agent_tool_version) || {
+    cleanup_codex_metadata
+    return 1
+  }
+  [ "$NORMALIZED_LATEST" = "$LATEST" ] || { cleanup_codex_metadata; return 1; }
   PLATFORM_SPEC=$(jq -r --arg package "@openai/codex-$PLATFORM" \
     '.optionalDependencies[$package] // empty' "$LATEST_META")
   PLATFORM_VERSION=${PLATFORM_SPEC#npm:@openai/codex@}
@@ -2409,8 +2438,6 @@ install_boxlite_codex() {
       [ "$(sha512sum "$ARCHIVE" | cut -d ' ' -f 1)" = "$EXPECTED_SHA512" ]
   }
 
-  CODEX_LATEST_VERSION=$LATEST
-  export CODEX_LATEST_VERSION
   if docker exec "$CONTAINER" sh -lc '
       set -eu
       FINAL="/opt/agentbox/tools/codex/$1/$2"
@@ -2560,9 +2587,8 @@ install_agent_tools() {
     COMMAND=$(agent_tool_command "$TOOL") || { echo "unsupported Agent tool: $TOOL" >&2; return 1; }
     if [ "$MODE" = ensure ] && [ "$TOOL" != pi ] && docker exec "$CONTAINER" sh -lc '
         command -v "$1" >/dev/null || exit 1
-        VERSION=$(timeout 20 "$1" --version 2>&1 | head -n 1)
-        [ -n "$VERSION" ]
-      ' agentbox "$COMMAND"; then
+        timeout 20 "$1" --version >/dev/null 2>&1
+      ' agentbox "$COMMAND" >/dev/null 2>&1; then
       report_agent_tool_progress "$TOOL" cached "已复用 Agent 工具缓存：$TOOL"
       continue
     fi
@@ -2717,18 +2743,17 @@ install_agent_tools() {
   for TOOL in $TOOLS; do
     report_agent_tool_progress "$TOOL" verifying "正在验证 Agent 工具：$TOOL"
     COMMAND=$(agent_tool_command "$TOOL") || { rm -f "$VERSION_FILE"; return 1; }
-    VERSION=$(docker exec "$CONTAINER" sh -lc '
+    if ! docker exec "$CONTAINER" sh -lc '
       command -v "$1" >/dev/null || exit 1
-      timeout 20 "$1" --version 2>&1 | head -n 1
-    ' agentbox "$COMMAND" 2>/dev/null) || {
+      timeout 20 "$1" --version >/dev/null 2>&1
+    ' agentbox "$COMMAND" >/dev/null 2>&1; then
       report_agent_tool_progress "$TOOL" failed "Agent 工具验证失败：$TOOL"
       echo "Agent tool $TOOL was installed but command $COMMAND is unavailable" >&2
       rm -f "$VERSION_FILE"
       return 1
-    }
-    [ -n "$VERSION" ] || VERSION=installed
+    fi
     NEXT_VERSION_FILE=$(mktemp)
-    jq --arg tool "$TOOL" --arg version "$VERSION" '. + {($tool): $version}' \
+    jq --arg tool "$TOOL" '. + {($tool): "installed"}' \
       "$VERSION_FILE" > "$NEXT_VERSION_FILE"
     mv "$NEXT_VERSION_FILE" "$VERSION_FILE"
     report_agent_tool_progress "$TOOL" succeeded "Agent 工具已就绪：$TOOL"
@@ -2737,7 +2762,8 @@ install_agent_tools() {
     EXISTING_VERSION_FILE=$(mktemp)
     MERGED_VERSION_FILE=$(mktemp)
     if agent_tool_exec "$CONTAINER" cat /opt/agentbox/agent-versions.json > "$EXISTING_VERSION_FILE" 2>/dev/null &&
-       jq -s '.[0] * .[1]' "$EXISTING_VERSION_FILE" "$VERSION_FILE" > "$MERGED_VERSION_FILE" 2>/dev/null; then
+       jq -s '((.[0] | if type == "object" then with_entries(.value = "installed") else {} end) * .[1])' \
+         "$EXISTING_VERSION_FILE" "$VERSION_FILE" > "$MERGED_VERSION_FILE" 2>/dev/null; then
       mv "$MERGED_VERSION_FILE" "$VERSION_FILE"
     else
       rm -f "$MERGED_VERSION_FILE"
@@ -2752,21 +2778,6 @@ install_agent_tools() {
     return 1
   fi
   rm -f "$VERSION_FILE"
-}
-
-agent_tool_npm_package() {
-  case "$1" in
-    claude-code) printf '%s' '@anthropic-ai/claude-code' ;;
-    codex) printf '%s' '@openai/codex' ;;
-    deepseek-harness) printf '%s' '@deepseek-ai/dsh' ;;
-    gemini-cli) printf '%s' '@google/gemini-cli' ;;
-    grok) printf '%s' '@xai-official/grok' ;;
-    kimi) printf '%s' '@moonshot-ai/kimi-code' ;;
-    opencode) printf '%s' 'opencode-ai' ;;
-    pi) printf '%s' '@earendil-works/pi-coding-agent' ;;
-    reasonix) printf '%s' 'reasonix' ;;
-    *) return 1 ;;
-  esac
 }
 
 agent_tool_source() {
@@ -2784,41 +2795,33 @@ agent_tool_source() {
   esac
 }
 
-agent_tool_detect_version() {
+normalize_trusted_agent_tool_version() {
+  LC_ALL=C head -c 4096 | jq -Rsj '
+    [splits("[[:space:]]+") |
+      select(length > 0) |
+      sub("^[vV]"; "") |
+      select(test("^(0|[1-9][0-9]{0,5})\\.(0|[1-9][0-9]{0,5})\\.(0|[1-9][0-9]{0,5})(-(alpha|beta|rc|pre|dev|canary|next)(\\.(0|[1-9][0-9]{0,5}))?)?$"))
+    ][0] // empty
+  '
+}
+
+agent_tool_probe_usable() {
   CONTAINER=$1
   TOOL_ID=$2
   COMMAND=$(agent_tool_command "$TOOL_ID") || return 1
-  VERSION_ATTEMPT=1
-  while [ "$VERSION_ATTEMPT" -le 3 ]; do
-    if RAW_VERSION=$(docker exec "$CONTAINER" sh -lc \
-        'command -v "$1" >/dev/null || exit 1; timeout 20 "$1" --version 2>&1 | head -n 3' \
-        agentbox "$COMMAND" 2>/dev/null); then
-      break
+  PROBE_ATTEMPT=1
+  while [ "$PROBE_ATTEMPT" -le 3 ]; do
+    if docker exec "$CONTAINER" sh -lc \
+        'command -v "$1" >/dev/null || exit 1; timeout 20 "$1" --version >/dev/null 2>&1' \
+        agentbox "$COMMAND" >/dev/null 2>&1; then
+      return 0
     fi
     [ "${AGENTBOX_RUNTIME_DRIVER:-docker}" = boxlite ] || return 2
-    VERSION_ATTEMPT=$((VERSION_ATTEMPT + 1))
-    [ "$VERSION_ATTEMPT" -le 3 ] || return 2
+    PROBE_ATTEMPT=$((PROBE_ATTEMPT + 1))
+    [ "$PROBE_ATTEMPT" -le 3 ] || return 2
     sleep 1
   done
-  VERSION=$(printf '%s\n' "$RAW_VERSION" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?' | head -n 1)
-  [ -n "$VERSION" ] || return 2
-  printf '%s' "$VERSION"
-}
-
-agent_tool_latest_version() {
-  CONTAINER=$1
-  TOOL_ID=$2
-  if [ "$TOOL_ID" = deepseek-harness ]; then
-    printf '%s' 0.1.0-rc.7
-    return
-  fi
-  PACKAGE=$(agent_tool_npm_package "$TOOL_ID") || return 1
-  docker exec "$CONTAINER" sh -lc '
-    set -a
-    [ ! -r /opt/agentbox/secrets/proxy.env ] || . /opt/agentbox/secrets/proxy.env
-    set +a
-    curl --connect-timeout 15 --max-time 60 -fsSL "$1/latest" | jq -r ".version // empty"
-  ' agentbox "https://registry.npmjs.org/$PACKAGE" 2>/dev/null
+  return 2
 }
 
 append_agent_tool_state() {
@@ -2868,25 +2871,22 @@ check_agent_tools() {
   export PROGRESS_STAGE
   for TOOL_ID in $TOOLS; do
     report_agent_tool_progress "$TOOL_ID" running "正在检测 Agent 工具：$TOOL_ID"
-    LATEST_VERSION=$(agent_tool_latest_version "$TARGET" "$TOOL_ID" || true)
     SOURCE=$(agent_tool_source "$TOOL_ID")
     COMMAND=$(agent_tool_command "$TOOL_ID") || return 1
     if ! docker exec "$TARGET" sh -lc 'command -v "$1" >/dev/null' agentbox "$COMMAND"; then
-      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "$LATEST_VERSION" "" \
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "" "" \
         not-installed "Agent 工具尚未安装" "$SOURCE"
       report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具尚未安装：$TOOL_ID"
       continue
     fi
-    if CURRENT_VERSION=$(agent_tool_detect_version "$TARGET" "$TOOL_ID"); then
-      MESSAGE="已检测当前版本"
-      [ -n "$LATEST_VERSION" ] || MESSAGE="已检测当前版本，但暂时无法查询最新版本"
-      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$CURRENT_VERSION" "$LATEST_VERSION" "" \
-        installed "$MESSAGE" "$SOURCE"
+    if agent_tool_probe_usable "$TARGET" "$TOOL_ID"; then
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "" "" \
+        installed "Agent 工具命令可用；为保护沙箱数据，未采集版本输出" "$SOURCE"
       report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具检测完成：$TOOL_ID"
     else
-      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "$LATEST_VERSION" "" \
-        broken "命令存在，但无法读取版本" "$SOURCE"
-      report_agent_tool_progress "$TOOL_ID" failed "Agent 工具版本检测失败：$TOOL_ID"
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "" "" \
+        broken "命令存在，但可用性探测失败" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" failed "Agent 工具可用性检测失败：$TOOL_ID"
     fi
   done
 }
@@ -2902,13 +2902,8 @@ update_agent_tools() {
   PROGRESS_STAGE=agent-tools-update
   export PROGRESS_STAGE
   for TOOL_ID in $TOOLS; do
-    BEFORE_VERSION=$(agent_tool_detect_version "$TARGET" "$TOOL_ID" || true)
-    if [ "$TOOL_ID" = codex ] && [ "$DRIVER" = boxlite ]; then
-      CODEX_LATEST_VERSION=
-      LATEST_VERSION=
-    else
-      LATEST_VERSION=$(agent_tool_latest_version "$TARGET" "$TOOL_ID" || true)
-    fi
+    BEFORE_USABLE=false
+    agent_tool_probe_usable "$TARGET" "$TOOL_ID" && BEFORE_USABLE=true
     SOURCE=$(agent_tool_source "$TOOL_ID")
     TOOL_JOB_FILE=$(mktemp)
     jq --arg tool "$TOOL_ID" '.job.payload.agentTools = [$tool]' "$JOB_FILE" > "$TOOL_JOB_FILE"
@@ -2927,28 +2922,21 @@ update_agent_tools() {
     AGENTBOX_AGENT_TOOL_PROGRESS_STAGE=$PREVIOUS_STAGE
     export AGENTBOX_AGENT_TOOL_MODE AGENTBOX_AGENT_TOOL_PROGRESS_STAGE
     rm -f "$TOOL_JOB_FILE"
-    AFTER_VERSION=$(agent_tool_detect_version "$TARGET" "$TOOL_ID" || true)
-    if [ -z "$LATEST_VERSION" ] && [ "$TOOL_ID" = codex ] && [ "$DRIVER" = boxlite ]; then
-      LATEST_VERSION=${CODEX_LATEST_VERSION:-}
-    fi
-    [ -n "$LATEST_VERSION" ] || LATEST_VERSION=$(agent_tool_latest_version "$TARGET" "$TOOL_ID" || true)
-    if [ "$UPDATE_OK" != true ] || [ -z "$AFTER_VERSION" ]; then
-      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
-        "$BEFORE_VERSION" failed "Agent 工具更新失败" "$SOURCE"
+    AFTER_USABLE=false
+    agent_tool_probe_usable "$TARGET" "$TOOL_ID" && AFTER_USABLE=true
+    if [ "$UPDATE_OK" != true ] || [ "$AFTER_USABLE" != true ]; then
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "" "" \
+        failed "Agent 工具更新失败" "$SOURCE"
       report_agent_tool_progress "$TOOL_ID" failed "Agent 工具更新失败：$TOOL_ID"
       FAILURES=$((FAILURES + 1))
-    elif [ -z "$BEFORE_VERSION" ]; then
-      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
-        "" updated "Agent 工具已安装" "$SOURCE"
+    elif [ "$BEFORE_USABLE" != true ]; then
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "" "" \
+        updated "Agent 工具已安装；为保护沙箱数据，未采集版本输出" "$SOURCE"
       report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具已安装：$TOOL_ID"
-    elif [ "$AFTER_VERSION" != "$BEFORE_VERSION" ]; then
-      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
-        "$BEFORE_VERSION" updated "Agent 工具已更新" "$SOURCE"
-      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具已更新：$TOOL_ID"
     else
-      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "$AFTER_VERSION" "$LATEST_VERSION" \
-        "$BEFORE_VERSION" unchanged "更新命令已完成，但版本没有变化" "$SOURCE"
-      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具版本未变化：$TOOL_ID"
+      append_agent_tool_state "$RESULT_FILE" "$TOOL_ID" "" "" "" \
+        updated "Agent 工具更新命令已完成；为保护沙箱数据，未采集版本输出" "$SOURCE"
+      report_agent_tool_progress "$TOOL_ID" succeeded "Agent 工具已更新：$TOOL_ID"
     fi
   done
   [ "$FAILURES" -eq 0 ]
@@ -3216,10 +3204,13 @@ append_env() {
 remove_env() {
   ENV_FILE=$1
   KEY=$2
-  FILTERED=$(mktemp)
-  awk -v key="$KEY" 'index($0, key "=") != 1' "$ENV_FILE" > "$FILTERED"
-  cat "$FILTERED" > "$ENV_FILE"
-  rm -f "$FILTERED"
+  FILTERED=$(mktemp) || return 1
+  if ! awk -v key="$KEY" 'index($0, key "=") != 1' "$ENV_FILE" > "$FILTERED" ||
+     ! cat "$FILTERED" > "$ENV_FILE"; then
+    rm -f "$FILTERED"
+    return 1
+  fi
+  rm -f "$FILTERED" || return 1
 }
 
 replace_env() {
@@ -3706,203 +3697,988 @@ configure_credentials() {
   JOB_FILE=$ORIGINAL_JOB_FILE
 }
 
-configure_skills() {
-  CONTAINER=$1
-  JOB_FILE=$2
-  SKILL_COUNT=$(jq '.job.payload.skills | length' "$JOB_FILE")
-  [ "$SKILL_COUNT" -gt 0 ] || return 0
+append_env_file() {
+  ENV_FILE=$1
+  KEY=$2
+  VALUE_FILE=$3
+  VALUE_LINES=$(wc -l < "$VALUE_FILE") || return 1
+  VALUE_LINES=$(printf '%s' "$VALUE_LINES" | tr -d '[:space:]') || return 1
+  if [ "$VALUE_LINES" -gt 0 ]; then
+    ENCODED_FILE=$(mktemp) || return 1
+    if ! chmod 600 "$ENCODED_FILE" || ! base64 < "$VALUE_FILE" > "$ENCODED_FILE"; then
+      rm -f "$ENCODED_FILE"
+      return 1
+    fi
+    ENCODED_VALUE=$(tr -d '\r\n' < "$ENCODED_FILE") || {
+      rm -f "$ENCODED_FILE"
+      return 1
+    }
+    rm -f "$ENCODED_FILE" || return 1
+    printf "%s=\$(printf '%%s' '%s' | base64 -d; printf x); %s=\${%s%%x}\n" \
+      "$KEY" "$ENCODED_VALUE" "$KEY" "$KEY" >> "$ENV_FILE" || return 1
+    return 0
+  fi
+  printf "%s='" "$KEY" >> "$ENV_FILE" || return 1
+  sed "s/'/'\"'\"'/g" "$VALUE_FILE" >> "$ENV_FILE" || return 1
+  printf "'\n" >> "$ENV_FILE" || return 1
+}
 
-  docker exec "$CONTAINER" mkdir -p /opt/agentbox/skills || return 1
-  jq -c '.job.payload.skills[]' "$JOB_FILE" | while IFS= read -r SKILL; do
-    (
-    ID=$(printf '%s' "$SKILL" | jq -r '.id')
-    case "$ID" in ''|*[!a-z0-9-]*) exit 1 ;; esac
-    NAME=$(printf '%s' "$SKILL" | jq -r '.name | @json')
-    DESCRIPTION=$(printf '%s' "$SKILL" | jq -r '.description | @json')
-    INSTRUCTIONS=$(printf '%s' "$SKILL" | jq -r '.spec.instructions // empty')
-    [ -n "$INSTRUCTIONS" ] || INSTRUCTIONS=$(printf '%s' "$SKILL" | jq -r '.description')
-    SKILL_FILE=$(mktemp) || exit 1
-    trap 'rm -f "$SKILL_FILE"' EXIT
+strip_one_line_ending() {
+  VALUE_FILE=$1
+  VALUE_SIZE=$(wc -c < "$VALUE_FILE" | tr -d '[:space:]') || return 1
+  [ "$VALUE_SIZE" -gt 0 ] || return 0
+  LAST_BYTE=$(tail -c 1 "$VALUE_FILE" | od -An -tu1 | tr -d '[:space:]') || return 1
+  [ "$LAST_BYTE" = 10 ] || return 0
+  TRIMMED_FILE=$(mktemp) || return 1
+  if ! head -c "$((VALUE_SIZE - 1))" "$VALUE_FILE" > "$TRIMMED_FILE"; then
+    rm -f "$TRIMMED_FILE"
+    return 1
+  fi
+  if ! mv "$TRIMMED_FILE" "$VALUE_FILE"; then
+    rm -f "$TRIMMED_FILE"
+    return 1
+  fi
+  VALUE_SIZE=$((VALUE_SIZE - 1))
+  [ "$VALUE_SIZE" -gt 0 ] || return 0
+  LAST_BYTE=$(tail -c 1 "$VALUE_FILE" | od -An -tu1 | tr -d '[:space:]') || return 1
+  [ "$LAST_BYTE" = 13 ] || return 0
+  TRIMMED_FILE=$(mktemp) || return 1
+  if ! head -c "$((VALUE_SIZE - 1))" "$VALUE_FILE" > "$TRIMMED_FILE"; then
+    rm -f "$TRIMMED_FILE"
+    return 1
+  fi
+  if ! mv "$TRIMMED_FILE" "$VALUE_FILE"; then
+    rm -f "$TRIMMED_FILE"
+    return 1
+  fi
+}
+
+worker_secret_path() {
+  printf '/etc/agentbox-worker-secrets/%s' "$1"
+}
+
+worker_secret_metadata() {
+  stat -c '%u:%a:%s' "$1"
+}
+
+resolve_worker_variables() (
+  RESOLVE_JOB_FILE=$1
+  RESOLVE_OUTPUT_FILE=$2
+  RESOLVE_LIST=$(mktemp) || exit 1
+  RESOLVE_ENTRIES=$(mktemp) || { rm -f "$RESOLVE_LIST"; exit 1; }
+  RESOLVE_VALUE=$(mktemp) || { rm -f "$RESOLVE_LIST" "$RESOLVE_ENTRIES"; exit 1; }
+  trap 'rm -f "$RESOLVE_LIST" "$RESOLVE_ENTRIES" "$RESOLVE_VALUE"' EXIT
+  chmod 600 "$RESOLVE_LIST" "$RESOLVE_ENTRIES" "$RESOLVE_VALUE" || exit 1
+  if ! jq -c '.job.payload.variables[]?' "$RESOLVE_JOB_FILE" > "$RESOLVE_LIST"; then
+    echo 'AgentBox variable definitions are invalid' >&2
+    exit 1
+  fi
+  : > "$RESOLVE_ENTRIES" || exit 1
+  while IFS= read -r RESOLVE_VARIABLE; do
+    RESOLVE_KEY=$(printf '%s' "$RESOLVE_VARIABLE" | jq -er '.spec.key') || exit 1
+    RESOLVE_MODE=$(printf '%s' "$RESOLVE_VARIABLE" | jq -er '.spec.mode') || exit 1
+    RESOLVE_REFERENCE=$(printf '%s' "$RESOLVE_VARIABLE" | jq -er '.spec.reference') || exit 1
+    case "$RESOLVE_KEY" in ''|[0-9]*|*[!A-Za-z0-9_]*) echo "AgentBox variable key is invalid: $RESOLVE_KEY" >&2; exit 1 ;; esac
+    case "$RESOLVE_REFERENCE" in
+      env://*)
+        [ "$RESOLVE_MODE" = value-ref ] || { echo "AgentBox variable mode does not match env reference: $RESOLVE_KEY" >&2; exit 1; }
+        RESOLVE_SOURCE=${RESOLVE_REFERENCE#env://}
+        case "$RESOLVE_SOURCE" in ''|[0-9]*|*[!A-Za-z0-9_]*) echo "AgentBox env reference is invalid: $RESOLVE_KEY" >&2; exit 1 ;; esac
+        if ! printenv "$RESOLVE_SOURCE" > "$RESOLVE_VALUE"; then
+          echo "AgentBox env reference is unavailable: $RESOLVE_KEY" >&2
+          exit 1
+        fi
+        strip_one_line_ending "$RESOLVE_VALUE" || exit 1
+        RESOLVE_SIZE=$(wc -c < "$RESOLVE_VALUE" | tr -d '[:space:]') || exit 1
+        [ "$RESOLVE_SIZE" -le 16384 ] || { echo "AgentBox env value exceeds 16 KiB: $RESOLVE_KEY" >&2; exit 1; }
+        ;;
+      secret://*)
+        [ "$RESOLVE_MODE" = secret-ref ] || { echo "AgentBox variable mode does not match secret reference: $RESOLVE_KEY" >&2; exit 1; }
+        RESOLVE_SOURCE=${RESOLVE_REFERENCE#secret://}
+        case "$RESOLVE_SOURCE" in ''|[0-9]*|*[!A-Za-z0-9_]*) echo "AgentBox secret reference is invalid: $RESOLVE_KEY" >&2; exit 1 ;; esac
+        RESOLVE_SECRET=$(worker_secret_path "$RESOLVE_SOURCE") || exit 1
+        if [ ! -f "$RESOLVE_SECRET" ] || [ -L "$RESOLVE_SECRET" ]; then
+          echo "AgentBox secret reference is not a regular file: $RESOLVE_KEY" >&2
+          exit 1
+        fi
+        RESOLVE_METADATA=$(worker_secret_metadata "$RESOLVE_SECRET") || { echo "AgentBox secret metadata is unavailable: $RESOLVE_KEY" >&2; exit 1; }
+        RESOLVE_OWNER=${RESOLVE_METADATA%%:*}
+        RESOLVE_REMAINDER=${RESOLVE_METADATA#*:}
+        RESOLVE_MODE_BITS=${RESOLVE_REMAINDER%%:*}
+        RESOLVE_SIZE=${RESOLVE_REMAINDER##*:}
+        case "$RESOLVE_OWNER:$RESOLVE_MODE_BITS:$RESOLVE_SIZE" in
+          *[!0-9:]*|::*|*::*) echo "AgentBox secret metadata is invalid: $RESOLVE_KEY" >&2; exit 1 ;;
+        esac
+        [ "$RESOLVE_OWNER" = 0 ] || { echo "AgentBox secret is not root-owned: $RESOLVE_KEY" >&2; exit 1; }
+        RESOLVE_MODE_DECIMAL=$(printf '%s' "$RESOLVE_MODE_BITS" | sed 's/^0*//') || exit 1
+        [ -n "$RESOLVE_MODE_DECIMAL" ] || RESOLVE_MODE_DECIMAL=0
+        [ $((RESOLVE_MODE_DECIMAL % 100)) -eq 0 ] || { echo "AgentBox secret permissions are too broad: $RESOLVE_KEY" >&2; exit 1; }
+        [ "$RESOLVE_SIZE" -le 16384 ] || { echo "AgentBox secret exceeds 16 KiB: $RESOLVE_KEY" >&2; exit 1; }
+        if ! tr -d '\000' < "$RESOLVE_SECRET" | cmp -s - "$RESOLVE_SECRET"; then
+          echo "AgentBox secret contains NUL: $RESOLVE_KEY" >&2
+          exit 1
+        fi
+        cp "$RESOLVE_SECRET" "$RESOLVE_VALUE" || exit 1
+        strip_one_line_ending "$RESOLVE_VALUE" || exit 1
+        ;;
+      *) echo "AgentBox variable reference scheme is invalid: $RESOLVE_KEY" >&2; exit 1 ;;
+    esac
+    if ! jq -Rsc --arg key "$RESOLVE_KEY" '{key: $key, value: .}' "$RESOLVE_VALUE" >> "$RESOLVE_ENTRIES"; then
+      exit 1
+    fi
+  done < "$RESOLVE_LIST"
+  if ! jq -se '
+    if (map(.key) | length) != (map(.key) | unique | length)
+    then error("duplicate AgentBox variable key")
+    else map({key: .key, value: .value}) | from_entries
+    end
+  ' "$RESOLVE_ENTRIES" > "$RESOLVE_OUTPUT_FILE"; then
+    echo 'AgentBox resolved variable set is invalid' >&2
+    exit 1
+  fi
+)
+
+write_container_file_atomic() {
+  WRITE_CONTAINER=$1
+  WRITE_PATH=$2
+  WRITE_MODE=$3
+  WRITE_SOURCE=$4
+  docker exec -i "$WRITE_CONTAINER" sh -c '
+    set -eu
+    WRITE_PATH=$1
+    WRITE_MODE=$2
+    WRITE_PARENT=${WRITE_PATH%/*}
+    mkdir -p "$WRITE_PARENT"
+    WRITE_TEMP=$(mktemp "$WRITE_PARENT/.agentbox-next.XXXXXX")
+    trap '\''rm -f "$WRITE_TEMP"'\'' EXIT HUP INT TERM
+    cat > "$WRITE_TEMP"
+    chmod "$WRITE_MODE" "$WRITE_TEMP"
+    mv -f "$WRITE_TEMP" "$WRITE_PATH"
+    trap - EXIT HUP INT TERM
+  ' agentbox "$WRITE_PATH" "$WRITE_MODE" < "$WRITE_SOURCE"
+}
+
+managed_paths_reconcile() {
+  MANAGED_CONTAINER=$1
+  MANAGED_OPERATIONS=$2
+  docker exec -i "$MANAGED_CONTAINER" sh -c '
+    set -eu
+    MANAGED_STATE_DIR=$1
+    MANAGED_NEWLINE=$(printf "\nx")
+    MANAGED_NEWLINE=${MANAGED_NEWLINE%x}
+    managed_no_symlink_chain() {
+      MANAGED_CHECK=$1
+      while :; do
+        [ ! -L "$MANAGED_CHECK" ] || return 1
+        [ "$MANAGED_CHECK" != / ] || return 0
+        MANAGED_CHECK_PARENT=${MANAGED_CHECK%/*}
+        [ -n "$MANAGED_CHECK_PARENT" ] || MANAGED_CHECK_PARENT=/
+        [ "$MANAGED_CHECK_PARENT" != "$MANAGED_CHECK" ] || return 1
+        MANAGED_CHECK=$MANAGED_CHECK_PARENT
+      done
+    }
+    if ! managed_no_symlink_chain "$MANAGED_STATE_DIR"; then
+      echo "AgentBox managed state path has a symlink ancestor" >&2
+      exit 1
+    fi
+    MANAGED_OPERATIONS=$(mktemp "$MANAGED_STATE_DIR/.managed-operations.XXXXXX")
+    MANAGED_STAGED=$(mktemp "$MANAGED_STATE_DIR/.managed-staged.XXXXXX")
+    MANAGED_APPLIED=$(mktemp "$MANAGED_STATE_DIR/.managed-applied.XXXXXX")
+    MANAGED_SEEN=$(mktemp "$MANAGED_STATE_DIR/.managed-seen.XXXXXX")
+    MANAGED_SUCCESS=false
+    managed_cleanup() {
+      MANAGED_STATUS=$?
+      MANAGED_CLEANUP_FAILED=false
+      trap - EXIT HUP INT TERM
+      if [ "$MANAGED_SUCCESS" != true ]; then
+        while IFS="$(printf '\''\t'\'')" read -r MANAGED_TARGET MANAGED_BACKUP MANAGED_HAD_OLD; do
+          [ -n "$MANAGED_TARGET" ] || continue
+          if ! rm -rf "$MANAGED_TARGET"; then
+            echo "AgentBox managed rollback could not remove a staged target" >&2
+            MANAGED_CLEANUP_FAILED=true
+            continue
+          fi
+          if [ "$MANAGED_HAD_OLD" = 1 ]; then
+            if ! mv "$MANAGED_BACKUP" "$MANAGED_TARGET"; then
+              echo "AgentBox managed rollback could not restore a previous target" >&2
+              MANAGED_CLEANUP_FAILED=true
+            fi
+          fi
+        done < "$MANAGED_APPLIED"
+      else
+        while IFS="$(printf '\''\t'\'')" read -r MANAGED_TARGET MANAGED_BACKUP MANAGED_HAD_OLD; do
+          if [ "$MANAGED_HAD_OLD" = 1 ] && ! rm -rf "$MANAGED_BACKUP"; then
+            echo "AgentBox managed commit could not remove a backup target" >&2
+            MANAGED_CLEANUP_FAILED=true
+          fi
+        done < "$MANAGED_APPLIED"
+      fi
+      while IFS="$(printf '\''\t'\'')" read -r MANAGED_ACTION MANAGED_TARGET MANAGED_NEXT MANAGED_BACKUP MANAGED_MODE; do
+        if [ -n "$MANAGED_NEXT" ] && ! rm -rf "$MANAGED_NEXT"; then
+          echo "AgentBox managed reconciliation could not remove a staged path" >&2
+          MANAGED_CLEANUP_FAILED=true
+        fi
+      done < "$MANAGED_STAGED"
+      if ! rm -f "$MANAGED_OPERATIONS" "$MANAGED_STAGED" "$MANAGED_APPLIED" "$MANAGED_SEEN"; then
+        echo "AgentBox managed reconciliation could not remove transaction metadata" >&2
+        MANAGED_CLEANUP_FAILED=true
+      fi
+      [ "$MANAGED_CLEANUP_FAILED" != true ] || MANAGED_STATUS=1
+      exit "$MANAGED_STATUS"
+    }
+    trap managed_cleanup EXIT
+    trap '\''exit 1'\'' HUP INT TERM
+    cat > "$MANAGED_OPERATIONS"
+    MANAGED_INDEX=0
+    while IFS="$(printf '\''\t'\'')" read -r MANAGED_ACTION MANAGED_TARGET MANAGED_SOURCE MANAGED_REPLACE MANAGED_MODE; do
+      [ -n "$MANAGED_ACTION" ] || continue
+      case "$MANAGED_ACTION" in put|delete) ;; *) echo "invalid AgentBox managed operation" >&2; exit 1 ;; esac
+      case "$MANAGED_TARGET" in /*) ;; *) echo "invalid AgentBox managed target" >&2; exit 1 ;; esac
+      case "$MANAGED_TARGET" in *"/../"*|*/..|*"$MANAGED_NEWLINE"*) echo "unsafe AgentBox managed target" >&2; exit 1 ;; esac
+      if printf '%s' "$MANAGED_TARGET" | LC_ALL=C grep -q '[[:cntrl:]]'; then
+        echo "unsafe AgentBox managed target" >&2
+        exit 1
+      fi
+      if grep -Fqx "$MANAGED_TARGET" "$MANAGED_SEEN"; then
+        echo "duplicate AgentBox managed target" >&2
+        exit 1
+      fi
+      printf "%s\n" "$MANAGED_TARGET" >> "$MANAGED_SEEN"
+      MANAGED_PARENT=${MANAGED_TARGET%/*}
+      [ -n "$MANAGED_PARENT" ] || MANAGED_PARENT=/
+      MANAGED_BASE=${MANAGED_TARGET##*/}
+      if ! managed_no_symlink_chain "$MANAGED_PARENT"; then
+        echo "AgentBox managed target parent has a symlink ancestor" >&2
+        exit 1
+      fi
+      mkdir -p "$MANAGED_PARENT"
+      MANAGED_INDEX=$((MANAGED_INDEX + 1))
+      MANAGED_NEXT="$MANAGED_PARENT/.agentbox-next-$MANAGED_BASE-$$-$MANAGED_INDEX"
+      MANAGED_BACKUP="$MANAGED_PARENT/.agentbox-backup-$MANAGED_BASE-$$-$MANAGED_INDEX"
+      rm -rf "$MANAGED_NEXT" "$MANAGED_BACKUP"
+      if [ "$MANAGED_ACTION" = put ]; then
+        case "$MANAGED_SOURCE" in /*) ;; *) echo "invalid AgentBox managed source" >&2; exit 1 ;; esac
+        case "$MANAGED_SOURCE" in *"$MANAGED_NEWLINE"*) echo "unsafe AgentBox managed source" >&2; exit 1 ;; esac
+        if printf '%s' "$MANAGED_SOURCE" | LC_ALL=C grep -q '[[:cntrl:]]' ||
+           ! managed_no_symlink_chain "$MANAGED_SOURCE"; then
+          echo "unsafe AgentBox managed source" >&2
+          exit 1
+        fi
+        if [ -d "$MANAGED_SOURCE" ]; then
+          mkdir "$MANAGED_NEXT"
+          cp -R "$MANAGED_SOURCE/." "$MANAGED_NEXT/"
+        elif [ -f "$MANAGED_SOURCE" ]; then
+          cp "$MANAGED_SOURCE" "$MANAGED_NEXT"
+        else
+          echo "AgentBox managed source is unavailable" >&2
+          exit 1
+        fi
+        [ "$MANAGED_MODE" = - ] || chmod "$MANAGED_MODE" "$MANAGED_NEXT"
+      else
+        MANAGED_NEXT=
+      fi
+      if [ "$MANAGED_REPLACE" != 1 ] && { [ -e "$MANAGED_TARGET" ] || [ -L "$MANAGED_TARGET" ]; }; then
+        echo "AgentBox managed target collides with an unmanaged path" >&2
+        exit 1
+      fi
+      printf "%s\t%s\t%s\t%s\t%s\n" "$MANAGED_ACTION" "$MANAGED_TARGET" "$MANAGED_NEXT" "$MANAGED_BACKUP" "$MANAGED_MODE" >> "$MANAGED_STAGED"
+    done < "$MANAGED_OPERATIONS"
+    while IFS="$(printf '\''\t'\'')" read -r MANAGED_ACTION MANAGED_TARGET MANAGED_NEXT MANAGED_BACKUP MANAGED_MODE; do
+      MANAGED_PARENT=${MANAGED_TARGET%/*}
+      [ -n "$MANAGED_PARENT" ] || MANAGED_PARENT=/
+      if ! managed_no_symlink_chain "$MANAGED_PARENT"; then
+        echo "AgentBox managed target parent changed to a symlink" >&2
+        exit 1
+      fi
+      MANAGED_HAD_OLD=0
+      if [ -e "$MANAGED_TARGET" ] || [ -L "$MANAGED_TARGET" ]; then
+        mv "$MANAGED_TARGET" "$MANAGED_BACKUP"
+        MANAGED_HAD_OLD=1
+      fi
+      if ! printf "%s\t%s\t%s\n" "$MANAGED_TARGET" "$MANAGED_BACKUP" "$MANAGED_HAD_OLD" >> "$MANAGED_APPLIED"; then
+        if [ "$MANAGED_HAD_OLD" = 1 ] && ! mv "$MANAGED_BACKUP" "$MANAGED_TARGET"; then
+          echo "AgentBox managed transaction could not restore an unjournaled target" >&2
+        fi
+        exit 1
+      fi
+      if [ "$MANAGED_ACTION" = put ]; then
+        mv "$MANAGED_NEXT" "$MANAGED_TARGET"
+      fi
+    done < "$MANAGED_STAGED"
+    MANAGED_SUCCESS=true
+  ' agentbox /opt/agentbox < "$MANAGED_OPERATIONS"
+}
+
+skill_target_for_tool() {
+  case "$1" in
+    antigravity) printf '%s\n' /root/.gemini/antigravity-cli/skills ;;
+    claude-code) printf '%s\n' /root/.claude/skills ;;
+    codebuddy) printf '%s\n' /root/.codebuddy/skills ;;
+    codex) printf '%s\n' /root/.agents/skills ;;
+    copilot-cli) printf '%s\n' /root/.copilot/skills ;;
+    deepseek-harness) printf '%s\n' /root/.agents/skills ;;
+    deveco) printf '%s\n' /root/.config/deveco/skills ;;
+    gemini-cli) printf '%s\n' /root/.gemini/skills ;;
+    grok) printf '%s\n' /root/.grok/skills ;;
+    kimi) printf '%s\n' /root/.kimi/skills ;;
+    omp) printf '%s\n' /root/.omp/agent/skills ;;
+    openclaw) printf '%s\n' /root/.openclaw/skills ;;
+    opencode) printf '%s\n' /root/.config/opencode/skills ;;
+    pi) printf '%s\n' /root/.pi/agent/skills ;;
+    qoder-cli) printf '%s\n' /root/.qoder/skills ;;
+    qoder-cn) printf '%s\n' /root/.qoder-cn/skills ;;
+    qwen-code) printf '%s\n' /root/.qwen/skills ;;
+    qwenpaw) printf '%s\n' /root/.qwenpaw/skill_pool ;;
+    reasonix) printf '%s\n' /root/.reasonix/skills ;;
+    trae-cli) printf '%s\n' /root/.traecli/skills ;;
+    cursor) printf '%s\n' /root/.cursor/skills ;;
+    *) return 1 ;;
+  esac
+}
+
+all_skill_targets() {
+  for SKILL_TOOL in antigravity claude-code codebuddy codex copilot-cli deepseek-harness deveco gemini-cli grok kimi omp openclaw opencode pi qoder-cli qoder-cn qwen-code qwenpaw reasonix trae-cli cursor; do
+    skill_target_for_tool "$SKILL_TOOL" || return 1
+  done
+  # Legacy Workers copied Codex skills here. Keep it only in the migration
+  # cleanup set; current Codex discovers user skills from ~/.agents/skills.
+  printf '%s\n' /root/.codex/skills
+}
+
+configure_variables() (
+  VARIABLE_CONTAINER=$1
+  VARIABLE_JOB_FILE=$2
+  VARIABLE_SNAPSHOT=${3:-}
+  VARIABLE_STAGE=
+  VARIABLE_TEMP_DIR=$(mktemp -d) || exit 1
+  chmod 700 "$VARIABLE_TEMP_DIR" || { rm -rf "$VARIABLE_TEMP_DIR"; exit 1; }
+  VARIABLE_RESOLVED=$VARIABLE_TEMP_DIR/resolved.json
+  VARIABLE_ENV=$VARIABLE_TEMP_DIR/agentbox.env
+  VARIABLE_VALUE=$VARIABLE_TEMP_DIR/value
+  VARIABLE_LIST=$VARIABLE_TEMP_DIR/list
+  VARIABLE_DIRECT_KEYS=$VARIABLE_TEMP_DIR/direct-keys
+  VARIABLE_PREVIOUS=$VARIABLE_TEMP_DIR/previous.json
+  VARIABLE_DESIRED=$VARIABLE_TEMP_DIR/desired.json
+  VARIABLE_OPERATIONS=$VARIABLE_TEMP_DIR/operations
+  variable_cleanup() {
+    rm -rf "$VARIABLE_TEMP_DIR"
+    [ -z "$VARIABLE_STAGE" ] || docker exec "$VARIABLE_CONTAINER" rm -rf "$VARIABLE_STAGE" >/dev/null 2>&1 || true
+  }
+  trap variable_cleanup EXIT
+  if [ -n "$VARIABLE_SNAPSHOT" ]; then
+    cp "$VARIABLE_SNAPSHOT" "$VARIABLE_RESOLVED" || exit 1
+  else
+    resolve_worker_variables "$VARIABLE_JOB_FILE" "$VARIABLE_RESOLVED" || exit 1
+  fi
+  if ! jq -e 'type == "object" and all(to_entries[];
+    (.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type) == "string")' "$VARIABLE_RESOLVED" >/dev/null; then
+    echo 'AgentBox resolved Variable snapshot is invalid' >&2
+    exit 1
+  fi
+  if ! docker exec "$VARIABLE_CONTAINER" sh -c 'test ! -f "$1" || cat "$1"' agentbox /opt/agentbox/secrets/agentbox.env > "$VARIABLE_ENV"; then
+    echo 'AgentBox could not read the sandbox environment file' >&2
+    exit 1
+  fi
+  if read_container_file "$VARIABLE_CONTAINER" /opt/agentbox/variables.manifest.json "$VARIABLE_PREVIOUS" && [ -s "$VARIABLE_PREVIOUS" ]; then
+    if ! jq -e 'type == "object" and .version == 1 and (.keys | type == "array") and all(.keys[]; type == "string" and test("^[A-Za-z_][A-Za-z0-9_]*$"))' "$VARIABLE_PREVIOUS" >/dev/null; then
+      echo 'AgentBox Variable managed manifest is invalid' >&2
+      exit 1
+    fi
+  else
+    printf '{"version":1,"keys":[]}\n' > "$VARIABLE_PREVIOUS" || exit 1
+  fi
+  if ! jq -r '
+    [(.job.payload.environmentVariables // [])[] |
+      if (.name | type) == "string" and (.name | test("^[A-Za-z_][A-Za-z0-9_]*$"))
+      then .name else error("invalid direct environment variable name") end] |
+    if length == (unique | length) then unique[] else error("duplicate direct environment variable name") end
+  ' "$VARIABLE_JOB_FILE" > "$VARIABLE_DIRECT_KEYS"; then
+    echo 'AgentBox direct environment variable definitions are invalid' >&2
+    exit 1
+  fi
+  if ! jq -e --slurpfile resolved "$VARIABLE_RESOLVED" --rawfile direct "$VARIABLE_DIRECT_KEYS" '
+    ($direct | split("\n") | map(select(length > 0))) as $directKeys |
+    all(($resolved[0] | keys)[]; . as $key | ($directKeys | index($key)) == null)
+  ' "$VARIABLE_JOB_FILE" >/dev/null; then
+    echo 'AgentBox Variable key conflicts with a direct environment variable' >&2
+    exit 1
+  fi
+  jq -r '.keys[]' "$VARIABLE_PREVIOUS" > "$VARIABLE_LIST" || exit 1
+  while IFS= read -r VARIABLE_KEY; do
+    [ -n "$VARIABLE_KEY" ] || continue
+    if ! jq -e --arg key "$VARIABLE_KEY" 'has($key)' "$VARIABLE_RESOLVED" >/dev/null &&
+       grep -Fxq "$VARIABLE_KEY" "$VARIABLE_DIRECT_KEYS"; then
+      continue
+    fi
+    remove_env "$VARIABLE_ENV" "$VARIABLE_KEY" || exit 1
+  done < "$VARIABLE_LIST"
+  if ! jq -r 'to_entries[] | [.key, (.value | @base64)] | @tsv' "$VARIABLE_RESOLVED" > "$VARIABLE_LIST"; then
+    exit 1
+  fi
+  while IFS="$(printf '\t')" read -r VARIABLE_KEY VARIABLE_BASE64; do
+    [ -n "$VARIABLE_KEY" ] || continue
+    if ! printf '%s' "$VARIABLE_BASE64" | base64 -d > "$VARIABLE_VALUE"; then
+      exit 1
+    fi
+    remove_env "$VARIABLE_ENV" "$VARIABLE_KEY" || exit 1
+    append_env_file "$VARIABLE_ENV" "$VARIABLE_KEY" "$VARIABLE_VALUE" || exit 1
+  done < "$VARIABLE_LIST"
+  if ! sh -n "$VARIABLE_ENV"; then
+    echo 'AgentBox resolved variables produced an invalid environment file' >&2
+    exit 1
+  fi
+  jq '{version: 1, keys: (keys | sort)}' "$VARIABLE_RESOLVED" > "$VARIABLE_DESIRED" || exit 1
+  if ! VARIABLE_STAGE=$(docker exec "$VARIABLE_CONTAINER" sh -c 'mkdir -p /opt/agentbox; mktemp -d /opt/agentbox/.variables-stage.XXXXXX'); then
+    echo 'AgentBox could not create the Variable staging directory' >&2
+    exit 1
+  fi
+  docker exec -i "$VARIABLE_CONTAINER" sh -c 'umask 077; cat > "$1"' agentbox "$VARIABLE_STAGE/agentbox.env" < "$VARIABLE_ENV" || exit 1
+  docker exec -i "$VARIABLE_CONTAINER" sh -c 'umask 077; cat > "$1"' agentbox "$VARIABLE_STAGE/manifest.json" < "$VARIABLE_DESIRED" || exit 1
+  {
+    printf 'put\t/opt/agentbox/secrets/agentbox.env\t%s/agentbox.env\t1\t600\n' "$VARIABLE_STAGE"
+    printf 'put\t/opt/agentbox/variables.manifest.json\t%s/manifest.json\t1\t600\n' "$VARIABLE_STAGE"
+  } > "$VARIABLE_OPERATIONS" || exit 1
+  managed_paths_reconcile "$VARIABLE_CONTAINER" "$VARIABLE_OPERATIONS" || exit 1
+)
+
+configure_skills() (
+  SKILL_CONTAINER=$1
+  SKILL_JOB_FILE=$2
+  SKILL_STAGE=
+  SKILL_TEMP_FILES=
+  skill_cleanup() {
+    [ -z "$SKILL_TEMP_FILES" ] || rm -f $SKILL_TEMP_FILES
+    [ -z "$SKILL_STAGE" ] || docker exec "$SKILL_CONTAINER" rm -rf "$SKILL_STAGE" >/dev/null 2>&1 || true
+  }
+  trap skill_cleanup EXIT
+  SKILL_LIST=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_LIST"
+  SKILL_FILE=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_FILE"
+  SKILL_ATTACHMENTS=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_ATTACHMENTS"
+  SKILL_PREVIOUS=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_PREVIOUS"
+  SKILL_DESIRED=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_DESIRED"
+  SKILL_TARGETS=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_TARGETS"
+  SKILL_TOOLS=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_TOOLS"
+  SKILL_ENCODED=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_ENCODED"
+  SKILL_OPERATIONS=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_OPERATIONS"
+  chmod 600 $SKILL_TEMP_FILES || exit 1
+  if ! jq -c '.job.payload.skills[]?' "$SKILL_JOB_FILE" > "$SKILL_LIST"; then
+    echo 'AgentBox Skill definitions are invalid' >&2
+    exit 1
+  fi
+  if ! SKILL_STAGE=$(docker exec "$SKILL_CONTAINER" sh -c 'mkdir -p /opt/agentbox; mktemp -d /opt/agentbox/.skills-stage.XXXXXX'); then
+    echo 'AgentBox could not create the Skill staging directory' >&2
+    exit 1
+  fi
+  docker exec "$SKILL_CONTAINER" mkdir -p "$SKILL_STAGE/skills" || exit 1
+  while IFS= read -r SKILL; do
+    if ! SKILL_ID=$(printf '%s' "$SKILL" | jq -er '
+      .id | select(type == "string" and length >= 2 and length <= 64 and
+        test("^[a-z0-9]+(-[a-z0-9]+)*$"))'); then
+      echo 'AgentBox Skill id is invalid' >&2
+      exit 1
+    fi
+    if ! printf '%s' "$SKILL" | jq -e '
+      def valid_skill_path:
+        type == "string" and utf8bytelength <= 240 and . != "." and
+        (startswith("/") | not) and (contains("\\") | not) and (contains(":") | not) and
+        (test("[\\x00-\\x1F\\x7F-\\x9F]") | not) and
+        (split("/") | length > 0 and all(.[]; length > 0 and . != "." and . != ".."));
+      (.spec.files // []) as $files |
+      ($files | type) == "array" and ($files | length) < 128 and
+      all($files[]; type == "object" and (.path | valid_skill_path) and
+        (.path | ascii_downcase) != "skill.md" and (.content | type) == "string") and
+      ((["skill.md"] + [$files[].path | ascii_downcase]) as $paths |
+        ($paths | length) == ($paths | unique | length) and
+        all($paths[]; . as $candidate |
+          all($paths[]; . == $candidate or (startswith($candidate + "/") | not))))
+    ' >/dev/null; then
+      echo "AgentBox Skill attachment paths are invalid: $SKILL_ID" >&2
+      exit 1
+    fi
+    SKILL_NAME=$(printf '%s' "$SKILL" | jq -r '.name | @json') || exit 1
+    SKILL_DESCRIPTION=$(printf '%s' "$SKILL" | jq -r '.description | @json') || exit 1
+    SKILL_INSTRUCTIONS=$(printf '%s' "$SKILL" | jq -r '.spec.instructions // empty') || exit 1
+    [ -n "$SKILL_INSTRUCTIONS" ] || SKILL_INSTRUCTIONS=$(printf '%s' "$SKILL" | jq -r '.description') || exit 1
     if printf '%s' "$SKILL" | jq -e '(.spec.instructions // "") | test("^---\\r?\\n")' >/dev/null; then
       printf '%s' "$SKILL" | jq -j '.spec.instructions' > "$SKILL_FILE" || exit 1
     else
-      printf '%s\n' '---' "name: $NAME" "description: $DESCRIPTION" '---' '' "$INSTRUCTIONS" > "$SKILL_FILE"
+      printf '%s\n' '---' "name: $SKILL_NAME" "description: $SKILL_DESCRIPTION" '---' '' "$SKILL_INSTRUCTIONS" > "$SKILL_FILE" || exit 1
     fi
-    # Replace only this Skill's directory, so removed attachments cannot survive a restart.
-    docker exec "$CONTAINER" sh -c 'rm -rf "$1" && mkdir -p "$1"' agentbox "/opt/agentbox/skills/$ID" || exit 1
-    docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/SKILL.md" < "$SKILL_FILE" || exit 1
-    printf '%s' "$SKILL" | jq -c '.spec.files[]?' | while IFS= read -r SKILL_ATTACHMENT; do
-      SKILL_PATH=$(printf '%s' "$SKILL_ATTACHMENT" | jq -r '.path')
-      case "$SKILL_PATH" in ''|.|..|/*|*/../*|../*|*/..|*\\*|*:*|SKILL.md) exit 1 ;; esac
-      SKILL_PARENT=$(dirname -- "$SKILL_PATH")
-      docker exec "$CONTAINER" mkdir -p "/opt/agentbox/skills/$ID/$SKILL_PARENT" || exit 1
-      printf '%s' "$SKILL_ATTACHMENT" | jq -r '.content' | base64 -d > "$SKILL_FILE" || exit 1
-      docker exec -i "$CONTAINER" sh -c 'cat > "$1"' agentbox "/opt/agentbox/skills/$ID/$SKILL_PATH" < "$SKILL_FILE" || exit 1
+    docker exec "$SKILL_CONTAINER" mkdir -p "$SKILL_STAGE/skills/$SKILL_ID" || exit 1
+    docker exec -i "$SKILL_CONTAINER" sh -c 'umask 077; cat > "$1"' agentbox "$SKILL_STAGE/skills/$SKILL_ID/SKILL.md" < "$SKILL_FILE" || exit 1
+    printf '%s' "$SKILL" | jq -c '.spec.files[]?' > "$SKILL_ATTACHMENTS" || exit 1
+    while IFS= read -r SKILL_ATTACHMENT; do
+      SKILL_PATH=$(printf '%s' "$SKILL_ATTACHMENT" | jq -er '.path') || exit 1
+      SKILL_PARENT=$(dirname -- "$SKILL_PATH") || exit 1
+      docker exec "$SKILL_CONTAINER" mkdir -p "$SKILL_STAGE/skills/$SKILL_ID/$SKILL_PARENT" || exit 1
+      printf '%s' "$SKILL_ATTACHMENT" | jq -er '.content' > "$SKILL_ENCODED" || exit 1
+      base64 -d < "$SKILL_ENCODED" > "$SKILL_FILE" || exit 1
+      docker exec -i "$SKILL_CONTAINER" sh -c 'umask 077; cat > "$1"' agentbox "$SKILL_STAGE/skills/$SKILL_ID/$SKILL_PATH" < "$SKILL_FILE" || exit 1
       if printf '%s' "$SKILL_ATTACHMENT" | jq -e '.executable == true' >/dev/null; then
-        docker exec "$CONTAINER" chmod 755 "/opt/agentbox/skills/$ID/$SKILL_PATH" || exit 1
+        docker exec "$SKILL_CONTAINER" chmod 755 "$SKILL_STAGE/skills/$SKILL_ID/$SKILL_PATH" || exit 1
       fi
-    done || exit 1
-    docker exec "$CONTAINER" sh -c '
-      SKILL_SOURCE=$1
-      shift
-      for SKILL_TARGET do
-        rm -rf "$SKILL_TARGET" && mkdir -p "$SKILL_TARGET" &&
-          cp -R "$SKILL_SOURCE/." "$SKILL_TARGET/" || exit 1
-      done
-    ' agentbox "/opt/agentbox/skills/$ID" \
-      "/root/.agents/skills/$ID" \
-      "/root/.gemini/antigravity-cli/skills/$ID" \
-      "/root/.codex/skills/$ID" \
-      "/root/.claude/skills/$ID" \
-      "/root/.codebuddy/skills/$ID" \
-      "/root/.gemini/skills/$ID" \
-      "/root/.config/opencode/skills/$ID" \
-      "/root/.config/deveco/skills/$ID" \
-      "/root/.openclaw/skills/$ID" \
-      "/root/.pi/agent/skills/$ID" \
-      "/root/.omp/agent/skills/$ID" \
-      "/root/.copilot/skills/$ID" \
-      "/root/.cursor/skills/$ID" \
-      "/root/.kimi/skills/$ID" \
-      "/root/.reasonix/skills/$ID" \
-      "/root/.qoder/skills/$ID" \
-      "/root/.qoder-cn/skills/$ID" \
-      "/root/.traecli/skills/$ID" \
-      "/root/.grok/skills/$ID" \
-      "/root/.qwen/skills/$ID" \
-      "/root/.qwenpaw/skill_pool/$ID" || exit 1
-    ) || return 1
-  done
+    done < "$SKILL_ATTACHMENTS"
+  done < "$SKILL_LIST"
+  : > "$SKILL_TARGETS" || exit 1
+  if ! jq -r '.job.payload.agentTools[]?' "$SKILL_JOB_FILE" > "$SKILL_FILE" ||
+     ! sort -u "$SKILL_FILE" > "$SKILL_TOOLS"; then
+    echo 'AgentBox Agent tool selection is invalid for Skill sync' >&2
+    exit 1
+  fi
+  while IFS= read -r SKILL_TOOL; do
+    if ! skill_target_for_tool "$SKILL_TOOL" >> "$SKILL_TARGETS"; then
+      echo "AgentBox warning: Skill sync is unsupported for Agent tool $SKILL_TOOL" >&2
+    fi
+  done < "$SKILL_TOOLS"
+  sort -u -o "$SKILL_TARGETS" "$SKILL_TARGETS" || exit 1
+  if docker exec "$SKILL_CONTAINER" sh -c 'test -f /opt/agentbox/skills.manifest.json && cat /opt/agentbox/skills.manifest.json' > "$SKILL_PREVIOUS" 2>/dev/null; then
+    if ! jq -e 'type == "object" and .version == 1 and (.ids | type == "array") and (.targets | type == "array") and all(.ids[]; type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$")) and all(.targets[]; type == "string")' "$SKILL_PREVIOUS" >/dev/null; then
+      echo 'AgentBox Skill managed manifest is invalid' >&2
+      exit 1
+    fi
+  else
+    SKILL_LEGACY_IDS=$(mktemp) || exit 1; SKILL_TEMP_FILES="$SKILL_TEMP_FILES $SKILL_LEGACY_IDS"; chmod 600 "$SKILL_LEGACY_IDS" || exit 1
+    docker exec "$SKILL_CONTAINER" sh -c 'if [ -d /opt/agentbox/skills ]; then for entry in /opt/agentbox/skills/*; do if [ -d "$entry" ]; then basename "$entry"; fi; done; fi' > "$SKILL_LEGACY_IDS" || exit 1
+    if ! all_skill_targets > "$SKILL_FILE"; then exit 1; fi
+    if ! jq -n --rawfile ids "$SKILL_LEGACY_IDS" --rawfile targets "$SKILL_FILE" '{version: 1, ids: ($ids | split("\n") | map(select(length > 0))), targets: (if ($ids | length) == 0 then [] else ($targets | split("\n") | map(select(length > 0))) end)}' > "$SKILL_PREVIOUS"; then
+      exit 1
+    fi
+  fi
+  if ! jq -n --argjson ids "$(jq -c '[.job.payload.skills[]?.id] | unique' "$SKILL_JOB_FILE")" --rawfile targets "$SKILL_TARGETS" '{version: 1, ids: $ids, targets: ($targets | split("\n") | map(select(length > 0)) | unique)}' > "$SKILL_DESIRED"; then
+    exit 1
+  fi
+  docker exec -i "$SKILL_CONTAINER" sh -c 'umask 077; cat > "$1"' agentbox "$SKILL_STAGE/manifest.json" < "$SKILL_DESIRED" || exit 1
+  if ! jq -nr --slurpfile previous "$SKILL_PREVIOUS" --slurpfile desired "$SKILL_DESIRED" --arg stage "$SKILL_STAGE" '
+    (($previous[0].targets + $desired[0].targets) | unique)[] as $target |
+    (($previous[0].ids + $desired[0].ids) | unique)[] as $id |
+    (($previous[0].targets | index($target)) != null and ($previous[0].ids | index($id)) != null) as $was_managed |
+    (($desired[0].targets | index($target)) != null and ($desired[0].ids | index($id)) != null) as $wanted |
+    if $wanted then ["put", ($target + "/" + $id), ($stage + "/skills/" + $id), (if $was_managed then "1" else "0" end), "-"] | @tsv
+    elif $was_managed then ["delete", ($target + "/" + $id), "-", "1", "-"] | @tsv
+    else empty end
+  ' > "$SKILL_OPERATIONS"; then
+    exit 1
+  fi
+  printf 'put\t/opt/agentbox/skills\t%s/skills\t1\t-\n' "$SKILL_STAGE" >> "$SKILL_OPERATIONS" || exit 1
+  printf 'put\t/opt/agentbox/skills.manifest.json\t%s/manifest.json\t1\t600\n' "$SKILL_STAGE" >> "$SKILL_OPERATIONS" || exit 1
+  managed_paths_reconcile "$SKILL_CONTAINER" "$SKILL_OPERATIONS" || exit 1
+)
+
+read_container_file() {
+  READ_CONTAINER=$1
+  READ_PATH=$2
+  READ_OUTPUT=$3
+  docker exec "$READ_CONTAINER" sh -c '
+    if [ -f "$1" ]; then cat "$1"; elif [ -e "$1" ]; then exit 1; fi
+  ' agentbox "$READ_PATH" > "$READ_OUTPUT"
 }
 
-configure_mcp_servers() {
-  CONTAINER=$1
-  JOB_FILE=$2
-  MCP_COUNT=$(jq '.job.payload.mcpServers | length' "$JOB_FILE")
-  [ "$MCP_COUNT" -gt 0 ] || return 0
+configure_mcp_servers() (
+  MCP_CONTAINER=$1
+  MCP_JOB_FILE=$2
+  MCP_VARIABLE_SNAPSHOT=${3:-}
+  MCP_STAGE=
+  MCP_TEMP_DIR=$(mktemp -d) || exit 1
+  chmod 700 "$MCP_TEMP_DIR" || { rm -rf "$MCP_TEMP_DIR"; exit 1; }
+  mcp_cleanup() {
+    rm -rf "$MCP_TEMP_DIR"
+    [ -z "$MCP_STAGE" ] || docker exec "$MCP_CONTAINER" rm -rf "$MCP_STAGE" >/dev/null 2>&1 || true
+  }
+  trap mcp_cleanup EXIT
+  MCP_NORMALIZED=$MCP_TEMP_DIR/normalized.json
+  MCP_RESOLVED=$MCP_TEMP_DIR/resolved.json
+  MCP_PREVIOUS=$MCP_TEMP_DIR/previous.json
+  MCP_DESIRED=$MCP_TEMP_DIR/desired.json
+  MCP_ADAPTERS=$MCP_TEMP_DIR/adapters
+  MCP_TOOLS=$MCP_TEMP_DIR/tools
+  MCP_IDS=$MCP_TEMP_DIR/ids
+  MCP_OPERATIONS=$MCP_TEMP_DIR/operations
+  MCP_GENERIC=$MCP_TEMP_DIR/mcp.json
+  MCP_LEGACY_MANIFEST=$MCP_TEMP_DIR/legacy-manifest.json
+  MCP_CURRENT=$MCP_TEMP_DIR/current
+  MCP_NEXT=$MCP_TEMP_DIR/next
+  MCP_AUX=$MCP_TEMP_DIR/aux
+  MCP_COUNT=$(jq -er '(.job.payload.mcpServers // []) | if type == "array" then length else error("MCP server list must be an array") end' "$MCP_JOB_FILE") || exit 1
+  if [ -n "$MCP_VARIABLE_SNAPSHOT" ]; then
+    cp "$MCP_VARIABLE_SNAPSHOT" "$MCP_RESOLVED" || exit 1
+  else
+    resolve_worker_variables "$MCP_JOB_FILE" "$MCP_RESOLVED" || exit 1
+  fi
+  if ! jq -e 'type == "object" and all(to_entries[];
+    (.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type) == "string")' "$MCP_RESOLVED" >/dev/null; then
+    echo 'AgentBox resolved Variable snapshot is invalid for MCP configuration' >&2
+    exit 1
+  fi
+  if ! jq -er --slurpfile resolved "$MCP_RESOLVED" '
+    def trim: gsub("^[[:space:]]+|[[:space:]]+$"; "");
+    def arguments:
+      (.spec.arguments // .spec.args // []) |
+      if type == "array" then
+        if all(.[]; type == "string") then . else error("MCP arguments must contain only strings") end
+      elif type == "string" then [scan("[^[:space:]]+")]
+      else error("MCP arguments must be an array or legacy string") end;
+    def headers:
+      (.spec.headers // []) |
+      if type == "array" then map(
+        if type == "object" and (.name | type) == "string" and (.valueFrom | type) == "string"
+        then {name: (.name | trim), valueFrom: (.valueFrom | trim)}
+        else error("MCP header entries must contain name and valueFrom") end)
+      elif type == "string" then
+        split("\n") | map(rtrimstr("\r") | trim | select(length > 0) |
+          (index("=") as $separator |
+           if $separator == null or $separator == 0 then error("legacy MCP header is invalid")
+           else {name: (.[0:$separator] | trim), valueFrom: (.[$separator + 1:] | trim)} end))
+      else error("MCP headers must be an array or legacy string") end;
+    .job.payload as $payload |
+    [($payload.mcpServers // [])[] |
+      . as $server |
+      if (.id | type) != "string" or (.id | test("^[a-z0-9]+(-[a-z0-9]+)*$") | not)
+      then error("MCP server id is invalid") else . end |
+      (arguments) as $arguments |
+      (headers) as $headers |
+      if (($headers | map(.name | ascii_downcase) | length) != ($headers | map(.name | ascii_downcase) | unique | length))
+      then error("MCP header names must be unique") else . end |
+      [$headers[] |
+        . as $header |
+        if (.name | test("^[!#$%&'\''*+.^_`|~0-9A-Za-z-]+$") | not) then error("MCP header name is invalid") else . end |
+        (.valueFrom | capture("^(?<scheme>env|secret)://(?<key>[A-Za-z_][A-Za-z0-9_]*)$")) as $reference |
+        [$payload.variables[]? | select(.spec.key == $reference.key)] as $variables |
+        if ($variables | length) != 1 then error("MCP header must reference one selected Variable") else . end |
+        $variables[0] as $variable |
+        ($variable.spec.reference | capture("^(?<scheme>env|secret)://(?<source>[A-Za-z_][A-Za-z0-9_]*)$")) as $source |
+        if (($reference.scheme == "env" and $variable.spec.mode != "value-ref") or
+            ($reference.scheme == "secret" and $variable.spec.mode != "secret-ref") or
+            $reference.scheme != $source.scheme)
+        then error("MCP header reference does not match selected Variable mode") else . end |
+        if ($resolved[0] | has($reference.key) | not) then error("MCP header Variable could not be resolved")
+        elif ($resolved[0][$reference.key] | test("[\\x00-\\x1F\\x7F]")) then error("MCP header Variable contains a control character")
+        else . end |
+        {name: $header.name, valueFrom: $header.valueFrom, envKey: $reference.key, value: $resolved[0][$reference.key]}
+      ] as $normalized_headers |
+      if .spec.transport == "stdio" then
+        if (.spec.command | type) != "string" or (.spec.command | length) == 0 then error("stdio MCP command is required")
+        elif ($normalized_headers | length) > 0 then error("stdio MCP cannot define HTTP headers")
+        else {id: .id, name: (.name // .id), transport: "stdio", command: .spec.command,
+              arguments: $arguments,
+              cwd: (if ((.spec.cwd // "") | type) == "string" and ((.spec.cwd // "") | length) > 0 then .spec.cwd
+                    elif (($payload.workdir // "") | type) == "string" and (($payload.workdir // "") | length) > 0 then $payload.workdir
+                    else "/workspace" end), headers: []} end
+      elif .spec.transport == "http" then
+        if (.spec.url | type) != "string" or (.spec.url | length) == 0 then error("HTTP MCP URL is required")
+        else {id: .id, name: (.name // .id), transport: "http", url: .spec.url,
+              headers: $normalized_headers} end
+      else error("unsupported MCP transport") end
+    ]
+  ' "$MCP_JOB_FILE" > "$MCP_NORMALIZED"; then
+    echo 'AgentBox MCP configuration is invalid' >&2
+    exit 1
+  fi
+  : > "$MCP_ADAPTERS" || exit 1
+  if ! jq -r '.job.payload.agentTools[]?' "$MCP_JOB_FILE" > "$MCP_AUX" ||
+     ! sort -u "$MCP_AUX" > "$MCP_TOOLS"; then
+    echo 'AgentBox Agent tool selection is invalid for MCP sync' >&2
+    exit 1
+  fi
+  while IFS= read -r MCP_TOOL; do
+    case "$MCP_TOOL" in
+      deepseek-harness) printf '%s\n' dsh >> "$MCP_ADAPTERS" ;;
+      codex) printf '%s\n' codex >> "$MCP_ADAPTERS" ;;
+      claude-code) printf '%s\n' claude >> "$MCP_ADAPTERS" ;;
+      gemini-cli) printf '%s\n' gemini >> "$MCP_ADAPTERS" ;;
+      opencode) printf '%s\n' opencode >> "$MCP_ADAPTERS" ;;
+      '') ;;
+      *) [ "$MCP_COUNT" -eq 0 ] || echo "AgentBox warning: MCP sync is unsupported for Agent tool $MCP_TOOL" >&2 ;;
+    esac
+  done < "$MCP_TOOLS"
+  sort -u -o "$MCP_ADAPTERS" "$MCP_ADAPTERS" || exit 1
+  if [ "$MCP_COUNT" -gt 0 ] && [ ! -s "$MCP_ADAPTERS" ]; then
+    echo 'AgentBox MCP configuration has no supported selected Agent tool' >&2
+    exit 1
+  fi
+  if read_container_file "$MCP_CONTAINER" /opt/agentbox/mcp.manifest.json "$MCP_PREVIOUS" && [ -s "$MCP_PREVIOUS" ]; then
+    if ! jq -e 'type == "object" and .version == 1 and (.ids | type == "array") and (.adapters | type == "array") and all(.ids[]; type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$")) and all(.adapters[]; . == "dsh" or . == "codex" or . == "claude" or . == "gemini" or . == "opencode")' "$MCP_PREVIOUS" >/dev/null; then
+      echo 'AgentBox MCP managed manifest is invalid' >&2
+      exit 1
+    fi
+  else
+    if ! read_container_file "$MCP_CONTAINER" /opt/agentbox/mcp.json "$MCP_CURRENT"; then
+      echo 'AgentBox could not read the legacy MCP manifest' >&2
+      exit 1
+    fi
+    if [ -s "$MCP_CURRENT" ]; then
+      if ! jq -e 'type == "object" and ((.mcpServers // {}) | type == "object")' "$MCP_CURRENT" >/dev/null; then
+        echo 'AgentBox legacy MCP manifest is invalid' >&2
+        exit 1
+      fi
+      # Legacy Workers recorded the selected Agent tools in manifest.json and
+      # projected every MCP id into each matching client. Recover ownership
+      # from that durable provenance; guessing could delete a same-named user
+      # entry or leave a removed AgentBox binding active.
+      if ! read_container_file "$MCP_CONTAINER" /opt/agentbox/manifest.json "$MCP_LEGACY_MANIFEST" ||
+         ! jq -e 'type == "object" and (.agentTools | type) == "array" and
+           all(.agentTools[]; type == "string")' "$MCP_LEGACY_MANIFEST" >/dev/null; then
+        echo 'AgentBox cannot safely migrate the legacy MCP configuration because its Agent tool manifest is unavailable' >&2
+        exit 1
+      fi
+      if ! jq --slurpfile manifest "$MCP_LEGACY_MANIFEST" '
+        {version: 1, ids: ((.mcpServers // {}) | keys), adapters:
+          ([$manifest[0].agentTools[] |
+            if . == "deepseek-harness" then "dsh"
+            elif . == "codex" then "codex"
+            elif . == "claude-code" then "claude"
+            elif . == "gemini-cli" then "gemini"
+            elif . == "opencode" then "opencode"
+            else empty end] | unique)}
+      ' "$MCP_CURRENT" > "$MCP_PREVIOUS"; then
+        echo 'AgentBox could not migrate the legacy MCP ownership manifest' >&2
+        exit 1
+      fi
+    else
+      printf '{"version":1,"ids":[],"adapters":[]}\n' > "$MCP_PREVIOUS" || exit 1
+    fi
+  fi
+  if ! jq -n --argjson ids "$(jq -c 'map(.id) | unique' "$MCP_NORMALIZED")" --rawfile adapters "$MCP_ADAPTERS" '{version: 1, ids: $ids, adapters: ($adapters | split("\n") | map(select(length > 0)) | unique)}' > "$MCP_DESIRED"; then
+    exit 1
+  fi
+  if ! jq '{mcpServers: (map({key: .id, value:
+      ({transport: .transport} +
+       (if .transport == "stdio" then {command: .command, arguments: .arguments, cwd: .cwd}
+        else {url: .url, headers: [.headers[] | {name: .name, valueFrom: .valueFrom}]} end))}) | from_entries)}' "$MCP_NORMALIZED" > "$MCP_GENERIC"; then
+    exit 1
+  fi
+  if ! MCP_STAGE=$(docker exec "$MCP_CONTAINER" sh -c 'mkdir -p /opt/agentbox; mktemp -d /opt/agentbox/.mcp-stage.XXXXXX'); then
+    echo 'AgentBox could not create the MCP staging directory' >&2
+    exit 1
+  fi
+  mcp_stage_file() {
+    MCP_STAGE_NAME=$1
+    MCP_STAGE_SOURCE=$2
+    docker exec -i "$MCP_CONTAINER" sh -c 'umask 077; cat > "$1"' agentbox "$MCP_STAGE/$MCP_STAGE_NAME" < "$MCP_STAGE_SOURCE"
+  }
+  mcp_stage_file mcp.json "$MCP_GENERIC" || exit 1
+  mcp_stage_file manifest.json "$MCP_DESIRED" || exit 1
+  : > "$MCP_OPERATIONS" || exit 1
+  printf 'put\t/opt/agentbox/mcp.json\t%s/mcp.json\t1\t600\n' "$MCP_STAGE" >> "$MCP_OPERATIONS" || exit 1
 
-  MCP_MANIFEST=$(mktemp)
-  jq '{mcpServers: (.job.payload.mcpServers | map({key: .id, value: .spec}) | from_entries)}' \
-    "$JOB_FILE" > "$MCP_MANIFEST"
-  docker exec "$CONTAINER" mkdir -p /opt/agentbox
-  docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /opt/agentbox/mcp.json' < "$MCP_MANIFEST"
-  rm -f "$MCP_MANIFEST"
-
-  if jq -e '.job.payload.agentTools | index("deepseek-harness")' "$JOB_FILE" >/dev/null; then
-    DSH_MCP_PATCH=$(mktemp)
+  MCP_DSH_ENABLED=false
+  grep -Fxq dsh "$MCP_ADAPTERS" && MCP_DSH_ENABLED=true
+  if [ "$MCP_DSH_ENABLED" = true ] && [ "$MCP_COUNT" -gt 0 ]; then
     if ! jq -er '
       def dsh_name:
         (gsub("[^A-Za-z0-9_-]"; "_") | if length == 0 then "server" else . end) as $raw |
-        if ($raw | length) <= 28 then "abx_" + $raw
-        else "abx_" + $raw[:13] + "_" + $raw[-14:]
-        end;
-      .job.payload as $payload |
-      [$payload.mcpServers[] | . + {dshName: (.id | dsh_name)}] as $servers |
+        if ($raw | length) <= 28 then "abx_" + $raw else "abx_" + $raw[:13] + "_" + $raw[-14:] end;
+      [.[] | . + {dshName: (.id | dsh_name)}] as $servers |
       if (($servers | group_by(.dshName) | map(select(length > 1)) | length) > 0)
-      then error("DSH MCP server names collide after normalization")
-      else $servers[]
-      end |
-      .dshName as $server_name |
+      then error("DSH MCP server names collide after normalization") else $servers[] end |
       "- insert:\n" +
-      "  - id: " + (("agentbox-mcp-" + $server_name) | @json) + "\n" +
+      "  - id: " + (("agentbox-mcp-" + .dshName) | @json) + "\n" +
       "    name: \"@deepseek-ai/dsh-mcp-client\"\n" +
       "    config:\n" +
-      "      serverName: " + ($server_name | @json) + "\n" +
-      (if .spec.transport == "stdio" then
+      "      serverName: " + (.dshName | @json) + "\n" +
+      (if .transport == "stdio" then
         "      transport: stdio\n" +
-        "      command: " + (.spec.command | @json) + "\n" +
-        "      args: " + (((.spec.args // "") | [scan("[^[:space:]]+")]) | tojson) + "\n" +
+        "      command: " + (.command | @json) + "\n" +
+        "      args: " + (.arguments | tojson) + "\n" +
         "      env: {}\n" +
-        "      cwd: " + (($payload.workdir // "/workspace") | @json)
-      elif .spec.transport == "http" then
-        "      transport: streamable-http\n" +
-        "      url: " + (.spec.url | @json) + "\n" +
-        "      headers: {}"
-      else error("unsupported DSH MCP transport") end)
-    ' "$JOB_FILE" > "$DSH_MCP_PATCH"; then
-      rm -f "$DSH_MCP_PATCH"
-      echo "DSH MCP configuration is invalid" >&2
-      return 1
-    fi
-    docker exec "$CONTAINER" mkdir -p /opt/agentbox
-    docker exec -i "$CONTAINER" sh -c \
-      'umask 077; cat > /opt/agentbox/dsh-mcp.patch.yml' < "$DSH_MCP_PATCH"
-    rm -f "$DSH_MCP_PATCH"
-  fi
-
-  if jq -e '.job.payload.agentTools | index("codex")' "$JOB_FILE" >/dev/null; then
-    CODEX_CONFIG=$(mktemp)
-    docker exec "$CONTAINER" sh -c 'test ! -f /root/.codex/config.toml || cat /root/.codex/config.toml' > "$CODEX_CONFIG"
-    printf '\n' >> "$CODEX_CONFIG"
-    jq -r '.job.payload.mcpServers[] |
-      "[mcp_servers." + .id + "]\n" +
-      (if .spec.transport == "stdio" then
-        "type = \"stdio\"\ncommand = " + (.spec.command | @json) + "\nargs = " +
-          (((.spec.args // "") | [scan("[^[:space:]]+")]) | tojson) + "\n"
+        "      cwd: " + (.cwd | @json)
       else
-        "type = \"http\"\nurl = " + (.spec.url | @json) + "\n"
-      end)' "$JOB_FILE" >> "$CODEX_CONFIG"
-    docker exec "$CONTAINER" mkdir -p /root/.codex
-    docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.codex/config.toml' < "$CODEX_CONFIG"
-    rm -f "$CODEX_CONFIG"
+        "      transport: streamable-http\n" +
+        "      url: " + (.url | @json) + "\n" +
+        "      headers: " + ((.headers | map({key: .name, value: .value}) | from_entries) | tojson)
+      end)
+    ' "$MCP_NORMALIZED" > "$MCP_NEXT"; then
+      echo 'DSH MCP configuration is invalid' >&2
+      exit 1
+    fi
+    mcp_stage_file dsh-mcp.patch.yml "$MCP_NEXT" || exit 1
+    printf 'put\t/opt/agentbox/dsh-mcp.patch.yml\t%s/dsh-mcp.patch.yml\t1\t600\n' "$MCP_STAGE" >> "$MCP_OPERATIONS" || exit 1
+  else
+    printf 'delete\t/opt/agentbox/dsh-mcp.patch.yml\t-\t1\t-\n' >> "$MCP_OPERATIONS" || exit 1
   fi
 
-  if jq -e '.job.payload.agentTools | index("claude-code")' "$JOB_FILE" >/dev/null; then
-    CLAUDE_CURRENT=$(mktemp)
-    CLAUDE_MCP=$(mktemp)
-    CLAUDE_CONFIG=$(mktemp)
-    docker exec "$CONTAINER" sh -c \
-      'test ! -s /root/.claude.json || cat /root/.claude.json' > "$CLAUDE_CURRENT"
-    [ -s "$CLAUDE_CURRENT" ] || printf '{}\n' > "$CLAUDE_CURRENT"
-    jq '{mcpServers: (.job.payload.mcpServers | map(
-      . as $server | {key: .id, value:
-        (if .spec.transport == "stdio" then
-          {type: "stdio", command: .spec.command,
-           args: ((.spec.args // "") | [scan("[^[:space:]]+")])}
-        else {type: "http", url: .spec.url} end)}
-    ) | from_entries)}' "$JOB_FILE" > "$CLAUDE_MCP"
-    jq -s '.[0] * .[1] | .hasCompletedOnboarding = true' \
-      "$CLAUDE_CURRENT" "$CLAUDE_MCP" > "$CLAUDE_CONFIG"
-    docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.claude.json' < "$CLAUDE_CONFIG"
-    rm -f "$CLAUDE_CURRENT" "$CLAUDE_MCP" "$CLAUDE_CONFIG"
+  MCP_PREVIOUS_IDS=$(jq -r '.ids | join(",")' "$MCP_PREVIOUS") || exit 1
+  MCP_CODEX_ENABLED=false
+  grep -Fxq codex "$MCP_ADAPTERS" && MCP_CODEX_ENABLED=true
+  MCP_CODEX_WAS_ENABLED=false
+  jq -e '.adapters | index("codex") != null' "$MCP_PREVIOUS" >/dev/null && MCP_CODEX_WAS_ENABLED=true
+  if [ "$MCP_CODEX_ENABLED" = true ] || [ "$MCP_CODEX_WAS_ENABLED" = true ]; then
+    MCP_CODEX_OLD_IDS=
+    [ "$MCP_CODEX_WAS_ENABLED" != true ] || MCP_CODEX_OLD_IDS=$MCP_PREVIOUS_IDS
+    read_container_file "$MCP_CONTAINER" /root/.codex/config.toml "$MCP_CURRENT" || exit 1
+    if ! awk -v managed_ids="$MCP_CODEX_OLD_IDS" '
+      BEGIN { split(managed_ids, values, ","); for (i in values) managed[values[i]] = 1; skip = 0 }
+      $0 == "# BEGIN AGENTBOX MANAGED MCP" { next }
+      $0 == "# END AGENTBOX MANAGED MCP" { next }
+      /^[[:space:]]*\[[[:space:]]*mcp_servers[[:space:]]*\.[[:space:]]*"?[a-z0-9-]+"?[[:space:]]*\][[:space:]]*(#.*)?$/ {
+        id = $0
+        sub(/#.*/, "", id)
+        gsub(/[[:space:]\[\]"]/, "", id)
+        sub(/^mcp_servers\./, "", id)
+        skip = (id in managed); if (skip) next
+      }
+      /^[[:space:]]*\[/ { skip = 0 }
+      !skip { print }
+    ' "$MCP_CURRENT" > "$MCP_NEXT"; then
+      exit 1
+    fi
+    if [ "$MCP_CODEX_ENABLED" = true ] && [ "$MCP_COUNT" -gt 0 ]; then
+      jq -r '.[].id' "$MCP_NORMALIZED" > "$MCP_IDS" || exit 1
+      while IFS= read -r MCP_ID; do
+        [ -n "$MCP_ID" ] || continue
+        case ",$MCP_CODEX_OLD_IDS," in
+          *",$MCP_ID,"*) ;;
+          *)
+            if grep -Eq "^[[:space:]]*\\[[[:space:]]*mcp_servers[[:space:]]*\\.[[:space:]]*\"?$MCP_ID\"?[[:space:]]*\\][[:space:]]*(#.*)?$" "$MCP_CURRENT"; then
+              echo "AgentBox MCP id collides with an unmanaged Codex server: $MCP_ID" >&2
+              exit 1
+            fi
+            ;;
+        esac
+      done < "$MCP_IDS"
+      printf '\n# BEGIN AGENTBOX MANAGED MCP\n' >> "$MCP_NEXT" || exit 1
+      if ! jq -r '.[] |
+        "[mcp_servers." + .id + "]\n" +
+        (if .transport == "stdio" then
+          "command = " + (.command | @json) + "\n" +
+          "args = " + (.arguments | tojson) + "\n" +
+          (if (.cwd // "") == "" then "" else "cwd = " + (.cwd | @json) + "\n" end)
+        else
+          "url = " + (.url | @json) + "\n" +
+          (if (.headers | length) == 0 then "" else
+            "env_http_headers = { " + ([.headers[] | (.name | @json) + " = " + (.envKey | @json)] | join(", ")) + " }\n" end)
+        end)' "$MCP_NORMALIZED" >> "$MCP_NEXT"; then
+        exit 1
+      fi
+      printf '# END AGENTBOX MANAGED MCP\n' >> "$MCP_NEXT" || exit 1
+    fi
+    mcp_stage_file codex-config.toml "$MCP_NEXT" || exit 1
+    printf 'put\t/root/.codex/config.toml\t%s/codex-config.toml\t1\t600\n' "$MCP_STAGE" >> "$MCP_OPERATIONS" || exit 1
   fi
 
-  if jq -e '.job.payload.agentTools | index("gemini-cli")' "$JOB_FILE" >/dev/null; then
-    GEMINI_CURRENT=$(mktemp)
-    GEMINI_MCP=$(mktemp)
-    docker exec "$CONTAINER" sh -c 'test ! -f /root/.gemini/settings.json || cat /root/.gemini/settings.json' > "$GEMINI_CURRENT"
-    [ -s "$GEMINI_CURRENT" ] || printf '{}\n' > "$GEMINI_CURRENT"
-    jq '{mcpServers: (.job.payload.mcpServers | map(
-      {key: .id, value:
-        (if .spec.transport == "stdio" then
-          {command: .spec.command, args: ((.spec.args // "") | [scan("[^[:space:]]+")])}
-        else {httpUrl: .spec.url} end)}
-    ) | from_entries)}' "$JOB_FILE" > "$GEMINI_MCP"
-    GEMINI_CONFIG=$(mktemp)
-    jq -s '.[0] * .[1]' "$GEMINI_CURRENT" "$GEMINI_MCP" > "$GEMINI_CONFIG"
-    docker exec "$CONTAINER" mkdir -p /root/.gemini
-    docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.gemini/settings.json' < "$GEMINI_CONFIG"
-    rm -f "$GEMINI_CURRENT" "$GEMINI_MCP" "$GEMINI_CONFIG"
+  MCP_CLAUDE_ENABLED=false
+  grep -Fxq claude "$MCP_ADAPTERS" && MCP_CLAUDE_ENABLED=true
+  MCP_CLAUDE_WAS_ENABLED=false
+  jq -e '.adapters | index("claude") != null' "$MCP_PREVIOUS" >/dev/null && MCP_CLAUDE_WAS_ENABLED=true
+  if [ "$MCP_CLAUDE_ENABLED" = true ] || [ "$MCP_CLAUDE_WAS_ENABLED" = true ]; then
+    read_container_file "$MCP_CONTAINER" /root/.claude.json "$MCP_CURRENT" || exit 1
+    [ -s "$MCP_CURRENT" ] || printf '{}\n' > "$MCP_CURRENT"
+    if ! jq --slurpfile previous "$MCP_PREVIOUS" --slurpfile desired "$MCP_NORMALIZED" --argjson enabled "$MCP_CLAUDE_ENABLED" --arg adapter claude '
+      if type != "object" or ((.mcpServers // {}) | type) != "object" then error("Claude MCP config must be an object") else . end |
+      . as $config |
+      ($previous[0] | if (.adapters | index($adapter)) != null then .ids else [] end) as $old |
+      ($desired[0] | map(.id)) as $wanted |
+      if any($wanted[]; . as $id | (($old | index($id)) == null and (($config.mcpServers // {}) | has($id)))) then error("Claude MCP id collides with unmanaged config") else . end |
+      reduce $old[] as $id (. ; del(.mcpServers[$id])) |
+      if $enabled then .mcpServers = ((.mcpServers // {}) + ($desired[0] | map({key: .id, value:
+        (if .transport == "stdio" then
+          {type: "stdio", command: "sh",
+           args: (["-c", "cd -- \"$1\" && shift && exec \"$@\"", "agentbox-mcp", .cwd, .command] + .arguments)}
+         else ({type: "http", url: .url} + (if (.headers | length) == 0 then {} else
+           {headers: (.headers | map({key: .name, value: ("${" + .envKey + "}")}) | from_entries)} end)) end)}) | from_entries)) else . end |
+      if ((.mcpServers // {}) | length) == 0 then del(.mcpServers) else . end
+    ' "$MCP_CURRENT" > "$MCP_NEXT"; then
+      echo 'Claude MCP configuration is invalid' >&2
+      exit 1
+    fi
+    mcp_stage_file claude.json "$MCP_NEXT" || exit 1
+    printf 'put\t/root/.claude.json\t%s/claude.json\t1\t600\n' "$MCP_STAGE" >> "$MCP_OPERATIONS" || exit 1
   fi
 
-  if jq -e '.job.payload.agentTools | index("opencode")' "$JOB_FILE" >/dev/null; then
-    OPENCODE_CURRENT=$(mktemp)
-    OPENCODE_MCP=$(mktemp)
-    docker exec "$CONTAINER" sh -c 'test ! -f /root/.config/opencode/opencode.json || cat /root/.config/opencode/opencode.json' > "$OPENCODE_CURRENT"
-    [ -s "$OPENCODE_CURRENT" ] || printf '{}\n' > "$OPENCODE_CURRENT"
-    jq '{mcp: (.job.payload.mcpServers | map(
-      {key: .id, value:
-        (if .spec.transport == "stdio" then
-          {type: "local", command: ([.spec.command] + ((.spec.args // "") | [scan("[^[:space:]]+")])), enabled: true}
-        else {type: "remote", url: .spec.url, enabled: true} end)}
-    ) | from_entries)}' "$JOB_FILE" > "$OPENCODE_MCP"
-    OPENCODE_CONFIG=$(mktemp)
-    jq -s '.[0] * .[1]' "$OPENCODE_CURRENT" "$OPENCODE_MCP" > "$OPENCODE_CONFIG"
-    docker exec "$CONTAINER" mkdir -p /root/.config/opencode
-    docker exec -i "$CONTAINER" sh -c 'umask 077; cat > /root/.config/opencode/opencode.json' < "$OPENCODE_CONFIG"
-    rm -f "$OPENCODE_CURRENT" "$OPENCODE_MCP" "$OPENCODE_CONFIG"
+  MCP_GEMINI_ENABLED=false
+  grep -Fxq gemini "$MCP_ADAPTERS" && MCP_GEMINI_ENABLED=true
+  MCP_GEMINI_WAS_ENABLED=false
+  jq -e '.adapters | index("gemini") != null' "$MCP_PREVIOUS" >/dev/null && MCP_GEMINI_WAS_ENABLED=true
+  if [ "$MCP_GEMINI_ENABLED" = true ] || [ "$MCP_GEMINI_WAS_ENABLED" = true ]; then
+    read_container_file "$MCP_CONTAINER" /root/.gemini/settings.json "$MCP_CURRENT" || exit 1
+    [ -s "$MCP_CURRENT" ] || printf '{}\n' > "$MCP_CURRENT"
+    if ! jq --slurpfile previous "$MCP_PREVIOUS" --slurpfile desired "$MCP_NORMALIZED" --argjson enabled "$MCP_GEMINI_ENABLED" --arg adapter gemini '
+      if type != "object" or ((.mcpServers // {}) | type) != "object" then error("Gemini config must be an object") else . end |
+      . as $config |
+      ($previous[0] | if (.adapters | index($adapter)) != null then .ids else [] end) as $old |
+      ($desired[0] | map(.id)) as $wanted |
+      if any($wanted[]; . as $id | (($old | index($id)) == null and (($config.mcpServers // {}) | has($id)))) then error("Gemini MCP id collides with unmanaged config") else . end |
+      reduce $old[] as $id (. ; del(.mcpServers[$id])) |
+      if $enabled then .mcpServers = ((.mcpServers // {}) + ($desired[0] | map({key: .id, value:
+        (if .transport == "stdio" then
+          ({command: .command, args: .arguments} + (if (.cwd // "") == "" then {} else {cwd: .cwd} end))
+         else ({httpUrl: .url} + (if (.headers | length) == 0 then {} else
+           {headers: (.headers | map({key: .name, value: ("$" + .envKey)}) | from_entries)} end)) end)}) | from_entries)) else . end |
+      if ((.mcpServers // {}) | length) == 0 then del(.mcpServers) else . end
+    ' "$MCP_CURRENT" > "$MCP_NEXT"; then
+      echo 'Gemini MCP configuration is invalid' >&2
+      exit 1
+    fi
+    mcp_stage_file gemini-settings.json "$MCP_NEXT" || exit 1
+    printf 'put\t/root/.gemini/settings.json\t%s/gemini-settings.json\t1\t600\n' "$MCP_STAGE" >> "$MCP_OPERATIONS" || exit 1
   fi
-}
+
+  MCP_OPENCODE_ENABLED=false
+  grep -Fxq opencode "$MCP_ADAPTERS" && MCP_OPENCODE_ENABLED=true
+  MCP_OPENCODE_WAS_ENABLED=false
+  jq -e '.adapters | index("opencode") != null' "$MCP_PREVIOUS" >/dev/null && MCP_OPENCODE_WAS_ENABLED=true
+  if [ "$MCP_OPENCODE_ENABLED" = true ] || [ "$MCP_OPENCODE_WAS_ENABLED" = true ]; then
+    read_container_file "$MCP_CONTAINER" /root/.config/opencode/opencode.json "$MCP_CURRENT" || exit 1
+    [ -s "$MCP_CURRENT" ] || printf '{}\n' > "$MCP_CURRENT"
+    if ! jq --slurpfile previous "$MCP_PREVIOUS" --slurpfile desired "$MCP_NORMALIZED" --argjson enabled "$MCP_OPENCODE_ENABLED" --arg adapter opencode '
+      if type != "object" or ((.mcp // {}) | type) != "object" then error("OpenCode config must be an object") else . end |
+      . as $config |
+      ($previous[0] | if (.adapters | index($adapter)) != null then .ids else [] end) as $old |
+      ($desired[0] | map(.id)) as $wanted |
+      if any($wanted[]; . as $id | (($old | index($id)) == null and (($config.mcp // {}) | has($id)))) then error("OpenCode MCP id collides with unmanaged config") else . end |
+      reduce $old[] as $id (. ; del(.mcp[$id])) |
+      if $enabled then .mcp = ((.mcp // {}) + ($desired[0] | map({key: .id, value:
+        (if .transport == "stdio" then {type: "local", command: ([.command] + .arguments), cwd: .cwd, enabled: true}
+         else ({type: "remote", url: .url, enabled: true} + (if (.headers | length) == 0 then {} else
+           {headers: (.headers | map({key: .name, value: ("{env:" + .envKey + "}")}) | from_entries)} end)) end)}) | from_entries)) else . end |
+      if ((.mcp // {}) | length) == 0 then del(.mcp) else . end
+    ' "$MCP_CURRENT" > "$MCP_NEXT"; then
+      echo 'OpenCode MCP configuration is invalid' >&2
+      exit 1
+    fi
+    mcp_stage_file opencode.json "$MCP_NEXT" || exit 1
+    printf 'put\t/root/.config/opencode/opencode.json\t%s/opencode.json\t1\t600\n' "$MCP_STAGE" >> "$MCP_OPERATIONS" || exit 1
+  fi
+  printf 'put\t/opt/agentbox/mcp.manifest.json\t%s/manifest.json\t1\t600\n' "$MCP_STAGE" >> "$MCP_OPERATIONS" || exit 1
+  managed_paths_reconcile "$MCP_CONTAINER" "$MCP_OPERATIONS" || exit 1
+)
+
+configure_sandbox_agent_config() (
+  CONFIG_CONTAINER=$1
+  CONFIG_JOB_FILE=$2
+  CONFIG_VARIABLES=${3:-}
+  CONFIG_RESOLVE_VARIABLES=false
+  if [ -z "$CONFIG_VARIABLES" ]; then
+    CONFIG_VARIABLES=$(mktemp) || exit 1
+    trap 'rm -f "$CONFIG_VARIABLES"' EXIT
+    chmod 600 "$CONFIG_VARIABLES" || exit 1
+    CONFIG_RESOLVE_VARIABLES=true
+  fi
+  CONFIG_IMAGE=$(jq -r '.job.payload.image // empty' "$CONFIG_JOB_FILE") || exit 1
+  if [ "$CONFIG_RESOLVE_VARIABLES" = true ] && ! resolve_worker_variables "$CONFIG_JOB_FILE" "$CONFIG_VARIABLES"; then
+    echo "stage variables failed: image $CONFIG_IMAGE could not resolve AgentBox variable references" >&2
+    exit 1
+  fi
+  if ! configure_credentials "$CONFIG_CONTAINER" "$CONFIG_JOB_FILE"; then
+    echo "stage credentials failed: image $CONFIG_IMAGE could not accept AgentBox configuration" >&2
+    exit 1
+  fi
+  if ! configure_variables "$CONFIG_CONTAINER" "$CONFIG_JOB_FILE" "$CONFIG_VARIABLES"; then
+    echo "stage variables failed: image $CONFIG_IMAGE could not accept AgentBox variable references" >&2
+    exit 1
+  fi
+  if ! configure_skills "$CONFIG_CONTAINER" "$CONFIG_JOB_FILE"; then
+    echo "stage skills failed: image $CONFIG_IMAGE could not accept AgentBox skills" >&2
+    exit 1
+  fi
+  if ! configure_mcp_servers "$CONFIG_CONTAINER" "$CONFIG_JOB_FILE" "$CONFIG_VARIABLES"; then
+    echo "stage mcp failed: image $CONFIG_IMAGE could not accept MCP configuration" >&2
+    exit 1
+  fi
+  if ! install_agent_wrappers "$CONFIG_CONTAINER" "$CONFIG_JOB_FILE"; then
+    echo "stage agent-wrappers failed: image $CONFIG_IMAGE could not install Agent wrappers" >&2
+    exit 1
+  fi
+)
 
 install_agent_wrappers() {
   CONTAINER=$1
@@ -3949,42 +4725,30 @@ memory_mib() {
   esac
 }
 
-redact_extension_output() (
-  if [ "$(wc -c < "$2")" -ge 1048576 ]; then
-    printf '%s' '[extension output exceeded 1 MiB; log withheld]'
-    return 0
-  fi
-  # Redact before truncation so the tail never exposes part of a cut secret.
-  if ! jq -nr --slurpfile job "$1" --rawfile output "$2" '
-    def redact_pending_secret($secret):
-      . as $text |
-      if length == 0 then . else
-        (first(($secret | indices($text[-1:]) | reverse[]) as $index |
-          select($index < ($text | length)) |
-          select($text | endswith($secret[:($index + 1)])) | $index + 1) // 0) as $length |
-        if $length > 0 then .[:-$length] + "[REDACTED]" else . end
-      end;
-    if ($output | utf8bytelength) >= 1048576 then
-      "[extension output exceeded 1 MiB; log withheld]"
-    else
-    $job[0].job.payload as $payload |
-    ([ $payload.environmentVariables[]?.value,
-       ($payload | del(.extensions) | .. | objects | to_entries[] |
-         select(.key | test("secret|token|password|authorization|api.?key"; "i")) | .value),
-       $payload.proxy.redactionValues[]?, $payload.proxy.url,
-       ($payload.proxy.url? // "" | try capture("^[^:]+://(?<auth>[^@]+)@").auth catch empty |
-         ., (split(":")[])) ] |
-      map(select(type == "string" and length > 0)) |
-      map(., @uri, @base64, (@json | .[1:-1]), @sh) | unique | sort_by(length) | reverse) as $secrets |
-    reduce $secrets[] as $secret ($output; split($secret) | join("[REDACTED]")) |
-    reduce $secrets[] as $secret (.; redact_pending_secret($secret)) |
-    gsub("[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]"; "") |
-    .[-4096:] | until(utf8bytelength <= 4096; .[1:])
-    end
-  ' 2>/dev/null; then
-    printf '%s' '[extension log unavailable: redaction failed]'
-  fi
+prepare_job_variable_snapshot() (
+  SNAPSHOT_JOB_FILE=$1
+  SNAPSHOT_OUTPUT_FILE=$2
+  SNAPSHOT_NEXT=$(mktemp "${SNAPSHOT_OUTPUT_FILE}.XXXXXX") || exit 1
+  trap 'rm -f "$SNAPSHOT_NEXT"' EXIT HUP INT TERM
+  chmod 600 "$SNAPSHOT_NEXT" || exit 1
+  resolve_worker_variables "$SNAPSHOT_JOB_FILE" "$SNAPSHOT_NEXT" || exit 1
+  jq -e 'type == "object" and all(to_entries[];
+    (.key | test("^[A-Za-z_][A-Za-z0-9_]*$")) and (.value | type) == "string")' \
+    "$SNAPSHOT_NEXT" >/dev/null || exit 1
+  mv -f "$SNAPSHOT_NEXT" "$SNAPSHOT_OUTPUT_FILE" || exit 1
+  trap - EXIT HUP INT TERM
 )
+
+redact_job_output() {
+  # Sandbox commands and extensions can encode image, workspace, or rotated
+  # secrets that are absent from the current job snapshot. Never export
+  # free-form command output across the Worker API boundary.
+  printf '%s' '[job output withheld: Worker does not export command output]'
+}
+
+redact_extension_output() {
+  printf '%s' '[extension output withheld: Worker does not export sandbox output]'
+}
 
 report_extension_progress() (
   [ -n "${JOB_ID:-}" ] || return 0
@@ -4016,6 +4780,7 @@ run_extension_step() (
   EXTENSION_LOG=$6
   EXTENSION_TIMEOUT=$7
   EXTENSION_WORKDIR=$8
+  EXTENSION_VARIABLE_SNAPSHOT=${9:-}
   EXTENSION_CONTROL=$(basename "$(dirname "$EXTENSION_SCRIPT")")-$EXTENSION_STATUS
   EXTENSION_EXIT_FILE=$EXTENSION_SCRIPT.exit
   : >> "$EXTENSION_LOG"
@@ -4054,7 +4819,7 @@ run_extension_step() (
   while kill -0 "$EXTENSION_PID" 2>/dev/null; do
     [ "$(wc -c < "$EXTENSION_LOG")" -lt 1048576 ] || break
     report_extension_progress "$EXTENSION_ID" "$EXTENSION_STATUS" \
-      "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_LOG")" || true
+      "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_LOG" "$EXTENSION_VARIABLE_SNAPSHOT")" || true
     sleep 2
   done
   if [ "$(wc -c < "$EXTENSION_LOG")" -ge 1048576 ]; then
@@ -4075,6 +4840,7 @@ run_extension_step() (
 install_sandbox_extensions() (
   EXTENSION_CONTAINER=$1
   EXTENSION_JOB=$2
+  EXTENSION_VARIABLE_SNAPSHOT=${3:-}
   EXTENSION_COUNT=$(jq -er '.job.payload.extensions // [] | length' "$EXTENSION_JOB" 2>/dev/null) || return 1
   [ "$EXTENSION_COUNT" -gt 0 ] || return 0
   EXTENSION_DIR=$(mktemp -d) || return 1
@@ -4102,17 +4868,18 @@ install_sandbox_extensions() (
       fi
       jq -r --arg key "$EXTENSION_SCRIPT_KEY" '.spec[$key]' "$EXTENSION_DIR/definition.json" > "$EXTENSION_DIR/step.sh" || return 1
       report_extension_progress "$EXTENSION_ID" "$EXTENSION_STATUS" \
-        "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log")" || true
+        "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log" "$EXTENSION_VARIABLE_SNAPSHOT")" || true
       if ! run_extension_step "$EXTENSION_CONTAINER" "$EXTENSION_JOB" "$EXTENSION_ID" "$EXTENSION_STATUS" \
-        "$EXTENSION_DIR/step.sh" "$EXTENSION_DIR/output.log" "$EXTENSION_TIMEOUT" "$EXTENSION_WORKDIR"; then
+        "$EXTENSION_DIR/step.sh" "$EXTENSION_DIR/output.log" "$EXTENSION_TIMEOUT" "$EXTENSION_WORKDIR" \
+        "$EXTENSION_VARIABLE_SNAPSHOT"; then
         report_extension_progress "$EXTENSION_ID" failed \
-          "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log")" || true
+          "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log" "$EXTENSION_VARIABLE_SNAPSHOT")" || true
         echo 'stage extensions failed: extension installation or verification failed; inspect redacted extension progress' >&2
         return 1
       fi
     done
     if ! report_extension_progress "$EXTENSION_ID" succeeded \
-      "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log")"; then
+      "$(redact_extension_output "$EXTENSION_JOB" "$EXTENSION_DIR/output.log" "$EXTENSION_VARIABLE_SNAPSHOT")"; then
       echo 'stage extensions failed: Server did not acknowledge extension verification' >&2
       return 1
     fi
@@ -4184,8 +4951,46 @@ enforce_docker_network_policy() {
   return 1
 }
 
+build_sandbox_manifest() {
+  MANIFEST_JOB_FILE=$1
+  MANIFEST_OUTPUT=$2
+  jq '
+    .job.payload as $payload |
+    {
+      manifestVersion: 1,
+      sandboxId: $payload.sandboxId,
+      name: $payload.name,
+      driver: $payload.driver,
+      image: $payload.image,
+      workdir: $payload.workdir,
+      cpu: $payload.cpu,
+      memory: $payload.memory,
+      desktop: $payload.desktop,
+      network: $payload.network,
+      workspace: $payload.workspace,
+      proxyId: $payload.proxyId,
+      agentTools: ($payload.agentTools // []),
+      credentialIds: ($payload.credentialIds // []),
+      skillIds: ($payload.skillIds // []),
+      mcpServerIds: ($payload.mcpServerIds // []),
+      variableIds: ($payload.variableIds // []),
+      extensionIds: ($payload.extensionIds // []),
+      capabilityDigest: $payload.capabilityDigest,
+      mcpAllowNet: ($payload.mcpAllowNet // []),
+      controlPlane: {allowNet: ($payload.controlPlane.allowNet // [])},
+      variables: [($payload.variables // [])[] | {id: .id, key: .spec.key}],
+      skills: [($payload.skills // [])[] | {id: .id, name: .name,
+        digest: (.spec.bundleDigest // ""), fileCount: (((.spec.files // []) | length) + 1)}],
+      mcpServers: [($payload.mcpServers // [])[] | {id: .id, name: .name, transport: .spec.transport}]
+    } |
+    with_entries(select(.value != null))
+  ' "$MANIFEST_JOB_FILE" > "$MANIFEST_OUTPUT"
+}
+
 create_sandbox() {
   JOB_FILE=$1
+  CREATE_VARIABLE_SNAPSHOT=${2:-}
+  CREATE_VARIABLE_SNAPSHOT_OWNED=false
   if jq -e '(.job.payload.extensions // [] | length) > 0 and .job.action != "create-sandbox"' "$JOB_FILE" >/dev/null; then
     echo 'stage extensions failed: extensions can only run in a new create-sandbox job; create a new sandbox' >&2
     return 1
@@ -4201,7 +5006,7 @@ create_sandbox() {
   MEMORY_VALUE=$(jq -r '.job.payload.memory // empty' "$JOB_FILE")
   NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
   SETUP=$(jq -r '.job.payload.setup // empty' "$JOB_FILE")
-  TARGET="agentbox-$SANDBOX_ID"
+  TARGET=$(sandbox_created_container_name "$JOB_FILE") || return 1
   VOLUME="agentbox-$SANDBOX_ID-workspace"
   SANDBOX_PREEXISTED=false
   SANDBOX_VOLUME_PREEXISTED=false
@@ -4342,7 +5147,7 @@ create_sandbox() {
     if [ "$DRIVER" = boxlite ] && [ "$NETWORK" = restricted ]; then
       CONTROL_PLANE_HOST=$(sandbox_control_plane_host "$DRIVER")
       for ALLOWED_HOST in $CONTROL_PLANE_HOST $(jq -r \
-        '.job.payload.controlPlane.allowNet[]?, .job.payload.proxy.allowNet[]?' "$JOB_FILE" | sort -u); do
+        '.job.payload.controlPlane.allowNet[]?, .job.payload.proxy.allowNet[]?, .job.payload.mcpAllowNet[]?' "$JOB_FILE" | sort -u); do
         set -- "$@" --allow-net "$ALLOWED_HOST"
       done
     fi
@@ -4387,43 +5192,45 @@ create_sandbox() {
     runtime_call "$DRIVER" fs-mkdir "$TARGET" /opt/agentbox >/dev/null
   fi
   MANIFEST=$(mktemp)
-  if ! docker exec "$TARGET" rm -rf /opt/agentbox/manifest.json ||
-     ! jq '.job.payload | del(.credentials, .proxy)' "$JOB_FILE" > "$MANIFEST" ||
-     ! docker exec -i "$TARGET" sh -c 'cat > /opt/agentbox/manifest.json' < "$MANIFEST"; then
+  if ! build_sandbox_manifest "$JOB_FILE" "$MANIFEST" ||
+     ! jq -e 'type == "object"' "$MANIFEST" >/dev/null ||
+     ! write_container_file_atomic "$TARGET" /opt/agentbox/manifest.json 600 "$MANIFEST"; then
     rm -f "$MANIFEST"
     cleanup_failed_create
     echo "stage manifest-write failed: could not provision the sandbox manifest" >&2
     return 1
   fi
   rm -f "$MANIFEST"
-  if ! configure_credentials "$TARGET" "$JOB_FILE"; then
+  if [ -z "$CREATE_VARIABLE_SNAPSHOT" ]; then
+    CREATE_VARIABLE_SNAPSHOT=$(mktemp) || {
+      cleanup_failed_create
+      echo "stage variables failed: could not create a protected Variable snapshot" >&2
+      return 1
+    }
+    CREATE_VARIABLE_SNAPSHOT_OWNED=true
+    if ! chmod 600 "$CREATE_VARIABLE_SNAPSHOT" ||
+       ! resolve_worker_variables "$JOB_FILE" "$CREATE_VARIABLE_SNAPSHOT"; then
+      rm -f "$CREATE_VARIABLE_SNAPSHOT"
+      cleanup_failed_create
+      echo "stage variables failed: image $IMAGE could not resolve AgentBox variable references" >&2
+      return 1
+    fi
+  fi
+  if ! configure_sandbox_agent_config "$TARGET" "$JOB_FILE" "$CREATE_VARIABLE_SNAPSHOT"; then
+    [ "$CREATE_VARIABLE_SNAPSHOT_OWNED" != true ] || rm -f "$CREATE_VARIABLE_SNAPSHOT"
     cleanup_failed_create
-    echo "stage credentials failed: image $IMAGE could not accept AgentBox configuration" >&2
     return 1
   fi
-  if ! configure_skills "$TARGET" "$JOB_FILE"; then
-    cleanup_failed_create
-    echo "stage skills failed: image $IMAGE could not accept AgentBox skills" >&2
-    return 1
-  fi
-  if ! configure_mcp_servers "$TARGET" "$JOB_FILE"; then
-    cleanup_failed_create
-    echo "stage mcp failed: image $IMAGE could not accept MCP configuration" >&2
-    return 1
-  fi
-  if ! install_agent_wrappers "$TARGET" "$JOB_FILE"; then
-    cleanup_failed_create
-    echo "stage agent-wrappers failed: image $IMAGE could not install Agent wrappers" >&2
-    return 1
-  fi
-  if ! install_sandbox_extensions "$TARGET" "$JOB_FILE"; then
+  if ! install_sandbox_extensions "$TARGET" "$JOB_FILE" "$CREATE_VARIABLE_SNAPSHOT"; then
+    [ "$CREATE_VARIABLE_SNAPSHOT_OWNED" != true ] || rm -f "$CREATE_VARIABLE_SNAPSHOT"
     cleanup_failed_create
     echo 'stage extensions failed: sandbox extension provisioning did not complete' >&2
     return 1
   fi
+  [ "$CREATE_VARIABLE_SNAPSHOT_OWNED" != true ] || rm -f "$CREATE_VARIABLE_SNAPSHOT"
   if [ -n "$SETUP" ]; then
     report_job_progress setup "正在执行模板初始化命令"
-    if ! docker exec "$TARGET" sh -lc "$SETUP" >&2; then
+    if ! docker exec "$TARGET" sh -lc "$SETUP" >/dev/null 2>&1; then
       cleanup_failed_create
       echo "stage setup-command failed: image $IMAGE must provide a POSIX shell for setup commands" >&2
       return 1
@@ -4445,25 +5252,44 @@ create_sandbox() {
   printf '%s' "$TARGET"
 }
 
+sandbox_external_id() {
+  SANDBOX_EXTERNAL_ID=$1
+  SANDBOX_EXTERNAL_ID_SIZE=$(printf '%s' "$SANDBOX_EXTERNAL_ID" | wc -c | tr -d '[:space:]') || return 1
+  case "$SANDBOX_EXTERNAL_ID" in
+    ''|*[!A-Za-z0-9_.-]*) echo 'sandbox external id is invalid' >&2; return 1 ;;
+  esac
+  [ "$SANDBOX_EXTERNAL_ID_SIZE" -le 128 ] || { echo 'sandbox external id is invalid' >&2; return 1; }
+  printf '%s' "$SANDBOX_EXTERNAL_ID"
+}
+
+sandbox_created_container_name() {
+  SANDBOX_CREATED_ID=$(jq -er '.job.payload.sandboxId |
+    if type == "string" and test("^[a-z0-9]+(-[a-z0-9]+)*$") then . else error("invalid sandbox id") end' "$1") || {
+    echo 'sandbox id is invalid' >&2
+    return 1
+  }
+  sandbox_external_id "agentbox-$SANDBOX_CREATED_ID"
+}
+
 sandbox_container_name() {
   JOB_FILE=$1
   EXTERNAL_ID=$(jq -r '.job.payload.externalId // empty' "$JOB_FILE")
   if [ -n "$EXTERNAL_ID" ]; then
-    printf '%s' "$EXTERNAL_ID"
+    sandbox_external_id "$EXTERNAL_ID"
   else
-    SANDBOX_ID=$(jq -r '.job.payload.sandboxId' "$JOB_FILE")
-    printf 'agentbox-%s' "$SANDBOX_ID"
+    sandbox_created_container_name "$JOB_FILE"
   fi
 }
 
 start_sandbox() {
   JOB_FILE=$1
+  START_VARIABLE_SNAPSHOT=${2:-}
   DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
   NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
   validate_sandbox_network_policy_value "$NETWORK" || return 1
   EXTERNAL_ID=$(jq -r '.job.payload.externalId // empty' "$JOB_FILE")
   if [ -z "$EXTERNAL_ID" ]; then
-    create_sandbox "$JOB_FILE"
+    create_sandbox "$JOB_FILE" "$START_VARIABLE_SNAPSHOT"
     return
   fi
   TARGET=$(sandbox_container_name "$JOB_FILE")
@@ -4500,10 +5326,7 @@ start_sandbox() {
   if jq -e '.job.payload.credentials? and .job.payload.agentTools?' "$JOB_FILE" >/dev/null; then
     report_job_progress configuration "正在同步沙箱配置"
     install_agent_tools "$TARGET" "$JOB_FILE" || return 1
-    configure_credentials "$TARGET" "$JOB_FILE" || return 1
-    configure_skills "$TARGET" "$JOB_FILE" || return 1
-    configure_mcp_servers "$TARGET" "$JOB_FILE" || return 1
-    install_agent_wrappers "$TARGET" "$JOB_FILE" || return 1
+    configure_sandbox_agent_config "$TARGET" "$JOB_FILE" "$START_VARIABLE_SNAPSHOT" || return 1
   fi
   ensure_desktop "$TARGET" "$JOB_FILE" || return 1
   report_job_progress verify "正在验证沙箱可用性"
@@ -4512,6 +5335,7 @@ start_sandbox() {
 
 restart_sandbox() {
   JOB_FILE=$1
+  RESTART_VARIABLE_SNAPSHOT=${2:-}
   DRIVER=$(jq -r '.job.payload.driver // "docker"' "$JOB_FILE")
   NETWORK=$(effective_sandbox_network_policy "$DRIVER" "$(jq -r '.job.payload.network // empty' "$JOB_FILE")")
   validate_sandbox_network_policy_value "$NETWORK" || return 1
@@ -4529,7 +5353,7 @@ restart_sandbox() {
     validate_sandbox_network_policy "$DRIVER" "$NETWORK" || return 1
   fi
   stop_sandbox "$JOB_FILE" >/dev/null || return 1
-  start_sandbox "$JOB_FILE"
+  start_sandbox "$JOB_FILE" "$RESTART_VARIABLE_SNAPSHOT"
 }
 
 apply_sandbox_proxy() {
@@ -4953,7 +5777,19 @@ process_create_job() (
     complete_cancelled_create
     return
   fi
-  create_sandbox "$JOB_FILE" >"$CREATE_STATE_DIR/output" 2>"$CREATE_STATE_DIR/log" &
+  (
+    CREATE_VARIABLE_SNAPSHOT=$CREATE_STATE_DIR/variables.snapshot.json
+    if ! prepare_job_variable_snapshot "$JOB_FILE" "$CREATE_VARIABLE_SNAPSHOT"; then
+      # Resolution errors contain only the target key. Keep an empty protected
+      # snapshot so the final error can still redact direct env/credential data.
+      printf '%s\n' '{}' > "$CREATE_VARIABLE_SNAPSHOT"
+      chmod 600 "$CREATE_VARIABLE_SNAPSHOT"
+      : > "$CREATE_STATE_DIR/variable-resolution-failed"
+      echo 'stage variables failed: could not resolve AgentBox variable references' >&2
+      exit 1
+    fi
+    create_sandbox "$JOB_FILE" "$CREATE_VARIABLE_SNAPSHOT"
+  ) >"$CREATE_STATE_DIR/output" 2>"$CREATE_STATE_DIR/log" &
   CREATE_PID=$!
   while kill -0 "$CREATE_PID" 2>/dev/null; do
     CONTROL=$(poll_create_control)
@@ -4975,7 +5811,12 @@ process_create_job() (
   CREATE_SUCCESS=true
   wait "$CREATE_PID" || CREATE_SUCCESS=false
   CREATE_PID=
-  EXTERNAL_ID=$(cat "$CREATE_STATE_DIR/output")
+  EXTERNAL_ID=
+  if [ "$CREATE_SUCCESS" = true ] &&
+     ! EXTERNAL_ID=$(sandbox_created_container_name "$JOB_FILE"); then
+    CREATE_SUCCESS=false
+    echo 'stage create-result failed: sandbox external id is invalid' >> "$CREATE_STATE_DIR/log"
+  fi
   MESSAGE='Sandbox created'
   ERROR_CODE=
   ERROR_STAGE=
@@ -4983,9 +5824,14 @@ process_create_job() (
   CLEANUP_CONFIRMED=true
   if [ "$CREATE_SUCCESS" = false ]; then
     EXTERNAL_ID=
-    MESSAGE=$(tail -c 3500 "$CREATE_STATE_DIR/log")
-    ERROR_STAGE=$(worker_error_stage "$MESSAGE")
-    [ -n "$ERROR_STAGE" ] || ERROR_STAGE=create
+    if [ -f "$CREATE_STATE_DIR/variable-resolution-failed" ]; then
+      ERROR_STAGE=variables
+      MESSAGE='stage variables failed: could not resolve AgentBox variable references'
+    else
+      ERROR_STAGE=$(worker_error_stage_from_log "$CREATE_STATE_DIR/log" || true)
+      [ -n "$ERROR_STAGE" ] || ERROR_STAGE=create
+      MESSAGE=$(worker_safe_stage_message "$ERROR_STAGE")
+    fi
     ERROR_CODE=sandbox_create_failed
     ERROR_RETRYABLE=$(worker_error_retryable "$ERROR_STAGE")
     if ! cleanup_cancelled_create 2>>"$CREATE_STATE_DIR/log"; then
@@ -5075,6 +5921,19 @@ process_job() {
   JOB_ID=$(jq -r '.job.id' "$JOB_FILE")
   LEASE_GENERATION=$(jq -r '.job.leaseGeneration // 0' "$JOB_FILE")
   ACTION=$(jq -r '.job.action' "$JOB_FILE")
+  JOB_VARIABLE_SNAPSHOT=
+  JOB_VARIABLE_SNAPSHOT_ERROR=
+  JOB_VARIABLE_SNAPSHOT_READY=true
+  if [ "$ACTION" != create-sandbox ]; then
+    JOB_VARIABLE_SNAPSHOT=$(mktemp) || return 1
+    JOB_VARIABLE_SNAPSHOT_ERROR=$(mktemp) || { rm -f "$JOB_VARIABLE_SNAPSHOT"; return 1; }
+    rm -f "$JOB_VARIABLE_SNAPSHOT"
+    if ! prepare_job_variable_snapshot "$JOB_FILE" "$JOB_VARIABLE_SNAPSHOT" 2>"$JOB_VARIABLE_SNAPSHOT_ERROR"; then
+      JOB_VARIABLE_SNAPSHOT_READY=false
+      printf '%s\n' '{}' > "$JOB_VARIABLE_SNAPSHOT" || return 1
+      chmod 600 "$JOB_VARIABLE_SNAPSHOT" || return 1
+    fi
+  fi
   case "$ACTION" in
     check-network-proxy)
       RESULT_FILE=$(mktemp)
@@ -5098,8 +5957,10 @@ process_job() {
       if check_agent_tools "$JOB_FILE" "$RESULT_FILE" 2>"$LOG_FILE"; then
         complete_agent_tool_job "$JOB_ID" true "Agent 工具检测完成" "$RESULT_FILE" "$ACTION"
       else
-        MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        [ -n "$MESSAGE" ] || MESSAGE="Agent 工具检测失败"
+        MESSAGE=$(redact_job_output "$JOB_FILE" "$LOG_FILE" "$JOB_VARIABLE_SNAPSHOT" 3500)
+        if [ -z "$MESSAGE" ] || worker_output_was_withheld "$MESSAGE"; then
+          MESSAGE="Agent 工具检测失败；详细命令输出仅保留在 Worker 本机"
+        fi
         complete_agent_tool_job "$JOB_ID" false "$MESSAGE" "$RESULT_FILE" "$ACTION" \
           sandbox_agent_tools_check_failed
       fi
@@ -5140,8 +6001,10 @@ process_job() {
       if [ "$UPDATE_OK" = true ]; then
         complete_agent_tool_job "$JOB_ID" true "Agent 工具更新完成" "$RESULT_FILE" "$ACTION"
       else
-        MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        [ -n "$MESSAGE" ] || MESSAGE="部分 Agent 工具更新失败"
+        MESSAGE=$(redact_job_output "$JOB_FILE" "$LOG_FILE" "$JOB_VARIABLE_SNAPSHOT" 3500)
+        if [ -z "$MESSAGE" ] || worker_output_was_withheld "$MESSAGE"; then
+          MESSAGE="部分 Agent 工具更新失败；详细命令输出仅保留在 Worker 本机"
+        fi
         complete_agent_tool_job "$JOB_ID" false "$MESSAGE" "$RESULT_FILE" "$ACTION" \
           sandbox_agent_tools_update_failed
       fi
@@ -5150,7 +6013,10 @@ process_job() {
     update-worker)
       LOG_FILE=$(mktemp)
       if ! update_worker "$JOB_FILE" 2>"$LOG_FILE"; then
-        MESSAGE=$(tail -c 3500 "$LOG_FILE")
+        MESSAGE=$(redact_job_output "$JOB_FILE" "$LOG_FILE" "$JOB_VARIABLE_SNAPSHOT" 3500)
+        if [ -z "$MESSAGE" ] || worker_output_was_withheld "$MESSAGE"; then
+          MESSAGE="Worker 更新失败；详细命令输出仅保留在 Worker 本机"
+        fi
         if [ -e "$STATE_DIR/worker-update.json" ]; then
           # Activation may have failed after the durable journal was created.
           # Leave the lease unresolved so the finalizer can restore and report
@@ -5164,7 +6030,16 @@ process_job() {
       ;;
     configure-sandbox-proxy)
       LOG_FILE=$(mktemp)
-      if EXTERNAL_ID=$(apply_sandbox_proxy "$JOB_FILE" 2>"$LOG_FILE"); then
+      OPERATION_OUTPUT=$(mktemp)
+      PROXY_OK=false
+      if apply_sandbox_proxy "$JOB_FILE" >"$OPERATION_OUTPUT" 2>"$LOG_FILE"; then
+        if EXTERNAL_ID=$(sandbox_container_name "$JOB_FILE"); then
+          PROXY_OK=true
+        else
+          echo 'stage proxy-config failed: sandbox external id is invalid' >> "$LOG_FILE"
+        fi
+      fi
+      if [ "$PROXY_OK" = true ]; then
         if jq -e '.job.payload.proxy? and (.job.payload.proxy.url // "") != ""' "$JOB_FILE" >/dev/null; then
           MESSAGE="沙箱网络代理已应用；新的 Agent 和终端进程将使用该代理"
         else
@@ -5172,34 +6047,73 @@ process_job() {
         fi
         complete_job "$JOB_ID" true "$EXTERNAL_ID" "$MESSAGE"
       else
-        MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        [ -n "$MESSAGE" ] || MESSAGE="沙箱网络出口应用失败"
+        MESSAGE=$(redact_job_output "$JOB_FILE" "$LOG_FILE" "$JOB_VARIABLE_SNAPSHOT" 3500)
+        if [ -z "$MESSAGE" ] || worker_output_was_withheld "$MESSAGE"; then
+          MESSAGE="沙箱网络出口应用失败；详细命令输出仅保留在 Worker 本机"
+        fi
         complete_job_failure "$JOB_ID" sandbox_proxy_apply_failed proxy-config true "$MESSAGE" "$ACTION"
       fi
-      rm -f "$LOG_FILE"
+      rm -f "$LOG_FILE" "$OPERATION_OUTPUT"
       ;;
     create-sandbox)
       process_create_job
       ;;
     start-sandbox|stop-sandbox|restart-sandbox|delete-sandbox)
       LOG_FILE=$(mktemp)
+      OPERATION_OUTPUT=$(mktemp)
       case "$ACTION" in
         start-sandbox) OPERATION=start_sandbox ;;
         stop-sandbox) OPERATION=stop_sandbox ;;
         restart-sandbox) OPERATION=restart_sandbox ;;
         delete-sandbox) OPERATION=delete_sandbox ;;
       esac
-      if EXTERNAL_ID=$($OPERATION "$JOB_FILE" 2>"$LOG_FILE"); then
-        MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        [ -n "$MESSAGE" ] || MESSAGE="Sandbox operation completed"
+      OPERATION_READY=true
+      OPERATION_SAFE_FAILURE_MESSAGE=
+      case "$ACTION" in
+        start-sandbox|restart-sandbox)
+          if [ "$JOB_VARIABLE_SNAPSHOT_READY" != true ]; then
+            cat "$JOB_VARIABLE_SNAPSHOT_ERROR" > "$LOG_FILE"
+            echo 'stage variables failed: could not resolve AgentBox variable references' >> "$LOG_FILE"
+            OPERATION_READY=false
+            OPERATION_SAFE_FAILURE_MESSAGE='stage variables failed: could not resolve AgentBox variable references'
+          fi
+          ;;
+      esac
+      OPERATION_OK=false
+      if [ "$OPERATION_READY" = true ] &&
+         "$OPERATION" "$JOB_FILE" "$JOB_VARIABLE_SNAPSHOT" >"$OPERATION_OUTPUT" 2>"$LOG_FILE"; then
+        OPERATION_OK=true
+        if [ "$ACTION" = delete-sandbox ]; then
+          EXTERNAL_ID=
+        elif ! EXTERNAL_ID=$(sandbox_container_name "$JOB_FILE"); then
+          echo "stage ${ACTION%-sandbox} failed: sandbox external id is invalid" >> "$LOG_FILE"
+          OPERATION_OK=false
+        fi
+      fi
+      if [ "$OPERATION_OK" = true ]; then
+        case "$ACTION" in
+          start-sandbox) MESSAGE="Sandbox started" ;;
+          stop-sandbox) MESSAGE="Sandbox stopped" ;;
+          restart-sandbox) MESSAGE="Sandbox restarted" ;;
+          delete-sandbox) MESSAGE="Sandbox deleted" ;;
+        esac
         complete_job "$JOB_ID" true "$EXTERNAL_ID" "$MESSAGE"
       else
-        MESSAGE=$(tail -c 3500 "$LOG_FILE")
-        ERROR_STAGE=${ACTION%-sandbox}
+        if [ -n "$OPERATION_SAFE_FAILURE_MESSAGE" ]; then
+          MESSAGE=$OPERATION_SAFE_FAILURE_MESSAGE
+          ERROR_STAGE=variables
+        else
+          ERROR_STAGE=$(worker_error_stage_from_log "$LOG_FILE" || true)
+          [ -n "$ERROR_STAGE" ] || ERROR_STAGE=${ACTION%-sandbox}
+          MESSAGE=$(redact_job_output "$JOB_FILE" "$LOG_FILE" "$JOB_VARIABLE_SNAPSHOT" 3500)
+          if [ -z "$MESSAGE" ] || worker_output_was_withheld "$MESSAGE"; then
+            MESSAGE=$(worker_safe_stage_message "$ERROR_STAGE")
+          fi
+        fi
         ERROR_CODE=$(printf '%s_failed' "$ACTION" | tr '-' '_')
         complete_job_failure "$JOB_ID" "$ERROR_CODE" "$ERROR_STAGE" false "$MESSAGE" "$ACTION"
       fi
-      rm -f "$LOG_FILE"
+      rm -f "$LOG_FILE" "$OPERATION_OUTPUT"
       ;;
     *) complete_job_failure "$JOB_ID" worker_action_unsupported dispatch false \
          "Unsupported worker action: $ACTION" "$ACTION" ;;
@@ -5207,6 +6121,7 @@ process_job() {
   case "$ACTION" in
     create-sandbox|start-sandbox|restart-sandbox) mark_worker_inventory_dirty || true ;;
   esac
+  rm -f "$JOB_VARIABLE_SNAPSHOT" "$JOB_VARIABLE_SNAPSHOT_ERROR"
 }
 
 mark_worker_inventory_dirty() {

@@ -55,7 +55,7 @@ func TestCreateSandboxFreezesInheritedModelBindingsAndLegacyFallbackStaysConserv
 	inventory := platform.ServerInventory{
 		DockerImages: []platform.ServerImage{{Reference: "ubuntu:24.04", Architecture: "amd64"}},
 	}
-	if err := s.HeartbeatServer(ctx, serverID, workerCredential, []string{"docker"}, &inventory, "test"); err != nil {
+	if err := s.HeartbeatServer(ctx, serverID, workerCredential, []string{"docker", workerFailClosedJobOutputCapability}, &inventory, "test"); err != nil {
 		t.Fatalf("heartbeat legacy binding Worker: %v", err)
 	}
 

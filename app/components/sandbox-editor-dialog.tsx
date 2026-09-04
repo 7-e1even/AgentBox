@@ -22,12 +22,19 @@ import {
 } from "@/lib/environment-variables"
 import { reconcileModelBindings } from "@/lib/model-bindings"
 import {
+  hasOnlyUnsupportedMCPAgentTools,
+  mergeRequiredMCPVariableIds,
+  missingMCPVariableIds,
+  unresolvedMCPHeaderReferences,
+} from "@/lib/mcp-config"
+import {
   resourceInputSchema,
   sandboxSpecForUpdate,
   type Resource,
   type ResourceDraft,
   type ResourceInput,
   type ResourceOfKind,
+  type SandboxCapabilityOverrideKey,
 } from "@/lib/platform-schema"
 import {
   normalizeRuntimeImageReference,
@@ -36,6 +43,7 @@ import {
 import type { ManagedServer } from "@/lib/server-schema"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
 import { ExtensionSelector } from "@/components/extension-selector"
+import { MCPCompatibilityNotice } from "@/components/mcp-compatibility-notice"
 import { RuntimeImageCombobox } from "@/components/runtime-image-combobox"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Button } from "@/components/ui/button"
@@ -124,6 +132,9 @@ export function SandboxEditorDialog({
       ? sandboxInputFromResource(resource, initialTemplate, credentials)
       : createSandboxInput(projectId, resources, initialTemplate, credentials)
   )
+  const [touchedCapabilityKeys, setTouchedCapabilityKeys] = useState<
+    Set<SandboxCapabilityOverrideKey>
+  >(() => new Set())
   const [error, setError] = useState("")
   const [saving, setSaving] = useState(false)
   const template = templates.find((item) => item.id === input.spec.runtimeId)
@@ -160,8 +171,24 @@ export function SandboxEditorDialog({
     credential: credentials.find((item) => item.id === id && item.enabled),
   }))
   const enabledCredentials = credentials.filter((item) => item.enabled)
-  const projectSkills = projectResources(resources, projectId, "skill")
-  const projectMCPServers = projectResources(resources, projectId, "mcp")
+  const capabilityResources = resources.filter(
+    (item) => item.projectId === projectId
+  )
+  const projectSkills = projectResources(
+    capabilityResources,
+    projectId,
+    "skill"
+  )
+  const projectMCPServers = projectResources(
+    capabilityResources,
+    projectId,
+    "mcp"
+  )
+  const projectVariables = projectResources(
+    capabilityResources,
+    projectId,
+    "variable"
+  )
   const driverOptions = runtimeDriverOptions(server)
   const imageChoices = runtimeImageChoices(
     server,
@@ -196,6 +223,14 @@ export function SandboxEditorDialog({
     setError("")
   }
 
+  function updateCapability(
+    key: SandboxCapabilityOverrideKey,
+    values: string[]
+  ) {
+    setTouchedCapabilityKeys((current) => new Set(current).add(key))
+    updateSpec(key, values)
+  }
+
   function selectTemplate(runtimeId: string) {
     const nextTemplate = templates.find((item) => item.id === runtimeId)
     setInput((current) => ({
@@ -203,7 +238,7 @@ export function SandboxEditorDialog({
       spec: {
         ...current.spec,
         runtimeId,
-        ...templateDefaults(nextTemplate),
+        ...templateDefaultsForCreate(nextTemplate, resources),
         modelBindings: reconcileModelBindings(
           stringList(nextTemplate?.spec.credentialIds),
           credentials,
@@ -285,6 +320,35 @@ export function SandboxEditorDialog({
     })
   }
 
+  function selectMCPServers(values: string[]) {
+    const currentVariableIds = stringList(input.spec.variableIds)
+    const nextVariableIds = mergeRequiredMCPVariableIds(
+      values,
+      currentVariableIds,
+      capabilityResources
+    )
+    setTouchedCapabilityKeys((current) => {
+      const next = new Set(current).add("mcpServerIds" as const)
+      if (!sameStringList(currentVariableIds, nextVariableIds)) {
+        next.add("variableIds")
+      }
+      return next
+    })
+    setInput((current) => ({
+      ...current,
+      spec: {
+        ...current.spec,
+        mcpServerIds: values,
+        variableIds: mergeRequiredMCPVariableIds(
+          values,
+          current.spec.variableIds,
+          capabilityResources
+        ),
+      },
+    }))
+    setError("")
+  }
+
   async function submit() {
     if (saving || !dependenciesReady) return
     if (!template) {
@@ -310,6 +374,39 @@ export function SandboxEditorDialog({
       setError(environmentError)
       return
     }
+    if (
+      hasOnlyUnsupportedMCPAgentTools(
+        input.spec.agentTools,
+        input.spec.mcpServerIds
+      )
+    ) {
+      setError(
+        "所选 Agent 均不支持 MCP；请增加 Codex、Claude Code、DeepSeek Harness、Gemini CLI 或 OpenCode，或取消 MCP。"
+      )
+      return
+    }
+    const unresolvedReferences = unresolvedMCPHeaderReferences(
+      input.spec.mcpServerIds,
+      capabilityResources
+    )
+    if (unresolvedReferences.length > 0) {
+      setError(
+        `MCP Header 引用在当前项目没有对应 Variable：${unresolvedReferences.join("、")}`
+      )
+      return
+    }
+    const missingVariables = missingMCPVariableIds(
+      input.spec.mcpServerIds,
+      input.spec.variableIds,
+      capabilityResources
+    )
+    if (missingVariables.length > 0) {
+      const names = missingVariables.map(
+        (id) => capabilityResources.find((item) => item.id === id)?.name ?? id
+      )
+      setError(`MCP Header 还需要绑定 Variable：${names.join("、")}`)
+      return
+    }
     const next: ResourceDraft = {
       ...input,
       projectId,
@@ -322,7 +419,9 @@ export function SandboxEditorDialog({
       },
     }
     if (resource?.kind === "sandbox") {
-      next.spec = sandboxSpecForUpdate(next.spec, resource.spec)
+      next.spec = sandboxSpecForUpdate(next.spec, resource.spec, [
+        ...touchedCapabilityKeys,
+      ])
     }
     const parsed = resourceInputSchema.safeParse(next)
     if (!parsed.success) {
@@ -796,13 +895,25 @@ export function SandboxEditorDialog({
                 label="预装 Skills"
                 options={projectSkills}
                 value={stringList(input.spec.skillIds)}
-                onValueChange={(values) => updateSpec("skillIds", values)}
+                onValueChange={(values) => updateCapability("skillIds", values)}
               />
               <CapabilitySelector
                 label="预配 MCP Servers"
                 options={projectMCPServers}
                 value={stringList(input.spec.mcpServerIds)}
-                onValueChange={(values) => updateSpec("mcpServerIds", values)}
+                onValueChange={selectMCPServers}
+              />
+              <CapabilitySelector
+                label="变量引用"
+                options={projectVariables}
+                value={stringList(input.spec.variableIds)}
+                onValueChange={(values) =>
+                  updateCapability("variableIds", values)
+                }
+              />
+              <MCPCompatibilityNotice
+                agentTools={input.spec.agentTools}
+                mcpServerIds={input.spec.mcpServerIds}
               />
               <Field>
                 <FieldLabel>环境变量</FieldLabel>
@@ -1064,7 +1175,7 @@ function createSandboxInput(
       policy: "new",
       status: "requested",
       runtimeId: template?.id ?? "",
-      ...templateDefaults(template),
+      ...templateDefaultsForCreate(template, resources),
       modelBindings: reconcileModelBindings(
         stringList(template?.spec.credentialIds),
         credentials,
@@ -1133,6 +1244,31 @@ function templateDefaults(template?: ResourceOfKind<"runtime">) {
   }
 }
 
+function templateDefaultsForCreate(
+  template: ResourceOfKind<"runtime"> | undefined,
+  resources: Resource[]
+) {
+  const defaults = templateDefaults(template)
+  const projectResources = resources.filter(
+    (item) => item.projectId === template?.projectId
+  )
+  return {
+    ...defaults,
+    variableIds: mergeRequiredMCPVariableIds(
+      defaults.mcpServerIds,
+      defaults.variableIds,
+      projectResources
+    ),
+  }
+}
+
+function sameStringList(left: string[], right: string[]) {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  )
+}
+
 function runtimeDriverOptions(server?: ManagedServer) {
   if (!server) return []
   return [
@@ -1193,7 +1329,7 @@ function runtimeImageDescription(driver: string) {
 function projectResources(
   resources: Resource[],
   projectId: string,
-  kind: "skill" | "mcp"
+  kind: "skill" | "mcp" | "variable"
 ) {
   return resources
     .filter(

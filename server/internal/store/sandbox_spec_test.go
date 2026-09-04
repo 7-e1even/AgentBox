@@ -93,6 +93,12 @@ func TestIncompatibleAgentToolsChecksCredentialProtocols(t *testing.T) {
 	}
 }
 
+func TestIncompatibleAgentToolsAllowsAgentLoginWithoutCredentials(t *testing.T) {
+	if got := incompatibleAgentTools([]string{"codex"}, nil); len(got) != 0 {
+		t.Fatalf("incompatibleAgentTools() = %#v, want none without configured credentials", got)
+	}
+}
+
 func TestIncompatibleAgentToolsAllowsSingleConvertibleLLMProtocol(t *testing.T) {
 	for _, protocol := range []string{"anthropic", "openai-responses", "openai-chat"} {
 		got := incompatibleAgentTools(

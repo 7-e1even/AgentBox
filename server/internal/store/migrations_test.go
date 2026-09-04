@@ -291,6 +291,26 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 	if _, err := store.pool.Exec(ctx, string(legacySQL)); err != nil {
 		t.Fatalf("install v0.1.6 schema: %v", err)
 	}
+	// Simulate a database that received the structured Worker error columns
+	// before the security migration while still retaining v0.1.6 data.
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE worker_jobs
+	  ADD COLUMN IF NOT EXISTS result_error_code TEXT NOT NULL DEFAULT '',
+	  ADD COLUMN IF NOT EXISTS result_error_stage TEXT NOT NULL DEFAULT '',
+	  ADD COLUMN IF NOT EXISTS result_error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+	  ADD COLUMN IF NOT EXISTS result_error_details JSONB NOT NULL DEFAULT '{}'::jsonb;
+	ALTER TABLE automation_runs
+	  ADD COLUMN IF NOT EXISTS exit_code INTEGER,
+	  ADD COLUMN IF NOT EXISTS output TEXT NOT NULL DEFAULT '',
+	  ADD COLUMN IF NOT EXISTS output_truncated BOOLEAN NOT NULL DEFAULT FALSE,
+	  ADD COLUMN IF NOT EXISTS cleanup_status TEXT NOT NULL DEFAULT '',
+	  ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,
+	  ADD COLUMN IF NOT EXISTS error_stage TEXT NOT NULL DEFAULT '',
+	  ADD COLUMN IF NOT EXISTS error_retryable BOOLEAN NOT NULL DEFAULT FALSE,
+	  ADD COLUMN IF NOT EXISTS error_details JSONB NOT NULL DEFAULT '{}'::jsonb;
+	ALTER TABLE automation_runs DROP CONSTRAINT IF EXISTS automation_runs_action_type_check;
+	ALTER TABLE automation_runs DROP CONSTRAINT IF EXISTS automation_runs_status_check`); err != nil {
+		t.Fatalf("install partial structured Worker error schema: %v", err)
+	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO control_resources
 	  (id, kind, project_id, name, description, enabled, spec, created_at, updated_at)
 	  VALUES
@@ -298,18 +318,45 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 	    ('legacy-custom-skill', 'skill', 'legacy-project', 'Existing custom skill', '', TRUE,
 	      '{"content":"keep this custom skill"}'::jsonb, NOW(), NOW()),
 	    ('legacy-runtime', 'runtime', 'legacy-project', 'Existing template', '', TRUE,
-	      '{"driver":"docker","network":"restricted","skillIds":["legacy-custom-skill"],"customValue":"preserved"}'::jsonb,
+	      '{"driver":"docker","network":"restricted","skillIds":["legacy-custom-skill"],"agentTools":["codex"],"mcpServerIds":["legacy-mcp-safe","legacy-mcp-unsafe"],"customValue":"preserved"}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-url-runtime', 'runtime', 'legacy-project', 'Existing URL template', '', TRUE,
+	      '{"driver":"docker","network":"restricted","agentTools":["codex"],"mcpServerIds":["legacy-mcp-url-unsafe"]}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-mcp-safe', 'mcp', 'legacy-project', 'Existing referenced MCP', '', TRUE,
+	      '{"transport":"http","url":"https://safe.example.test/rpc","headers":" X-Api-Key = env://MCP_TOKEN \nX-Trace = secret://TRACE "}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-mcp-unsafe', 'mcp', 'legacy-project', 'Existing literal MCP', '', TRUE,
+	      '{"transport":"http","url":"https://unsafe.example.test/rpc","headers":"Authorization=Bearer resource-plaintext-secret"}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-mcp-malformed', 'mcp', 'legacy-project', 'Existing malformed MCP', '', TRUE,
+	      '{"transport":"http","url":"https://malformed.example.test/rpc","headers":{"X-Api-Key":"resource-shape-plaintext-secret"}}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-mcp-url-unsafe', 'mcp', 'legacy-project', 'Existing URL credential MCP', '', TRUE,
+	      '{"transport":"http","url":"https://user:url-plaintext-secret@url-unsafe.example.test/rpc?token=url-plaintext-secret#url-plaintext-secret"}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-mcp-canonical', 'mcp', 'legacy-project', 'Existing canonical MCP', '', TRUE,
+	      '{"transport":"http","url":"https://canonical.example.test/rpc","headers":[{"name":"X-Api-Key","valueFrom":"env://CANONICAL_TOKEN"}]}'::jsonb,
+	      NOW(), NOW()),
+	    ('legacy-canonical-runtime', 'runtime', 'legacy-project', 'Existing canonical template', '', TRUE,
+	      '{"driver":"docker","network":"restricted","mcpServerIds":["legacy-mcp-canonical"]}'::jsonb,
 	      NOW(), NOW()),
 	    ('legacy-microsandbox-runtime', 'runtime', 'legacy-project', 'Existing Microsandbox template', '', TRUE,
 	      '{"driver":"microsandbox","network":"restricted"}'::jsonb, NOW(), NOW()),
 	    ('legacy-boxlite-runtime', 'runtime', 'legacy-project', 'Existing BoxLite template', '', TRUE,
 	      '{"driver":"boxlite","network":"restricted"}'::jsonb, NOW(), NOW()),
 	    ('legacy-docker-sandbox', 'sandbox', 'legacy-project', 'Existing Docker sandbox', '', TRUE,
-	      '{"runtimeId":"legacy-runtime","driver":"docker","network":"restricted"}'::jsonb, NOW(), NOW()),
+	      '{"runtimeId":"legacy-runtime","driver":"docker","network":"restricted","status":"running","externalId":"sandbox-history-plaintext-secret","message":"sandbox-history-plaintext-secret","provisioning":{"message":"sandbox-history-plaintext-secret","extensions":[{"id":"example","output":"sandbox-history-plaintext-secret"}]},"extensionStates":[{"id":"example","status":"succeeded","output":"sandbox-history-plaintext-secret"}],"agentToolVersions":[{"tool":"codex","status":"installed","currentVersion":"sandbox-history-plaintext-secret","previousVersion":"sandbox-history-plaintext-secret"}],"agentToolOperation":{"message":"sandbox-history-plaintext-secret"},"proxyOperation":{"message":"sandbox-history-plaintext-secret"}}'::jsonb, NOW(), NOW()),
+	    ('orphan-history-sandbox', 'sandbox', 'legacy-project', 'Orphaned historical sandbox', '', TRUE,
+	      '{"driver":"docker","network":"egress","status":"running","externalId":"orphan-sandbox-plaintext-secret","message":"orphan-sandbox-plaintext-secret","provisioning":{"message":"orphan-sandbox-plaintext-secret"},"extensionStates":[{"id":"example","status":"succeeded","output":"orphan-sandbox-plaintext-secret"}],"agentToolVersions":[{"tool":"codex","status":"installed","currentVersion":"orphan-sandbox-plaintext-secret"}],"agentToolOperation":{"message":"orphan-sandbox-plaintext-secret"},"proxyOperation":{"message":"orphan-sandbox-plaintext-secret"}}'::jsonb, NOW(), NOW()),
+	    ('legacy-url-sandbox', 'sandbox', 'legacy-project', 'Existing URL sandbox', '', TRUE,
+	      '{"runtimeId":"legacy-url-runtime","driver":"docker","network":"restricted","status":"running"}'::jsonb, NOW(), NOW()),
 	    ('legacy-microsandbox-sandbox', 'sandbox', 'legacy-project', 'Existing Microsandbox sandbox', '', TRUE,
 	      '{"runtimeId":"legacy-microsandbox-runtime","network":"restricted"}'::jsonb, NOW(), NOW()),
 	    ('legacy-boxlite-sandbox', 'sandbox', 'legacy-project', 'Existing BoxLite sandbox', '', TRUE,
-	      '{"runtimeId":"legacy-boxlite-runtime","network":"restricted"}'::jsonb, NOW(), NOW())`); err != nil {
+	      '{"runtimeId":"legacy-boxlite-runtime","network":"restricted"}'::jsonb, NOW(), NOW()),
+	    ('legacy-canonical-sandbox', 'sandbox', 'legacy-project', 'Existing canonical sandbox', '', TRUE,
+	      '{"runtimeId":"legacy-canonical-runtime","driver":"docker","network":"restricted"}'::jsonb, NOW(), NOW())`); err != nil {
 		t.Fatalf("insert v0.1.6 resources: %v", err)
 	}
 	serverID := uuid.NewString()
@@ -324,19 +371,97 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 	microsandboxJobID := uuid.NewString()
 	boxliteJobID := uuid.NewString()
 	completedJobID := uuid.NewString()
+	canonicalJobID := uuid.NewString()
 	if _, err := store.pool.Exec(ctx, `INSERT INTO worker_jobs
 	  (id, server_id, resource_id, action, status, payload, created_at, updated_at)
 	  VALUES
 	    ($1, $5, 'legacy-docker-sandbox', 'create-sandbox', 'pending',
-	      '{"driver":"docker","network":"restricted"}'::jsonb, NOW(), NOW()),
+	      '{"driver":"docker","network":"restricted","mcpServers":[{"id":"legacy-mcp-safe","spec":{"transport":"http","url":"https://safe.example.test/rpc","headers":" X-Api-Key = env://MCP_TOKEN "}},{"id":"legacy-mcp-unsafe","spec":{"transport":"http","url":"https://unsafe.example.test/rpc","headers":"Authorization=Bearer pending-job-plaintext-secret"}},{"id":"legacy-mcp-url-unsafe","spec":{"transport":"http","url":"https://user:job-url-plaintext-secret@job-url.example.test/rpc?token=job-url-plaintext-secret"}}]}'::jsonb,
+	      NOW(), NOW()),
 	    ($2, $5, 'legacy-microsandbox-sandbox', 'start-sandbox', 'pending',
 	      '{"driver":"microsandbox","network":"restricted"}'::jsonb, NOW(), NOW()),
-	    ($3, $5, 'legacy-boxlite-sandbox', 'restart-sandbox', 'pending',
-	      '{"driver":"boxlite","network":"restricted"}'::jsonb, NOW(), NOW()),
-	    ($4, $5, 'legacy-docker-sandbox', 'restart-sandbox', 'succeeded',
-	      '{"driver":"docker","network":"restricted"}'::jsonb, NOW(), NOW())`,
-		dockerJobID, microsandboxJobID, boxliteJobID, completedJobID, serverID); err != nil {
+	    ($3, $5, 'legacy-boxlite-sandbox', 'restart-sandbox', 'leased',
+	      '{"driver":"boxlite","network":"restricted","mcpServers":[{"id":"legacy-mcp-unsafe","spec":{"transport":"http","url":"https://unsafe.example.test/rpc","headers":"Authorization=Bearer leased-job-plaintext-secret"}}]}'::jsonb,
+	      NOW(), NOW()),
+	    ($4, $5, 'legacy-docker-sandbox', 'restart-sandbox', 'failed',
+	      '{"driver":"docker","network":"restricted","mcpServers":[{"id":"legacy-mcp-unsafe","spec":{"transport":"http","url":"https://unsafe.example.test/rpc","headers":[{"name":"X-Api-Key","valueFrom":"terminal-job-plaintext-secret"}]}},{"id":"legacy-mcp-malformed","spec":{"transport":"http","url":"https://malformed.example.test/rpc","headers":{"X-Api-Key":"terminal-shape-plaintext-secret"}}}]}'::jsonb,
+	      NOW(), NOW()),
+	    ($6, $5, 'legacy-canonical-sandbox', 'restart-sandbox', 'succeeded',
+	      '{"driver":"docker","network":"restricted","mcpServers":[{"id":"legacy-mcp-canonical","spec":{"transport":"http","url":"https://canonical.example.test/rpc","headers":[{"name":"X-Api-Key","valueFrom":"env://CANONICAL_TOKEN"}]}}]}'::jsonb,
+	      NOW(), NOW())`,
+		dockerJobID, microsandboxJobID, boxliteJobID, completedJobID, serverID, canonicalJobID); err != nil {
 		t.Fatalf("insert v0.1.6 Worker jobs: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE worker_jobs SET
+	  result_message = 'job-history-plaintext-secret',
+	  result_output = 'job-history-plaintext-secret',
+	  external_id = 'job-history-plaintext-secret',
+	  result_error_code = 'job-code-plaintext-secret',
+	  result_error_stage = 'job-stage-plaintext-secret',
+	  result_error_retryable = TRUE,
+	  result_error_details = '{"raw":"job-error-plaintext-secret"}'::jsonb,
+	  progress = '{"message":"job-history-plaintext-secret","extensions":[{"id":"example","output":"job-history-plaintext-secret"}],"agentTools":[{"tool":"codex","message":"job-history-plaintext-secret"}]}'::jsonb
+	  WHERE id = ANY($1::uuid[])`, []string{
+		dockerJobID, microsandboxJobID, boxliteJobID, completedJobID, canonicalJobID,
+	}); err != nil {
+		t.Fatalf("seed historical Worker result sinks: %v", err)
+	}
+	automationRunID := uuid.NewString()
+	if _, err := store.pool.Exec(ctx, `INSERT INTO automation_runs
+	  (id, project_id, automation_name, action_type, template_id, template_name,
+	   trigger_source, auth_mode, payload_sha256, payload_bytes, status, sandbox_id,
+	   worker_job_id, error_code, error_message, output, error_stage, error_retryable,
+	   error_details, provisioning, received_at)
+	  VALUES ($1, 'legacy-project', 'Legacy automation', 'create-sandbox', 'legacy-runtime',
+	    'Existing template', 'manual-test', 'bearer', decode(repeat('00', 32), 'hex'), 0,
+	    'failed', 'legacy-docker-sandbox', $2, 'automation-code-plaintext-secret',
+	    'automation-history-plaintext-secret', 'retained-output-plaintext-secret',
+	    'automation-stage-plaintext-secret', TRUE,
+	    '{"raw":"automation-error-plaintext-secret"}'::jsonb,
+	    '{"message":"automation-history-plaintext-secret","extensions":[{"output":"automation-history-plaintext-secret"}]}'::jsonb,
+		NOW())`, automationRunID, completedJobID); err != nil {
+		t.Fatalf("seed historical automation Worker sinks: %v", err)
+	}
+	orphanAutomationRunID := uuid.NewString()
+	if _, err := store.pool.Exec(ctx, `INSERT INTO automation_runs
+	  (id, project_id, automation_name, action_type, template_id, template_name,
+	   trigger_source, auth_mode, payload_sha256, payload_bytes, status,
+	   error_code, error_message, error_stage, error_retryable, error_details,
+	   provisioning, received_at)
+	  VALUES ($1, 'legacy-project', 'Orphaned historical automation', 'create-sandbox',
+	    'legacy-runtime', 'Existing template', 'manual-test', 'bearer',
+	    decode(repeat('00', 32), 'hex'), 0, 'failed', 'orphan-code-plaintext-secret',
+	    'orphan-automation-plaintext-secret',
+	    'orphan-stage-plaintext-secret', TRUE,
+	    '{"raw":"orphan-error-plaintext-secret"}'::jsonb,
+	    '{"message":"orphan-automation-plaintext-secret","extensions":[{"output":"orphan-automation-plaintext-secret"}]}'::jsonb,
+	    NOW())`, orphanAutomationRunID); err != nil {
+		t.Fatalf("seed orphaned historical automation sinks: %v", err)
+	}
+	legacyActionRunID := uuid.NewString()
+	legacyStatusRunID := uuid.NewString()
+	if _, err := store.pool.Exec(ctx, `INSERT INTO automation_runs
+	  (id, project_id, automation_name, action_type, template_id, template_name,
+	   trigger_source, auth_mode, payload_sha256, payload_bytes, status,
+	   error_message, output, provisioning, received_at)
+	  VALUES
+	    ($1, 'legacy-project', 'Removed run-task automation', 'run-task', 'legacy-runtime',
+	      'Existing template', 'manual-test', 'bearer', decode(repeat('00', 32), 'hex'), 0,
+	      'running', 'legacy-action-plaintext-secret', 'legacy-output-plaintext-secret',
+	      '{"message":"legacy-action-plaintext-secret"}'::jsonb, NOW()),
+	    ($2, 'legacy-project', 'Removed skipped automation', 'create-sandbox', 'legacy-runtime',
+	      'Existing template', 'manual-test', 'bearer', decode(repeat('00', 32), 'hex'), 0,
+	      'skipped', 'legacy-status-plaintext-secret', '',
+	      '{"message":"legacy-status-plaintext-secret"}'::jsonb, NOW())`,
+		legacyActionRunID, legacyStatusRunID); err != nil {
+		t.Fatalf("seed retired automation runs: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `ALTER TABLE automation_runs
+	  ADD CONSTRAINT automation_runs_action_type_check
+	  CHECK (action_type = 'create-sandbox') NOT VALID;
+	ALTER TABLE automation_runs ADD CONSTRAINT automation_runs_status_check
+	  CHECK (status IN ('evaluating', 'queued', 'provisioning', 'succeeded', 'failed')) NOT VALID`); err != nil {
+		t.Fatalf("restore current Automation run constraints: %v", err)
 	}
 
 	for range 2 {
@@ -358,16 +483,211 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 	if !resourcesPreserved {
 		t.Fatal("upgrade did not preserve the existing project, custom skill, or template")
 	}
+	var firstHeaderName, firstHeaderReference, secondHeaderReference, canonicalHeaderReference string
+	var unsafeResourceHasHeaders, malformedResourceHasHeaders bool
+	if err := store.pool.QueryRow(ctx, `SELECT
+	    (SELECT spec#>>'{headers,0,name}' FROM control_resources WHERE id = 'legacy-mcp-safe'),
+	    (SELECT spec#>>'{headers,0,valueFrom}' FROM control_resources WHERE id = 'legacy-mcp-safe'),
+	    (SELECT spec#>>'{headers,1,valueFrom}' FROM control_resources WHERE id = 'legacy-mcp-safe'),
+	    (SELECT spec ? 'headers' FROM control_resources WHERE id = 'legacy-mcp-unsafe'),
+	    (SELECT spec ? 'headers' FROM control_resources WHERE id = 'legacy-mcp-malformed'),
+	    (SELECT spec#>>'{headers,0,valueFrom}' FROM control_resources WHERE id = 'legacy-mcp-canonical')`).Scan(
+		&firstHeaderName, &firstHeaderReference, &secondHeaderReference, &unsafeResourceHasHeaders,
+		&malformedResourceHasHeaders, &canonicalHeaderReference,
+	); err != nil {
+		t.Fatalf("load migrated MCP resource headers: %v", err)
+	}
+	if firstHeaderName != "X-Api-Key" || firstHeaderReference != "env://MCP_TOKEN" ||
+		secondHeaderReference != "secret://TRACE" || unsafeResourceHasHeaders || malformedResourceHasHeaders ||
+		canonicalHeaderReference != "env://CANONICAL_TOKEN" {
+		t.Fatalf("migrated MCP resource headers = %q/%q/%q unsafe=%v malformed=%v canonical=%q",
+			firstHeaderName, firstHeaderReference, secondHeaderReference, unsafeResourceHasHeaders,
+			malformedResourceHasHeaders, canonicalHeaderReference)
+	}
+	var unsafeURLPresent, unsafeURLEnabled bool
+	var safeURL string
+	if err := store.pool.QueryRow(ctx, `SELECT
+	    (SELECT spec ? 'url' FROM control_resources WHERE id = 'legacy-mcp-url-unsafe'),
+	    (SELECT enabled FROM control_resources WHERE id = 'legacy-mcp-url-unsafe'),
+	    (SELECT spec->>'url' FROM control_resources WHERE id = 'legacy-mcp-safe')`).Scan(
+		&unsafeURLPresent, &unsafeURLEnabled, &safeURL,
+	); err != nil {
+		t.Fatalf("load migrated MCP URLs: %v", err)
+	}
+	if unsafeURLPresent || unsafeURLEnabled || safeURL != "https://safe.example.test/rpc" {
+		t.Fatalf("migrated MCP URLs: unsafe present=%v enabled=%v safe=%q",
+			unsafeURLPresent, unsafeURLEnabled, safeURL)
+	}
+	for _, sandboxID := range []string{"legacy-docker-sandbox", "legacy-url-sandbox", "legacy-boxlite-sandbox"} {
+		var pending bool
+		var revision, generation int64
+		if err := store.pool.QueryRow(ctx, `SELECT
+	      COALESCE((spec->>'capabilitiesPendingRestart')::boolean, FALSE),
+	      COALESCE((spec->>'capabilityRevision')::bigint, 0), generation
+	      FROM control_resources WHERE id = $1`, sandboxID).Scan(&pending, &revision, &generation); err != nil {
+			t.Fatalf("load migrated Sandbox capability state for %s: %v", sandboxID, err)
+		}
+		if !pending || revision != 1 || generation != 1 {
+			t.Fatalf("migrated Sandbox %s state = pending %v, revision %d, generation %d",
+				sandboxID, pending, revision, generation)
+		}
+	}
+	var canonicalPending bool
+	var canonicalRevision, canonicalGeneration int64
+	if err := store.pool.QueryRow(ctx, `SELECT
+	    COALESCE((spec->>'capabilitiesPendingRestart')::boolean, FALSE),
+	    COALESCE((spec->>'capabilityRevision')::bigint, 0), generation
+	    FROM control_resources WHERE id = 'legacy-canonical-sandbox'`).Scan(
+		&canonicalPending, &canonicalRevision, &canonicalGeneration,
+	); err != nil {
+		t.Fatalf("load canonical Sandbox capability state: %v", err)
+	}
+	if canonicalPending || canonicalRevision != 0 || canonicalGeneration != 1 {
+		t.Fatalf("canonical Sandbox was unnecessarily marked pending: pending=%v revision=%d generation=%d",
+			canonicalPending, canonicalRevision, canonicalGeneration)
+	}
+	var pendingHeaderType, pendingHeaderReference string
+	var pendingUnsafeHasHeaders, leasedUnsafeHasHeaders, terminalUnsafeHasHeaders, terminalShapeHasHeaders bool
+	var canonicalJobHeaderReference string
+	if err := store.pool.QueryRow(ctx, `SELECT
+	    jsonb_typeof((SELECT payload#>'{mcpServers,0,spec,headers}' FROM worker_jobs WHERE id = $1)),
+	    (SELECT payload#>>'{mcpServers,0,spec,headers,0,valueFrom}' FROM worker_jobs WHERE id = $1),
+	    (SELECT (payload#>'{mcpServers,1,spec}') ? 'headers' FROM worker_jobs WHERE id = $1),
+	    (SELECT (payload#>'{mcpServers,0,spec}') ? 'headers' FROM worker_jobs WHERE id = $2),
+	    (SELECT (payload#>'{mcpServers,0,spec}') ? 'headers' FROM worker_jobs WHERE id = $3),
+	    (SELECT (payload#>'{mcpServers,1,spec}') ? 'headers' FROM worker_jobs WHERE id = $3),
+	    (SELECT payload#>>'{mcpServers,0,spec,headers,0,valueFrom}' FROM worker_jobs WHERE id = $4)`,
+		dockerJobID, boxliteJobID, completedJobID, canonicalJobID).Scan(
+		&pendingHeaderType, &pendingHeaderReference, &pendingUnsafeHasHeaders,
+		&leasedUnsafeHasHeaders, &terminalUnsafeHasHeaders, &terminalShapeHasHeaders,
+		&canonicalJobHeaderReference,
+	); err != nil {
+		t.Fatalf("load migrated Worker job MCP headers: %v", err)
+	}
+	if pendingHeaderType != "array" || pendingHeaderReference != "env://MCP_TOKEN" ||
+		pendingUnsafeHasHeaders || leasedUnsafeHasHeaders || terminalUnsafeHasHeaders || terminalShapeHasHeaders ||
+		canonicalJobHeaderReference != "env://CANONICAL_TOKEN" {
+		t.Fatalf("migrated Worker headers = %q/%q unsafe pending=%v leased=%v terminal=%v shape=%v canonical=%q",
+			pendingHeaderType, pendingHeaderReference, pendingUnsafeHasHeaders,
+			leasedUnsafeHasHeaders, terminalUnsafeHasHeaders, terminalShapeHasHeaders, canonicalJobHeaderReference)
+	}
+	var unsafeURLDefinitionPresent bool
+	if err := store.pool.QueryRow(ctx, `SELECT payload::text LIKE '%legacy-mcp-url-unsafe%'
+	    FROM worker_jobs WHERE id = $1`, dockerJobID).Scan(&unsafeURLDefinitionPresent); err != nil {
+		t.Fatalf("load migrated Worker job MCP URLs: %v", err)
+	}
+	if unsafeURLDefinitionPresent {
+		t.Fatal("migration retained an unsafe MCP URL definition in a Worker payload")
+	}
+	var migratedJobCode, migratedJobStage string
+	var migratedJobRetryable, migratedJobTimedOut bool
+	if err := store.pool.QueryRow(ctx, `SELECT result_error_code, result_error_stage,
+	    result_error_retryable, result_timed_out FROM worker_jobs WHERE id = $1`, completedJobID).Scan(
+		&migratedJobCode, &migratedJobStage, &migratedJobRetryable, &migratedJobTimedOut,
+	); err != nil {
+		t.Fatalf("load migrated Worker error metadata: %v", err)
+	}
+	if migratedJobCode != "restart_sandbox_failed" || migratedJobStage != "restart" ||
+		migratedJobRetryable || migratedJobTimedOut {
+		t.Fatalf("migrated Worker error = %q/%q retryable=%v timedOut=%v",
+			migratedJobCode, migratedJobStage, migratedJobRetryable, migratedJobTimedOut)
+	}
+	var orphanSandboxSpec, orphanSandboxExternalID, orphanSandboxMessage string
+	if err := store.pool.QueryRow(ctx, `SELECT spec::text, spec->>'externalId', spec->>'message'
+	    FROM control_resources WHERE id = 'orphan-history-sandbox'`).Scan(
+		&orphanSandboxSpec, &orphanSandboxExternalID, &orphanSandboxMessage,
+	); err != nil {
+		t.Fatalf("load orphaned historical Sandbox sinks: %v", err)
+	}
+	if strings.Contains(orphanSandboxSpec, "plaintext-secret") ||
+		orphanSandboxExternalID != "agentbox-orphan-history-sandbox" ||
+		orphanSandboxMessage != "Historical Worker diagnostic removed during security migration" {
+		t.Fatalf("orphaned Sandbox history was not safely migrated: %s", orphanSandboxSpec)
+	}
+	for _, removedField := range []string{
+		"provisioning", "extensionStates", "agentToolVersions", "agentToolOperation", "proxyOperation",
+	} {
+		if strings.Contains(orphanSandboxSpec, `"`+removedField+`"`) {
+			t.Fatalf("orphaned Sandbox retained %s: %s", removedField, orphanSandboxSpec)
+		}
+	}
+	var orphanAutomationCode, orphanAutomationMessage, orphanAutomationStage string
+	var orphanAutomationDetails, orphanAutomationProvisioning string
+	var orphanAutomationRetryable bool
+	var orphanAutomationJobMissing, orphanAutomationSandboxMissing bool
+	if err := store.pool.QueryRow(ctx, `SELECT error_code, error_message, error_stage,
+	    error_retryable, error_details::text, provisioning::text,
+	    worker_job_id IS NULL, sandbox_id IS NULL
+	    FROM automation_runs WHERE id = $1`, orphanAutomationRunID).Scan(
+		&orphanAutomationCode, &orphanAutomationMessage, &orphanAutomationStage,
+		&orphanAutomationRetryable, &orphanAutomationDetails, &orphanAutomationProvisioning,
+		&orphanAutomationJobMissing, &orphanAutomationSandboxMissing,
+	); err != nil {
+		t.Fatalf("load orphaned historical Automation sinks: %v", err)
+	}
+	if !orphanAutomationJobMissing || !orphanAutomationSandboxMissing ||
+		orphanAutomationCode != "worker_failed" || orphanAutomationStage != "create" ||
+		orphanAutomationRetryable ||
+		orphanAutomationMessage != "Historical Worker diagnostic removed during security migration" ||
+		orphanAutomationDetails != "{}" || orphanAutomationProvisioning != "{}" {
+		t.Fatalf("orphaned Automation history = code/stage %q/%q retryable=%v message %q details %s provisioning %s jobMissing=%v sandboxMissing=%v",
+			orphanAutomationCode, orphanAutomationStage, orphanAutomationRetryable,
+			orphanAutomationMessage, orphanAutomationDetails, orphanAutomationProvisioning,
+			orphanAutomationJobMissing, orphanAutomationSandboxMissing)
+	}
+	var retiredAutomationRuns int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM automation_runs
+	    WHERE id = ANY($1::uuid[])`, []string{legacyActionRunID, legacyStatusRunID}).Scan(
+		&retiredAutomationRuns,
+	); err != nil {
+		t.Fatalf("count retired Automation runs: %v", err)
+	}
+	if retiredAutomationRuns != 0 {
+		t.Fatalf("migration retained %d retired Automation runs", retiredAutomationRuns)
+	}
+	var legacyAutomationColumns int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+	    WHERE table_schema = current_schema() AND table_name = 'automation_runs'
+	      AND column_name = ANY($1::text[])`, []string{
+		"exit_code", "output", "output_truncated", "cleanup_status", "expires_at",
+	}).Scan(&legacyAutomationColumns); err != nil {
+		t.Fatalf("inspect retired Automation run columns: %v", err)
+	}
+	if legacyAutomationColumns != 0 {
+		t.Fatalf("migration retained %d retired Automation run columns", legacyAutomationColumns)
+	}
+	var plaintextCopies int
+	if err := store.pool.QueryRow(ctx, `SELECT
+	    (SELECT count(*) FROM control_resources WHERE spec::text LIKE '%plaintext-secret%') +
+	    (SELECT count(*) FROM worker_jobs WHERE payload::text LIKE '%plaintext-secret%'
+	      OR result_message LIKE '%plaintext-secret%' OR result_output LIKE '%plaintext-secret%'
+	      OR external_id LIKE '%plaintext-secret%' OR progress::text LIKE '%plaintext-secret%'
+	      OR result_error_code LIKE '%plaintext-secret%' OR result_error_stage LIKE '%plaintext-secret%'
+	      OR result_error_details::text LIKE '%plaintext-secret%') +
+	    (SELECT count(*) FROM automation_runs WHERE error_message LIKE '%plaintext-secret%'
+	      OR error_code LIKE '%plaintext-secret%' OR error_stage LIKE '%plaintext-secret%'
+	      OR error_details::text LIKE '%plaintext-secret%' OR provisioning::text LIKE '%plaintext-secret%') +
+	    (SELECT count(*) FROM system_logs WHERE message LIKE '%plaintext-secret%'
+	      OR detail::text LIKE '%plaintext-secret%')`).Scan(&plaintextCopies); err != nil {
+		t.Fatalf("scan migrated plaintext MCP headers: %v", err)
+	}
+	if plaintextCopies != 0 {
+		t.Fatalf("migration retained %d plaintext MCP header copies", plaintextCopies)
+	}
 	for _, expected := range []struct {
 		id      string
 		network string
 	}{
 		{id: "legacy-runtime", network: "egress"},
+		{id: "legacy-url-runtime", network: "egress"},
 		{id: "legacy-microsandbox-runtime", network: "egress"},
 		{id: "legacy-boxlite-runtime", network: "restricted"},
+		{id: "legacy-canonical-runtime", network: "egress"},
 		{id: "legacy-docker-sandbox", network: "egress"},
+		{id: "legacy-url-sandbox", network: "egress"},
 		{id: "legacy-microsandbox-sandbox", network: "egress"},
 		{id: "legacy-boxlite-sandbox", network: "restricted"},
+		{id: "legacy-canonical-sandbox", network: "egress"},
 	} {
 		var network string
 		if err := store.pool.QueryRow(ctx, `SELECT spec->>'network' FROM control_resources WHERE id = $1`, expected.id).Scan(&network); err != nil {
@@ -385,6 +705,7 @@ func TestDatabaseMigrationsUpgradeV016Schema(t *testing.T) {
 		{id: microsandboxJobID, network: "egress"},
 		{id: boxliteJobID, network: "restricted"},
 		{id: completedJobID, network: "restricted"},
+		{id: canonicalJobID, network: "restricted"},
 	} {
 		var network string
 		if err := store.pool.QueryRow(ctx, `SELECT payload->>'network' FROM worker_jobs WHERE id = $1`, expected.id).Scan(&network); err != nil {

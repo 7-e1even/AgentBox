@@ -3,6 +3,7 @@ import { describe, expect, expectTypeOf, it } from "vitest"
 import {
   resourceInputSchema,
   resourceSchema,
+  normalizeVariableSpec,
   sandboxSpecForUpdate,
   type ResourceInput,
   type ResourceKind,
@@ -21,10 +22,18 @@ const validSpecs: Record<ResourceKind, object> = {
   project: { emoji: "📁" },
   image: { reference: "ubuntu:24.04", architecture: "all", modes: ["docker"] },
   runtime: { serverId, driver: "docker", imageReference: "ubuntu:24.04" },
-  skill: { source: "inline", instructions: "Example" },
-  mcp: { transport: "stdio", command: "npx", args: "-y example" },
+  skill: {
+    source: "inline",
+    instructions:
+      "---\nname: example-resource\ndescription: Example skill\n---\nDo the work.\n",
+  },
+  mcp: { transport: "stdio", command: "npx", args: ["-y", "example"] },
   sandbox: { serverId, runtimeId: "example-template" },
-  variable: { key: "TOKEN", reference: "secret:example" },
+  variable: {
+    key: "TOKEN",
+    mode: "secret-ref",
+    reference: "secret://SOURCE_TOKEN",
+  },
   extension: {
     version: "1.0.0",
     installScript: "touch /tmp/extension-ready",
@@ -56,11 +65,84 @@ describe("typed resource contracts", () => {
     ["mcp", { transport: "stdio" }],
     ["mcp", { transport: "http", command: "ignored" }],
     ["variable", { key: "TOKEN" }],
-    ["variable", { reference: "secret:example" }],
+    ["variable", { reference: "secret://SOURCE_TOKEN" }],
   ])("requires complete %s desired fields", (kind, spec) => {
     expect(resourceInputSchema.safeParse({ ...base, kind, spec }).success).toBe(
       false
     )
+  })
+
+  it.each([
+    { key: "bad-key", mode: "value-ref", reference: "env://SOURCE" },
+    { key: "AGENTBOX_TOKEN", mode: "value-ref", reference: "env://SOURCE" },
+    { key: "IS_SANDBOX", mode: "value-ref", reference: "env://SOURCE" },
+    { key: "TOKEN", mode: "value-ref", reference: "secret://SOURCE" },
+    { key: "TOKEN", mode: "secret-ref", reference: "env://SOURCE" },
+    { key: "TOKEN", mode: "secret-ref", reference: "plaintext" },
+    { key: "A".repeat(129), mode: "value-ref", reference: "env://SOURCE" },
+    { key: "TOKEN", mode: "value-ref", reference: `env://${"A".repeat(129)}` },
+  ])("rejects invalid Variable contract %#", (spec) => {
+    expect(
+      resourceInputSchema.safeParse({ ...base, kind: "variable", spec }).success
+    ).toBe(false)
+  })
+
+  it("canonicalizes a legacy Variable mode from its reference scheme", () => {
+    expect(
+      resourceInputSchema.parse({
+        ...base,
+        kind: "variable",
+        spec: { key: "TOKEN", reference: "env://SOURCE_TOKEN" },
+      }).spec
+    ).toEqual({
+      key: "TOKEN",
+      mode: "value-ref",
+      reference: "env://SOURCE_TOKEN",
+    })
+    expect(
+      normalizeVariableSpec({
+        key: "TOKEN",
+        mode: " SECRET-REF ",
+        reference: "secret://SOURCE_TOKEN",
+      })
+    ).toEqual({
+      key: "TOKEN",
+      mode: "secret-ref",
+      reference: "secret://SOURCE_TOKEN",
+    })
+  })
+
+  it("rejects HTTP MCP URLs containing query parameters", () => {
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "mcp",
+        spec: {
+          transport: "http",
+          url: "https://mcp.example.test/api?token=plaintext",
+        },
+      }).success
+    ).toBe(false)
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "mcp",
+        spec: {
+          transport: "http",
+          url: "https://mcp.example.test/api?",
+        },
+      }).success
+    ).toBe(false)
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "mcp",
+        spec: {
+          transport: "http",
+          url: "https://mcp.example.test/api%3Fname",
+        },
+      }).success
+    ).toBe(true)
   })
 
   it.each([
@@ -70,7 +152,7 @@ describe("typed resource contracts", () => {
     ["runtime", "credentialIds", "credential-one"],
     ["runtime", "modelBindings", { credential: 42 }],
     ["runtime", "environmentVariables", [{ name: "TOKEN", value: 42 }]],
-    ["mcp", "args", ["--stdio"]],
+    ["mcp", "args", "--stdio"],
     ["skill", "instructions", false],
   ] as const)("rejects an incorrect %s.%s type", (kind, key, value) => {
     expect(
@@ -113,6 +195,9 @@ describe("typed resource contracts", () => {
         agentToolOperation: {},
         extensionSnapshots: [],
         extensionStates: [],
+        capabilitiesPendingRestart: true,
+        capabilityDigest: "sha256:applied",
+        capabilitiesAppliedAt: timestamp,
         runtimeModelSources: {
           primary: {
             credentialId: "backup",
@@ -215,7 +300,9 @@ describe("typed resource contracts", () => {
       string | undefined
     >()
     type MCPInput = Extract<ResourceInput, { kind: "mcp" }>
-    expectTypeOf<MCPInput["spec"]["args"]>().toEqualTypeOf<string | undefined>()
+    expectTypeOf<MCPInput["spec"]["args"]>().toEqualTypeOf<
+      string[] | undefined
+    >()
     type SandboxInput = Extract<ResourceInput, { kind: "sandbox" }>
     expectTypeOf<SandboxInput["spec"]["runtimeId"]>().toEqualTypeOf<string>()
   })
@@ -318,5 +405,162 @@ describe("typed resource contracts", () => {
     expect(
       sandboxSpecForUpdate({ extensionIds: ["new-extension"] }, {})
     ).not.toHaveProperty("extensionIds")
+  })
+
+  it("preserves legacy capability inheritance until that field is changed", () => {
+    const inheritedDraft = {
+      skillIds: ["template-skill"],
+      mcpServerIds: ["template-mcp"],
+      variableIds: ["template-variable"],
+    }
+    expect(sandboxSpecForUpdate(inheritedDraft, {})).toEqual({})
+    expect(
+      sandboxSpecForUpdate(inheritedDraft, {}, ["skillIds", "mcpServerIds"])
+    ).toEqual({
+      skillIds: ["template-skill"],
+      mcpServerIds: ["template-mcp"],
+    })
+    expect(
+      sandboxSpecForUpdate(inheritedDraft, {
+        skillIds: ["existing-override"],
+      })
+    ).toEqual({ skillIds: ["template-skill"] })
+  })
+
+  it("reads legacy MCP strings while requiring canonical arrays on input", () => {
+    const legacy = resourceSchema.parse({
+      ...base,
+      kind: "mcp",
+      spec: {
+        transport: "stdio",
+        command: "npx",
+        args: "-y example",
+        headers: "Authorization=secret://MCP_TOKEN",
+      },
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    })
+    if (legacy.kind !== "mcp") throw new Error("expected MCP resource")
+    expect(legacy.spec.args).toBe("-y example")
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "mcp",
+        spec: { transport: "stdio", command: "npx", args: "-y example" },
+      }).success
+    ).toBe(false)
+  })
+
+  it("accepts only structured MCP Header references", () => {
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "mcp",
+        spec: {
+          transport: "http",
+          url: "https://mcp.example.com",
+          headers: [{ name: "Authorization", valueFrom: "secret://MCP_TOKEN" }],
+        },
+      }).success
+    ).toBe(true)
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "mcp",
+        spec: {
+          transport: "http",
+          url: "https://mcp.example.com",
+          headers: [{ name: "Authorization", valueFrom: "Bearer plaintext" }],
+        },
+      }).success
+    ).toBe(false)
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "mcp",
+        spec: {
+          transport: "http",
+          url: "https://mcp.example.com",
+          headers: [
+            { name: "Authorization", valueFrom: `secret://${"A".repeat(129)}` },
+          ],
+        },
+      }).success
+    ).toBe(false)
+  })
+
+  it("matches MCP transport and protocol safety constraints", () => {
+    const parseMCP = (spec: Record<string, unknown>) =>
+      resourceInputSchema.safeParse({ ...base, kind: "mcp", spec }).success
+
+    expect(parseMCP({ transport: "stdio", command: "node", args: [""] })).toBe(
+      false
+    )
+    expect(
+      parseMCP({
+        transport: "stdio",
+        command: "node",
+        url: "https://mcp.example.com",
+      })
+    ).toBe(false)
+    expect(
+      parseMCP({
+        transport: "http",
+        url: "https://user:password@mcp.example.com/path#fragment",
+      })
+    ).toBe(false)
+    expect(
+      parseMCP({
+        transport: "http",
+        url: "https://mcp.example.com",
+        headers: [{ name: "Host", valueFrom: "env://MCP_HOST" }],
+      })
+    ).toBe(false)
+  })
+
+  it("validates canonical Skill identity and strips read-only summary fields", () => {
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "skill",
+        spec: {
+          ...validSpecs.skill,
+          instructions:
+            "---\nname: another-id\ndescription: Example skill\n---\nDo the work.\n",
+        },
+      }).success
+    ).toBe(false)
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "skill",
+        spec: { ...validSpecs.skill, bundleDigest: "sha256:server-owned" },
+      }).success
+    ).toBe(false)
+  })
+
+  it("blocks only all-unsupported Agent and MCP combinations", () => {
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "runtime",
+        spec: {
+          ...validSpecs.runtime,
+          agentTools: ["pi"],
+          mcpServerIds: ["docs"],
+        },
+      }).success
+    ).toBe(false)
+    expect(
+      resourceInputSchema.safeParse({
+        ...base,
+        kind: "runtime",
+        spec: {
+          ...validSpecs.runtime,
+          agentTools: ["pi", "codex"],
+          mcpServerIds: ["docs"],
+        },
+      }).success
+    ).toBe(true)
   })
 })

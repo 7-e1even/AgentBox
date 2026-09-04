@@ -21,7 +21,7 @@ func newExtensionTestEnvironment(t *testing.T) (*Store, string, string, platform
 		t.Fatal(err)
 	}
 	inventory := platform.ServerInventory{DockerImages: []platform.ServerImage{{Reference: "ubuntu:24.04", Architecture: "amd64"}}}
-	if err := s.HeartbeatServer(ctx, serverID, credential, []string{"docker", "sandbox-extensions"}, &inventory, "test"); err != nil {
+	if err := s.HeartbeatServer(ctx, serverID, credential, []string{"docker", "sandbox-extensions", workerFailClosedJobOutputCapability}, &inventory, "test"); err != nil {
 		t.Fatal(err)
 	}
 	projectID := "default"
@@ -34,7 +34,8 @@ func newExtensionTestEnvironment(t *testing.T) (*Store, string, string, platform
 	}
 	template, err := s.CreateResource(ctx, platform.Input{ID: "test-template", Kind: platform.KindRuntime, ProjectID: &projectID,
 		Name: "Test template", Enabled: true, Spec: map[string]any{
-			"serverId": serverID, "driver": "docker", "imageReference": "ubuntu:24.04", "extensionIds": []string{extension.ID},
+			"serverId": serverID, "driver": "docker", "imageReference": "ubuntu:24.04",
+			"network": "egress", "extensionIds": []string{extension.ID},
 		}})
 	if err != nil {
 		t.Fatal(err)
@@ -266,7 +267,7 @@ func TestExtensionCreationValidatesReferencesNetworkAndWorker(t *testing.T) {
 			case "no-network":
 				input.Spec["network"] = "none"
 			case "old-worker":
-				if err := s.HeartbeatServer(ctx, serverID, credential, []string{"docker"}, nil, "old"); err != nil {
+				if err := s.HeartbeatServer(ctx, serverID, credential, []string{"docker", workerFailClosedJobOutputCapability}, nil, "old"); err != nil {
 					t.Fatal(err)
 				}
 			}

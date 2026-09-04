@@ -30,7 +30,10 @@ func newCancellationFixture(t *testing.T) cancellationFixture {
 	if _, err := s.pool.Exec(t.Context(), `INSERT INTO control_resources
       (id, kind, project_id, name, description, enabled, spec, created_at, updated_at, observed_generation)
       VALUES ($1, 'sandbox', 'default', 'Cancellation test', '', TRUE,
-        jsonb_build_object('serverId', $2::text, 'driver', 'docker', 'status', 'requested'), NOW(), NOW(), 0)`,
+        jsonb_build_object(
+          'serverId', $2::text, 'driver', 'docker', 'status', 'requested',
+          'credentialedProxyIdAtCreation', ''::text
+        ), NOW(), NOW(), 0)`,
 		fixture.sandboxID, fixture.serverID); err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +155,6 @@ func TestCancellingInstallationFencesProgressAndCompletionUntilCleanup(t *testin
 		{LeaseGeneration: 1, Success: true},
 		{LeaseGeneration: 1, Error: &platform.WorkerJobError{Code: "worker_failed"}},
 		{LeaseGeneration: 2, Error: &platform.WorkerJobError{Code: "job_cancelled"}},
-		{LeaseGeneration: 1, Error: &platform.WorkerJobError{Code: "job_cancelled", Retryable: true}},
 	} {
 		if err := f.store.CompleteWorkerJob(t.Context(), f.serverID, f.credential, f.jobID, result); !errors.Is(err, ErrResourceNotFound) {
 			t.Fatalf("invalid cancellation completion accepted: %+v, %v", result, err)

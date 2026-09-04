@@ -13,6 +13,18 @@
 
 轮询共用轻量控制器：同查询单次请求、取消与过期结果隔离、可重试错误退避、页面隐藏/离线暂停；刷新失败保留上次数据并明确提示。配置依赖未就绪时保留编辑草稿、禁用提交。
 
+## Skills、Variables 与 MCP
+
+- Skill 写入以 `SKILL.md` 为权威：服务端校验 YAML frontmatter、资源 ID 与 `name` 一致、路径/文件数/解码后大小，并根据规范化正文和排序后的附件生成 SHA-256 bundle digest。列表 API 只返回摘要和大小统计，详情 API 才返回正文与附件。
+- Variable 只保存 Worker 来源引用。`env://NAME` 由 Worker 服务环境解析，`secret://NAME` 由 root-only 的 `/etc/agentbox-worker-secrets/NAME` 解析；解析后的值只写入沙箱内权限受限的受管配置文件，不进入沙箱 manifest、任务结果或审计详情。MCP Header 只引用同一环境已绑定 Variable 的目标 key。
+- Runtime、Sandbox 与其引用的 Skill、Variable、MCP 必须属于同一 Project 且处于启用状态；服务端在写入和任务组装时都重新校验，不依赖前端过滤。重复 Variable key、与直接环境变量同名以及 MCP Header 缺少对应 Variable 都会拒绝。
+- MCP 持久层使用 `stdio {command,args[],cwd}` 或 `http {url,headers[{name,valueFrom}]}` 的单一结构。读取兼容旧字符串格式，但成功写入总会规范化；含明文 Header 的旧数据不会返回客户端或下发 Worker。
+- Worker 用只含资源 ID、目标和摘要的受管 manifest 做 desired-state 调和。Variable、Skill 和 MCP 各自在沙箱内暂存并以一组受管路径原子替换；该组任一步失败会恢复该组旧配置。不同配置组之间采用失败可见、下次重试收敛的顺序调和，不宣称跨组事务。成功的重复执行没有额外副作用，删除或清空绑定会只移除 AgentBox 上次管理的内容。
+- Worker heartbeat 的 `managed-capability-config` 与 `mcp-managed-config` capability 是受管配置格式门禁。通过输出安全门禁但缺少新格式能力的 Worker，只允许服务端确认可无损串行化的初次配置；清理旧配置、Variable 注入等不能证明等价的任务会在入队前要求升级。
+- `fail-closed-job-output` 是业务任务的安全门禁：未声明该能力的旧 Worker 只能领取自身升级任务。升级前已经租出的任务仍由 Server 在写库前二次规范化，任意 guest 输出不进入结果、审计或 Automation；错误 code/stage、重试属性、外部实例 ID 和 Agent 状态也只接受动作相关的固定词表。
+- 沙箱详情中的 `generation` 是 desired 版本，`observedGeneration` 和 `capabilityDigest` 只在创建、启动或重启任务成功后推进。能力资源发生变化时，引用它的沙箱标为待重启；“资源已启用”不等同于“运行时已应用”。
+- BoxLite `restricted` 的网络允许列表在实例创建时冻结。已有实例若增删 HTTP MCP 主机，或被引用 MCP 改到另一主机，服务端会拒绝并要求新建沙箱；不能通过一次看似成功的重启伪装成网络策略已更新。同一主机下的路径、Header 或 STDIO 配置变化仍可通过重启调和。
+
 ## 审计与运行遥测
 
 账号/会话、资源、凭据、代理、服务器、自动化和任务认领/完成等关键变更，在业务事务内追加审计 outbox；审计追加失败则业务一并回滚。现有日志刷新循环投递 outbox，日志写入和投递确认在同一事务，事件 ID 唯一约束防止重复。

@@ -109,6 +109,10 @@ import {
 } from "@/lib/provisioning"
 import { agentToolOptions, supportedAgentToolList } from "@/lib/agent-tools"
 import { runtimeInventoryImages } from "@/lib/runtime-images"
+import {
+  sandboxCapabilitySelection,
+  sandboxConfigurationState,
+} from "@/lib/resource-capabilities"
 import type { ManagedServer } from "@/lib/server-schema"
 import {
   sandboxProxyOperationSchema,
@@ -1249,12 +1253,31 @@ function SandboxDetailsDialog({
       ? sandbox.spec.credentialIds
       : environment?.spec.credentialIds
   )
-  const skills = stringList(environment?.spec.skillIds).map(
+  const skillSelection = sandboxCapabilitySelection(
+    sandbox,
+    environment,
+    "skillIds"
+  )
+  const mcpSelection = sandboxCapabilitySelection(
+    sandbox,
+    environment,
+    "mcpServerIds"
+  )
+  const variableSelection = sandboxCapabilitySelection(
+    sandbox,
+    environment,
+    "variableIds"
+  )
+  const skills = skillSelection.ids.map(
     (id) => resources.find((item) => item.id === id)?.name ?? id
   )
-  const mcpServers = stringList(environment?.spec.mcpServerIds).map(
+  const mcpServers = mcpSelection.ids.map(
     (id) => resources.find((item) => item.id === id)?.name ?? id
   )
+  const variables = variableSelection.ids.map(
+    (id) => resources.find((item) => item.id === id)?.name ?? id
+  )
+  const configurationState = sandboxConfigurationState(sandbox)
   const externalId =
     typeof sandbox.spec.externalId === "string"
       ? sandbox.spec.externalId
@@ -1373,16 +1396,64 @@ function SandboxDetailsDialog({
             </div>
           )}
 
-          {skills.length > 0 || mcpServers.length > 0 ? (
-            <div className="grid gap-x-6 gap-y-3 border-t pt-3 sm:grid-cols-2">
-              <CapabilityList title="Skills" values={skills} />
-              <CapabilityList title="MCP Servers" values={mcpServers} />
+          <div className="border-t pt-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-sm font-medium">能力配置</p>
+              <Badge
+                variant={
+                  configurationState === "restart-required"
+                    ? "destructive"
+                    : configurationState === "applied"
+                      ? "secondary"
+                      : "outline"
+                }
+              >
+                {configurationState === "applied"
+                  ? "Desired = Applied"
+                  : configurationState === "applying"
+                    ? "正在应用"
+                    : "待重启"}
+              </Badge>
             </div>
-          ) : (
-            <p className="border-t pt-3 text-xs text-muted-foreground">
-              Skills 与 MCP Servers 均未配置
+            <p className="mt-1 text-xs text-muted-foreground">
+              Desired generation {sandbox.generation} · Applied generation{" "}
+              {sandbox.observedGeneration}
+              {configurationState === "restart-required"
+                ? "；重启沙箱后应用当前 Skills、Variables 与 MCP。"
+                : configurationState === "applying"
+                  ? "；Worker 正在应用当前配置。"
+                  : "；当前能力配置已应用。"}
             </p>
-          )}
+            {(sandbox.spec.capabilityDigest ||
+              sandbox.spec.capabilitiesAppliedAt) && (
+              <p className="mt-1 min-w-0 truncate text-xs text-muted-foreground">
+                Applied snapshot
+                {sandbox.spec.capabilityDigest
+                  ? ` · ${sandbox.spec.capabilityDigest}`
+                  : ""}
+                {sandbox.spec.capabilitiesAppliedAt
+                  ? ` · ${sandbox.spec.capabilitiesAppliedAt}`
+                  : ""}
+              </p>
+            )}
+            {(skillSelection.legacyTemplateFallback ||
+              mcpSelection.legacyTemplateFallback ||
+              variableSelection.legacyTemplateFallback) && (
+              <p className="mt-1 text-xs text-amber-700 dark:text-amber-400">
+                这是旧版沙箱记录，缺少实例能力快照；当前暂按模板显示。
+              </p>
+            )}
+            <div className="mt-3 grid gap-x-6 gap-y-3 sm:grid-cols-3">
+              <CapabilityList title="Desired Skills" values={skills} />
+              <CapabilityList title="Desired Variables" values={variables} />
+              <CapabilityList title="Desired MCP Servers" values={mcpServers} />
+            </div>
+            {configurationState !== "applied" && (
+              <p className="mt-3 text-xs text-muted-foreground">
+                Applied 仅记录上一代配置版本，服务端尚未保存上一版能力明细。
+              </p>
+            )}
+          </div>
         </div>
 
         <DialogFooter className="mx-0 mb-0 min-w-0 p-3">

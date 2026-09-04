@@ -33,7 +33,9 @@ func TestSandboxLifecyclePropagatesFailuresInsideWorkerConditional(t *testing.T)
 		{"boxlite guest", "boxlite", "start", "boxlite-guest"},
 		{"microsandbox workdir", "microsandbox", "start", "microsandbox-fs-mkdir"},
 		{"agent installation", "docker", "start", "agent-tools"},
+		{"variable resolution", "docker", "start", "variables-resolve"},
 		{"credential injection", "docker", "start", "credentials"},
+		{"variable injection", "docker", "start", "variables"},
 		{"skill injection", "docker", "start", "skills"},
 		{"MCP injection", "docker", "start", "mcp"},
 		{"wrapper installation", "docker", "start", "wrappers"},
@@ -64,10 +66,20 @@ install_boxlite_guest() { check_step boxlite-guest; }
 report_job_progress() { return 0; }
 configure_proxy() { return 0; }
 install_agent_tools() { check_step agent-tools; }
+resolve_worker_variables() { check_step variables-resolve; }
 configure_credentials() { check_step credentials; }
+configure_variables() { check_step variables; }
 configure_skills() { check_step skills; }
 configure_mcp_servers() { check_step mcp; }
 install_agent_wrappers() { check_step wrappers; }
+configure_sandbox_agent_config() {
+  resolve_worker_variables || return 1
+  configure_credentials || return 1
+  configure_variables || return 1
+  configure_skills || return 1
+  configure_mcp_servers || return 1
+  install_agent_wrappers || return 1
+}
 ensure_desktop() { return 0; }
 `
 			invoke := `
@@ -90,6 +102,80 @@ fi
 				t.Fatalf("failure %s was reported as success: (%q, %v)", test.failure, output, err)
 			}
 		})
+	}
+}
+
+func TestSandboxSetupOutputCannotEnterCreateFailureLog(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("POSIX shell is not available on this test host")
+	}
+	create := daemonSection(t, "create_sandbox() {", "sandbox_container_name() {")
+	root := t.TempDir()
+	logPath := root + "/create.log"
+	outputPath := root + "/create.output"
+	const marker = "setup-output-must-not-leak"
+	const secret = "setup-secret-must-not-leak"
+	mock := `
+jq() {
+  case "$*" in
+    *payload.extensions*) return 1 ;;
+    *payload.sandboxId*) printf sandbox-one ;;
+    *payload.driver*) printf docker ;;
+    *payload.image*) printf runtime:latest ;;
+    *payload.workdir*) printf /workspace ;;
+    *payload.cpu*|*payload.memory*) printf '' ;;
+    *payload.network*) printf egress ;;
+    *payload.setup*) printf '%s' "$SETUP_COMMAND" ;;
+    *payload.desktop*) return 1 ;;
+    *'type == "object"'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+timeout() { shift; "$@"; }
+docker() {
+  case "$*" in
+    info) return 0 ;;
+    'inspect agentbox-sandbox-one') return 0 ;;
+    *'.Config.Labels "agentbox.sandbox"'*) printf sandbox-one ;;
+    'start agentbox-sandbox-one') return 0 ;;
+    *"sh -lc $SETUP_COMMAND"*) printf '%s\n' "$SETUP_MARKER"; printf '%s\n' "$SETUP_SECRET" >&2; return 7 ;;
+    *) return 0 ;;
+  esac
+}
+effective_sandbox_network_policy() { printf egress; }
+validate_sandbox_network_policy_value() { :; }
+validate_sandbox_network_policy() { :; }
+enforce_docker_network_policy() { :; }
+record_create_resource() { :; }
+report_job_progress() { :; }
+configure_proxy() { :; }
+build_sandbox_manifest() { printf '{}\n' > "$2"; }
+write_container_file_atomic() { :; }
+resolve_worker_variables() { printf '{}\n' > "$2"; }
+configure_sandbox_agent_config() { :; }
+install_sandbox_extensions() { :; }
+ensure_desktop() { :; }
+`
+	command := exec.CommandContext(t.Context(), sh, "-s")
+	command.Env = append(command.Environ(), "TEST_LOG="+shellPath(logPath), "TEST_OUTPUT="+shellPath(outputPath),
+		"SETUP_COMMAND=fixture-setup", "SETUP_MARKER="+marker, "SETUP_SECRET="+secret)
+	command.Stdin = strings.NewReader("set -eu\n" + mock + create + `
+if create_sandbox ignored >"$TEST_OUTPUT" 2>"$TEST_LOG"; then exit 40; fi
+cat "$TEST_LOG"
+`)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("exercise failing setup: %v\n%s", err, output)
+	}
+	log, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completionMessage := string(log)
+	if strings.Contains(completionMessage, marker) || strings.Contains(completionMessage, secret) ||
+		!strings.Contains(completionMessage, "stage setup-command failed") {
+		t.Fatalf("create failure log = %q", completionMessage)
 	}
 }
 

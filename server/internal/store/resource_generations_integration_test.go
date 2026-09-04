@@ -3,6 +3,7 @@ package store
 import (
 	"errors"
 	"maps"
+	"strings"
 	"testing"
 
 	"agentbox/internal/platform"
@@ -19,7 +20,7 @@ func newVersionedSandbox(t *testing.T) (*Store, string, string, platform.Resourc
 		t.Fatal(err)
 	}
 	inventory := platform.ServerInventory{DockerImages: []platform.ServerImage{{Reference: "ubuntu:24.04", Architecture: "amd64"}}}
-	if err := s.HeartbeatServer(ctx, serverID, credential, []string{"docker"}, &inventory, "test"); err != nil {
+	if err := s.HeartbeatServer(ctx, serverID, credential, []string{"docker", workerFailClosedJobOutputCapability}, &inventory, "test"); err != nil {
 		t.Fatal(err)
 	}
 	projectID := "default"
@@ -78,15 +79,28 @@ func TestResourceGenerationsTrackDesiredAndObservedState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if updated.Generation != 2 || updated.ObservedGeneration != 1 || updated.Spec["automationRunId"] != "original-run" ||
+	if updated.Generation != 2 || updated.ObservedGeneration != 2 || updated.Spec["automationRunId"] != "original-run" ||
 		len(updated.Spec["agentToolVersions"].([]any)) != 1 || updated.Spec["runtimeModelTokenEpoch"] != firstTokenEpoch {
 		t.Fatalf("configuration update lost observations: %#v", updated)
+	}
+	configurationInput := updated.Input
+	configurationInput.Spec = maps.Clone(updated.Spec)
+	configurationInput.Spec["environmentVariables"] = []any{map[string]any{"name": "FEATURE_FLAG", "value": "enabled"}}
+	updated, err = s.UpdateResource(ctx, sandbox.ID, configurationInput)
+	if err != nil || updated.Generation != 3 || updated.ObservedGeneration != 2 {
+		t.Fatalf("desired configuration update = %#v, error = %v", updated, err)
+	}
+	metadataInput := updated.Input
+	metadataInput.Name = "Renamed while restart is pending"
+	updated, err = s.UpdateResource(ctx, sandbox.ID, metadataInput)
+	if err != nil || updated.Generation != 4 || updated.ObservedGeneration != 2 {
+		t.Fatalf("metadata update hid pending configuration = %#v, error = %v", updated, err)
 	}
 	if _, err := s.OperateSandbox(ctx, sandbox.ID, "restart"); err != nil {
 		t.Fatal(err)
 	}
 	job, err = s.ClaimWorkerJob(ctx, serverID, credential)
-	if err != nil || job.ResourceGeneration != 2 {
+	if err != nil || job.ResourceGeneration != 4 {
 		t.Fatalf("new configuration job = %#v, error = %v", job, err)
 	}
 	if job.ID == firstTokenEpoch || job.Payload["runtimeTokenEpoch"] != job.ID {
@@ -96,7 +110,7 @@ func TestResourceGenerationsTrackDesiredAndObservedState(t *testing.T) {
 		t.Fatal(err)
 	}
 	updated, err = s.GetResource(ctx, sandbox.ID)
-	if err != nil || updated.ObservedGeneration != 2 {
+	if err != nil || updated.ObservedGeneration != 4 {
 		t.Fatalf("observed = %d, error = %v", updated.ObservedGeneration, err)
 	}
 	if updated.Spec["runtimeModelTokenEpoch"] != job.ID {
@@ -177,6 +191,134 @@ func TestResourceGenerationFencesOldProgressAndCompletion(t *testing.T) {
 	}
 	if status != "failed" || code != "resource_generation_changed" {
 		t.Fatalf("old job = %s/%s", status, code)
+	}
+}
+
+func TestCapabilityRevisionDoesNotFenceLifecycleCompletion(t *testing.T) {
+	s := newIntegrationTestStore(t)
+	ctx := t.Context()
+	projectID := "default"
+	serverID := uuid.NewString()
+	_, credential, err := s.RegisterServer(ctx, testServerRegistration(serverID, mustCreatePairingToken(t, s)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	inventory := platform.ServerInventory{DockerImages: []platform.ServerImage{{Reference: "ubuntu:24.04", Architecture: "amd64"}}}
+	if err := s.HeartbeatServer(ctx, serverID, credential,
+		[]string{"docker", "managed-capability-config", "mcp-managed-config", workerFailClosedJobOutputCapability}, &inventory, "test"); err != nil {
+		t.Fatal(err)
+	}
+
+	skillID := "raced-skill-" + uuid.NewString()
+	instructions := "---\nname: " + skillID + "\ndescription: Initial capability\n---\n\nRun the initial workflow.\n"
+	skill, err := s.CreateResource(ctx, platform.Input{
+		ID: skillID, Kind: platform.KindSkill, ProjectID: &projectID,
+		Name: "Raced skill", Description: "Initial capability", Enabled: true,
+		Spec: map[string]any{"instructions": instructions},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeID := "raced-runtime-" + uuid.NewString()
+	if _, err := s.CreateResource(ctx, platform.Input{
+		ID: runtimeID, Kind: platform.KindRuntime, ProjectID: &projectID,
+		Name: "Raced runtime", Enabled: true,
+		Spec: map[string]any{
+			"serverId": serverID, "driver": "docker", "imageReference": "ubuntu:24.04",
+			"agentTools": []string{"codex"}, "skillIds": []string{skillID},
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sandbox, err := s.CreateResource(ctx, platform.Input{
+		ID: "raced-sandbox-" + uuid.NewString(), Kind: platform.KindSandbox, ProjectID: &projectID,
+		Name: "Raced sandbox", Enabled: true,
+		Spec: map[string]any{"serverId": serverID, "runtimeId": runtimeID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := s.ClaimWorkerJob(ctx, serverID, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sandboxCapabilityRevision(job.Payload); got != 1 {
+		t.Fatalf("create job capability revision = %d, want 1", got)
+	}
+	oldDigest, _ := job.Payload["capabilityDigest"].(string)
+
+	skillInput := skill.Input
+	skillInput.Spec = maps.Clone(skill.Spec)
+	skillInput.Spec["instructions"] = strings.Replace(instructions, "initial workflow", "updated workflow", 1)
+	if _, err := s.UpdateResource(ctx, skill.ID, skillInput); err != nil {
+		t.Fatal(err)
+	}
+	var generation, observedGeneration, capabilityRevision int64
+	var pending bool
+	if err := s.pool.QueryRow(ctx, `SELECT generation, observed_generation,
+	    COALESCE((spec->>'capabilityRevision')::bigint, 0),
+	    COALESCE((spec->>'capabilitiesPendingRestart')::boolean, FALSE)
+	    FROM control_resources WHERE id = $1`, sandbox.ID).Scan(
+		&generation, &observedGeneration, &capabilityRevision, &pending,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if generation != 1 || observedGeneration != 0 || capabilityRevision != 2 || !pending {
+		t.Fatalf("raced desired state = generation %d, observed %d, revision %d, pending %v",
+			generation, observedGeneration, capabilityRevision, pending)
+	}
+
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, job.ID, platform.WorkerJobResult{
+		LeaseGeneration: job.LeaseGeneration, Success: true, ExternalID: "raced-container",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.GetResource(ctx, sandbox.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Spec["status"] != "running" || current.Spec["externalId"] != "agentbox-"+sandbox.ID ||
+		current.ObservedGeneration != 0 || current.Spec["capabilitiesPendingRestart"] != true ||
+		current.Spec["capabilityDigest"] != oldDigest {
+		t.Fatalf("raced lifecycle completion did not converge truthfully: %#v", current)
+	}
+	if _, exposed := current.Spec["capabilityRevision"]; exposed {
+		t.Fatal("internal capability revision was returned by the resource API")
+	}
+	var jobStatus string
+	if err := s.pool.QueryRow(ctx, `SELECT status FROM worker_jobs WHERE id = $1`, job.ID).Scan(&jobStatus); err != nil {
+		t.Fatal(err)
+	}
+	if jobStatus != "succeeded" {
+		t.Fatalf("raced lifecycle job status = %q", jobStatus)
+	}
+
+	if _, err := s.OperateSandbox(ctx, sandbox.ID, "restart"); err != nil {
+		t.Fatal(err)
+	}
+	restart, err := s.ClaimWorkerJob(ctx, serverID, credential)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sandboxCapabilityRevision(restart.Payload); got != 2 {
+		t.Fatalf("restart capability revision = %d, want 2", got)
+	}
+	newDigest, _ := restart.Payload["capabilityDigest"].(string)
+	if newDigest == "" || newDigest == oldDigest {
+		t.Fatalf("restart capability digest = %q, old = %q", newDigest, oldDigest)
+	}
+	if err := s.CompleteWorkerJob(ctx, serverID, credential, restart.ID, platform.WorkerJobResult{
+		LeaseGeneration: restart.LeaseGeneration, Success: true, ExternalID: "raced-container",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current, err = s.GetResource(ctx, sandbox.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.ObservedGeneration != current.Generation || current.Spec["capabilitiesPendingRestart"] != false ||
+		current.Spec["capabilityDigest"] != newDigest || current.Spec["capabilitiesAppliedAt"] == nil {
+		t.Fatalf("current capability restart was not recorded as applied: %#v", current)
 	}
 }
 

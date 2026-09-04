@@ -1,7 +1,9 @@
 import { z } from "zod"
 
 import { supportedAgentToolIds } from "./agent-tools"
+import { hasOnlyUnsupportedMCPAgentTools } from "./mcp-config"
 import { sandboxProxyOperationSchema } from "./network-proxy-schema"
+import { skillDocumentIssue } from "./skill-frontmatter"
 
 export const provisioningStageTimingSchema = z.object({
   stage: z.string(),
@@ -150,6 +152,11 @@ export const skillSpecSchema = z.object({
   source: z.string().optional(),
   path: z.string().optional(),
   instructions: z.string().optional(),
+  license: z.string().optional(),
+  compatibility: z.string().optional(),
+  bundleDigest: z.string().optional(),
+  fileCount: z.number().int().nonnegative().optional(),
+  decodedBytes: z.number().int().nonnegative().optional(),
   files: z
     .array(
       z.object({
@@ -160,18 +167,250 @@ export const skillSpecSchema = z.object({
     )
     .optional(),
 })
-const mcpSpecSchema = z.object({
+const skillInputSpecSchema = skillSpecSchema
+  .omit({
+    bundleDigest: true,
+    fileCount: true,
+    decodedBytes: true,
+  })
+  .extend({ instructions: z.string().min(1, "请填写 SKILL.md") })
+const mcpHeaderReferenceSchema = z
+  .object({
+    name: z
+      .string()
+      .trim()
+      .min(1, "请填写 Header 名称")
+      .max(128, "Header 名称不能超过 128 个字符")
+      .regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/, "Header 名称格式不正确"),
+    valueFrom: z
+      .string()
+      .trim()
+      .regex(
+        /^(?:env|secret):\/\/[A-Za-z_][A-Za-z0-9_]*$/,
+        "Header 值只能引用 env://KEY 或 secret://KEY"
+      )
+      .refine(
+        (reference) =>
+          reference.slice(reference.indexOf("://") + 3).length <= 128,
+        "Header 引用的 Variable key 不能超过 128 个字符"
+      ),
+  })
+  .strict()
+const mcpInputSpecSchema = z
+  .object({
+    transport: z.enum(["stdio", "http"]),
+    command: z
+      .string()
+      .trim()
+      .refine(
+        (value) => Array.from(value).length <= 4096 && !/[\0\r\n]/.test(value),
+        "stdio MCP command 无效"
+      )
+      .optional(),
+    args: z
+      .array(
+        z
+          .string()
+          .min(1, "MCP 参数不能为空")
+          .refine(
+            (value) => Array.from(value).length <= 4096,
+            "单个参数不能超过 4096 个字符"
+          )
+          .refine((value) => !value.includes("\0"), "参数不能包含空字节")
+      )
+      .max(128, "参数不能超过 128 个")
+      .optional(),
+    cwd: z
+      .string()
+      .trim()
+      .refine(
+        (value) =>
+          !value ||
+          (new TextEncoder().encode(value).length <= 4096 &&
+            value.startsWith("/") &&
+            !/[\0\r\n]/.test(value)),
+        "MCP cwd 必须是有效的绝对路径"
+      )
+      .optional(),
+    url: z.string().trim().max(8192).optional(),
+    headers: z.array(mcpHeaderReferenceSchema).max(64).optional(),
+  })
+  .strict()
+  .superRefine((spec, context) => {
+    const key = spec.transport === "stdio" ? "command" : "url"
+    if (!spec[key]?.trim()) {
+      context.addIssue({
+        code: "custom",
+        path: [key],
+        message:
+          key === "command" ? "stdio MCP 需要启动命令" : "HTTP MCP 需要 URL",
+      })
+    }
+    if (spec.transport === "http" && spec.url) {
+      try {
+        const parsed = new URL(spec.url)
+        if (
+          (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+          !parsed.host ||
+          parsed.username ||
+          parsed.password ||
+          parsed.search ||
+          spec.url.includes("?") ||
+          parsed.hash
+        ) {
+          throw new Error()
+        }
+      } catch {
+        context.addIssue({
+          code: "custom",
+          path: ["url"],
+          message: "HTTP MCP 需要无凭据、query 和 fragment 的 http(s) URL",
+        })
+      }
+    }
+    if (spec.transport === "stdio") {
+      if (spec.url?.trim()) {
+        context.addIssue({
+          code: "custom",
+          path: ["url"],
+          message: "stdio MCP 不能同时配置 URL",
+        })
+      }
+      if ((spec.headers?.length ?? 0) > 0) {
+        context.addIssue({
+          code: "custom",
+          path: ["headers"],
+          message: "stdio MCP 不能配置 HTTP Header",
+        })
+      }
+    } else if (
+      spec.command?.trim() ||
+      (spec.args?.length ?? 0) > 0 ||
+      spec.cwd?.trim()
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["transport"],
+        message: "HTTP MCP 不能配置 command、args 或 cwd",
+      })
+    }
+    const names = new Set<string>()
+    const reservedNames = new Set([
+      "accept",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "keep-alive",
+      "last-event-id",
+      "mcp-method",
+      "mcp-name",
+      "mcp-protocol-version",
+      "mcp-session-id",
+      "proxy-authenticate",
+      "proxy-authorization",
+      "te",
+      "trailer",
+      "transfer-encoding",
+      "upgrade",
+    ])
+    for (const [index, header] of (spec.headers ?? []).entries()) {
+      const normalized = header.name.toLowerCase()
+      if (reservedNames.has(normalized)) {
+        context.addIssue({
+          code: "custom",
+          path: ["headers", index, "name"],
+          message: "MCP Header 不能覆盖连接或协议保留字段",
+        })
+      }
+      if (names.has(normalized)) {
+        context.addIssue({
+          code: "custom",
+          path: ["headers", index, "name"],
+          message: "Header 名称不能重复",
+        })
+      }
+      names.add(normalized)
+    }
+  })
+const mcpResponseSpecSchema = z.object({
   transport: z.string(),
   command: z.string().optional(),
-  args: z.string().optional(),
+  args: z.union([z.array(z.string()), z.string()]).optional(),
+  cwd: z.string().optional(),
   url: z.string().optional(),
-  headers: z.string().optional(),
+  headers: z.union([z.array(mcpHeaderReferenceSchema), z.string()]).optional(),
 })
 const variableSpecSchema = z.object({
   key: z.string(),
   mode: z.string().optional(),
   reference: z.string(),
 })
+const variableNamePattern = /^[A-Za-z_][A-Za-z0-9_]*$/
+const variableReferencePattern = /^(env|secret):\/\/[A-Za-z_][A-Za-z0-9_]*$/
+export function normalizeVariableSpec(spec: Record<string, unknown>) {
+  const normalized = { ...spec }
+  if (typeof normalized.mode === "string") {
+    const mode = normalized.mode.trim().toLowerCase()
+    if (mode) normalized.mode = mode
+    else delete normalized.mode
+  }
+  if (normalized.mode == null && typeof normalized.reference === "string") {
+    const reference = normalized.reference.trim()
+    if (reference.startsWith("env://")) normalized.mode = "value-ref"
+    if (reference.startsWith("secret://")) normalized.mode = "secret-ref"
+  }
+  return normalized
+}
+const variableInputSpecSchema = z.preprocess(
+  (value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value))
+      return value
+    return normalizeVariableSpec(value as Record<string, unknown>)
+  },
+  z
+    .object({
+      key: z
+        .string()
+        .trim()
+        .min(1, "请填写环境变量名")
+        .max(128, "Variable key 不能超过 128 个字符")
+        .regex(variableNamePattern, "Variable key 必须是有效的环境变量名")
+        .refine(
+          (key) => key !== "IS_SANDBOX" && !key.startsWith("AGENTBOX_"),
+          "该 Variable key 由平台保留"
+        ),
+      mode: z.enum(["value-ref", "secret-ref"]),
+      reference: z
+        .string()
+        .trim()
+        .min(1, "请填写变量或密钥引用")
+        .max(137, "Variable reference 不能超过 137 个字符")
+        .regex(
+          variableReferencePattern,
+          "Variable reference 只能是 env://NAME 或 secret://NAME"
+        )
+        .refine(
+          (reference) =>
+            reference.slice(reference.indexOf("://") + 3).length <= 128,
+          "Variable reference 名称不能超过 128 个字符"
+        ),
+    })
+    .strict()
+    .superRefine((spec, context) => {
+      const expectedScheme = spec.mode === "value-ref" ? "env://" : "secret://"
+      if (!spec.reference.startsWith(expectedScheme)) {
+        context.addIssue({
+          code: "custom",
+          path: ["reference"],
+          message:
+            spec.mode === "value-ref"
+              ? "value-ref Variable 必须使用 env://NAME"
+              : "secret-ref Variable 必须使用 secret://NAME",
+        })
+      }
+    })
+)
 
 const executionInputSpecSchema = executionSpecSchema
   .extend({
@@ -233,6 +472,9 @@ const sandboxObservedSpecSchema = z.object({
   runtimeModelSourcesComplete: z.boolean().nullish(),
   extensionSnapshots: z.array(extensionSnapshotSchema).nullish(),
   extensionStates: z.array(provisioningExtensionSchema).nullish(),
+  capabilitiesPendingRestart: z.boolean().nullish(),
+  capabilityDigest: z.string().nullish(),
+  capabilitiesAppliedAt: z.string().datetime({ offset: true }).nullish(),
 })
 
 const sandboxInputSpecSchema = z.preprocess(
@@ -281,7 +523,7 @@ export const resourceInputSchema = z
     }),
     resourceBaseSchema.extend({
       kind: z.literal("skill"),
-      spec: skillSpecSchema.strict(),
+      spec: skillInputSpecSchema.strict(),
     }),
     resourceBaseSchema.extend({
       kind: z.literal("extension"),
@@ -289,23 +531,7 @@ export const resourceInputSchema = z
     }),
     resourceBaseSchema.extend({
       kind: z.literal("mcp"),
-      spec: mcpSpecSchema
-        .extend({
-          transport: z.enum(["stdio", "http"]),
-        })
-        .strict()
-        .superRefine((spec, context) => {
-          const key = spec.transport === "stdio" ? "command" : "url"
-          if (!spec[key]?.trim())
-            context.addIssue({
-              code: "custom",
-              path: [key],
-              message:
-                key === "command"
-                  ? "stdio MCP 需要启动命令"
-                  : "HTTP MCP 需要 URL",
-            })
-        }),
+      spec: mcpInputSpecSchema,
     }),
     resourceBaseSchema.extend({
       kind: z.literal("sandbox"),
@@ -313,15 +539,20 @@ export const resourceInputSchema = z
     }),
     resourceBaseSchema.extend({
       kind: z.literal("variable"),
-      spec: variableSpecSchema
-        .extend({
-          key: z.string().trim().min(1, "请填写环境变量名"),
-          reference: z.string().trim().min(1, "请填写变量或密钥引用"),
-        })
-        .strict(),
+      spec: variableInputSpecSchema,
     }),
   ])
   .superRefine((resource, context) => {
+    if (resource.kind === "skill") {
+      const issue = skillDocumentIssue(resource.spec.instructions, resource.id)
+      if (issue) {
+        context.addIssue({
+          code: "custom",
+          path: ["spec", "instructions"],
+          message: issue,
+        })
+      }
+    }
     if (resource.kind === "extension" && resource.enabled) {
       for (const [key, label] of [
         ["version", "固定版本"],
@@ -336,6 +567,19 @@ export const resourceInputSchema = z
           })
         }
       }
+    }
+    if (
+      (resource.kind === "runtime" || resource.kind === "sandbox") &&
+      hasOnlyUnsupportedMCPAgentTools(
+        resource.spec.agentTools,
+        resource.spec.mcpServerIds
+      )
+    ) {
+      context.addIssue({
+        code: "custom",
+        path: ["spec", "mcpServerIds"],
+        message: "所选 Agent 均不支持 MCP；请增加受支持的 Agent，或取消 MCP",
+      })
     }
     if (
       resource.kind !== "project" &&
@@ -381,7 +625,7 @@ export const resourceSchema = z.discriminatedUnion("kind", [
   }),
   resourceResponseBaseSchema.extend({
     kind: z.literal("mcp"),
-    spec: mcpSpecSchema.partial(),
+    spec: mcpResponseSpecSchema.partial(),
   }),
   resourceResponseBaseSchema.extend({
     kind: z.literal("sandbox"),
@@ -411,6 +655,8 @@ export type ResourceOfKind<K extends ResourceKind> = Extract<
   Resource,
   { kind: K }
 >
+export type SandboxCapabilityOverrideKey =
+  "skillIds" | "mcpServerIds" | "variableIds"
 // Editors intentionally hold incomplete fields until submit-time validation.
 export type ResourceDraft = z.input<typeof resourceBaseSchema> & {
   kind: ResourceKind
@@ -420,7 +666,8 @@ export type ResourceDraft = z.input<typeof resourceBaseSchema> & {
 // Template defaults are display fallbacks, not edits to an existing instance.
 export function sandboxSpecForUpdate(
   draft: Record<string, unknown>,
-  current: ResourceOfKind<"sandbox">["spec"]
+  current: ResourceOfKind<"sandbox">["spec"],
+  touchedCapabilityKeys: readonly SandboxCapabilityOverrideKey[] = []
 ) {
   const spec = { ...draft }
   for (const key of [
@@ -441,6 +688,10 @@ export function sandboxSpecForUpdate(
   ] as const) {
     if (Object.hasOwn(current, key)) spec[key] = current[key]
     else delete spec[key]
+  }
+  const touched = new Set(touchedCapabilityKeys)
+  for (const key of ["skillIds", "mcpServerIds", "variableIds"] as const) {
+    if (!Object.hasOwn(current, key) && !touched.has(key)) delete spec[key]
   }
   return spec
 }

@@ -19,6 +19,7 @@ import {
   sandboxEnvironmentVariables,
 } from "@/lib/environment-variables"
 import {
+  normalizeVariableSpec,
   resourceInputSchema,
   type Resource,
   type ResourceDraft,
@@ -26,15 +27,31 @@ import {
   type ResourceKind,
 } from "@/lib/platform-schema"
 import {
+  hasOnlyUnsupportedMCPAgentTools,
+  missingMCPVariableIds,
+  normalizeMCPArgs,
+  normalizeMCPHeaders,
+  requiredMCPVariableIds,
+  unresolvedMCPHeaderReferences,
+  unresolvedMCPValueReferences,
+} from "@/lib/mcp-config"
+import {
   normalizeRuntimeImageReference,
   runtimeImageChoices,
   type RuntimeImageChoices,
 } from "@/lib/runtime-images"
 import type { ManagedServer } from "@/lib/server-schema"
 import type { ImportedSkill } from "@/lib/skill-import"
+import {
+  readSkillFrontmatter,
+  skillDocumentIssue,
+  syncSkillDocument,
+} from "@/lib/skill-frontmatter"
 import { cn } from "@/lib/utils"
 import { EnvironmentVariablesEditor } from "@/components/environment-variables-editor"
 import { ExtensionSelector } from "@/components/extension-selector"
+import { MCPCompatibilityNotice } from "@/components/mcp-compatibility-notice"
+import { MCPConfigEditor } from "@/components/mcp-config-editor"
 import { RuntimeImageCombobox } from "@/components/runtime-image-combobox"
 import { SkillImportPanel } from "@/components/skill-import-panel"
 import { SkillSearchPanel } from "@/components/skill-search-panel"
@@ -338,6 +355,16 @@ function fields(
           advanced: true,
         },
         {
+          key: "variableIds",
+          label: "变量引用",
+          multiOptions: resources
+            .filter((item) => item.kind === "variable" && item.enabled)
+            .map((item) => ({ value: item.id, label: item.name })),
+          description:
+            "MCP Header 使用的 Variable 必须与模板一起绑定；选择 MCP 时会自动补齐。",
+          advanced: true,
+        },
+        {
           key: "environmentVariables",
           label: "环境变量",
           environmentVariables: true,
@@ -373,30 +400,7 @@ function fields(
         },
       ]
     case "mcp":
-      return [
-        {
-          key: "transport",
-          label: "Transport",
-          options: values("stdio", "http"),
-        },
-        {
-          key: "command",
-          label: "启动命令",
-          placeholder: "npx -y @example/mcp-server",
-        },
-        { key: "args", label: "参数", placeholder: "--stdio --readonly" },
-        {
-          key: "url",
-          label: "HTTP URL",
-          placeholder: "https://mcp.example.com",
-        },
-        {
-          key: "headers",
-          label: "Header 引用",
-          textarea: true,
-          placeholder: "Authorization=secret://MCP_TOKEN",
-        },
-      ]
+      return []
     case "sandbox":
       return [
         {
@@ -442,7 +446,10 @@ function fields(
         {
           key: "reference",
           label: "引用",
-          placeholder: "env://CUSTOM_API_TOKEN",
+          placeholder:
+            spec.mode === "value-ref"
+              ? "env://HOST_ENV_NAME"
+              : "secret://HOST_SECRET_NAME",
           description: "平台只保存引用，不保存明文密钥。",
         },
       ]
@@ -490,8 +497,12 @@ function defaults(kind: ResourceKind) {
       environmentVariables: sandboxEnvironmentVariables(undefined),
       credentialIds: [],
     },
-    skill: { version: "1.0.0", source: "inline" },
-    mcp: { transport: "stdio" },
+    skill: {
+      version: "1.0.0",
+      source: "inline",
+      instructions: syncSkillDocument("", { name: "", description: "" }),
+    },
+    mcp: { transport: "stdio", args: [], headers: [] },
     sandbox: {
       policy: "new",
       status: "requested",
@@ -676,6 +687,27 @@ function nextSpec(
   servers: ManagedServer[]
 ) {
   const next = { ...spec, [key]: value }
+  if (kind === "runtime" && key === "mcpServerIds") {
+    next.variableIds = Array.from(
+      new Set([
+        ...stringArray(next.variableIds),
+        ...requiredMCPVariableIds(value, resources),
+      ])
+    )
+  }
+  if (kind === "mcp" && key === "transport") {
+    if (value === "stdio") {
+      delete next.url
+      delete next.headers
+      next.args = normalizeMCPArgs(next.args)
+    } else {
+      delete next.command
+      delete next.args
+      delete next.cwd
+      next.headers = normalizeMCPHeaders(next.headers)
+    }
+    return next
+  }
   if (kind === "runtime" && key === "network" && value === "none") {
     next.proxyId = ""
   }
@@ -794,6 +826,32 @@ function initialEditorSpec(
 }
 
 function inputFromResource(resource: Resource): ResourceDraft {
+  if (resource.kind === "skill") {
+    const spec = { ...resource.spec }
+    delete spec.bundleDigest
+    delete spec.fileCount
+    delete spec.decodedBytes
+    return { ...resource, spec }
+  }
+  if (resource.kind === "mcp") {
+    const spec: Record<string, unknown> = {
+      ...resource.spec,
+      args: normalizeMCPArgs(resource.spec.args),
+      headers: normalizeMCPHeaders(resource.spec.headers),
+    }
+    if (resource.spec.transport === "http") {
+      delete spec.command
+      delete spec.args
+      delete spec.cwd
+    } else {
+      delete spec.url
+      delete spec.headers
+    }
+    return { ...resource, spec }
+  }
+  if (resource.kind === "variable") {
+    return { ...resource, spec: normalizeVariableSpec(resource.spec) }
+  }
   if (resource.kind !== "runtime" && resource.kind !== "sandbox")
     return { ...resource, spec: { ...resource.spec } }
   const spec = {
@@ -889,6 +947,30 @@ export function ResourceEditorDialog({
   const creatingSkill = kind === "skill" && !resource
   const showDetails = !creatingSkill || skillMode === "manual" || skillImported
   const skillFiles = Array.isArray(input.spec.files) ? input.spec.files : []
+  const skillFrontmatter = readSkillFrontmatter(
+    typeof input.spec.instructions === "string" ? input.spec.instructions : ""
+  )
+  const currentSkillIssue =
+    kind === "skill"
+      ? skillDocumentIssue(
+          typeof input.spec.instructions === "string"
+            ? input.spec.instructions
+            : "",
+          input.id
+        )
+      : ""
+  const skillBundleDigest =
+    resource?.kind === "skill" && typeof resource.spec.bundleDigest === "string"
+      ? resource.spec.bundleDigest
+      : ""
+  const skillFileCount =
+    resource?.kind === "skill" && typeof resource.spec.fileCount === "number"
+      ? resource.spec.fileCount
+      : skillFiles.length + 1
+  const skillDecodedBytes =
+    resource?.kind === "skill" && typeof resource.spec.decodedBytes === "number"
+      ? resource.spec.decodedBytes
+      : undefined
   const projects = resources.filter((item) => item.kind === "project")
   const projectResources = resources.filter(
     (item) =>
@@ -916,10 +998,33 @@ export function ResourceEditorDialog({
   }
 
   function updateSpec(key: string, value: unknown) {
-    setInput((current) => ({
-      ...current,
-      spec: nextSpec(kind, current.spec, key, value, projectResources, servers),
-    }))
+    setInput((current) => {
+      const spec = nextSpec(
+        kind,
+        current.spec,
+        key,
+        value,
+        projectResources,
+        servers
+      )
+      if (
+        kind !== "skill" ||
+        key !== "instructions" ||
+        typeof value !== "string"
+      ) {
+        return { ...current, spec }
+      }
+      const frontmatter = readSkillFrontmatter(value)
+      return {
+        ...current,
+        description: frontmatter.metadata.description || current.description,
+        spec: {
+          ...spec,
+          license: frontmatter.metadata.license,
+          compatibility: frontmatter.metadata.compatibility,
+        },
+      }
+    })
     setErrors((current) => ({ ...current, spec: "" }))
   }
 
@@ -934,7 +1039,77 @@ export function ResourceEditorDialog({
 
   async function submit() {
     if (saving || importing || !showDetails || !dependenciesReady) return
-    const parsed = resourceInputSchema.safeParse(input)
+    let candidate = input
+    if (kind === "skill") {
+      const instructions = String(input.spec.instructions ?? "")
+      const issue = skillDocumentIssue(instructions, input.id)
+      if (issue) {
+        setErrors({ spec: issue })
+        document.getElementById("spec-instructions")?.focus()
+        return
+      }
+      const frontmatter = readSkillFrontmatter(instructions).metadata
+      candidate = {
+        ...input,
+        description: frontmatter.description,
+        spec: {
+          ...input.spec,
+          license: frontmatter.license,
+          compatibility: frontmatter.compatibility,
+        },
+      }
+    }
+    if (
+      kind === "runtime" &&
+      hasOnlyUnsupportedMCPAgentTools(
+        input.spec.agentTools,
+        input.spec.mcpServerIds
+      )
+    ) {
+      setErrors({
+        spec: "所选 Agent 均不支持 MCP；请增加 Codex、Claude Code、DeepSeek Harness、Gemini CLI 或 OpenCode，或取消 MCP。",
+      })
+      return
+    }
+    if (kind === "mcp") {
+      const unresolvedReferences = unresolvedMCPValueReferences(
+        input.spec.headers,
+        projectResources
+      )
+      if (unresolvedReferences.length > 0) {
+        setErrors({
+          spec: `MCP Header 引用在当前项目没有对应 Variable：${unresolvedReferences.join("、")}`,
+        })
+        return
+      }
+    }
+    if (kind === "runtime") {
+      const unresolvedReferences = unresolvedMCPHeaderReferences(
+        input.spec.mcpServerIds,
+        projectResources
+      )
+      if (unresolvedReferences.length > 0) {
+        setErrors({
+          spec: `MCP Header 引用在当前项目没有对应 Variable：${unresolvedReferences.join("、")}`,
+        })
+        return
+      }
+      const missingVariables = missingMCPVariableIds(
+        input.spec.mcpServerIds,
+        input.spec.variableIds,
+        projectResources
+      )
+      if (missingVariables.length > 0) {
+        const names = missingVariables.map(
+          (id) => projectResources.find((item) => item.id === id)?.name ?? id
+        )
+        setErrors({
+          spec: `MCP Header 还需要绑定 Variable：${names.join("、")}`,
+        })
+        return
+      }
+    }
+    const parsed = resourceInputSchema.safeParse(candidate)
     if (!parsed.success) {
       setErrors(
         Object.fromEntries(
@@ -1002,12 +1177,31 @@ export function ResourceEditorDialog({
   }
 
   function importSkill(skill: ImportedSkill) {
+    const id = createSlug(skill.name)
+    const description = skill.description.trim()
+    const instructions = syncSkillDocument(
+      typeof skill.spec.instructions === "string"
+        ? skill.spec.instructions
+        : "",
+      { name: id, description }
+    )
+    const frontmatter = readSkillFrontmatter(instructions).metadata
+    const importedSpec = { ...skill.spec }
+    delete importedSpec.bundleDigest
+    delete importedSpec.fileCount
+    delete importedSpec.decodedBytes
     setInput((current) => ({
       ...current,
       name: skill.name,
-      id: createSlug(skill.name),
-      description: skill.description,
-      spec: { ...defaults("skill"), ...skill.spec },
+      id,
+      description,
+      spec: {
+        ...defaults("skill"),
+        ...importedSpec,
+        instructions,
+        license: frontmatter.license,
+        compatibility: frontmatter.compatibility,
+      },
     }))
     setSlugEdited(false)
     setErrors({})
@@ -1201,9 +1395,31 @@ export function ResourceEditorDialog({
                   value={input.name}
                   aria-invalid={Boolean(errors.name)}
                   onChange={(event) => {
-                    update("name", event.target.value)
-                    if (!slugEdited)
-                      update("id", createSlug(event.target.value))
+                    const name = event.target.value
+                    if (kind === "skill" && !slugEdited) {
+                      const id = createSlug(name)
+                      setInput((current) => ({
+                        ...current,
+                        name,
+                        id,
+                        spec: {
+                          ...current.spec,
+                          instructions: syncSkillDocument(
+                            String(current.spec.instructions ?? ""),
+                            { name: id, description: current.description }
+                          ),
+                        },
+                      }))
+                      setErrors((current) => ({
+                        ...current,
+                        name: "",
+                        id: "",
+                        spec: "",
+                      }))
+                      return
+                    }
+                    update("name", name)
+                    if (!slugEdited) update("id", createSlug(name))
                   }}
                 />
                 <FieldError>{errors.name}</FieldError>
@@ -1217,7 +1433,27 @@ export function ResourceEditorDialog({
                   aria-invalid={Boolean(errors.id)}
                   onChange={(event) => {
                     setSlugEdited(true)
-                    update("id", event.target.value.toLowerCase())
+                    const id = event.target.value.toLowerCase()
+                    if (kind === "skill") {
+                      setInput((current) => ({
+                        ...current,
+                        id,
+                        spec: {
+                          ...current.spec,
+                          instructions: syncSkillDocument(
+                            String(current.spec.instructions ?? ""),
+                            { name: id, description: current.description }
+                          ),
+                        },
+                      }))
+                      setErrors((current) => ({
+                        ...current,
+                        id: "",
+                        spec: "",
+                      }))
+                      return
+                    }
+                    update("id", id)
                   }}
                 />
                 <FieldError>{errors.id}</FieldError>
@@ -1233,10 +1469,35 @@ export function ResourceEditorDialog({
                     "min-h-20",
                     kind === "skill" && "max-h-24 overflow-y-auto"
                   )}
-                  onChange={(event) =>
-                    update("description", event.target.value)
-                  }
+                  onChange={(event) => {
+                    const description = event.target.value
+                    if (kind === "skill") {
+                      setInput((current) => ({
+                        ...current,
+                        description,
+                        spec: {
+                          ...current.spec,
+                          instructions: syncSkillDocument(
+                            String(current.spec.instructions ?? ""),
+                            { name: current.id, description }
+                          ),
+                        },
+                      }))
+                      setErrors((current) => ({
+                        ...current,
+                        description: "",
+                        spec: "",
+                      }))
+                      return
+                    }
+                    update("description", description)
+                  }}
                 />
+                {kind === "skill" && (
+                  <FieldDescription>
+                    与 SKILL.md frontmatter 的 description 保持同步。
+                  </FieldDescription>
+                )}
               </Field>
             )}
             <div className="grid gap-4 sm:grid-cols-2">
@@ -1251,17 +1512,49 @@ export function ResourceEditorDialog({
                 />
               ))}
             </div>
-            {kind === "runtime" && (
-              <ExtensionSelector
-                resources={projectResources}
-                selectedIds={stringArray(input.spec.extensionIds)}
-                onChange={(ids) => updateSpec("extensionIds", ids)}
-                network={
-                  typeof input.spec.network === "string"
-                    ? input.spec.network
-                    : undefined
+            {kind === "mcp" && (
+              <MCPConfigEditor
+                spec={input.spec}
+                variables={projectResources.filter(
+                  (item): item is Extract<Resource, { kind: "variable" }> =>
+                    item.kind === "variable"
+                )}
+                legacyArgs={
+                  resource?.kind === "mcp" ? resource.spec.args : undefined
                 }
+                legacyHeaders={
+                  resource?.kind === "mcp" ? resource.spec.headers : undefined
+                }
+                invalid={Boolean(errors.spec)}
+                onChange={updateSpec}
               />
+            )}
+            {kind === "skill" && (
+              <SkillMetadataSummary
+                metadata={skillFrontmatter.metadata}
+                issue={currentSkillIssue}
+                bundleDigest={skillBundleDigest}
+                fileCount={skillFileCount}
+                decodedBytes={skillDecodedBytes}
+              />
+            )}
+            {kind === "runtime" && (
+              <>
+                <ExtensionSelector
+                  resources={projectResources}
+                  selectedIds={stringArray(input.spec.extensionIds)}
+                  onChange={(ids) => updateSpec("extensionIds", ids)}
+                  network={
+                    typeof input.spec.network === "string"
+                      ? input.spec.network
+                      : undefined
+                  }
+                />
+                <MCPCompatibilityNotice
+                  agentTools={input.spec.agentTools}
+                  mcpServerIds={input.spec.mcpServerIds}
+                />
+              </>
             )}
             {advancedSpecFields.length > 0 && (
               <details
@@ -1402,4 +1695,91 @@ export function ResourceEditorDialog({
       </DialogContent>
     </Dialog>
   )
+}
+
+function SkillMetadataSummary({
+  metadata,
+  issue,
+  bundleDigest,
+  fileCount,
+  decodedBytes,
+}: {
+  metadata: {
+    name: string
+    description: string
+    license: string
+    compatibility: string
+  }
+  issue: string
+  bundleDigest: string
+  fileCount: number
+  decodedBytes?: number
+}) {
+  return (
+    <div className="rounded-xl border bg-muted/15 p-4" aria-live="polite">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-sm font-medium">规范与来源</p>
+        <Badge variant={issue ? "destructive" : "secondary"}>
+          {issue ? "需要修正 frontmatter" : "frontmatter 有效"}
+        </Badge>
+      </div>
+      {issue && <p className="mt-2 text-sm text-destructive">{issue}</p>}
+      <dl className="mt-3 grid gap-x-6 gap-y-3 text-xs sm:grid-cols-2">
+        <SkillMetadataItem
+          label="Skill 标识"
+          value={metadata.name || "未填写"}
+          mono
+        />
+        <SkillMetadataItem
+          label="License"
+          value={metadata.license || "未声明"}
+        />
+        <SkillMetadataItem
+          label="Compatibility"
+          value={metadata.compatibility || "未声明"}
+        />
+        <SkillMetadataItem
+          label="Bundle"
+          value={`${fileCount} 个文件${decodedBytes === undefined ? "" : ` · ${formatBytes(decodedBytes)}`}`}
+        />
+        <SkillMetadataItem
+          label="Bundle digest"
+          value={bundleDigest || "保存后由服务端计算"}
+          mono
+        />
+        <SkillMetadataItem
+          label="来源提交"
+          value="未记录；当前接口不提供不可变 commit"
+        />
+      </dl>
+    </div>
+  )
+}
+
+function SkillMetadataItem({
+  label,
+  value,
+  mono = false,
+}: {
+  label: string
+  value: string
+  mono?: boolean
+}) {
+  return (
+    <div className="min-w-0">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd
+        className={cn("mt-1 break-words text-foreground", mono && "font-mono")}
+        title={value}
+      >
+        {value}
+      </dd>
+    </div>
+  )
+}
+
+function formatBytes(value: number) {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`
+  return `${(value / 1024 / 1024).toFixed(1)} MiB`
 }

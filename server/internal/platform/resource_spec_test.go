@@ -13,7 +13,7 @@ func TestResourceSpecContractsRejectWrongShapes(t *testing.T) {
 		{"runtime cpu", KindRuntime, map[string]any{"cpu": 2}},
 		{"sandbox binding", KindSandbox, map[string]any{"modelBindings": map[string]any{"credential": 1}}},
 		{"skill version", KindSkill, map[string]any{"version": false}},
-		{"mcp args", KindMCP, map[string]any{"args": []string{"one"}}},
+		{"mcp args", KindMCP, map[string]any{"args": []any{"one", 2}}},
 		{"variable reference", KindVariable, map[string]any{"reference": 1}},
 		{"nested environment", KindRuntime, map[string]any{"environmentVariables": []any{map[string]any{"name": "KEY", "value": 1}}}},
 	} {
@@ -47,6 +47,10 @@ func TestDesiredSandboxSpecDropsRuntimeModelSources(t *testing.T) {
 		"runtimeModelSourcesComplete":   true,
 		"runtimeModelTokenEpoch":        "restart-job-one",
 		"credentialedProxyIdAtCreation": "proxy-one",
+		"capabilitiesPendingRestart":    true,
+		"capabilityDigest":              "sha256:test",
+		"capabilitiesAppliedAt":         "2026-09-04T00:00:00Z",
+		"capabilityRevision":            3,
 	})
 	if _, ok := desired["runtimeModelSources"]; ok {
 		t.Fatal("runtime model source observation leaked into desired configuration")
@@ -59,6 +63,11 @@ func TestDesiredSandboxSpecDropsRuntimeModelSources(t *testing.T) {
 	}
 	if _, ok := desired["credentialedProxyIdAtCreation"]; ok {
 		t.Fatal("credentialed proxy provenance leaked into desired configuration")
+	}
+	for _, field := range []string{"capabilitiesPendingRestart", "capabilityDigest", "capabilitiesAppliedAt", "capabilityRevision"} {
+		if _, ok := desired[field]; ok {
+			t.Fatalf("capability observation %s leaked into desired configuration", field)
+		}
 	}
 	if desired["runtimeId"] != "runtime-one" {
 		t.Fatalf("desired runtimeId = %#v", desired["runtimeId"])

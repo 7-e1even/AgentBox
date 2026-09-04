@@ -3,6 +3,10 @@ import { describe, expect, it } from "vitest"
 import { incompatibleAgentTools } from "./agent-tools"
 
 describe("incompatibleAgentTools", () => {
+  it("allows agents to authenticate themselves when no model service is configured", () => {
+    expect(incompatibleAgentTools(["codex"], [])).toEqual([])
+  })
+
   it("uses the LLM facade so one Anthropic credential can serve every curated Agent", () => {
     expect(
       incompatibleAgentTools(

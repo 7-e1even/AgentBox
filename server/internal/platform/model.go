@@ -358,8 +358,33 @@ func Normalize(input *Input) {
 	if input.Spec == nil {
 		input.Spec = map[string]any{}
 	}
+	if input.Kind == KindVariable {
+		for _, key := range []string{"key", "reference"} {
+			if value, ok := input.Spec[key].(string); ok {
+				input.Spec[key] = strings.TrimSpace(value)
+			}
+		}
+		if value, ok := input.Spec["mode"].(string); ok {
+			input.Spec["mode"] = strings.ToLower(strings.TrimSpace(value))
+		}
+		mode, _ := input.Spec["mode"].(string)
+		if strings.TrimSpace(mode) == "" {
+			if reference, ok := input.Spec["reference"].(string); ok {
+				if scheme, _, valid := ParseMCPValueReference(reference); valid {
+					if scheme == "env" {
+						input.Spec["mode"] = "value-ref"
+					} else {
+						input.Spec["mode"] = "secret-ref"
+					}
+				}
+			}
+		}
+	}
 	normalizeExtensionSpec(input)
 	if input.Kind == KindRuntime || input.Kind == KindSandbox {
+		for _, key := range []string{"agentTools", "skillIds", "mcpServerIds", "variableIds"} {
+			normalizeResourceIDList(input.Spec, key)
+		}
 		// Do not normalize malformed values into a valid empty list before validation.
 		if value := input.Spec["environmentVariables"]; value == nil {
 			input.Spec["environmentVariables"] = SandboxEnvironmentVariables(nil)
@@ -367,6 +392,39 @@ func Normalize(input *Input) {
 			input.Spec["environmentVariables"] = SandboxEnvironmentVariables(value)
 		}
 	}
+}
+
+func normalizeResourceIDList(spec map[string]any, key string) {
+	raw, exists := spec[key]
+	if !exists {
+		return
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		if strings, stringsOK := raw.([]string); stringsOK {
+			items = make([]any, len(strings))
+			for index, value := range strings {
+				items[index] = value
+			}
+		} else {
+			return
+		}
+	}
+	seen := make(map[string]struct{}, len(items))
+	result := make([]any, 0, len(items))
+	for _, item := range items {
+		value, ok := item.(string)
+		if !ok {
+			return
+		}
+		value = strings.ToLower(strings.TrimSpace(value))
+		if _, duplicate := seen[value]; duplicate {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	spec[key] = result
 }
 
 func SandboxEnvironmentVariables(value any) []any {
@@ -650,7 +708,7 @@ func Validate(input Input) error {
 		return &ValidationError{Message: "请选择所属项目"}
 	}
 	if input.Kind == KindSkill {
-		return ValidateSkillSpec(*decodedSpec.(*SkillSpec))
+		return ValidateSkillResource(input.ID, input.Description, *decodedSpec.(*SkillSpec))
 	}
 	if input.Kind == KindExtension {
 		return ValidateExtensionSpec(*decodedSpec.(*ExtensionSpec), input.Enabled)
@@ -683,16 +741,13 @@ func Validate(input Input) error {
 		}
 	}
 	if input.Kind == KindMCP {
-		transport, _ := input.Spec["transport"].(string)
-		if transport != "stdio" && transport != "http" {
-			return &ValidationError{Message: "MCP transport 只能是 stdio 或 http"}
-		}
-		if transport == "stdio" {
-			return require(input.Spec, "command", "stdio MCP 需要启动命令")
-		}
-		return require(input.Spec, "url", "HTTP MCP 需要 URL")
+		return ValidateMCPSpec(*decodedSpec.(*MCPSpec))
 	}
 	if input.Kind == KindRuntime {
+		spec := decodedSpec.(*RuntimeSpec).ExecutionSpec
+		if err := validateCapabilityBindings(spec); err != nil {
+			return err
+		}
 		serverID, _ := input.Spec["serverId"].(string)
 		if _, err := uuid.Parse(serverID); err != nil {
 			return &ValidationError{Message: "请选择运行服务器"}
@@ -724,6 +779,10 @@ func Validate(input Input) error {
 		}
 	}
 	if input.Kind == KindSandbox {
+		spec := decodedSpec.(*SandboxSpec).ExecutionSpec
+		if err := validateCapabilityBindings(spec); err != nil {
+			return err
+		}
 		if err := require(input.Spec, "runtimeId", "请选择沙箱模板"); err != nil {
 			return err
 		}
@@ -745,10 +804,85 @@ func Validate(input Input) error {
 		}
 	}
 	if input.Kind == KindVariable {
-		if err := require(input.Spec, "key", "请填写环境变量名"); err != nil {
-			return err
+		return ValidateVariableSpec(*decodedSpec.(*VariableSpec))
+	}
+	return nil
+}
+
+func validateCapabilityBindings(spec ExecutionSpec) error {
+	if len(spec.SkillIDs) > MaxSkillBindings {
+		return &ValidationError{Message: "一个环境最多绑定 32 个 Skill"}
+	}
+	if len(spec.MCPServerIDs) > MaxMCPBindings {
+		return &ValidationError{Message: "一个环境最多绑定 32 个 MCP Server"}
+	}
+	if len(spec.VariableIDs) > MaxVariableBindings {
+		return &ValidationError{Message: "一个环境最多绑定 100 个 Variable"}
+	}
+	for label, ids := range map[string][]string{
+		"Skill": spec.SkillIDs, "MCP": spec.MCPServerIDs, "Variable": spec.VariableIDs,
+	} {
+		seen := make(map[string]struct{}, len(ids))
+		for _, id := range ids {
+			if !idPattern.MatchString(id) || len(id) > 64 {
+				return &ValidationError{Message: label + " 引用标识无效"}
+			}
+			if _, duplicate := seen[id]; duplicate {
+				return &ValidationError{Message: label + " 引用不能重复"}
+			}
+			seen[id] = struct{}{}
 		}
-		return require(input.Spec, "reference", "请填写变量或密钥引用")
+	}
+	if len(spec.MCPServerIDs) == 0 {
+		return nil
+	}
+	for _, tool := range spec.AgentTools {
+		if SupportsMCPAgentTool(tool) {
+			return nil
+		}
+	}
+	return &ValidationError{Message: "已选择 MCP Server，但当前 Agent 均不支持 MCP；请选择 Claude Code、Codex、DeepSeek Harness、Gemini CLI 或 OpenCode"}
+}
+
+func SupportsMCPAgentTool(tool string) bool {
+	switch tool {
+	case "claude-code", "codex", "deepseek-harness", "gemini-cli", "opencode":
+		return true
+	default:
+		return false
+	}
+}
+
+func ValidateVariableSpec(spec VariableSpec) error {
+	if len(spec.Key) > MaxVariableNameLength || !environmentVariableNamePattern.MatchString(spec.Key) {
+		return &ValidationError{Message: "Variable key 必须是有效的环境变量名"}
+	}
+	if spec.Key == "IS_SANDBOX" || strings.HasPrefix(spec.Key, "AGENTBOX_") {
+		return &ValidationError{Message: "该 Variable key 由平台保留"}
+	}
+	scheme, source, ok := ParseMCPValueReference(spec.Reference)
+	if !ok || len(source) > MaxVariableNameLength {
+		return &ValidationError{Message: "Variable reference 只能是 env://NAME 或 secret://NAME"}
+	}
+	mode := spec.Mode
+	if mode == "" {
+		if scheme == "env" {
+			mode = "value-ref"
+		} else {
+			mode = "secret-ref"
+		}
+	}
+	switch mode {
+	case "value-ref":
+		if scheme != "env" {
+			return &ValidationError{Message: "value-ref Variable 必须使用 env://NAME"}
+		}
+	case "secret-ref":
+		if scheme != "secret" {
+			return &ValidationError{Message: "secret-ref Variable 必须使用 secret://NAME"}
+		}
+	default:
+		return &ValidationError{Message: "Variable mode 只能是 value-ref 或 secret-ref"}
 	}
 	return nil
 }
