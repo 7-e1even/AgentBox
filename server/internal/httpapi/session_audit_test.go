@@ -71,25 +71,6 @@ func newAuditSessionServer(t *testing.T, store *auditCaptureSessionStore) (*http
 	return server, handler
 }
 
-func connectAuditTestWorker(t *testing.T, ctx context.Context, server *httptest.Server, handler *Server) *websocket.Conn {
-	t.Helper()
-	worker, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/servers/"+sessionTestServerID+"/sessions/connect"), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + strings.Repeat("w", 32)}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = worker.CloseNow() })
-	for !handler.sessions.hasWorker(sessionTestServerID) {
-		select {
-		case <-ctx.Done():
-			t.Fatalf("timed out waiting for Worker session registration: %v", ctx.Err())
-		case <-time.After(time.Millisecond):
-		}
-	}
-	return worker
-}
-
 func issueAuditTestTicket(t *testing.T, ctx context.Context, server *httptest.Server) string {
 	t.Helper()
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/sandboxes/sandbox-one/session-ticket", nil)
@@ -131,7 +112,7 @@ func TestPrivilegedSessionAuditCarriesIdentityAndOnlySummaryMetadata(t *testing.
 	server, handler := newAuditSessionServer(t, store)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	worker := connectAuditTestWorker(t, ctx, server, handler)
+	worker := connectSessionTestWorker(t, ctx, server, handler)
 	ticket := issueAuditTestTicket(t, ctx, server)
 	browser := connectAuditTestBrowser(t, ctx, server, ticket)
 
@@ -204,7 +185,7 @@ func TestPrivilegedSessionFailsClosedBeforeWorkerOpenWhenAuditFails(t *testing.T
 	server, handler := newAuditSessionServer(t, store)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	worker := connectAuditTestWorker(t, ctx, server, handler)
+	worker := connectSessionTestWorker(t, ctx, server, handler)
 	ticket := issueAuditTestTicket(t, ctx, server)
 	browser := connectAuditTestBrowser(t, ctx, server, ticket)
 	defer browser.CloseNow()

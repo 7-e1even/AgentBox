@@ -56,7 +56,7 @@ func (sessionTestStore) ListResources(context.Context) ([]platform.Resource, err
 	}, nil
 }
 
-func newSessionTestServer(t *testing.T) *httptest.Server {
+func newSessionTestServer(t *testing.T) (*httptest.Server, *Server) {
 	t.Helper()
 	// 该测试模拟反向代理部署（依赖 X-Forwarded-Host 放行浏览器 Origin），
 	// 因此显式开启可信代理模式。
@@ -69,11 +69,32 @@ func newSessionTestServer(t *testing.T) *httptest.Server {
 	)
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
-	return server
+	return server, handler
 }
 
 func websocketTestURL(serverURL, path string) string {
 	return "ws" + strings.TrimPrefix(serverURL, "http") + path
+}
+
+func connectSessionTestWorker(t *testing.T, ctx context.Context, server *httptest.Server, handler *Server) *websocket.Conn {
+	t.Helper()
+	worker, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/servers/"+sessionTestServerID+"/sessions/connect"), &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + strings.Repeat("w", 32)}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = worker.CloseNow() })
+
+	poll := time.Tick(time.Millisecond)
+	for !handler.sessions.hasWorker(sessionTestServerID) {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for Worker session registration: %v", ctx.Err())
+		case <-poll:
+		}
+	}
+	return worker
 }
 
 func TestSandboxSessionTicketIsSingleUse(t *testing.T) {
@@ -122,7 +143,7 @@ func TestWorkerSessionProtocolHandshake(t *testing.T) {
 		{name: "malformed", minimum: "1", status: http.StatusBadRequest},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			server := newSessionTestServer(t)
+			server, _ := newSessionTestServer(t)
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			header := http.Header{"Authorization": []string{"Bearer " + strings.Repeat("w", 32)}}
@@ -163,7 +184,7 @@ func TestSandboxSessionTicketCannotChangeMode(t *testing.T) {
 }
 
 func TestSandboxDesktopTicketRejectsMissingDesktopSnapshot(t *testing.T) {
-	server := newSessionTestServer(t)
+	server, _ := newSessionTestServer(t)
 	request, err := http.NewRequestWithContext(
 		t.Context(),
 		http.MethodPost,
@@ -226,17 +247,11 @@ func TestSessionAcceptOptionsRejectInvalidForwardedGatewayHost(t *testing.T) {
 }
 
 func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
-	server := newSessionTestServer(t)
+	server, handler := newSessionTestServer(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	worker, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/servers/"+sessionTestServerID+"/sessions/connect"), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + strings.Repeat("w", 32)}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer worker.CloseNow()
+	worker := connectSessionTestWorker(t, ctx, server, handler)
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/sandboxes/sandbox-one/session-ticket", nil)
 	if err != nil {
@@ -355,17 +370,11 @@ func TestSandboxSessionForwardsTerminalFrames(t *testing.T) {
 }
 
 func TestSandboxSessionForwardsDesktopFrames(t *testing.T) {
-	server := newSessionTestServer(t)
+	server, handler := newSessionTestServer(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 
-	worker, _, err := websocket.Dial(ctx, websocketTestURL(server.URL, "/api/servers/"+sessionTestServerID+"/sessions/connect"), &websocket.DialOptions{
-		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + strings.Repeat("w", 32)}},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer worker.CloseNow()
+	worker := connectSessionTestWorker(t, ctx, server, handler)
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, server.URL+"/api/sandboxes/sandbox-one/desktop-ticket", nil)
 	if err != nil {
