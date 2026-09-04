@@ -16,6 +16,7 @@ jobs:
   worker:
     name: Test and build Worker binaries
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:16-alpine
@@ -92,50 +93,167 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  images:
-    name: Publish multi-architecture images
+  image-build:
+    name: Build ${{ matrix.image }} (${{ matrix.arch }})
     needs: worker
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: server
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            repository: ghcr.io/7-e1even/agentbox-server
+          - image: server
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            repository: ghcr.io/7-e1even/agentbox-server
+          - image: app
+            arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            repository: ghcr.io/7-e1even/agentbox-app
+          - image: app
+            arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            repository: ghcr.io/7-e1even/agentbox-app
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Publish Server image
+      - name: Build and push Server image by digest
+        id: server
+        if: matrix.image == 'server'
         uses: docker/build-push-action@v6
         with:
           context: ./server
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: ${{ matrix.platform }}
           build-args: |
             VERSION=${{ github.ref_name }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
-          tags: |
-            ghcr.io/7-e1even/agentbox-server:${{ github.ref_name }}
-      - name: Publish Web image
+          outputs: type=image,name=${{ matrix.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=agentbox-release-${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=agentbox-release-${{ matrix.image }}-${{ matrix.arch }},ignore-error=true
+      - name: Build and push Web image by digest
+        id: app
+        if: matrix.image == 'app'
         uses: docker/build-push-action@v6
         with:
           context: ./app
-          platforms: linux/amd64,linux/arm64
-          push: true
+          platforms: ${{ matrix.platform }}
           build-args: |
             AGENTBOX_API_URL=http://server:8091
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.revision=${{ github.sha }}
-          tags: |
-            ghcr.io/7-e1even/agentbox-app:${{ github.ref_name }}
+          outputs: type=image,name=${{ matrix.repository }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=agentbox-release-${{ matrix.image }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=agentbox-release-${{ matrix.image }}-${{ matrix.arch }},ignore-error=true
+      - name: Record image digest
+        env:
+          APP_DIGEST: ${{ steps.app.outputs.digest }}
+          IMAGE: ${{ matrix.image }}
+          SERVER_DIGEST: ${{ steps.server.outputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$IMAGE" in
+            server) digest=$SERVER_DIGEST ;;
+            app) digest=$APP_DIGEST ;;
+            *) echo "::error::unknown image: $IMAGE"; exit 1 ;;
+          esac
+          test -n "$digest"
+          test "${digest#sha256:}" != "$digest"
+          mkdir -p "/tmp/digests/$IMAGE"
+          touch "/tmp/digests/$IMAGE/${digest#sha256:}"
+      - name: Upload image digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest-${{ matrix.image }}-${{ matrix.arch }}
+          path: /tmp/digests/${{ matrix.image }}/*
+          if-no-files-found: error
+          retention-days: 1
+
+  images:
+    name: Publish multi-architecture images
+    needs: image-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-server-*
+          path: /tmp/digests/server
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: image-digest-app-*
+          path: /tmp/digests/app
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Merge and verify versioned image manifests
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          server_repo=ghcr.io/7-e1even/agentbox-server
+          app_repo=ghcr.io/7-e1even/agentbox-app
+
+          publish_manifest() {
+            local repository=$1 digest_dir=$2
+            local -a sources=()
+            local digest_file
+
+            mapfile -t digest_files < <(find "$digest_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
+            if [ "${#digest_files[@]}" -ne 2 ]; then
+              echo "::error::expected two architecture digests for $repository, found ${#digest_files[@]}"
+              return 1
+            fi
+            for digest_file in "${digest_files[@]}"; do
+              [[ "$digest_file" =~ ^[0-9a-f]{64}$ ]] || {
+                echo "::error::invalid image digest: $digest_file"
+                return 1
+              }
+              sources+=("$repository@sha256:$digest_file")
+            done
+
+            docker buildx imagetools create --tag "$repository:$VERSION" "${sources[@]}"
+            docker buildx imagetools inspect "$repository:$VERSION" --raw > manifest.json
+            for architecture in amd64 arm64; do
+              jq -e --arg architecture "$architecture" \
+                'any(.manifests[]?; .platform.os == "linux" and .platform.architecture == $architecture)' \
+                manifest.json >/dev/null || {
+                  echo "::error::$repository:$VERSION is missing linux/$architecture"
+                  return 1
+                }
+            done
+          }
+
+          publish_manifest "$server_repo" /tmp/digests/server
+          publish_manifest "$app_repo" /tmp/digests/app
 
   release:
     name: Publish GitHub Release
@@ -143,6 +261,7 @@ jobs:
       - worker
       - images
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       packages: write
