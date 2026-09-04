@@ -182,6 +182,15 @@ const server = createServer(async (request, response) => {
       expiresAt: "2026-09-03T00:05:00Z",
     })
   }
+  if (
+    request.method === "POST" &&
+    url.pathname === `/api/sandboxes/${sandbox.id}/desktop-ticket`
+  ) {
+    return json(response, 200, {
+      ticket: "e2e-desktop-ticket",
+      expiresAt: "2026-09-03T00:05:00Z",
+    })
+  }
   return json(response, 404, {
     error: `unhandled E2E route: ${request.method} ${url.pathname}`,
   })
@@ -194,6 +203,8 @@ function sandboxFixture() {
     runtimeId: runtime.id,
     serverId: "00000000-0000-4000-8000-000000000002",
     status: "running",
+    desktop: true,
+    workdir: "/workspace",
     credentialIds: ["slot-primary"],
     modelBindings: { "slot-primary": "model-old" },
     runtimeModelSourcesComplete: true,

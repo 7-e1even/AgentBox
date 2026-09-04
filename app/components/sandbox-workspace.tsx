@@ -305,6 +305,11 @@ function SandboxWorkspaceContent({
       : inheritedAgents
   )
   const desktopEnabled = isSandboxDesktopEnabled(sandbox?.spec)
+  const desktopUploadDirectory =
+    typeof sandbox?.spec.workdir === "string" &&
+    sandbox.spec.workdir.trim().startsWith("/")
+      ? sandbox.spec.workdir.trim()
+      : "/workspace"
   const desktopUnavailableReason =
     typeof sandbox?.spec.desktop !== "boolean" && runtime?.spec.desktop === true
       ? "此旧沙箱尚未应用模板的图形桌面配置；请从沙箱列表选择“重启并应用配置”"
@@ -594,6 +599,11 @@ function SandboxWorkspaceContent({
       uploadInputRef.current.value = ""
       uploadInputRef.current.click()
     }
+  }
+
+  function uploadDesktopFiles(files: FileList) {
+    uploadDirectoryRef.current = desktopUploadDirectory
+    void uploadSelectedFiles(files)
   }
 
   function markUploadDropTarget(
@@ -1593,6 +1603,10 @@ function SandboxWorkspaceContent({
                   sandboxId={sandbox.id}
                   active
                   running={isRunning}
+                  uploadDestination={desktopUploadDirectory}
+                  uploadEnabled={sessionState === "ready"}
+                  uploadProgress={uploadProgress}
+                  onUploadFiles={uploadDesktopFiles}
                 />
               </div>
             ) : (

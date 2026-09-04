@@ -1,9 +1,10 @@
 "use client"
 
-import { useEffect, useRef, useState } from "react"
+import { useEffect, useRef, useState, type DragEvent } from "react"
 import {
   AlertCircleIcon,
   ExpandIcon,
+  FileUpIcon,
   KeyboardIcon,
   MonitorIcon,
   RefreshCwIcon,
@@ -13,6 +14,7 @@ import type RFB from "@novnc/novnc"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Progress } from "@/components/ui/progress"
 import { Skeleton } from "@/components/ui/skeleton"
 import {
   Tooltip,
@@ -28,23 +30,42 @@ type DesktopTicket = {
   expiresAt: string
 }
 
+type DesktopUploadProgress = {
+  fileName: string
+  fileIndex: number
+  fileCount: number
+  percent: number
+}
+
 export function SandboxDesktop({
   sandboxId,
   active,
   running,
+  uploadDestination,
+  uploadEnabled,
+  uploadProgress,
+  onUploadFiles,
 }: {
   sandboxId: string
   active: boolean
   running: boolean
+  uploadDestination: string
+  uploadEnabled: boolean
+  uploadProgress: DesktopUploadProgress | null
+  onUploadFiles: (files: FileList) => void
 }) {
   const screenRef = useRef<HTMLDivElement>(null)
   const frameRef = useRef<HTMLDivElement>(null)
   const rfbRef = useRef<RFB | null>(null)
+  const uploadInputRef = useRef<HTMLInputElement>(null)
+  const dragDepthRef = useRef(0)
   const [state, setState] = useState<DesktopState>("disconnected")
   const [failure, setFailure] = useState("")
   const [desktopName, setDesktopName] = useState("XFCE")
   const [retry, setRetry] = useState(0)
   const [fullscreen, setFullscreen] = useState(false)
+  const [draggingFiles, setDraggingFiles] = useState(false)
+  const canUpload = uploadEnabled && !uploadProgress
 
   useEffect(() => {
     const updateFullscreen = () =>
@@ -144,6 +165,51 @@ export function SandboxDesktop({
     }
   }
 
+  function isFileDrag(event: DragEvent<HTMLElement>) {
+    return Array.from(event.dataTransfer.types).includes("Files")
+  }
+
+  function markFileDrag(event: DragEvent<HTMLDivElement>) {
+    if (!isFileDrag(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+    dragDepthRef.current += 1
+    event.dataTransfer.dropEffect = canUpload ? "copy" : "none"
+    setDraggingFiles(true)
+  }
+
+  function keepFileDrag(event: DragEvent<HTMLDivElement>) {
+    if (!isFileDrag(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+    event.dataTransfer.dropEffect = canUpload ? "copy" : "none"
+  }
+
+  function clearFileDrag(event: DragEvent<HTMLDivElement>) {
+    if (!isFileDrag(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
+    if (dragDepthRef.current === 0) setDraggingFiles(false)
+  }
+
+  function uploadDroppedFiles(event: DragEvent<HTMLDivElement>) {
+    if (!isFileDrag(event)) return
+    event.preventDefault()
+    event.stopPropagation()
+    dragDepthRef.current = 0
+    setDraggingFiles(false)
+    if (canUpload && event.dataTransfer.files.length > 0) {
+      onUploadFiles(event.dataTransfer.files)
+    }
+  }
+
+  function chooseUploadFiles() {
+    if (!canUpload || !uploadInputRef.current) return
+    uploadInputRef.current.value = ""
+    uploadInputRef.current.click()
+  }
+
   return (
     <section
       ref={frameRef}
@@ -172,6 +238,20 @@ export function SandboxDesktop({
           1440 × 900
         </span>
         <div className="ml-auto flex items-center gap-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                disabled={!canUpload}
+                aria-label="上传文件到工作目录"
+                onClick={chooseUploadFiles}
+              >
+                <FileUpIcon aria-hidden="true" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>上传到 {uploadDestination}</TooltipContent>
+          </Tooltip>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
@@ -214,7 +294,14 @@ export function SandboxDesktop({
           </Tooltip>
         </div>
       </div>
-      <div className="relative min-h-0 flex-1 overflow-hidden bg-neutral-950">
+      <div
+        data-slot="sandbox-desktop-viewport"
+        className="relative min-h-0 flex-1 overflow-hidden bg-neutral-950"
+        onDragEnterCapture={markFileDrag}
+        onDragOverCapture={keepFileDrag}
+        onDragLeaveCapture={clearFileDrag}
+        onDropCapture={uploadDroppedFiles}
+      >
         <div
           ref={screenRef}
           className="flex size-full items-start justify-center overflow-hidden [&_canvas]:!mx-auto [&_canvas]:!my-0"
@@ -246,7 +333,62 @@ export function SandboxDesktop({
             </Alert>
           </div>
         ) : null}
+        {uploadProgress ? (
+          <div className="absolute inset-x-3 bottom-3 z-10 border bg-background/95 px-3 py-2 shadow-sm backdrop-blur-sm">
+            <div className="mb-1.5 flex min-w-0 items-center gap-2 text-xs">
+              <FileUpIcon
+                aria-hidden="true"
+                className="shrink-0 text-muted-foreground"
+              />
+              <span className="min-w-0 flex-1 truncate">
+                {uploadProgress.fileName}
+              </span>
+              <span className="shrink-0 text-muted-foreground tabular-nums">
+                {uploadProgress.fileIndex}/{uploadProgress.fileCount} ·{" "}
+                {uploadProgress.percent}%
+              </span>
+            </div>
+            <Progress
+              aria-label={`正在上传 ${uploadProgress.fileName}`}
+              value={uploadProgress.percent}
+            />
+          </div>
+        ) : null}
+        {draggingFiles ? (
+          <div
+            role="status"
+            aria-live="polite"
+            className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 border-2 border-dashed border-primary/70 bg-background/90 p-6 text-center backdrop-blur-sm"
+          >
+            <FileUpIcon aria-hidden="true" className="text-primary" />
+            <p className="text-sm font-medium">
+              {uploadProgress
+                ? "当前文件上传完成后再试"
+                : uploadEnabled
+                  ? "松开上传到沙箱工作目录"
+                  : "文件会话连接后可上传"}
+            </p>
+            <p className="max-w-full truncate font-mono text-xs text-muted-foreground">
+              {uploadDestination}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              支持多文件，单个文件不超过 50 MiB
+            </p>
+          </div>
+        ) : null}
       </div>
+      <input
+        ref={uploadInputRef}
+        type="file"
+        multiple
+        className="sr-only"
+        aria-label="选择要上传到沙箱工作目录的文件"
+        onChange={(event) => {
+          if (event.currentTarget.files?.length) {
+            onUploadFiles(event.currentTarget.files)
+          }
+        }}
+      />
     </section>
   )
 }
